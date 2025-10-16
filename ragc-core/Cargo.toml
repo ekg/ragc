@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Core compression and decompression algorithms for the AGC genome compression format"
 
 [dependencies]
 # Local dependencies

@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Common data structures and utilities for the ragc AGC genome compression library"
 
 [dependencies]
 # Workspace dependencies

@@ -12,6 +12,11 @@ edition = "2021"
 authors = ["Erik Garrison <erik.garrison@gmail.com>"]
 license = "GPL-3.0"
 repository = "https://github.com/ekg/ragc"
+homepage = "https://github.com/ekg/ragc"
+documentation = "https://docs.rs/ragc"
+readme = "README.md"
+keywords = ["bioinformatics", "genomics", "compression", "agc"]
+categories = ["compression", "science"]
 
 [workspace.dependencies]
 # Serialization

@@ -1,5 +1,64 @@
-// AGC Common Library
-// Shared types, utilities, and data structures
+//! Common data structures and utilities for AGC genome compression.
+//!
+//! This crate provides the foundational types and utilities used across the ragc project:
+//!
+//! - **Archive I/O** - Reading and writing AGC archive format
+//! - **Collection metadata** - Managing samples, contigs, and segment descriptors
+//! - **Variable-length integers** - Space-efficient encoding/decoding
+//! - **Hash functions** - MurmurHash implementations for k-mer hashing
+//! - **Stream naming** - Archive version-aware stream identification
+//!
+//! # Examples
+//!
+//! ## Creating and reading an archive
+//!
+//! ```no_run
+//! use ragc_common::Archive;
+//!
+//! // Create a new archive for writing
+//! let mut archive = Archive::new_writer();
+//! archive.open("output.agc").expect("Failed to create archive");
+//!
+//! // Register a stream and add data
+//! let stream_id = archive.register_stream("my_stream");
+//! let data = b"Hello, AGC!";
+//! archive.add_part(stream_id, data, data.len() as u64).expect("Failed to add data");
+//!
+//! archive.close().expect("Failed to close archive");
+//!
+//! // Read it back
+//! let mut archive = Archive::new_reader();
+//! archive.open("output.agc").expect("Failed to open archive");
+//!
+//! let stream_id = archive.get_stream_id("my_stream").expect("Stream not found");
+//! let (data, _) = archive.get_part_by_id(stream_id, 0).expect("Failed to read data");
+//!
+//! assert_eq!(&data, b"Hello, AGC!");
+//! ```
+//!
+//! ## Variable-length integer encoding
+//!
+//! ```
+//! use ragc_common::{write_varint, read_varint};
+//! use std::io::Cursor;
+//!
+//! let mut buffer = Vec::new();
+//! write_varint(&mut buffer, 12345).expect("Failed to encode");
+//!
+//! let mut cursor = Cursor::new(&buffer);
+//! let (value, bytes_read) = read_varint(&mut cursor).expect("Failed to decode");
+//!
+//! assert_eq!(value, 12345);
+//! ```
+//!
+//! ## Using hash functions
+//!
+//! ```
+//! use ragc_common::MurMur64Hash;
+//!
+//! let kmer_value = 0x12345678u64;
+//! let hash = MurMur64Hash::hash(kmer_value);
+//! ```
 
 pub mod archive;
 pub mod collection;

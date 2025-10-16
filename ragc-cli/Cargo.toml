@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Command-line interface for the ragc AGC genome compression tool"
 
 [[bin]]
 name = "ragc"
