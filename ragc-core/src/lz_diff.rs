@@ -144,7 +144,7 @@ impl LZDiff {
 
         let mut digits = Vec::new();
         while x > 0 {
-            digits.push((b'0' + (x % 10) as u8));
+            digits.push(b'0' + (x % 10) as u8);
             x /= 10;
         }
 

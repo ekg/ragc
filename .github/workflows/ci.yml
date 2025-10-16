@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  cpp_compat:
+    name: C++ Compatibility Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install C++ dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git nasm
+
+      - name: Clone and build C++ AGC
+        run: |
+          cd $HOME
+          git clone --depth 1 --branch main https://github.com/refresh-bio/agc.git cpp-agc
+          cd cpp-agc
+          git submodule update --init --recursive
+          make -j$(nproc)
+          sudo cp bin/agc /usr/local/bin/agc
+          agc --version || echo "AGC version not available"
+
+      - name: Build ragc
+        run: cargo build --release
+
+      - name: Run C++ compatibility tests
+        run: cargo test --package ragc-core --test cpp_compat -- --nocapture
+
+      - name: Test: ragc create → C++ read
+        run: |
+          echo ">test_seq" > /tmp/test.fasta
+          echo "ACGTACGTACGTACGTACGTACGTACGTACGT" >> /tmp/test.fasta
+
+          ./target/release/ragc create --output /tmp/test_ragc.agc /tmp/test.fasta
+          agc getset /tmp/test_ragc.agc test > /tmp/cpp_output.fasta
+
+          if [ ! -s /tmp/cpp_output.fasta ]; then
+            echo "ERROR: C++ failed to read ragc archive!"
+            exit 1
+          fi
+          echo "✓ C++ successfully read ragc archive"
+
+      - name: Test: C++ create → ragc read
+        run: |
+          echo ">test_seq2" > /tmp/test2.fasta
+          echo "TGCATGCATGCATGCATGCATGCATGCATGCA" >> /tmp/test2.fasta
+
+          agc create -o /tmp/test_cpp.agc /tmp/test2.fasta
+          ./target/release/ragc getset /tmp/test_cpp.agc test2 > /tmp/ragc_output.fasta
+
+          if [ ! -s /tmp/ragc_output.fasta ]; then
+            echo "ERROR: ragc failed to read C++ archive!"
+            exit 1
+          fi
+          echo "✓ ragc successfully read C++ archive"
+
+  build:
+    name: Build Release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Test binary
+        run: ./target/release/ragc --version

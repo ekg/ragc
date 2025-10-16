@@ -46,3 +46,6 @@ proptest = "1.4"
 
 # Benchmarking (dev-only)
 criterion = "0.5"
+
+# Hashing for tests
+sha2 = "0.10"
