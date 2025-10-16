@@ -1,9 +1,13 @@
 // Collection compatibility tests
 // Read collections created by C++ implementation to validate format compatibility
+//
+// NOTE: These tests require pre-generated C++ collection files in ../test-data/
+// They are ignored by default. See ragc-core/tests/cpp_compat.rs for active C++ compatibility tests.
 
 use ragc_common::{Archive, CollectionV3};
 
 #[test]
+#[ignore] // Requires pre-generated test fixtures
 fn test_read_cpp_simple_collection() {
     let mut archive = Archive::new_reader();
     archive
@@ -12,10 +16,12 @@ fn test_read_cpp_simple_collection() {
 
     let mut collection = CollectionV3::new();
     collection.set_config(1000, 21, None);
-    collection.prepare_for_decompression(&archive)
+    collection
+        .prepare_for_decompression(&archive)
         .expect("Failed to prepare for decompression");
 
-    collection.load_batch_sample_names(&mut archive)
+    collection
+        .load_batch_sample_names(&mut archive)
         .expect("Failed to load sample names");
 
     assert_eq!(collection.get_no_samples(), 2);
@@ -24,7 +30,8 @@ fn test_read_cpp_simple_collection() {
     assert_eq!(samples, vec!["sample1", "sample2"]);
 
     // Load contig batch
-    collection.load_contig_batch(&mut archive, 0)
+    collection
+        .load_contig_batch(&mut archive, 0)
         .expect("Failed to load contig batch");
 
     // Check sample1 contigs
@@ -76,6 +83,7 @@ fn test_read_cpp_simple_collection() {
 }
 
 #[test]
+#[ignore] // Requires pre-generated test fixtures
 fn test_read_cpp_collection_segments() {
     let mut archive = Archive::new_reader();
     archive
@@ -84,10 +92,12 @@ fn test_read_cpp_collection_segments() {
 
     let mut collection = CollectionV3::new();
     collection.set_config(1000, 21, None);
-    collection.prepare_for_decompression(&archive)
+    collection
+        .prepare_for_decompression(&archive)
         .expect("Failed to prepare for decompression");
 
-    collection.load_batch_sample_names(&mut archive)
+    collection
+        .load_batch_sample_names(&mut archive)
         .expect("Failed to load sample names");
 
     assert_eq!(collection.get_no_samples(), 1);
@@ -96,7 +106,8 @@ fn test_read_cpp_collection_segments() {
     assert_eq!(samples, vec!["sample1"]);
 
     // Load contig batch
-    collection.load_contig_batch(&mut archive, 0)
+    collection
+        .load_contig_batch(&mut archive, 0)
         .expect("Failed to load contig batch");
 
     // Get segment descriptors
