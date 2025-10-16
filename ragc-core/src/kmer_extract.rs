@@ -1,8 +1,8 @@
 // K-mer extraction and enumeration
 // Rust equivalent of enumerate_kmers and related functions in agc_compressor.cpp
 
-use ragc_common::Contig;
 use crate::kmer::{Kmer, KmerMode};
+use ragc_common::Contig;
 
 /// Enumerate all canonical k-mers from a contig
 ///

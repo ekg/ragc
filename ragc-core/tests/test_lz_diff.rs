@@ -1,8 +1,8 @@
 // Integration test for LZ diff encoding/decoding
 // Should produce output identical to C++ test_lz_diff
 
-use ragc_core::LZDiff;
 use ragc_common::types::Contig;
+use ragc_core::LZDiff;
 
 fn print_contig(label: &str, contig: &Contig) {
     print!("{} len:{} data:", label, contig.len());
@@ -50,7 +50,10 @@ fn test_encode_decode(reference: &Contig, target: &Contig, lz_diff: &mut LZDiff)
     }
 
     print_contig("decoded", &decoded);
-    println!("match:{}", if *target == decoded { "true" } else { "false" });
+    println!(
+        "match:{}",
+        if *target == decoded { "true" } else { "false" }
+    );
 }
 
 fn test_simple_match() {

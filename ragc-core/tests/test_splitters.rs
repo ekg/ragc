@@ -36,10 +36,7 @@ fn main() {
     // Test 2: Identical contigs (no singletons)
     println!("\n# Test 2: No singletons (identical contigs)");
     {
-        let contigs = vec![
-            vec![0, 1, 2, 3],
-            vec![0, 1, 2, 3],
-        ];
+        let contigs = vec![vec![0, 1, 2, 3], vec![0, 1, 2, 3]];
 
         let splitters = determine_splitters(&contigs, 3);
         print_splitters(&splitters, 50);

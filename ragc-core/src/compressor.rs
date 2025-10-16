@@ -1,17 +1,20 @@
 // AGC Compressor
 // Orchestrates the compression pipeline: FASTA → segments → compression → archive
 
-use ragc_common::{Archive, CollectionV3, Contig, AGC_FILE_MAJOR, AGC_FILE_MINOR, CONTIG_SEPARATOR, stream_delta_name};
 use crate::{
-    kmer::{Kmer, KmerMode},
     genome_io::GenomeIO,
+    kmer::{Kmer, KmerMode},
     lz_diff::LZDiff,
     segment_compression::compress_segment,
 };
 use anyhow::{Context, Result};
+use ragc_common::{
+    stream_delta_name, Archive, CollectionV3, Contig, AGC_FILE_MAJOR, AGC_FILE_MINOR,
+    CONTIG_SEPARATOR,
+};
 use std::collections::HashMap;
-use std::path::Path;
 use std::fs::File;
+use std::path::Path;
 
 /// Configuration for the compressor
 #[derive(Debug, Clone)]
@@ -71,7 +74,8 @@ impl Compressor {
     /// Create a new compressor
     pub fn new(archive_path: &str, config: CompressorConfig) -> Result<Self> {
         let mut archive = Archive::new_writer();
-        archive.open(archive_path)
+        archive
+            .open(archive_path)
             .context("Failed to create archive")?;
 
         let mut collection = CollectionV3::new();
@@ -95,8 +99,7 @@ impl Compressor {
             println!("Processing sample: {} from {:?}", sample_name, fasta_path);
         }
 
-        let mut reader = GenomeIO::<File>::open(fasta_path)
-            .context("Failed to open FASTA file")?;
+        let mut reader = GenomeIO::<File>::open(fasta_path).context("Failed to open FASTA file")?;
 
         // Read contigs with conversion (ASCII -> numeric)
         while let Some((contig_name, sequence)) = reader.read_contig_converted()? {
@@ -107,7 +110,12 @@ impl Compressor {
     }
 
     /// Add a contig to the archive
-    pub fn add_contig(&mut self, sample_name: &str, contig_name: &str, sequence: Contig) -> Result<()> {
+    pub fn add_contig(
+        &mut self,
+        sample_name: &str,
+        contig_name: &str,
+        sequence: Contig,
+    ) -> Result<()> {
         if sequence.is_empty() {
             return Ok(());
         }
@@ -115,7 +123,8 @@ impl Compressor {
         self.total_bases_processed += sequence.len();
 
         // Register in collection
-        self.collection.register_sample_contig(sample_name, contig_name)?;
+        self.collection
+            .register_sample_contig(sample_name, contig_name)?;
 
         // For now, treat entire contig as a single segment
         // TODO: Add splitter-based segmentation later
@@ -125,7 +134,13 @@ impl Compressor {
     }
 
     /// Add a segment to the compressor
-    fn add_segment(&mut self, sample_name: &str, contig_name: &str, seg_part_no: usize, segment: Contig) -> Result<()> {
+    fn add_segment(
+        &mut self,
+        sample_name: &str,
+        contig_name: &str,
+        seg_part_no: usize,
+        segment: Contig,
+    ) -> Result<()> {
         // Extract flanking k-mers
         let k = self.config.kmer_length as u32;
 
@@ -183,7 +198,10 @@ impl Compressor {
         kmer_back: u64,
         is_rev_comp: bool,
     ) -> Result<()> {
-        let key = SegmentGroupKey { kmer_front, kmer_back };
+        let key = SegmentGroupKey {
+            kmer_front,
+            kmer_back,
+        };
 
         let seg_info = SegmentInfo {
             sample_name: sample_name.to_string(),
@@ -195,7 +213,10 @@ impl Compressor {
             is_rev_comp,
         };
 
-        self.segment_groups.entry(key).or_insert_with(Vec::new).push(seg_info);
+        self.segment_groups
+            .entry(key)
+            .or_insert_with(Vec::new)
+            .push(seg_info);
         self.total_segments += 1;
 
         Ok(())
@@ -217,7 +238,8 @@ impl Compressor {
         append_u32(&mut params_data, self.config.segment_size);
 
         let stream_id = self.archive.register_stream("params");
-        self.archive.add_part(stream_id, &params_data, params_data.len() as u64)?;
+        self.archive
+            .add_part(stream_id, &params_data, params_data.len() as u64)?;
 
         Ok(())
     }
@@ -272,7 +294,13 @@ impl Compressor {
         append_str(&mut data, &AGC_FILE_MINOR.to_string());
 
         append_str(&mut data, "comment");
-        append_str(&mut data, &format!("AGC (Rust implementation) v.{}.{}", AGC_FILE_MAJOR, AGC_FILE_MINOR));
+        append_str(
+            &mut data,
+            &format!(
+                "AGC (Rust implementation) v.{}.{}",
+                AGC_FILE_MAJOR, AGC_FILE_MINOR
+            ),
+        );
 
         let stream_id = self.archive.register_stream("file_type_info");
         // raw_size = number of key-value pairs (7)
@@ -353,7 +381,8 @@ impl Compressor {
                 let mut compressed = compress_segment(&packed_data)?;
                 compressed.push(0); // Marker byte
 
-                self.archive.add_part(stream_id, &compressed, total_raw_size)?;
+                self.archive
+                    .add_part(stream_id, &compressed, total_raw_size)?;
             }
 
             group_id += 1;
@@ -369,12 +398,14 @@ impl Compressor {
         self.store_segment_splitters_stream()?;
 
         // Store collection metadata
-        self.collection.store_batch_sample_names(&mut self.archive)?;
+        self.collection
+            .store_batch_sample_names(&mut self.archive)?;
 
         // Store all samples in one batch
         let num_samples = self.collection.get_no_samples();
         if num_samples > 0 {
-            self.collection.store_contig_batch(&mut self.archive, 0, num_samples)?;
+            self.collection
+                .store_contig_batch(&mut self.archive, 0, num_samples)?;
         }
 
         // Store file_type_info stream (must be last, C++ reads this first)
@@ -430,8 +461,12 @@ mod tests {
         let seq1 = vec![0, 1, 2, 3, 0, 1, 2, 3]; // ACGTACGT
         let seq2 = vec![3, 2, 1, 0, 3, 2, 1, 0]; // TGCATGCA
 
-        compressor.add_contig("sample1", "chr1", seq1.clone()).unwrap();
-        compressor.add_contig("sample1", "chr2", seq2.clone()).unwrap();
+        compressor
+            .add_contig("sample1", "chr1", seq1.clone())
+            .unwrap();
+        compressor
+            .add_contig("sample1", "chr2", seq2.clone())
+            .unwrap();
         compressor.add_contig("sample2", "chr1", seq1).unwrap();
 
         compressor.finalize().unwrap();
@@ -468,7 +503,9 @@ mod tests {
         let fasta_path = Path::new("../test-data/test_simple.fasta");
 
         if fasta_path.exists() {
-            compressor.add_fasta_file("test_sample", fasta_path).unwrap();
+            compressor
+                .add_fasta_file("test_sample", fasta_path)
+                .unwrap();
             compressor.finalize().unwrap();
 
             assert!(Path::new(archive_path).exists());

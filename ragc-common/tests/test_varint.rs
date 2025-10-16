@@ -1,7 +1,7 @@
 // Integration test for variable-length integer encoding
 // Should produce output identical to C++ test_varint
 
-use ragc_common::{write_varint, read_varint, write_fixed_u64, read_fixed_u64};
+use ragc_common::{read_fixed_u64, read_varint, write_fixed_u64, write_varint};
 use std::io::Cursor;
 
 fn print_bytes(bytes: &[u8]) {
@@ -59,13 +59,7 @@ fn main() {
     // Test 3: Fixed u64 encoding
     println!("\n# Test 3: Fixed u64 encoding");
 
-    let fixed_test_values: Vec<u64> = vec![
-        0,
-        1,
-        42,
-        0xDEADBEEF,
-        0xFFFFFFFFFFFFFFFF,
-    ];
+    let fixed_test_values: Vec<u64> = vec![0, 1, 42, 0xDEADBEEF, 0xFFFFFFFFFFFFFFFF];
 
     for val in &fixed_test_values {
         let mut buf = Vec::new();

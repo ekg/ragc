@@ -1,8 +1,8 @@
 // FASTA/FASTQ genome I/O
 // Rust equivalent of genome_io.cpp
 
-use std::io::{self, BufRead, BufReader, Read, Write};
 use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use ragc_common::Contig;
@@ -17,13 +17,13 @@ const CNV_NUM: [u8; 128] = [
     b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ',
     b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ',
     // 64-79: Upper case letters starting at 'A' (65)
-    b' ',   0,  11,   1,  12,  30,  30,   2,  13,  30,  30,   9,  30,  10,   4,  30,
+    b' ', 0, 11, 1, 12, 30, 30, 2, 13, 30, 30, 9, 30, 10, 4, 30,
     // 80-95: Upper case continued
-     30,  30,   5,   7,   3,  15,  14,   8,  30,   6,  30,  30,  30,  30,  30,  30,
+    30, 30, 5, 7, 3, 15, 14, 8, 30, 6, 30, 30, 30, 30, 30, 30,
     // 96-111: Lower case letters starting at 'a' (97)
-    b' ',   0,  11,   1,  12,  30,  30,   2,  13,  30,  30,   9,  30,  10,   4,  30,
+    b' ', 0, 11, 1, 12, 30, 30, 2, 13, 30, 30, 9, 30, 10, 4, 30,
     // 112-127: Lower case continued
-     30,  30,   5,   7,   3,  15,  14,   8,  30,   6,  30,  30,  30,  30,  30,  30
+    30, 30, 5, 7, 3, 15, 14, 8, 30, 6, 30, 30, 30, 30, 30, 30,
 ];
 
 /// FASTA/FASTQ parser
@@ -155,7 +155,12 @@ impl<W: Write> GenomeWriter<W> {
 
     /// Save a contig directly (without line wrapping)
     /// If gzip_level > 0, the header is gzip-compressed but sequence is raw
-    pub fn save_contig_directly(&mut self, id: &str, contig: &Contig, _gzip_level: u32) -> io::Result<()> {
+    pub fn save_contig_directly(
+        &mut self,
+        id: &str,
+        contig: &Contig,
+        _gzip_level: u32,
+    ) -> io::Result<()> {
         // For now, ignore gzip_level and write directly
         // Full gzip support would require the refresh library or similar
         write!(self.writer, ">{}\n", id)?;

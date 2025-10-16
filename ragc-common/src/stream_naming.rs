@@ -91,8 +91,8 @@ mod tests {
         assert_eq!(int_to_base64(63), "#");
 
         // Test multi-digit values
-        assert_eq!(int_to_base64(64), "01");  // 64 = 1*64 + 0
-        assert_eq!(int_to_base64(65), "11");  // 65 = 1*64 + 1
+        assert_eq!(int_to_base64(64), "01"); // 64 = 1*64 + 0
+        assert_eq!(int_to_base64(65), "11"); // 65 = 1*64 + 1
     }
 
     #[test]

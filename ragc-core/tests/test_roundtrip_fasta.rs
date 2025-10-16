@@ -3,8 +3,8 @@
 
 use ragc_core::{Compressor, CompressorConfig, Decompressor, DecompressorConfig};
 use std::fs;
-use std::path::Path;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 #[test]
 fn test_roundtrip_fasta_output() {
@@ -28,8 +28,12 @@ fn test_roundtrip_fasta_output() {
         let seq1 = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]; // ACGTACGTACGTACGT
         let seq2 = vec![3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0]; // TGCATGCATGCA
 
-        compressor.add_contig("test_sample", "chr1", seq1.clone()).unwrap();
-        compressor.add_contig("test_sample", "chr2", seq2.clone()).unwrap();
+        compressor
+            .add_contig("test_sample", "chr1", seq1.clone())
+            .unwrap();
+        compressor
+            .add_contig("test_sample", "chr2", seq2.clone())
+            .unwrap();
 
         compressor.finalize().unwrap();
     }
@@ -39,7 +43,9 @@ fn test_roundtrip_fasta_output() {
         let config = DecompressorConfig { verbosity: 0 };
         let mut decompressor = Decompressor::open(archive_path, config).unwrap();
 
-        decompressor.write_sample_fasta("test_sample", Path::new(output_fasta)).unwrap();
+        decompressor
+            .write_sample_fasta("test_sample", Path::new(output_fasta))
+            .unwrap();
         decompressor.close().unwrap();
     }
 
@@ -54,7 +60,13 @@ fn test_roundtrip_fasta_output() {
             eprintln!("  [{}]: {}", i, line);
         }
 
-        assert_eq!(lines.len(), 4, "Expected 4 lines, got {}: {:?}", lines.len(), lines); // 2 headers + 2 sequences
+        assert_eq!(
+            lines.len(),
+            4,
+            "Expected 4 lines, got {}: {:?}",
+            lines.len(),
+            lines
+        ); // 2 headers + 2 sequences
 
         // Check chr1
         assert_eq!(lines[0], ">chr1");
@@ -94,7 +106,9 @@ fn test_roundtrip_real_fasta() {
         };
 
         let mut compressor = Compressor::new(archive_path, config).unwrap();
-        compressor.add_fasta_file("test_sample", test_fasta).unwrap();
+        compressor
+            .add_fasta_file("test_sample", test_fasta)
+            .unwrap();
         compressor.finalize().unwrap();
     }
 
@@ -102,7 +116,9 @@ fn test_roundtrip_real_fasta() {
     {
         let config = DecompressorConfig { verbosity: 0 };
         let mut decompressor = Decompressor::open(archive_path, config).unwrap();
-        decompressor.write_sample_fasta("test_sample", Path::new(output_fasta)).unwrap();
+        decompressor
+            .write_sample_fasta("test_sample", Path::new(output_fasta))
+            .unwrap();
         decompressor.close().unwrap();
     }
 
@@ -112,18 +128,23 @@ fn test_roundtrip_real_fasta() {
         let output = fs::read_to_string(output_fasta).unwrap();
 
         // Extract sequences (skip headers, concatenate all sequence lines)
-        let original_seq: String = original.lines()
+        let original_seq: String = original
+            .lines()
             .filter(|l| !l.starts_with('>'))
             .map(|l| l.trim())
             .collect();
 
-        let output_seq: String = output.lines()
+        let output_seq: String = output
+            .lines()
             .filter(|l| !l.starts_with('>'))
             .map(|l| l.trim())
             .collect();
 
-        assert_eq!(original_seq.to_uppercase(), output_seq.to_uppercase(),
-                   "Sequence data should match after round-trip");
+        assert_eq!(
+            original_seq.to_uppercase(),
+            output_seq.to_uppercase(),
+            "Sequence data should match after round-trip"
+        );
     }
 
     fs::remove_file(archive_path).unwrap();

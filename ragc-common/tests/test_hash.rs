@@ -1,7 +1,7 @@
 // Integration test for hash functions
 // Should produce output identical to C++ test_hash
 
-use ragc_common::{MurMur64Hash, MurMurPair64Hash, MurMurStringsHash, MurMur32Hash};
+use ragc_common::{MurMur32Hash, MurMur64Hash, MurMurPair64Hash, MurMurStringsHash};
 
 fn main() {
     // Test 1: MurMur64Hash for various values
@@ -24,7 +24,12 @@ fn main() {
     ];
 
     for (first, second) in test_pairs {
-        println!("{:x}\t{:x}\t{:x}", first, second, MurMurPair64Hash::hash(first, second));
+        println!(
+            "{:x}\t{:x}\t{:x}",
+            first,
+            second,
+            MurMurPair64Hash::hash(first, second)
+        );
     }
 
     // Test 3: MurMurStringsHash

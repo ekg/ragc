@@ -1,7 +1,7 @@
 // Variable-length integer encoding
 // Rust equivalent of write/read template methods in src/common/archive.h
 
-use std::io::{self, Write, Read};
+use std::io::{self, Read, Write};
 
 /// Write a value with variable-length encoding
 /// Format: [num_bytes: u8][value bytes in big-endian]

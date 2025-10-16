@@ -1,9 +1,9 @@
 // Splitter identification
 // Rust equivalent of determine_splitters logic in agc_compressor.cpp
 
-use std::collections::HashSet;
-use ragc_common::Contig;
 use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
+use ragc_common::Contig;
+use std::collections::HashSet;
 
 /// Build a splitter set from reference contigs
 ///
@@ -101,10 +101,7 @@ mod tests {
     #[test]
     fn test_determine_splitters_no_singletons() {
         // Two identical contigs - all k-mers appear twice
-        let contigs = vec![
-            vec![0, 1, 2, 3],
-            vec![0, 1, 2, 3],
-        ];
+        let contigs = vec![vec![0, 1, 2, 3], vec![0, 1, 2, 3]];
 
         let splitters = determine_splitters(&contigs, 3);
 
@@ -168,7 +165,7 @@ mod tests {
 
         // Should be sorted
         for i in 1..candidates.len() {
-            assert!(candidates[i] >= candidates[i-1]);
+            assert!(candidates[i] >= candidates[i - 1]);
         }
     }
 }

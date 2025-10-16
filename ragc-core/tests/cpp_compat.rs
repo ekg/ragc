@@ -3,11 +3,11 @@
 //! These tests verify that ragc produces archives that are bit-compatible
 //! with C++ AGC and can read C++ AGC archives correctly.
 
+use ragc_core::{Compressor, CompressorConfig, Decompressor, DecompressorConfig};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use ragc_core::{Compressor, Decompressor, CompressorConfig, DecompressorConfig};
-use sha2::{Sha256, Digest};
 
 fn get_test_data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test-data")
@@ -20,13 +20,16 @@ fn compute_file_hash(path: &Path) -> String {
 }
 
 fn contig_to_string(contig: &[u8]) -> String {
-    contig.iter().map(|&b| match b {
-        0 => 'A',
-        1 => 'C',
-        2 => 'G',
-        3 => 'T',
-        _ => 'N',
-    }).collect()
+    contig
+        .iter()
+        .map(|&b| match b {
+            0 => 'A',
+            1 => 'C',
+            2 => 'G',
+            3 => 'T',
+            _ => 'N',
+        })
+        .collect()
 }
 
 fn create_test_fasta(path: &Path) {
@@ -52,18 +55,18 @@ fn test_ragc_creates_valid_archive() {
     let mut compressor = Compressor::new(archive_path.to_str().unwrap(), config)
         .expect("Failed to create compressor");
 
-    compressor.add_fasta_file("test_sample", &fasta_path)
+    compressor
+        .add_fasta_file("test_sample", &fasta_path)
         .expect("Failed to add FASTA");
 
-    compressor.finalize()
-        .expect("Failed to finalize archive");
+    compressor.finalize().expect("Failed to finalize archive");
 
     assert!(archive_path.exists(), "Archive was not created");
 
     // Verify archive can be read back
     let config = DecompressorConfig::default();
-    let mut decompressor = Decompressor::open(archive_path.to_str().unwrap(), config)
-        .expect("Failed to open archive");
+    let mut decompressor =
+        Decompressor::open(archive_path.to_str().unwrap(), config).expect("Failed to open archive");
 
     let samples = decompressor.list_samples();
 
@@ -91,18 +94,19 @@ fn test_ragc_rust_roundtrip() {
     let mut compressor = Compressor::new(archive_path.to_str().unwrap(), config)
         .expect("Failed to create compressor");
 
-    compressor.add_fasta_file("test_sample", &fasta_path)
+    compressor
+        .add_fasta_file("test_sample", &fasta_path)
         .expect("Failed to add FASTA");
 
-    compressor.finalize()
-        .expect("Failed to finalize archive");
+    compressor.finalize().expect("Failed to finalize archive");
 
     // Decompress with ragc
     let config = DecompressorConfig::default();
-    let mut decompressor = Decompressor::open(archive_path.to_str().unwrap(), config)
-        .expect("Failed to open archive");
+    let mut decompressor =
+        Decompressor::open(archive_path.to_str().unwrap(), config).expect("Failed to open archive");
 
-    let sequences = decompressor.get_sample("test_sample")
+    let sequences = decompressor
+        .get_sample("test_sample")
         .expect("Failed to extract sample");
 
     // Write output
@@ -116,9 +120,11 @@ fn test_ragc_rust_roundtrip() {
 
     let output_hash = compute_file_hash(&output_path);
 
-    assert_eq!(original_hash, output_hash,
+    assert_eq!(
+        original_hash, output_hash,
         "Roundtrip produced different data! Original: {}, Output: {}",
-        original_hash, output_hash);
+        original_hash, output_hash
+    );
 
     // Clean up
     let _ = fs::remove_file(&fasta_path);
@@ -142,14 +148,16 @@ fn test_deterministic_compression() {
     let config = CompressorConfig::default();
     let mut compressor1 = Compressor::new(archive1_path.to_str().unwrap(), config.clone())
         .expect("Failed to create compressor 1");
-    compressor1.add_fasta_file("test_sample", &fasta_path)
+    compressor1
+        .add_fasta_file("test_sample", &fasta_path)
         .expect("Failed to add FASTA 1");
     compressor1.finalize().expect("Failed to finalize 1");
 
     // Create second archive
     let mut compressor2 = Compressor::new(archive2_path.to_str().unwrap(), config)
         .expect("Failed to create compressor 2");
-    compressor2.add_fasta_file("test_sample", &fasta_path)
+    compressor2
+        .add_fasta_file("test_sample", &fasta_path)
         .expect("Failed to add FASTA 2");
     compressor2.finalize().expect("Failed to finalize 2");
 
@@ -172,10 +180,7 @@ mod with_cpp_agc {
     use super::*;
 
     fn cpp_agc_available() -> bool {
-        Command::new("agc")
-            .arg("--version")
-            .output()
-            .is_ok()
+        Command::new("agc").arg("--version").output().is_ok()
     }
 
     #[test]
@@ -198,7 +203,8 @@ mod with_cpp_agc {
         let config = CompressorConfig::default();
         let mut compressor = Compressor::new(archive_path.to_str().unwrap(), config)
             .expect("Failed to create compressor");
-        compressor.add_fasta_file("test_sample", &fasta_path)
+        compressor
+            .add_fasta_file("test_sample", &fasta_path)
             .expect("Failed to add FASTA");
         compressor.finalize().expect("Failed to finalize archive");
 
@@ -210,15 +216,20 @@ mod with_cpp_agc {
             .output()
             .expect("Failed to run C++ agc");
 
-        assert!(status.status.success(), "C++ agc failed to extract: {}",
-            String::from_utf8_lossy(&status.stderr));
+        assert!(
+            status.status.success(),
+            "C++ agc failed to extract: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
 
         fs::write(&output_path, &status.stdout).expect("Failed to write output");
         let output_hash = compute_file_hash(&output_path);
 
-        assert_eq!(original_hash, output_hash,
+        assert_eq!(
+            original_hash, output_hash,
             "C++ extracted different data!\nOriginal: {}\nC++ Output: {}",
-            original_hash, output_hash);
+            original_hash, output_hash
+        );
 
         // Clean up
         let _ = fs::remove_file(&fasta_path);
@@ -258,7 +269,8 @@ mod with_cpp_agc {
         let mut decompressor = Decompressor::open(archive_path.to_str().unwrap(), config)
             .expect("Failed to open C++ archive");
 
-        let sequences = decompressor.get_sample("test_ragc_read")
+        let sequences = decompressor
+            .get_sample("test_ragc_read")
             .expect("Failed to extract sample");
 
         let mut output_content = String::new();
@@ -271,9 +283,11 @@ mod with_cpp_agc {
 
         let output_hash = compute_file_hash(&output_path);
 
-        assert_eq!(original_hash, output_hash,
+        assert_eq!(
+            original_hash, output_hash,
             "ragc extracted different data from C++ archive!\nOriginal: {}\nragc Output: {}",
-            original_hash, output_hash);
+            original_hash, output_hash
+        );
 
         // Clean up
         let _ = fs::remove_file(&fasta_path);

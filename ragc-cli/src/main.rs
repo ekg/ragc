@@ -1,11 +1,11 @@
 // AGC CLI - Rust implementation
 // Compatible with C++ AGC format
 
-use ragc_core::{Compressor, CompressorConfig, Decompressor, DecompressorConfig};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use ragc_core::{Compressor, CompressorConfig, Decompressor, DecompressorConfig};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "agc")]
@@ -104,10 +104,20 @@ fn main() -> Result<()> {
             segment_size,
             min_match_len,
             verbosity,
-        } => create_archive(output, inputs, kmer_length, segment_size, min_match_len, verbosity)?,
+        } => create_archive(
+            output,
+            inputs,
+            kmer_length,
+            segment_size,
+            min_match_len,
+            verbosity,
+        )?,
 
         Commands::Info { archive } => {
-            eprintln!("Info command not yet implemented for archive: {:?}", archive);
+            eprintln!(
+                "Info command not yet implemented for archive: {:?}",
+                archive
+            );
             eprintln!("This will be implemented in a future version.");
         }
 
@@ -219,7 +229,8 @@ fn getset_command(
         }
     } else {
         // Extract to temp file then write to stdout
-        let temp_path = std::env::temp_dir().join(format!("agc_extract_{}.fasta", std::process::id()));
+        let temp_path =
+            std::env::temp_dir().join(format!("agc_extract_{}.fasta", std::process::id()));
         for sample_name in &samples {
             if verbosity > 0 {
                 eprintln!("Extracting sample: {}", sample_name);
@@ -260,11 +271,7 @@ fn listset_command(archive: PathBuf, output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn listctg_command(
-    archive: PathBuf,
-    samples: Vec<String>,
-    output: Option<PathBuf>,
-) -> Result<()> {
+fn listctg_command(archive: PathBuf, samples: Vec<String>, output: Option<PathBuf>) -> Result<()> {
     let archive_str = archive
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;

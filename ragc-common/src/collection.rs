@@ -136,15 +136,17 @@ impl CollectionVarInt {
             if ptr.len() < 2 {
                 anyhow::bail!("Unexpected end of data while decoding 2-byte varint");
             }
-            let num = ((ptr[0] as u32) << 8) + ptr[1] as u32 + Self::THR_1 - ((Self::PREF_2 as u32) << 8);
+            let num =
+                ((ptr[0] as u32) << 8) + ptr[1] as u32 + Self::THR_1 - ((Self::PREF_2 as u32) << 8);
             *ptr = &ptr[2..];
             Ok(num)
         } else if (first & Self::MASK_3) == Self::PREF_3 {
             if ptr.len() < 3 {
                 anyhow::bail!("Unexpected end of data while decoding 3-byte varint");
             }
-            let num = ((ptr[0] as u32) << 16) + ((ptr[1] as u32) << 8) + ptr[2] as u32 + Self::THR_2
-                - ((Self::PREF_3 as u32) << 16);
+            let num =
+                ((ptr[0] as u32) << 16) + ((ptr[1] as u32) << 8) + ptr[2] as u32 + Self::THR_2
+                    - ((Self::PREF_3 as u32) << 16);
             *ptr = &ptr[3..];
             Ok(num)
         } else if (first & Self::MASK_4) == Self::PREF_4 {
@@ -188,8 +190,7 @@ impl CollectionVarInt {
             .position(|&b| b == 0)
             .context("Null terminator not found in string")?;
 
-        let s = String::from_utf8(ptr[..end].to_vec())
-            .context("Invalid UTF-8 in string")?;
+        let s = String::from_utf8(ptr[..end].to_vec()).context("Invalid UTF-8 in string")?;
 
         *ptr = &ptr[end + 1..];
         Ok(s)
@@ -267,7 +268,7 @@ impl CollectionV3 {
             collection_samples_id: None,
             collection_contigs_id: None,
             collection_details_id: None,
-            batch_size: 1 << 20,  // 1MB batches
+            batch_size: 1 << 20, // 1MB batches
             segment_size: 0,
             kmer_length: 0,
             prev_sample_name: String::new(),
@@ -322,16 +323,22 @@ impl CollectionV3 {
         if stored_sample_name != self.prev_sample_name {
             // Check if sample was already registered
             if self.sample_ids.contains_key(&stored_sample_name) {
-                return Ok(false);  // Already exists
+                return Ok(false); // Already exists
             }
 
             let sample_id = self.sample_ids.len();
-            self.sample_ids.insert(stored_sample_name.clone(), sample_id);
-            self.sample_desc.push(SampleDesc::new(stored_sample_name.clone()));
+            self.sample_ids
+                .insert(stored_sample_name.clone(), sample_id);
+            self.sample_desc
+                .push(SampleDesc::new(stored_sample_name.clone()));
             self.prev_sample_name = stored_sample_name;
         }
 
-        self.sample_desc.last_mut().unwrap().contigs.push(ContigDesc::new(contig_name.to_string()));
+        self.sample_desc
+            .last_mut()
+            .unwrap()
+            .contigs
+            .push(ContigDesc::new(contig_name.to_string()));
         Ok(true)
     }
 
@@ -354,7 +361,9 @@ impl CollectionV3 {
 
         if self.placing_sample_name != stored_sample_name {
             self.placing_sample_name = stored_sample_name.clone();
-            self.placing_sample_id = *self.sample_ids.get(&stored_sample_name)
+            self.placing_sample_id = *self
+                .sample_ids
+                .get(&stored_sample_name)
                 .context("Sample not found")?;
         }
 
@@ -364,12 +373,17 @@ impl CollectionV3 {
                 if place >= contig.segments.len() {
                     contig.segments.resize(place + 1, SegmentDesc::empty());
                 }
-                contig.segments[place] = SegmentDesc::new(group_id, in_group_id, is_rev_comp, raw_length);
+                contig.segments[place] =
+                    SegmentDesc::new(group_id, in_group_id, is_rev_comp, raw_length);
                 return Ok(());
             }
         }
 
-        anyhow::bail!("Contig {} not found in sample {}", contig_name, stored_sample_name);
+        anyhow::bail!(
+            "Contig {} not found in sample {}",
+            contig_name,
+            stored_sample_name
+        );
     }
 
     /// Get list of samples
@@ -388,15 +402,17 @@ impl CollectionV3 {
 
     /// Get number of contigs in a sample
     pub fn get_no_contigs(&self, sample_name: &str) -> Option<usize> {
-        self.sample_ids.get(sample_name).map(|&id| {
-            self.sample_desc[id].contigs.len()
-        })
+        self.sample_ids
+            .get(sample_name)
+            .map(|&id| self.sample_desc[id].contigs.len())
     }
 
     /// Get contig list for a sample
     pub fn get_contig_list(&self, sample_name: &str) -> Option<Vec<String>> {
         self.sample_ids.get(sample_name).map(|&id| {
-            self.sample_desc[id].contigs.iter()
+            self.sample_desc[id]
+                .contigs
+                .iter()
                 .map(|c| c.name.clone())
                 .collect()
         })
@@ -405,16 +421,24 @@ impl CollectionV3 {
     /// Get sample descriptor with all contigs and segments
     pub fn get_sample_desc(&self, sample_name: &str) -> Option<Vec<(String, Vec<SegmentDesc>)>> {
         self.sample_ids.get(sample_name).map(|&id| {
-            self.sample_desc[id].contigs.iter()
+            self.sample_desc[id]
+                .contigs
+                .iter()
                 .map(|c| (c.name.clone(), c.segments.clone()))
                 .collect()
         })
     }
 
     /// Get contig descriptor for a specific contig in a sample
-    pub fn get_contig_desc(&self, sample_name: &str, contig_name: &str) -> Option<Vec<SegmentDesc>> {
+    pub fn get_contig_desc(
+        &self,
+        sample_name: &str,
+        contig_name: &str,
+    ) -> Option<Vec<SegmentDesc>> {
         self.sample_ids.get(sample_name).and_then(|&id| {
-            self.sample_desc[id].contigs.iter()
+            self.sample_desc[id]
+                .contigs
+                .iter()
                 .find(|c| c.name == contig_name)
                 .map(|c| c.segments.clone())
         })
@@ -427,10 +451,7 @@ impl CollectionV3 {
 
     /// Extract short contig name (first word)
     fn extract_contig_name(s: &str) -> String {
-        s.split_whitespace()
-            .next()
-            .unwrap_or(s)
-            .to_string()
+        s.split_whitespace().next().unwrap_or(s).to_string()
     }
 
     // Serialization/Deserialization methods
@@ -476,7 +497,7 @@ impl CollectionV3 {
 
         for i in 0..curr_split.len() {
             if prev_split[i] == curr_split[i] {
-                enc.push((-127i8) as u8);  // Same component marker (0x81 = 129)
+                enc.push((-127i8) as u8); // Same component marker (0x81 = 129)
             } else if prev_split[i].len() != curr_split[i].len() {
                 enc.extend_from_slice(curr_split[i].as_bytes());
             } else {
@@ -488,14 +509,14 @@ impl CollectionV3 {
                 for j in 0..c_bytes.len() {
                     if p_bytes[j] == c_bytes[j] {
                         if cnt == 100 {
-                            enc.push((-cnt) as u8);  // Repetition marker
+                            enc.push((-cnt) as u8); // Repetition marker
                             cnt = 1;
                         } else {
                             cnt += 1;
                         }
                     } else {
                         if cnt > 0 {
-                            enc.push((-cnt) as u8);  // Repetition marker
+                            enc.push((-cnt) as u8); // Repetition marker
                             cnt = 0;
                         }
                         enc.push(c_bytes[j]);
@@ -503,7 +524,7 @@ impl CollectionV3 {
                 }
 
                 if cnt > 0 {
-                    enc.push((-cnt) as u8);  // Repetition marker
+                    enc.push((-cnt) as u8); // Repetition marker
                 }
             }
 
@@ -661,7 +682,8 @@ impl CollectionV3 {
     /// Set in_group_id for a group
     fn set_in_group_id(&mut self, pos: usize, val: i32) {
         if pos >= self.in_group_ids.len() {
-            self.in_group_ids.resize((pos as f64 * 1.2) as usize + 1, -1);
+            self.in_group_ids
+                .resize((pos as f64 * 1.2) as usize + 1, -1);
         }
         self.in_group_ids[pos] = val;
     }
@@ -698,11 +720,14 @@ impl CollectionV3 {
                         } else if seg.in_group_id as i32 == prev_in_group_id + 1 {
                             1
                         } else {
-                            zigzag_encode(seg.in_group_id as u64, (prev_in_group_id + 1) as u64) as u32 + 1
+                            zigzag_encode(seg.in_group_id as u64, (prev_in_group_id + 1) as u64)
+                                as u32
+                                + 1
                         }
                     };
 
-                    let e_raw_length = zigzag_encode(seg.raw_length as u64, pred_raw_length as u64) as u32;
+                    let e_raw_length =
+                        zigzag_encode(seg.raw_length as u64, pred_raw_length as u64) as u32;
 
                     contig_encoded.push((e_group_id, e_in_group_id, e_raw_length, seg.is_rev_comp));
 
@@ -808,11 +833,13 @@ impl CollectionV3 {
                         } else if e_in_group_id == 1 {
                             (prev_in_group_id + 1) as u32
                         } else {
-                            zigzag_decode(e_in_group_id as u64 - 1, (prev_in_group_id + 1) as u64) as u32
+                            zigzag_decode(e_in_group_id as u64 - 1, (prev_in_group_id + 1) as u64)
+                                as u32
                         }
                     };
 
-                    let c_raw_length = zigzag_decode(v_det[3][item_idx] as u64, pred_raw_length as u64) as u32;
+                    let c_raw_length =
+                        zigzag_decode(v_det[3][item_idx] as u64, pred_raw_length as u64) as u32;
                     let c_is_rev_comp = v_det[4][item_idx] != 0;
 
                     contig_segs.push(SegmentDesc::new(
@@ -851,10 +878,10 @@ impl CollectionV3 {
     pub fn store_batch_sample_names(&mut self, archive: &mut Archive) -> Result<()> {
         let v_tmp = self.serialize_sample_names();
 
-        let v_data = zstd::encode_all(&v_tmp[..], 19)
-            .context("Failed to compress sample names")?;
+        let v_data = zstd::encode_all(&v_tmp[..], 19).context("Failed to compress sample names")?;
 
-        let stream_id = self.collection_samples_id
+        let stream_id = self
+            .collection_samples_id
             .context("collection-samples stream not registered")?;
 
         archive.add_part(stream_id, &v_data, v_tmp.len() as u64)?;
@@ -864,17 +891,22 @@ impl CollectionV3 {
 
     /// Load sample names batch (with ZSTD decompression)
     pub fn load_batch_sample_names(&mut self, archive: &mut Archive) -> Result<()> {
-        let stream_id = self.collection_samples_id
+        let stream_id = self
+            .collection_samples_id
             .context("collection-samples stream not found")?;
 
-        let (v_tmp, raw_size) = archive.get_part(stream_id)?
+        let (v_tmp, raw_size) = archive
+            .get_part(stream_id)?
             .context("No sample names batch found")?;
 
-        let v_data = zstd::decode_all(&v_tmp[..])
-            .context("Failed to decompress sample names")?;
+        let v_data = zstd::decode_all(&v_tmp[..]).context("Failed to decompress sample names")?;
 
         if v_data.len() != raw_size as usize {
-            anyhow::bail!("Decompressed size mismatch: expected {}, got {}", raw_size, v_data.len());
+            anyhow::bail!(
+                "Decompressed size mismatch: expected {}, got {}",
+                raw_size,
+                v_data.len()
+            );
         }
 
         self.deserialize_sample_names(&v_data)?;
@@ -885,22 +917,27 @@ impl CollectionV3 {
     /// Load a batch of contigs (names + details)
     pub fn load_contig_batch(&mut self, archive: &mut Archive, id_batch: usize) -> Result<()> {
         // Load contig names
-        let contig_stream_id = self.collection_contigs_id
+        let contig_stream_id = self
+            .collection_contigs_id
             .context("collection-contigs stream not found")?;
 
         let (v_tmp_names, raw_size_names) = archive.get_part_by_id(contig_stream_id, id_batch)?;
-        let v_data_names = zstd::decode_all(&v_tmp_names[..])
-            .context("Failed to decompress contig names")?;
+        let v_data_names =
+            zstd::decode_all(&v_tmp_names[..]).context("Failed to decompress contig names")?;
 
         if v_data_names.len() != raw_size_names as usize {
-            anyhow::bail!("Decompressed size mismatch for contig names: expected {}, got {}",
-                raw_size_names, v_data_names.len());
+            anyhow::bail!(
+                "Decompressed size mismatch for contig names: expected {}, got {}",
+                raw_size_names,
+                v_data_names.len()
+            );
         }
 
         self.deserialize_contig_names(&v_data_names, id_batch * self.batch_size)?;
 
         // Load contig details
-        let details_stream_id = self.collection_details_id
+        let details_stream_id = self
+            .collection_details_id
             .context("collection-details stream not found")?;
 
         let (v_stream, _) = archive.get_part_by_id(details_stream_id, id_batch)?;
@@ -927,8 +964,12 @@ impl CollectionV3 {
                 .context(format!("Failed to decompress contig details stream {}", i))?;
 
             if v_data_details[i].len() != sizes[i].0 as usize {
-                anyhow::bail!("Decompressed size mismatch for details stream {}: expected {}, got {}",
-                    i, sizes[i].0, v_data_details[i].len());
+                anyhow::bail!(
+                    "Decompressed size mismatch for details stream {}: expected {}, got {}",
+                    i,
+                    sizes[i].0,
+                    v_data_details[i].len()
+                );
             }
         }
 
@@ -938,13 +979,19 @@ impl CollectionV3 {
     }
 
     /// Store a batch of contigs (names + details)
-    pub fn store_contig_batch(&mut self, archive: &mut Archive, id_from: usize, id_to: usize) -> Result<()> {
+    pub fn store_contig_batch(
+        &mut self,
+        archive: &mut Archive,
+        id_from: usize,
+        id_to: usize,
+    ) -> Result<()> {
         // Store contig names
         let v_tmp_names = self.serialize_contig_names(id_from, id_to);
-        let v_data_names = zstd::encode_all(&v_tmp_names[..], 18)
-            .context("Failed to compress contig names")?;
+        let v_data_names =
+            zstd::encode_all(&v_tmp_names[..], 18).context("Failed to compress contig names")?;
 
-        let contig_stream_id = self.collection_contigs_id
+        let contig_stream_id = self
+            .collection_contigs_id
             .context("collection-contigs stream not registered")?;
 
         archive.add_part(contig_stream_id, &v_data_names, v_tmp_names.len() as u64)?;
@@ -968,7 +1015,8 @@ impl CollectionV3 {
             v_stream.extend_from_slice(&v_data_details_compressed[i]);
         }
 
-        let details_stream_id = self.collection_details_id
+        let details_stream_id = self
+            .collection_details_id
             .context("collection-details stream not registered")?;
 
         archive.add_part(details_stream_id, &v_stream, 0)?;
@@ -1055,9 +1103,9 @@ mod tests {
     #[test]
     fn test_zigzag_predictive() {
         // Test predictive zigzag encoding
-        assert_eq!(zigzag_encode(100, 100), 0);  // Same as previous
-        assert_eq!(zigzag_encode(101, 100), 2);  // Slightly above
-        assert_eq!(zigzag_encode(99, 100), 1);   // Slightly below
+        assert_eq!(zigzag_encode(100, 100), 0); // Same as previous
+        assert_eq!(zigzag_encode(101, 100), 2); // Slightly above
+        assert_eq!(zigzag_encode(99, 100), 1); // Slightly below
         assert_eq!(zigzag_encode(200, 100), 200); // Far away
 
         assert_eq!(zigzag_decode(0, 100), 100);

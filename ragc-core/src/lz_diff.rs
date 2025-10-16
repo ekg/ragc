@@ -58,7 +58,10 @@ impl LZDiff {
             if let Some(code) = self.get_code(&self.reference[i..]) {
                 let hash = MurMur64Hash::hash(code);
                 // Store i / HASHING_STEP (like C++ implementation)
-                self.ht.entry(hash).or_insert_with(Vec::new).push((i / HASHING_STEP) as u32);
+                self.ht
+                    .entry(hash)
+                    .or_insert_with(Vec::new)
+                    .push((i / HASHING_STEP) as u32);
             }
             i += HASHING_STEP;
         }
@@ -112,13 +115,7 @@ impl LZDiff {
     }
 
     /// Encode a match
-    fn encode_match(
-        &self,
-        ref_pos: u32,
-        len: Option<u32>,
-        pred_pos: u32,
-        encoded: &mut Vec<u8>,
-    ) {
+    fn encode_match(&self, ref_pos: u32, len: Option<u32>, pred_pos: u32, encoded: &mut Vec<u8>) {
         let dif_pos = (ref_pos as i32) - (pred_pos as i32);
         self.append_int(encoded, dif_pos as i64);
 
@@ -301,12 +298,7 @@ impl LZDiff {
                     Some(total_len)
                 };
 
-                self.encode_match(
-                    match_pos - len_bck,
-                    len_to_encode,
-                    pred_pos,
-                    &mut encoded,
-                );
+                self.encode_match(match_pos - len_bck, len_to_encode, pred_pos, &mut encoded);
 
                 pred_pos = match_pos - len_bck + total_len;
                 i += total_len as usize;

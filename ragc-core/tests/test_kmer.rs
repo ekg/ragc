@@ -1,7 +1,7 @@
 // Integration test for k-mer operations
 // Should produce output identical to C++ test_kmer
 
-use ragc_core::{Kmer, KmerMode, reverse_complement};
+use ragc_core::{reverse_complement, Kmer, KmerMode};
 
 fn main() {
     // Test 1: reverse_complement for individual bases
@@ -26,7 +26,10 @@ fn main() {
     println!("data_dir\t{:x}", kmer1.data_dir());
     println!("data_rc\t{:x}", kmer1.data_rc());
     println!("data_canonical\t{:x}", kmer1.data_canonical());
-    println!("is_dir_oriented\t{}", if kmer1.is_dir_oriented() { 1 } else { 0 });
+    println!(
+        "is_dir_oriented\t{}",
+        if kmer1.is_dir_oriented() { 1 } else { 0 }
+    );
 
     // Test 3: Create k-mer and insert bases (direct mode)
     println!("\n# Test 3: Insert ACGT (direct)");

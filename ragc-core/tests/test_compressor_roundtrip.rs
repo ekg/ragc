@@ -26,9 +26,15 @@ fn test_roundtrip_simple() {
         let seq1 = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]; // ACGTACGTACGT
         let seq2 = vec![3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0]; // TGCATGCATGCA
 
-        compressor.add_contig("sample1", "chr1", seq1.clone()).unwrap();
-        compressor.add_contig("sample1", "chr2", seq2.clone()).unwrap();
-        compressor.add_contig("sample2", "chr1", seq1.clone()).unwrap();
+        compressor
+            .add_contig("sample1", "chr1", seq1.clone())
+            .unwrap();
+        compressor
+            .add_contig("sample1", "chr2", seq2.clone())
+            .unwrap();
+        compressor
+            .add_contig("sample2", "chr1", seq1.clone())
+            .unwrap();
 
         compressor.finalize().unwrap();
     }
@@ -98,7 +104,9 @@ fn test_roundtrip_fasta() {
 
         let fasta_path = Path::new("../test-data/test_simple.fasta");
         if fasta_path.exists() {
-            compressor.add_fasta_file("test_sample", fasta_path).unwrap();
+            compressor
+                .add_fasta_file("test_sample", fasta_path)
+                .unwrap();
             compressor.finalize().unwrap();
 
             // Read back and verify

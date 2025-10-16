@@ -1,9 +1,9 @@
 // Segmentation logic
 // Splits contigs at splitter k-mer positions
 
-use std::collections::HashSet;
-use ragc_common::Contig;
 use crate::kmer::{Kmer, KmerMode};
+use ragc_common::Contig;
+use std::collections::HashSet;
 
 /// A segment of a contig bounded by splitter k-mers
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,8 +1,8 @@
 // Segment Compression
 // ZSTD compression/decompression for segments
 
-use ragc_common::types::{Contig, PackedBlock};
 use anyhow::{Context, Result};
+use ragc_common::types::{Contig, PackedBlock};
 
 /// Default ZSTD compression level
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
@@ -14,14 +14,12 @@ pub fn compress_segment(data: &Contig) -> Result<PackedBlock> {
 
 /// Compress a segment using ZSTD with specified compression level
 pub fn compress_segment_with_level(data: &Contig, level: i32) -> Result<PackedBlock> {
-    zstd::encode_all(data.as_slice(), level)
-        .context("Failed to compress segment with ZSTD")
+    zstd::encode_all(data.as_slice(), level).context("Failed to compress segment with ZSTD")
 }
 
 /// Decompress a segment using ZSTD
 pub fn decompress_segment(compressed: &PackedBlock) -> Result<Contig> {
-    zstd::decode_all(compressed.as_slice())
-        .context("Failed to decompress segment with ZSTD")
+    zstd::decode_all(compressed.as_slice()).context("Failed to decompress segment with ZSTD")
 }
 
 #[cfg(test)]

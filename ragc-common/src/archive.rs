@@ -143,7 +143,10 @@ impl Archive {
             anyhow::bail!("Invalid stream ID: {}", stream_id);
         }
 
-        let writer = self.writer.as_mut().context("Archive not open for writing")?;
+        let writer = self
+            .writer
+            .as_mut()
+            .context("Archive not open for writing")?;
 
         // Record part offset (before writing anything)
         let part_offset = self.f_offset;
@@ -159,7 +162,9 @@ impl Archive {
         self.f_offset += data.len() as u64;
 
         // Record part (size is only the data size, not including metadata)
-        self.streams[stream_id].parts.push(Part::new(part_offset, data.len() as u64));
+        self.streams[stream_id]
+            .parts
+            .push(Part::new(part_offset, data.len() as u64));
 
         // packed_size includes both metadata and data
         let total_size = (self.f_offset - part_offset) as u64;
@@ -238,7 +243,10 @@ impl Archive {
             return Ok(Some((Vec::new(), 0)));
         }
 
-        let reader = self.reader.as_mut().context("Archive not open for reading")?;
+        let reader = self
+            .reader
+            .as_mut()
+            .context("Archive not open for reading")?;
 
         // Seek to part offset
         reader.seek(SeekFrom::Start(part.offset))?;
@@ -255,7 +263,10 @@ impl Archive {
 
     /// Serialize footer to file (write mode)
     fn serialize(&mut self) -> Result<()> {
-        let writer = self.writer.as_mut().context("Archive not open for writing")?;
+        let writer = self
+            .writer
+            .as_mut()
+            .context("Archive not open for writing")?;
 
         let mut footer = Vec::new();
 
