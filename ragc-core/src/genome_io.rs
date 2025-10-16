@@ -116,8 +116,7 @@ impl<R: Read> GenomeIO<R> {
         };
 
         // Filter and optionally convert
-        let mut contig = Contig::new();
-        contig.reserve(raw_contig.len());
+        let mut contig = Contig::with_capacity(raw_contig.len());
 
         for &c in &raw_contig {
             // Only keep characters > 64 (ASCII 'A' is 65)

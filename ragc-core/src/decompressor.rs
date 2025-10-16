@@ -33,7 +33,7 @@ pub struct Decompressor {
     segment_cache: HashMap<u32, Contig>,
 
     // Archive parameters
-    segment_size: u32,
+    _segment_size: u32,
     kmer_length: u32,
 }
 
@@ -75,7 +75,7 @@ impl Decompressor {
             archive,
             collection,
             segment_cache: HashMap::new(),
-            segment_size,
+            _segment_size: segment_size,
             kmer_length,
         })
     }
@@ -310,7 +310,7 @@ impl Decompressor {
         let stream_id = self.archive.get_stream_id(&stream_name).ok_or_else(|| {
             // Try reference stream as fallback
             let ref_stream_name = stream_ref_name(archive_version, desc.group_id);
-            if let Some(ref_id) = self.archive.get_stream_id(&ref_stream_name) {
+            if let Some(_ref_id) = self.archive.get_stream_id(&ref_stream_name) {
                 return anyhow!(
                     "Found ref stream but not delta stream for group {}",
                     desc.group_id

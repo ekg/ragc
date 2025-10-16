@@ -68,6 +68,7 @@ impl LZDiff {
     }
 
     /// Extract k-mer code from sequence
+    #[allow(clippy::needless_range_loop)]
     fn get_code(&self, seq: &[u8]) -> Option<u64> {
         let mut code = 0u64;
         for i in 0..(self.key_len as usize) {

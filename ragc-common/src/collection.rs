@@ -979,6 +979,7 @@ impl CollectionV3 {
     }
 
     /// Store a batch of contigs (names + details)
+    #[allow(clippy::needless_range_loop)]
     pub fn store_contig_batch(
         &mut self,
         archive: &mut Archive,

@@ -134,6 +134,7 @@ fn test_read_cpp_collection_segments() {
     assert_eq!(segments[2].raw_length, 1021);
 
     // Verify pattern continues
+    #[allow(clippy::needless_range_loop)]
     for i in 0..10 {
         assert_eq!(segments[i].group_id, i as u32);
         assert_eq!(segments[i].in_group_id, (i % 3) as u32);

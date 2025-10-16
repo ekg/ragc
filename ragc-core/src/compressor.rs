@@ -43,7 +43,9 @@ struct SegmentInfo {
     contig_name: String,
     seg_part_no: usize,
     data: Contig,
+    #[allow(dead_code)]
     kmer_front: u64,
+    #[allow(dead_code)]
     kmer_back: u64,
     is_rev_comp: bool,
 }
@@ -134,6 +136,7 @@ impl Compressor {
     }
 
     /// Add a segment to the compressor
+    #[allow(clippy::needless_range_loop)]
     fn add_segment(
         &mut self,
         sample_name: &str,
@@ -188,6 +191,7 @@ impl Compressor {
     }
 
     /// Add a segment with known k-mers
+    #[allow(clippy::too_many_arguments)]
     fn add_segment_with_kmers(
         &mut self,
         sample_name: &str,

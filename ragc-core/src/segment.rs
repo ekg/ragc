@@ -66,9 +66,8 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
     let mut segment_start = 0;
     let mut front_kmer = 0u64;
-    let mut pos = 0;
 
-    for &base in contig {
+    for (pos, &base) in contig.iter().enumerate() {
         if base > 3 {
             // Non-ACGT base, reset k-mer
             kmer.reset();
@@ -94,7 +93,6 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
                 }
             }
         }
-        pos += 1;
     }
 
     // Add final segment if there's data remaining
