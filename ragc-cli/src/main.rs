@@ -114,9 +114,7 @@ fn main() -> Result<()> {
         )?,
 
         Commands::Info { archive } => {
-            eprintln!(
-                "Info command not yet implemented for archive: {archive:?}"
-            );
+            eprintln!("Info command not yet implemented for archive: {archive:?}");
             eprintln!("This will be implemented in a future version.");
         }
 

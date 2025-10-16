@@ -51,9 +51,7 @@ impl Decompressor {
         let (segment_size, kmer_length) = Self::load_params(&mut archive)?;
 
         if config.verbosity > 1 {
-            eprintln!(
-                "Loaded params: segment_size={segment_size}, kmer_length={kmer_length}"
-            );
+            eprintln!("Loaded params: segment_size={segment_size}, kmer_length={kmer_length}");
         }
 
         // Configure collection
@@ -304,9 +302,7 @@ impl Decompressor {
         let position_in_pack = desc.in_group_id as usize % PACK_CARDINALITY;
 
         if self.config.verbosity > 1 {
-            eprintln!(
-                "  pack_id={pack_id}, position_in_pack={position_in_pack}"
-            );
+            eprintln!("  pack_id={pack_id}, position_in_pack={position_in_pack}");
         }
 
         // Get the pack containing our segment
@@ -390,7 +386,9 @@ impl Decompressor {
             self.segment_cache
                 .insert(desc.group_id, contig_data.clone());
             Ok(contig_data)
-        } else if let std::collections::hash_map::Entry::Vacant(e) = self.segment_cache.entry(desc.group_id) {
+        } else if let std::collections::hash_map::Entry::Vacant(e) =
+            self.segment_cache.entry(desc.group_id)
+        {
             // No cached reference for this group, so this must be raw data (C++ format)
             // Cache it as the reference
             e.insert(contig_data.clone());

@@ -385,9 +385,7 @@ impl CollectionV3 {
             }
         }
 
-        anyhow::bail!(
-            "Contig {contig_name} not found in sample {stored_sample_name}"
-        );
+        anyhow::bail!("Contig {contig_name} not found in sample {stored_sample_name}");
     }
 
     /// Get list of samples
@@ -723,8 +721,7 @@ impl CollectionV3 {
                     } else if seg.in_group_id as i32 == prev_in_group_id + 1 {
                         1
                     } else {
-                        zigzag_encode(seg.in_group_id as u64, (prev_in_group_id + 1) as u64)
-                            as u32
+                        zigzag_encode(seg.in_group_id as u64, (prev_in_group_id + 1) as u64) as u32
                             + 1
                     };
 

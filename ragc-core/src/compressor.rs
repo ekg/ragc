@@ -213,10 +213,7 @@ impl Compressor {
             is_rev_comp,
         };
 
-        self.segment_groups
-            .entry(key)
-            .or_default()
-            .push(seg_info);
+        self.segment_groups.entry(key).or_default().push(seg_info);
         self.total_segments += 1;
 
         Ok(())
@@ -296,9 +293,7 @@ impl Compressor {
         append_str(&mut data, "comment");
         append_str(
             &mut data,
-            &format!(
-                "AGC (Rust implementation) v.{AGC_FILE_MAJOR}.{AGC_FILE_MINOR}"
-            ),
+            &format!("AGC (Rust implementation) v.{AGC_FILE_MAJOR}.{AGC_FILE_MINOR}"),
         );
 
         let stream_id = self.archive.register_stream("file_type_info");
