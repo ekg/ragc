@@ -80,7 +80,7 @@ jobs:
       - name: Run C++ compatibility tests
         run: cargo test --package ragc-core --test cpp_compat -- --nocapture
 
-      - name: Test: ragc create → C++ read
+      - name: Test ragc create then C++ read
         run: |
           echo ">test_seq" > /tmp/test.fasta
           echo "ACGTACGTACGTACGTACGTACGTACGTACGT" >> /tmp/test.fasta
@@ -94,7 +94,7 @@ jobs:
           fi
           echo "✓ C++ successfully read ragc archive"
 
-      - name: Test: C++ create → ragc read
+      - name: Test C++ create then ragc read
         run: |
           echo ">test_seq2" > /tmp/test2.fasta
           echo "TGCATGCATGCATGCATGCATGCATGCATGCA" >> /tmp/test2.fasta
