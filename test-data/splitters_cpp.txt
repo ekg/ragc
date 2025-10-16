@@ -1,0 +1,23 @@
+# Test 1: Simple case (AAAC, GGGT)
+Count: 4
+Splitters: 0 400000000000000 1400000000000000 5400000000000000
+
+# Test 2: No singletons (identical contigs)
+Count: 0
+Splitters: 
+
+# Test 3: All unique (AAAA, CCCC)
+Count: 0
+Splitters: 
+
+# Test 4: Mixed scenario
+Count: 2
+Splitters: 400000000000000 1400000000000000
+
+# Test 5: Longer sequences
+Count: 0
+Splitters: 
+
+# Test 6: Single contig
+Count: 2
+Splitters: 7400000000000000 8400000000000000

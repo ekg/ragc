@@ -1,0 +1,50 @@
+[package]
+name = "ragc-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "test-kmer"
+path = "tests/test_kmer.rs"
+
+[[bin]]
+name = "test-fasta-parser"
+path = "tests/test_fasta_parser.rs"
+
+[[bin]]
+name = "test-kmer-extract"
+path = "tests/test_kmer_extract.rs"
+
+[[bin]]
+name = "test-splitters"
+path = "tests/test_splitters.rs"
+
+[[bin]]
+name = "test-segment"
+path = "tests/test_segment.rs"
+
+[[bin]]
+name = "test-lz-diff"
+path = "tests/test_lz_diff.rs"
+
+[dependencies]
+# Local dependencies
+ragc-common = { path = "../ragc-common" }
+
+# Workspace dependencies
+serde = { workspace = true }
+bincode = { workspace = true }
+zstd = { workspace = true }
+flate2 = { workspace = true }
+ahash = { workspace = true }
+hashbrown = { workspace = true }
+rayon = { workspace = true }
+crossbeam = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Direct dependencies
+byteorder = "1.5"

@@ -1,0 +1,52 @@
+# Test 1: reverse_complement
+0	3
+1	2
+2	1
+3	0
+
+# Test 2: Insert ACGT (canonical)
+is_full	1
+cur_size	4
+max_size	4
+data_dir	1b00000000000000
+data_rc	1b00000000000000
+data_canonical	1b00000000000000
+is_dir_oriented	1
+
+# Test 3: Insert ACGT (direct)
+is_full	1
+data_dir	1b00000000000000
+
+# Test 4: Insert ACGT (rev_comp)
+is_full	1
+data_rc	1b00000000000000
+
+# Test 5: Insert AAAA (direct)
+data_dir	0
+data_dir_top8	0
+
+# Test 6: Insert TTTT (direct)
+data_dir	ff00000000000000
+data_dir_top8	ff
+
+# Test 7: Get symbols from ACGT
+pos_0	0
+pos_1	1
+pos_2	2
+pos_3	3
+
+# Test 8: Swap dir/rc
+before_dir	1b00000000000000
+before_rc	1b00000000000000
+after_dir	1b00000000000000
+after_rc	1b00000000000000
+
+# Test 9: Larger k-mer (k=8)
+is_full	1
+data_dir	1b1b000000000000
+data_rc	1b1b000000000000
+data_canonical	1b1b000000000000
+
+# Test 10: Sliding window
+after_ACGT	1b00000000000000
+after_CGTA	6c00000000000000

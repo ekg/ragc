@@ -1,0 +1,36 @@
+# Test 1: MurMur64Hash
+0	0
+1	b456bcfc34c2cb2c
+2	3abf2a20650683e7
+2a	810879608e4259cc
+64	e6be2c94a54a2c62
+3e8	af002c114878da41
+deadbeef	d24bd59f862a1dac
+ffffffffffffffff	64b5720b4b825f21
+
+# Test 2: MurMurPair64Hash
+0	0	0
+1	2	4e0fcd7162342871
+2a	2b	48c4aea6ba106c4c
+64	c8	b0a27f744bf5a33
+deadbeef	cafebabe	99a757db091902d6
+ffffffffffffffff	0	fa605f44aea3667d
+
+# Test 3: MurMurStringsHash
+""	0
+"a"	63e06f2da757f1d3
+"hello"	90c637d90913861b
+"world"	b52195c981ce0ad0
+"The quick brown fox jumps over the lazy dog"	ff3a0f043b8acc8c
+"ACGT"	c48aa9ee47174615
+"sample_name_123"	93f1242f3197aaf7
+
+# Test 4: MurMur32Hash
+0	0
+1	514e28b7
+2	30f4c306
+2a	87fcd5c
+64	fdce5cea
+3e8	66692658
+deadbeef	de5c6a9
+ffffffff	81f16f39

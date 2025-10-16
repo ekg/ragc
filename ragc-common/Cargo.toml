@@ -1,0 +1,28 @@
+[package]
+name = "ragc-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "test-hash"
+path = "tests/test_hash.rs"
+
+[[bin]]
+name = "test-varint"
+path = "tests/test_varint.rs"
+
+[dependencies]
+# Workspace dependencies
+serde = { workspace = true }
+bincode = { workspace = true }
+ahash = { workspace = true }
+hashbrown = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+zstd = { workspace = true }
+
+# Direct dependencies
+byteorder = "1.5"

@@ -1,0 +1,39 @@
+# Test 1: Varint encoding
+0	1	00
+1	2	01 01
+7f	2	01 7f
+80	2	01 80
+ff	2	01 ff
+100	3	02 01 00
+ffff	3	02 ff ff
+10000	4	03 01 00 00
+ffffffff	5	04 ff ff ff ff
+1234567890abcdef	9	08 12 34 56 78 90 ab cd ef
+ffffffffffffffff	9	08 ff ff ff ff ff ff ff ff
+
+# Test 2: Varint roundtrip
+0	0	OK
+1	1	OK
+7f	7f	OK
+80	80	OK
+ff	ff	OK
+100	100	OK
+ffff	ffff	OK
+10000	10000	OK
+ffffffff	ffffffff	OK
+1234567890abcdef	1234567890abcdef	OK
+ffffffffffffffff	ffffffffffffffff	OK
+
+# Test 3: Fixed u64 encoding
+0	8	00 00 00 00 00 00 00 00
+1	8	01 00 00 00 00 00 00 00
+2a	8	2a 00 00 00 00 00 00 00
+deadbeef	8	ef be ad de 00 00 00 00
+ffffffffffffffff	8	ff ff ff ff ff ff ff ff
+
+# Test 4: Fixed u64 roundtrip
+0	0	OK
+1	1	OK
+2a	2a	OK
+deadbeef	deadbeef	OK
+ffffffffffffffff	ffffffffffffffff	OK

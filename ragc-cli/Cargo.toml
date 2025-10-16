@@ -1,0 +1,21 @@
+[package]
+name = "ragc-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ragc"
+path = "src/main.rs"
+
+[dependencies]
+# Local dependencies
+ragc-common = { path = "../ragc-common" }
+ragc-core = { path = "../ragc-core" }
+
+# Workspace dependencies
+clap = { workspace = true }
+anyhow = { workspace = true }
+rayon = { workspace = true }

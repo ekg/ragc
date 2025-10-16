@@ -1,0 +1,37 @@
+# Test 1: No splitters (entire contig)
+num_segments:1
+seg0 front_kmer:0 back_kmer:0 len:8 data: 0 1 2 3 0 1 2 3
+
+# Test 2: With one splitter
+num_segments:2
+seg0 front_kmer:0 back_kmer:0 len:3 data: 0 0 0
+seg1 front_kmer:0 back_kmer:0 len:6 data: 1 1 1 2 2 2
+
+# Test 3: Multiple splitters
+num_segments:6
+seg0 front_kmer:0 back_kmer:0 len:3 data: 0 0 0
+seg1 front_kmer:0 back_kmer:0 len:1 data: 0
+seg2 front_kmer:0 back_kmer:5400000000000000 len:3 data: 1 1 1
+seg3 front_kmer:5400000000000000 back_kmer:5400000000000000 len:1 data: 1
+seg4 front_kmer:5400000000000000 back_kmer:5400000000000000 len:3 data: 2 2 2
+seg5 front_kmer:5400000000000000 back_kmer:5400000000000000 len:1 data: 2
+
+# Test 4: Short contig
+num_segments:1
+seg0 front_kmer:0 back_kmer:0 len:2 data: 0 1
+
+# Test 5: Splitter at start
+num_segments:2
+seg0 front_kmer:0 back_kmer:0 len:3 data: 0 0 0
+seg1 front_kmer:0 back_kmer:0 len:3 data: 1 2 3
+
+# Test 6: Consecutive splitters
+num_segments:4
+seg0 front_kmer:0 back_kmer:0 len:3 data: 0 0 0
+seg1 front_kmer:0 back_kmer:0 len:1 data: 0
+seg2 front_kmer:0 back_kmer:0 len:1 data: 0
+seg3 front_kmer:0 back_kmer:0 len:1 data: 0
+
+# Test 7: With N bases
+num_segments:1
+seg0 front_kmer:0 back_kmer:0 len:7 data: 0 0 0 4 1 1 1
