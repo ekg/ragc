@@ -96,7 +96,7 @@ impl Compressor {
     /// Add a FASTA file to the archive
     pub fn add_fasta_file(&mut self, sample_name: &str, fasta_path: &Path) -> Result<()> {
         if self.config.verbosity > 0 {
-            println!("Processing sample: {} from {:?}", sample_name, fasta_path);
+            println!("Processing sample: {sample_name} from {fasta_path:?}");
         }
 
         let mut reader = GenomeIO::<File>::open(fasta_path).context("Failed to open FASTA file")?;
@@ -142,7 +142,7 @@ impl Compressor {
         segment: Contig,
     ) -> Result<()> {
         // Extract flanking k-mers
-        let k = self.config.kmer_length as u32;
+        let k = self.config.kmer_length;
 
         let (kmer_front, kmer_back, is_rev_comp) = if segment.len() >= (k * 2) as usize {
             // Extract front k-mer
@@ -215,7 +215,7 @@ impl Compressor {
 
         self.segment_groups
             .entry(key)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(seg_info);
         self.total_segments += 1;
 
@@ -297,8 +297,7 @@ impl Compressor {
         append_str(
             &mut data,
             &format!(
-                "AGC (Rust implementation) v.{}.{}",
-                AGC_FILE_MAJOR, AGC_FILE_MINOR
+                "AGC (Rust implementation) v.{AGC_FILE_MAJOR}.{AGC_FILE_MINOR}"
             ),
         );
 
@@ -417,7 +416,7 @@ impl Compressor {
         if self.config.verbosity > 0 {
             println!("Compression complete!");
             println!("Total bases: {}", self.total_bases_processed);
-            println!("Groups created: {}", group_id);
+            println!("Groups created: {group_id}");
         }
 
         Ok(())

@@ -163,7 +163,7 @@ mod tests {
         let segments = split_at_splitters(&contig, &splitters, 3);
 
         // Should split at the splitter position
-        assert!(segments.len() >= 1);
+        assert!(!segments.is_empty());
 
         // Total length should equal original contig
         let total_len: usize = segments.iter().map(|s| s.len()).sum();
@@ -197,7 +197,7 @@ mod tests {
         let segments = split_at_splitters(&contig, &splitters, 3);
 
         // Should create multiple small segments
-        assert!(segments.len() > 0);
+        assert!(!segments.is_empty());
     }
 
     #[test]
@@ -211,6 +211,6 @@ mod tests {
         let segments = split_at_splitters(&contig, &splitters, 3);
 
         // Should handle N bases without crashing
-        assert!(segments.len() >= 1);
+        assert!(!segments.is_empty());
     }
 }

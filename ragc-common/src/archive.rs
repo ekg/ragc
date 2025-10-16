@@ -140,7 +140,7 @@ impl Archive {
     /// Add a part to a stream
     pub fn add_part(&mut self, stream_id: usize, data: &[u8], metadata: u64) -> Result<()> {
         if stream_id >= self.streams.len() {
-            anyhow::bail!("Invalid stream ID: {}", stream_id);
+            anyhow::bail!("Invalid stream ID: {stream_id}");
         }
 
         let writer = self
@@ -167,7 +167,7 @@ impl Archive {
             .push(Part::new(part_offset, data.len() as u64));
 
         // packed_size includes both metadata and data
-        let total_size = (self.f_offset - part_offset) as u64;
+        let total_size = self.f_offset - part_offset;
         self.streams[stream_id].packed_size += total_size;
         self.streams[stream_id].packed_data_size += data.len() as u64;
 
@@ -207,7 +207,7 @@ impl Archive {
     /// Get the next part from a stream (sequential reading)
     pub fn get_part(&mut self, stream_id: usize) -> Result<Option<(Vec<u8>, u64)>> {
         if stream_id >= self.streams.len() {
-            anyhow::bail!("Invalid stream ID: {}", stream_id);
+            anyhow::bail!("Invalid stream ID: {stream_id}");
         }
 
         let stream = &mut self.streams[stream_id];
@@ -224,12 +224,12 @@ impl Archive {
     /// Get a specific part by ID from a stream (random access)
     pub fn get_part_by_id(&mut self, stream_id: usize, part_id: usize) -> Result<(Vec<u8>, u64)> {
         if stream_id >= self.streams.len() {
-            anyhow::bail!("Invalid stream ID: {}", stream_id);
+            anyhow::bail!("Invalid stream ID: {stream_id}");
         }
 
         let stream = &self.streams[stream_id];
         if part_id >= stream.parts.len() {
-            anyhow::bail!("Invalid part ID: {}", part_id);
+            anyhow::bail!("Invalid part ID: {part_id}");
         }
 
         let part = stream.parts[part_id].clone();

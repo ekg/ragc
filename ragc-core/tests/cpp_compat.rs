@@ -16,7 +16,7 @@ fn get_test_data_dir() -> PathBuf {
 fn compute_file_hash(path: &Path) -> String {
     let data = fs::read(path).expect("Failed to read file");
     let hash = Sha256::digest(&data);
-    format!("{:x}", hash)
+    format!("{hash:x}")
 }
 
 fn contig_to_string(contig: &[u8]) -> String {
@@ -65,7 +65,7 @@ fn test_ragc_creates_valid_archive() {
 
     // Verify archive can be read back
     let config = DecompressorConfig::default();
-    let mut decompressor =
+    let decompressor =
         Decompressor::open(archive_path.to_str().unwrap(), config).expect("Failed to open archive");
 
     let samples = decompressor.list_samples();
@@ -112,7 +112,7 @@ fn test_ragc_rust_roundtrip() {
     // Write output
     let mut output_content = String::new();
     for (name, contig) in sequences {
-        output_content.push_str(&format!(">{}\n", name));
+        output_content.push_str(&format!(">{name}\n"));
         output_content.push_str(&contig_to_string(&contig));
         output_content.push('\n');
     }
@@ -122,8 +122,7 @@ fn test_ragc_rust_roundtrip() {
 
     assert_eq!(
         original_hash, output_hash,
-        "Roundtrip produced different data! Original: {}, Output: {}",
-        original_hash, output_hash
+        "Roundtrip produced different data! Original: {original_hash}, Output: {output_hash}"
     );
 
     // Clean up
@@ -166,8 +165,7 @@ fn test_deterministic_compression() {
     let hash2 = compute_file_hash(&archive2_path);
 
     assert_eq!(hash1, hash2,
-        "Archives differ! This means compression is non-deterministic.\nArchive 1: {}\nArchive 2: {}",
-        hash1, hash2);
+        "Archives differ! This means compression is non-deterministic.\nArchive 1: {hash1}\nArchive 2: {hash2}");
 
     // Clean up
     let _ = fs::remove_file(&fasta_path);
@@ -227,8 +225,7 @@ mod with_cpp_agc {
 
         assert_eq!(
             original_hash, output_hash,
-            "C++ extracted different data!\nOriginal: {}\nC++ Output: {}",
-            original_hash, output_hash
+            "C++ extracted different data!\nOriginal: {original_hash}\nC++ Output: {output_hash}"
         );
 
         // Clean up
@@ -275,7 +272,7 @@ mod with_cpp_agc {
 
         let mut output_content = String::new();
         for (name, contig) in sequences {
-            output_content.push_str(&format!(">{}\n", name));
+            output_content.push_str(&format!(">{name}\n"));
             output_content.push_str(&contig_to_string(&contig));
             output_content.push('\n');
         }
@@ -285,8 +282,7 @@ mod with_cpp_agc {
 
         assert_eq!(
             original_hash, output_hash,
-            "ragc extracted different data from C++ archive!\nOriginal: {}\nragc Output: {}",
-            original_hash, output_hash
+            "ragc extracted different data from C++ archive!\nOriginal: {original_hash}\nragc Output: {output_hash}"
         );
 
         // Clean up

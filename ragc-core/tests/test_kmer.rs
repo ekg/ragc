@@ -93,15 +93,15 @@ fn main() {
 
     let dir_before = kmer7.data_dir();
     let rc_before = kmer7.data_rc();
-    println!("before_dir\t{:x}", dir_before);
-    println!("before_rc\t{:x}", rc_before);
+    println!("before_dir\t{dir_before:x}");
+    println!("before_rc\t{rc_before:x}");
 
     kmer7.swap_dir_rc();
 
     let dir_after = kmer7.data_dir();
     let rc_after = kmer7.data_rc();
-    println!("after_dir\t{:x}", dir_after);
-    println!("after_rc\t{:x}", rc_after);
+    println!("after_dir\t{dir_after:x}");
+    println!("after_rc\t{rc_after:x}");
 
     // Test 9: Larger k-mer (k=8)
     println!("\n# Test 9: Larger k-mer (k=8)");

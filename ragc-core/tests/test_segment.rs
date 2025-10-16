@@ -13,7 +13,7 @@ fn print_segment(seg: &ragc_core::Segment, max_data_len: usize) {
         if i >= max_data_len {
             break;
         }
-        print!(" {}", byte);
+        print!(" {byte}");
     }
     if seg.data.len() > max_data_len {
         print!(" ...");
@@ -31,7 +31,7 @@ fn main() {
 
         println!("num_segments:{}", segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            print!("seg{} ", i);
+            print!("seg{i} ");
             print_segment(seg, 20);
         }
     }
@@ -55,7 +55,7 @@ fn main() {
 
         println!("num_segments:{}", segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            print!("seg{} ", i);
+            print!("seg{i} ");
             print_segment(seg, 20);
         }
     }
@@ -84,7 +84,7 @@ fn main() {
 
         println!("num_segments:{}", segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            print!("seg{} ", i);
+            print!("seg{i} ");
             print_segment(seg, 20);
         }
     }
@@ -100,7 +100,7 @@ fn main() {
 
         println!("num_segments:{}", segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            print!("seg{} ", i);
+            print!("seg{i} ");
             print_segment(seg, 20);
         }
     }
@@ -122,7 +122,7 @@ fn main() {
 
         println!("num_segments:{}", segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            print!("seg{} ", i);
+            print!("seg{i} ");
             print_segment(seg, 20);
         }
     }
@@ -144,7 +144,7 @@ fn main() {
 
         println!("num_segments:{}", segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            print!("seg{} ", i);
+            print!("seg{i} ");
             print_segment(seg, 20);
         }
     }
@@ -161,7 +161,7 @@ fn main() {
 
         println!("num_segments:{}", segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            print!("seg{} ", i);
+            print!("seg{i} ");
             print_segment(seg, 20);
         }
     }

@@ -163,9 +163,9 @@ impl<W: Write> GenomeWriter<W> {
     ) -> io::Result<()> {
         // For now, ignore gzip_level and write directly
         // Full gzip support would require the refresh library or similar
-        write!(self.writer, ">{}\n", id)?;
+        writeln!(self.writer, ">{id}")?;
         self.writer.write_all(contig)?;
-        write!(self.writer, "\n")?;
+        writeln!(self.writer)?;
         Ok(())
     }
 }

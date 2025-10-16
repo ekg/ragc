@@ -53,12 +53,12 @@ fn test_read_cpp_simple_collection() {
     assert_eq!(chr1_segments.len(), 2);
     assert_eq!(chr1_segments[0].group_id, 0);
     assert_eq!(chr1_segments[0].in_group_id, 0);
-    assert_eq!(chr1_segments[0].is_rev_comp, false);
+    assert!(!chr1_segments[0].is_rev_comp);
     assert_eq!(chr1_segments[0].raw_length, 1021);
 
     assert_eq!(chr1_segments[1].group_id, 1);
     assert_eq!(chr1_segments[1].in_group_id, 0);
-    assert_eq!(chr1_segments[1].is_rev_comp, false);
+    assert!(!chr1_segments[1].is_rev_comp);
     assert_eq!(chr1_segments[1].raw_length, 1021);
 
     // sample1/chr2 should have 1 segment
@@ -66,7 +66,7 @@ fn test_read_cpp_simple_collection() {
     assert_eq!(chr2_segments.len(), 1);
     assert_eq!(chr2_segments[0].group_id, 2);
     assert_eq!(chr2_segments[0].in_group_id, 0);
-    assert_eq!(chr2_segments[0].is_rev_comp, true);
+    assert!(chr2_segments[0].is_rev_comp);
     assert_eq!(chr2_segments[0].raw_length, 1021);
 
     // Check segment descriptors for sample2
@@ -78,7 +78,7 @@ fn test_read_cpp_simple_collection() {
     assert_eq!(chr1_segments.len(), 1);
     assert_eq!(chr1_segments[0].group_id, 0);
     assert_eq!(chr1_segments[0].in_group_id, 1);
-    assert_eq!(chr1_segments[0].is_rev_comp, false);
+    assert!(!chr1_segments[0].is_rev_comp);
     assert_eq!(chr1_segments[0].raw_length, 1021);
 }
 
@@ -120,24 +120,24 @@ fn test_read_cpp_collection_segments() {
     // Verify first few segments match C++ output
     assert_eq!(segments[0].group_id, 0);
     assert_eq!(segments[0].in_group_id, 0);
-    assert_eq!(segments[0].is_rev_comp, true);
+    assert!(segments[0].is_rev_comp);
     assert_eq!(segments[0].raw_length, 1021);
 
     assert_eq!(segments[1].group_id, 1);
     assert_eq!(segments[1].in_group_id, 1);
-    assert_eq!(segments[1].is_rev_comp, false);
+    assert!(!segments[1].is_rev_comp);
     assert_eq!(segments[1].raw_length, 1021);
 
     assert_eq!(segments[2].group_id, 2);
     assert_eq!(segments[2].in_group_id, 2);
-    assert_eq!(segments[2].is_rev_comp, true);
+    assert!(segments[2].is_rev_comp);
     assert_eq!(segments[2].raw_length, 1021);
 
     // Verify pattern continues
     for i in 0..10 {
         assert_eq!(segments[i].group_id, i as u32);
         assert_eq!(segments[i].in_group_id, (i % 3) as u32);
-        assert_eq!(segments[i].is_rev_comp, i % 2 == 0);
+        assert_eq!(segments[i].is_rev_comp, i.is_multiple_of(2));
         assert_eq!(segments[i].raw_length, 1021);
     }
 }

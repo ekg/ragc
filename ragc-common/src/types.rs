@@ -18,8 +18,7 @@ pub const CONTIG_SEPARATOR: u8 = 0xFF;
 /// Full version string
 pub fn agc_version() -> String {
     format!(
-        "AGC (Assembled Genomes Compressor) v. {}.{}.{} [build {}]",
-        AGC_VER_MAJOR, AGC_VER_MINOR, AGC_VER_BUGFIX, AGC_VER_BUILD
+        "AGC (Assembled Genomes Compressor) v. {AGC_VER_MAJOR}.{AGC_VER_MINOR}.{AGC_VER_BUGFIX} [build {AGC_VER_BUILD}]"
     )
 }
 

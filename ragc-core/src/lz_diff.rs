@@ -60,7 +60,7 @@ impl LZDiff {
                 // Store i / HASHING_STEP (like C++ implementation)
                 self.ht
                     .entry(hash)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push((i / HASHING_STEP) as u32);
             }
             i += HASHING_STEP;
@@ -361,7 +361,7 @@ impl LZDiff {
 
     /// Check if byte is a literal
     fn is_literal(&self, c: u8) -> bool {
-        (c >= b'A' && c <= b'A' + 20) || c == b'!'
+        (b'A'..=b'A' + 20).contains(&c) || c == b'!'
     }
 
     /// Decode a literal

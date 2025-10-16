@@ -13,7 +13,7 @@ fn print_contig(label: &str, contig: &Contig) {
         if i > 0 {
             print!(" ");
         }
-        print!("{}", byte);
+        print!("{byte}");
     }
     if contig.len() > 50 {
         print!(" ...");
@@ -27,7 +27,7 @@ fn print_encoded(label: &str, encoded: &[u8]) {
         if i >= 100 {
             break;
         }
-        print!("{:02x}", byte);
+        print!("{byte:02x}");
     }
     if encoded.len() > 100 {
         print!("...");

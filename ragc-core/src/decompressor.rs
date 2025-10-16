@@ -52,8 +52,7 @@ impl Decompressor {
 
         if config.verbosity > 1 {
             eprintln!(
-                "Loaded params: segment_size={}, kmer_length={}",
-                segment_size, kmer_length
+                "Loaded params: segment_size={segment_size}, kmer_length={kmer_length}"
             );
         }
 
@@ -70,7 +69,7 @@ impl Decompressor {
                 collection.get_no_samples()
             );
             let samples = collection.get_samples_list(false);
-            eprintln!("Sample names: {:?}", samples);
+            eprintln!("Sample names: {samples:?}");
         }
 
         Ok(Decompressor {
@@ -93,7 +92,7 @@ impl Decompressor {
         // Check that there is exactly one part
         let num_parts = archive.get_num_parts(stream_id);
         if num_parts != 1 {
-            anyhow::bail!("Expected 1 part in params stream, found {}", num_parts);
+            anyhow::bail!("Expected 1 part in params stream, found {num_parts}");
         }
 
         // Read the params part
@@ -124,7 +123,7 @@ impl Decompressor {
     /// Get list of contigs for a specific sample
     pub fn list_contigs(&mut self, sample_name: &str) -> Result<Vec<String>> {
         if self.config.verbosity > 1 {
-            eprintln!("list_contigs called for: {}", sample_name);
+            eprintln!("list_contigs called for: {sample_name}");
             eprintln!(
                 "get_no_contigs before load: {:?}",
                 self.collection.get_no_contigs(sample_name)
@@ -135,10 +134,10 @@ impl Decompressor {
         if self
             .collection
             .get_no_contigs(sample_name)
-            .map_or(true, |count| count == 0)
+            .is_none_or(|count| count == 0)
         {
             if self.config.verbosity > 1 {
-                eprintln!("Loading contig batch for sample: {}", sample_name);
+                eprintln!("Loading contig batch for sample: {sample_name}");
             }
             self.collection.load_contig_batch(&mut self.archive, 0)?;
 
@@ -148,21 +147,19 @@ impl Decompressor {
                     self.collection.get_no_contigs(sample_name)
                 );
             }
-        } else {
-            if self.config.verbosity > 1 {
-                eprintln!(
-                    "Contig batch already loaded, get_no_contigs = {:?}",
-                    self.collection.get_no_contigs(sample_name)
-                );
-            }
+        } else if self.config.verbosity > 1 {
+            eprintln!(
+                "Contig batch already loaded, get_no_contigs = {:?}",
+                self.collection.get_no_contigs(sample_name)
+            );
         }
 
         let result = self.collection.get_contig_list(sample_name);
         if self.config.verbosity > 1 {
-            eprintln!("get_contig_list result: {:?}", result);
+            eprintln!("get_contig_list result: {result:?}");
         }
 
-        result.ok_or_else(|| anyhow!("Sample not found: {}", sample_name))
+        result.ok_or_else(|| anyhow!("Sample not found: {sample_name}"))
     }
 
     /// Extract a specific contig from a sample
@@ -171,7 +168,7 @@ impl Decompressor {
         if self
             .collection
             .get_no_contigs(sample_name)
-            .map_or(true, |count| count == 0)
+            .is_none_or(|count| count == 0)
         {
             let _num_samples = self.collection.get_no_samples();
             self.collection.load_contig_batch(&mut self.archive, 0)?;
@@ -181,7 +178,7 @@ impl Decompressor {
         let segments = self
             .collection
             .get_contig_desc(sample_name, contig_name)
-            .ok_or_else(|| anyhow!("Contig not found: {}/{}", sample_name, contig_name))?;
+            .ok_or_else(|| anyhow!("Contig not found: {sample_name}/{contig_name}"))?;
 
         if self.config.verbosity > 1 {
             eprintln!(
@@ -208,7 +205,7 @@ impl Decompressor {
         if self
             .collection
             .get_no_contigs(sample_name)
-            .map_or(true, |count| count == 0)
+            .is_none_or(|count| count == 0)
         {
             let _num_samples = self.collection.get_no_samples();
             self.collection.load_contig_batch(&mut self.archive, 0)?;
@@ -217,7 +214,7 @@ impl Decompressor {
         let sample_desc = self
             .collection
             .get_sample_desc(sample_name)
-            .ok_or_else(|| anyhow!("Sample not found: {}", sample_name))?;
+            .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))?;
 
         let mut contigs = Vec::new();
 
@@ -308,8 +305,7 @@ impl Decompressor {
 
         if self.config.verbosity > 1 {
             eprintln!(
-                "  pack_id={}, position_in_pack={}",
-                pack_id, position_in_pack
+                "  pack_id={pack_id}, position_in_pack={position_in_pack}"
             );
         }
 
@@ -324,7 +320,7 @@ impl Decompressor {
                     desc.group_id
                 );
             }
-            anyhow!("Delta stream not found: {}", stream_name)
+            anyhow!("Delta stream not found: {stream_name}")
         })?;
 
         // Fetch pack at pack_id
@@ -394,7 +390,12 @@ impl Decompressor {
             self.segment_cache
                 .insert(desc.group_id, contig_data.clone());
             Ok(contig_data)
-        } else if self.segment_cache.contains_key(&desc.group_id) {
+        } else if let std::collections::hash_map::Entry::Vacant(e) = self.segment_cache.entry(desc.group_id) {
+            // No cached reference for this group, so this must be raw data (C++ format)
+            // Cache it as the reference
+            e.insert(contig_data.clone());
+            Ok(contig_data)
+        } else {
             // We have a reference cached for this group (16+), so this must be LZ-encoded
             let reference = self.segment_cache.get(&desc.group_id).ok_or_else(|| {
                 anyhow!("Reference segment not loaded for group {}", desc.group_id)
@@ -427,12 +428,6 @@ impl Decompressor {
             }
 
             Ok(reconstructed)
-        } else {
-            // No cached reference for this group, so this must be raw data (C++ format)
-            // Cache it as the reference
-            self.segment_cache
-                .insert(desc.group_id, contig_data.clone());
-            Ok(contig_data)
         }
     }
 
@@ -500,14 +495,14 @@ mod tests {
             eprintln!("=== Test: list_samples ===");
             // List samples
             let samples = decompressor.list_samples();
-            eprintln!("Samples: {:?}", samples);
+            eprintln!("Samples: {samples:?}");
             assert_eq!(samples.len(), 1);
             assert_eq!(samples[0], "sample1");
 
             eprintln!("=== Test: list_contigs ===");
             // List contigs
             let contigs = decompressor.list_contigs("sample1").unwrap();
-            eprintln!("Contigs: {:?}", contigs);
+            eprintln!("Contigs: {contigs:?}");
             assert_eq!(contigs.len(), 1);
             assert_eq!(contigs[0], "chr1");
 

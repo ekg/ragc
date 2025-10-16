@@ -31,7 +31,7 @@ pub fn stream_prefix(archive_version: u32) -> &'static str {
 /// Get base stream name
 pub fn stream_base(archive_version: u32, n: u32) -> String {
     if archive_version < 3000 {
-        format!("seg-{}", n)
+        format!("seg-{n}")
     } else {
         format!("x{}", int_to_base64(n))
     }
@@ -40,7 +40,7 @@ pub fn stream_base(archive_version: u32, n: u32) -> String {
 /// Get reference stream name
 pub fn stream_ref_name(archive_version: u32, n: u32) -> String {
     if archive_version < 3000 {
-        format!("seg-{}-ref", n)
+        format!("seg-{n}-ref")
     } else {
         format!("x{}r", int_to_base64(n))
     }
@@ -49,7 +49,7 @@ pub fn stream_ref_name(archive_version: u32, n: u32) -> String {
 /// Get delta stream name
 pub fn stream_delta_name(archive_version: u32, n: u32) -> String {
     if archive_version < 3000 {
-        format!("seg-{}-delta", n)
+        format!("seg-{n}-delta")
     } else {
         format!("x{}d", int_to_base64(n))
     }

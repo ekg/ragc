@@ -9,7 +9,7 @@ fn print_bytes(bytes: &[u8]) {
         if i > 0 {
             print!(" ");
         }
-        print!("{:02x}", byte);
+        print!("{byte:02x}");
     }
 }
 
@@ -34,7 +34,7 @@ fn main() {
     for val in &test_values {
         let mut buf = Vec::new();
         let bytes_written = write_varint(&mut buf, *val).unwrap();
-        print!("{:x}\t{}\t", val, bytes_written);
+        print!("{val:x}\t{bytes_written}\t");
         print_bytes(&buf);
         println!();
     }
@@ -64,7 +64,7 @@ fn main() {
     for val in &fixed_test_values {
         let mut buf = Vec::new();
         write_fixed_u64(&mut buf, *val).unwrap();
-        print!("{:x}\t8\t", val);
+        print!("{val:x}\t8\t");
         print_bytes(&buf);
         println!();
     }

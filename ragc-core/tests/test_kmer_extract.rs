@@ -10,7 +10,7 @@ fn print_kmers(vec: &[u64], max_count: usize) {
         if i > 0 {
             print!(" ");
         }
-        print!("{:x}", kmer);
+        print!("{kmer:x}");
     }
     println!();
 }

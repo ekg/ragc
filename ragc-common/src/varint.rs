@@ -108,7 +108,7 @@ mod tests {
         for value in test_values {
             let encoded = encode_varint(value);
             let (decoded, _) = decode_varint(&encoded).unwrap();
-            assert_eq!(value, decoded, "Roundtrip failed for value {}", value);
+            assert_eq!(value, decoded, "Roundtrip failed for value {value}");
         }
     }
 

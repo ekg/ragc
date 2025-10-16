@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ragc_core::{Compressor, CompressorConfig, Decompressor, DecompressorConfig};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "agc")]
@@ -115,8 +115,7 @@ fn main() -> Result<()> {
 
         Commands::Info { archive } => {
             eprintln!(
-                "Info command not yet implemented for archive: {:?}",
-                archive
+                "Info command not yet implemented for archive: {archive:?}"
             );
             eprintln!("This will be implemented in a future version.");
         }
@@ -149,12 +148,12 @@ fn create_archive(
     verbosity: u32,
 ) -> Result<()> {
     if verbosity > 0 {
-        eprintln!("Creating AGC archive: {:?}", output);
+        eprintln!("Creating AGC archive: {output:?}");
         eprintln!("Input files: {} FASTA file(s)", inputs.len());
         eprintln!("Parameters:");
-        eprintln!("  k-mer length: {}", kmer_length);
-        eprintln!("  segment size: {}", segment_size);
-        eprintln!("  min match length: {}", min_match_len);
+        eprintln!("  k-mer length: {kmer_length}");
+        eprintln!("  segment size: {segment_size}");
+        eprintln!("  min match length: {min_match_len}");
     }
 
     let config = CompressorConfig {
@@ -173,7 +172,7 @@ fn create_archive(
     // Process each input file
     for input_path in &inputs {
         if !input_path.exists() {
-            eprintln!("Warning: Input file not found: {:?}", input_path);
+            eprintln!("Warning: Input file not found: {input_path:?}");
             continue;
         }
 
@@ -184,7 +183,7 @@ fn create_archive(
             .unwrap_or("unknown");
 
         if verbosity > 0 {
-            eprintln!("Processing: {} <- {:?}", sample_name, input_path);
+            eprintln!("Processing: {sample_name} <- {input_path:?}");
         }
 
         compressor.add_fasta_file(sample_name, input_path)?;
@@ -198,7 +197,7 @@ fn create_archive(
     compressor.finalize()?;
 
     if verbosity > 0 {
-        eprintln!("Archive created successfully: {:?}", output);
+        eprintln!("Archive created successfully: {output:?}");
     }
 
     Ok(())
@@ -223,7 +222,7 @@ fn getset_command(
         // Extract each sample to the output file (append mode)
         for sample_name in &samples {
             if verbosity > 0 {
-                eprintln!("Extracting sample: {}", sample_name);
+                eprintln!("Extracting sample: {sample_name}");
             }
             decompressor.write_sample_fasta(sample_name, &output_path)?;
         }
@@ -233,7 +232,7 @@ fn getset_command(
             std::env::temp_dir().join(format!("agc_extract_{}.fasta", std::process::id()));
         for sample_name in &samples {
             if verbosity > 0 {
-                eprintln!("Extracting sample: {}", sample_name);
+                eprintln!("Extracting sample: {sample_name}");
             }
             decompressor.write_sample_fasta(sample_name, &temp_path)?;
         }
@@ -260,11 +259,11 @@ fn listset_command(archive: PathBuf, output: Option<PathBuf>) -> Result<()> {
     if let Some(output_path) = output {
         let mut file = std::fs::File::create(output_path)?;
         for sample in samples {
-            writeln!(file, "{}", sample)?;
+            writeln!(file, "{sample}")?;
         }
     } else {
         for sample in samples {
-            println!("{}", sample);
+            println!("{sample}");
         }
     }
 
@@ -284,18 +283,18 @@ fn listctg_command(archive: PathBuf, samples: Vec<String>, output: Option<PathBu
     for sample_name in &samples {
         let contigs = decompressor.list_contigs(sample_name)?;
         for contig_name in contigs {
-            output_lines.push(format!("{}\t{}", sample_name, contig_name));
+            output_lines.push(format!("{sample_name}\t{contig_name}"));
         }
     }
 
     if let Some(output_path) = output {
         let mut file = std::fs::File::create(output_path)?;
         for line in output_lines {
-            writeln!(file, "{}", line)?;
+            writeln!(file, "{line}")?;
         }
     } else {
         for line in output_lines {
-            println!("{}", line);
+            println!("{line}");
         }
     }
 

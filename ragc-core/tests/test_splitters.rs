@@ -15,7 +15,7 @@ fn print_splitters(splitters: &std::collections::HashSet<u64>, max_count: usize)
         if i > 0 {
             print!(" ");
         }
-        print!("{:x}", s);
+        print!("{s:x}");
     }
     println!();
 }

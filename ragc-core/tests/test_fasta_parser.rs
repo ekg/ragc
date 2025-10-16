@@ -9,7 +9,7 @@ fn print_bytes(data: &[u8], max_len: usize) {
         if i > 0 {
             print!(" ");
         }
-        print!("{:02x}", byte);
+        print!("{byte:02x}");
     }
 }
 
@@ -21,7 +21,7 @@ fn main() {
         let mut reader = GenomeIO::new(Cursor::new(fasta));
 
         if let Some((id, contig)) = reader.read_contig().unwrap() {
-            println!("ID: {}", id);
+            println!("ID: {id}");
             println!("Length: {}", contig.len());
             print!("Sequence: ");
             for &c in &contig {
@@ -43,8 +43,8 @@ fn main() {
         let mut count = 0;
         while let Some((id, contig)) = reader.read_contig().unwrap() {
             count += 1;
-            println!("Contig {}:", count);
-            println!("  ID: {}", id);
+            println!("Contig {count}:");
+            println!("  ID: {id}");
             println!("  Length: {}", contig.len());
             print!("  Sequence: ");
             for &c in &contig {
@@ -61,7 +61,7 @@ fn main() {
         let mut reader = GenomeIO::new(Cursor::new(fasta));
 
         if let Some((id, contig)) = reader.read_contig_converted().unwrap() {
-            println!("ID: {}", id);
+            println!("ID: {id}");
             println!("Length: {}", contig.len());
             print!("Numeric: ");
             print_bytes(&contig, 100);
@@ -76,7 +76,7 @@ fn main() {
         let mut reader = GenomeIO::new(Cursor::new(fasta));
 
         if let Some((id, contig)) = reader.read_contig().unwrap() {
-            println!("ID: {}", id);
+            println!("ID: {id}");
             println!("Length: {}", contig.len());
             print!("Sequence: ");
             for &c in &contig {
@@ -93,7 +93,7 @@ fn main() {
         let mut reader = GenomeIO::new(Cursor::new(fasta));
 
         if let Some((id, contig)) = reader.read_contig_converted().unwrap() {
-            println!("ID: {}", id);
+            println!("ID: {id}");
             println!("Length: {}", contig.len());
             print!("Numeric: ");
             print_bytes(&contig, 100);
@@ -108,7 +108,7 @@ fn main() {
         let mut reader = GenomeIO::new(Cursor::new(fasta));
 
         if let Some((id, contig)) = reader.read_contig_converted().unwrap() {
-            println!("ID: {}", id);
+            println!("ID: {id}");
             println!("Length: {}", contig.len());
             print!("Numeric: ");
             print_bytes(&contig, 100);

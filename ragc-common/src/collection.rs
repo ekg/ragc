@@ -208,7 +208,7 @@ pub fn zigzag_encode_i64(x: i64) -> u64 {
 
 pub fn zigzag_decode_i64(x: u64) -> i64 {
     if x & 1 != 0 {
-        -(((x + 1) / 2) as i64)
+        -(x.div_ceil(2) as i64)
     } else {
         (x / 2) as i64
     }
@@ -258,6 +258,12 @@ pub struct CollectionV3 {
 
     // For in_group_id delta encoding
     in_group_ids: Vec<i32>,
+}
+
+impl Default for CollectionV3 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CollectionV3 {
@@ -380,9 +386,7 @@ impl CollectionV3 {
         }
 
         anyhow::bail!(
-            "Contig {} not found in sample {}",
-            contig_name,
-            stored_sample_name
+            "Contig {contig_name} not found in sample {stored_sample_name}"
         );
     }
 
@@ -714,16 +718,14 @@ impl CollectionV3 {
                     let e_group_id = seg.group_id;
                     let e_in_group_id = if prev_in_group_id == -1 {
                         seg.in_group_id
+                    } else if seg.in_group_id == 0 {
+                        0
+                    } else if seg.in_group_id as i32 == prev_in_group_id + 1 {
+                        1
                     } else {
-                        if seg.in_group_id == 0 {
-                            0
-                        } else if seg.in_group_id as i32 == prev_in_group_id + 1 {
-                            1
-                        } else {
-                            zigzag_encode(seg.in_group_id as u64, (prev_in_group_id + 1) as u64)
-                                as u32
-                                + 1
-                        }
+                        zigzag_encode(seg.in_group_id as u64, (prev_in_group_id + 1) as u64)
+                            as u32
+                            + 1
                     };
 
                     let e_raw_length =
@@ -827,15 +829,13 @@ impl CollectionV3 {
                     let e_in_group_id = v_det[2][item_idx];
                     let c_in_group_id = if prev_in_group_id == -1 {
                         e_in_group_id
+                    } else if e_in_group_id == 0 {
+                        0
+                    } else if e_in_group_id == 1 {
+                        (prev_in_group_id + 1) as u32
                     } else {
-                        if e_in_group_id == 0 {
-                            0
-                        } else if e_in_group_id == 1 {
-                            (prev_in_group_id + 1) as u32
-                        } else {
-                            zigzag_decode(e_in_group_id as u64 - 1, (prev_in_group_id + 1) as u64)
-                                as u32
-                        }
+                        zigzag_decode(e_in_group_id as u64 - 1, (prev_in_group_id + 1) as u64)
+                            as u32
                     };
 
                     let c_raw_length =
@@ -961,7 +961,7 @@ impl CollectionV3 {
         let mut v_data_details: [Vec<u8>; 5] = Default::default();
         for i in 0..5 {
             v_data_details[i] = zstd::decode_all(&v_data_details_compressed[i][..])
-                .context(format!("Failed to decompress contig details stream {}", i))?;
+                .context(format!("Failed to decompress contig details stream {i}"))?;
 
             if v_data_details[i].len() != sizes[i].0 as usize {
                 anyhow::bail!(
@@ -1002,7 +1002,7 @@ impl CollectionV3 {
         let mut v_data_details_compressed: [Vec<u8>; 5] = Default::default();
         for i in 0..5 {
             v_data_details_compressed[i] = zstd::encode_all(&v_data_details_raw[i][..], 19)
-                .context(format!("Failed to compress contig details stream {}", i))?;
+                .context(format!("Failed to compress contig details stream {i}"))?;
         }
 
         // Pack into single stream
@@ -1119,7 +1119,7 @@ mod tests {
         let seg = SegmentDesc::new(42, 7, true, 1000);
         assert_eq!(seg.group_id, 42);
         assert_eq!(seg.in_group_id, 7);
-        assert_eq!(seg.is_rev_comp, true);
+        assert!(seg.is_rev_comp);
         assert_eq!(seg.raw_length, 1000);
     }
 

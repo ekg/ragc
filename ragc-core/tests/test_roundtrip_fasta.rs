@@ -57,7 +57,7 @@ fn test_roundtrip_fasta_output() {
 
         eprintln!("Output FASTA lines:");
         for (i, line) in lines.iter().enumerate() {
-            eprintln!("  [{}]: {}", i, line);
+            eprintln!("  [{i}]: {line}");
         }
 
         assert_eq!(
