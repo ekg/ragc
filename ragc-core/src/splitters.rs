@@ -139,8 +139,8 @@ mod tests {
         // The second contig has unique patterns: AAA, AAC, CCC, CCG, GGG
         // All should be singletons (appear only once)
         // The function should find at least some splitters
-        // Note: May be 0 if canonical causes matches, so let's just verify it runs
-        assert!(splitters.len() >= 0); // Always true, just verify it doesn't crash
+        // Note: May be 0 if canonical causes matches, so we just verify it runs without crashing
+        let _ = splitters; // Test passes if determine_splitters() doesn't panic
     }
 
     #[test]

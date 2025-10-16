@@ -349,6 +349,7 @@ impl CollectionV3 {
     }
 
     /// Add segment placement information
+    #[allow(clippy::too_many_arguments)]
     pub fn add_segment_placed(
         &mut self,
         sample_name: &str,
@@ -542,6 +543,7 @@ impl CollectionV3 {
     }
 
     /// Decode contig name using delta from previous name (from raw bytes)
+    #[allow(clippy::ptr_arg)]
     fn decode_split(prev_split: &mut Vec<String>, curr_split_bytes: &[u8]) -> String {
         // Split by space
         let parts: Vec<&[u8]> = curr_split_bytes.split(|&b| b == b' ').collect();
@@ -912,6 +914,7 @@ impl CollectionV3 {
     }
 
     /// Load a batch of contigs (names + details)
+    #[allow(clippy::needless_range_loop)]
     pub fn load_contig_batch(&mut self, archive: &mut Archive, id_batch: usize) -> Result<()> {
         // Load contig names
         let contig_stream_id = self
