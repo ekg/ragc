@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ragc_core::{Compressor, CompressorConfig, Decompressor, DecompressorConfig};
+use ragc_core::{StreamingCompressor, StreamingCompressorConfig, Decompressor, DecompressorConfig};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -93,6 +93,30 @@ enum Commands {
     },
 }
 
+/// Extract sample name from file path by stripping all genomic file extensions
+/// Examples:
+///   scerevisiae8.fa.gz -> scerevisiae8
+///   genome.fasta       -> genome
+///   data.fa            -> data
+fn extract_sample_name(path: &PathBuf) -> String {
+    let mut name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Strip known genomic file extensions (in order)
+    let extensions = [".fa.gz", ".fasta.gz", ".fna.gz", ".fa", ".fasta", ".fna", ".gz"];
+    for ext in &extensions {
+        if name.ends_with(ext) {
+            name = name[..name.len() - ext.len()].to_string();
+            break;
+        }
+    }
+
+    name
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -154,38 +178,38 @@ fn create_archive(
         eprintln!("  min match length: {min_match_len}");
     }
 
-    let config = CompressorConfig {
+    let config = StreamingCompressorConfig {
         kmer_length,
         segment_size,
         min_match_len,
         verbosity,
+        group_flush_threshold: 100, // Flush after 100 segments per group
+        periodic_flush_interval: 500, // Flush all groups after 500 contigs
     };
 
     let output_str = output
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid output path"))?;
 
-    let mut compressor = Compressor::new(output_str, config)?;
+    let mut compressor = StreamingCompressor::new(output_str, config)?;
 
-    // Process each input file
+    // Prepare input files with sample names
+    let mut fasta_files = Vec::new();
     for input_path in &inputs {
         if !input_path.exists() {
             eprintln!("Warning: Input file not found: {input_path:?}");
             continue;
         }
 
-        // Extract sample name from file path (without extension)
-        let sample_name = input_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
+        // Extract sample name from file path (without extensions)
+        // Strip all genomic file extensions: .gz, .fa, .fasta, etc.
+        let sample_name = extract_sample_name(input_path);
 
-        if verbosity > 0 {
-            eprintln!("Processing: {sample_name} <- {input_path:?}");
-        }
-
-        compressor.add_fasta_file(sample_name, input_path)?;
+        fasta_files.push((sample_name, input_path.as_path()));
     }
+
+    // Use splitter-based compression for better compression ratios
+    compressor.add_fasta_files_with_splitters(&fasta_files)?;
 
     // Finalize the archive
     if verbosity > 0 {

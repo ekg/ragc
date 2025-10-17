@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 
+use flate2::read::MultiGzDecoder;
 use ragc_common::Contig;
 
 /// Nucleotide conversion table matching C++ cnv_num
@@ -134,10 +135,28 @@ impl<R: Read> GenomeIO<R> {
 }
 
 impl GenomeIO<File> {
-    /// Open a FASTA file for reading
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    /// Open a FASTA file for reading (uncompressed files only)
+    fn open_raw<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::open(path)?;
         Ok(GenomeIO::new(file))
+    }
+}
+
+impl GenomeIO<Box<dyn Read>> {
+    /// Open a FASTA file for reading (supports .gz files)
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path)?;
+
+        // Check if file is gzipped by extension
+        let reader: Box<dyn Read> = if path.extension().and_then(|s| s.to_str()) == Some("gz") {
+            // Use MultiGzDecoder to handle BGZIP (multi-member gzip) files
+            Box::new(MultiGzDecoder::new(file))
+        } else {
+            Box::new(file)
+        };
+
+        Ok(GenomeIO::new(reader))
     }
 }
 

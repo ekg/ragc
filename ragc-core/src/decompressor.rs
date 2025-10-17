@@ -246,7 +246,9 @@ impl Decompressor {
             } else {
                 // Subsequent segments: skip first kmer_length bases (overlap with previous segment)
                 if segment_data.len() < self.kmer_length as usize {
-                    anyhow::bail!("Corrupted archive: segment too short");
+                    eprintln!("ERROR: Segment {} too short! Length={}, kmer_length={}", i, segment_data.len(), self.kmer_length);
+                    eprintln!("  Segment desc: group_id={}, in_group_id={}, raw_length={}", segment_desc.group_id, segment_desc.in_group_id, segment_desc.raw_length);
+                    anyhow::bail!("Corrupted archive: segment too short (segment {}, got {} bytes, need at least {} bytes)", i, segment_data.len(), self.kmer_length);
                 }
                 contig.extend_from_slice(&segment_data[self.kmer_length as usize..]);
             }
@@ -320,16 +322,25 @@ impl Decompressor {
         })?;
 
         // Fetch pack at pack_id
-        let (mut compressed, _) = self.archive.get_part_by_id(stream_id, pack_id)?;
+        let (mut data, metadata) = self.archive.get_part_by_id(stream_id, pack_id)?;
 
-        // Remove marker byte
-        if compressed.is_empty() {
-            anyhow::bail!("Empty compressed data for segment");
-        }
-        let _marker = compressed.pop().unwrap();
+        // C++ AGC logic:
+        // - If metadata == 0: data is uncompressed (no ZSTD)
+        // - If metadata > 0: data is compressed, decompress it
+        let decompressed_pack = if metadata == 0 {
+            // Data is uncompressed, use as-is
+            data
+        } else {
+            // Data is compressed
+            // Remove marker byte
+            if data.is_empty() {
+                anyhow::bail!("Empty compressed data for segment");
+            }
+            let _marker = data.pop().unwrap();
 
-        // Decompress the pack
-        let decompressed_pack = decompress_segment(&compressed)?;
+            // Decompress the pack
+            decompress_segment(&data)?
+        };
 
         if self.config.verbosity > 1 {
             eprintln!(

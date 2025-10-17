@@ -13,7 +13,7 @@ use ragc_common::{
     CONTIG_SEPARATOR,
 };
 use std::collections::HashMap;
-use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 /// Configuration for the compressor
@@ -101,7 +101,7 @@ impl Compressor {
             println!("Processing sample: {sample_name} from {fasta_path:?}");
         }
 
-        let mut reader = GenomeIO::<File>::open(fasta_path).context("Failed to open FASTA file")?;
+        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path).context("Failed to open FASTA file")?;
 
         // Read contigs with conversion (ASCII -> numeric)
         while let Some((contig_name, sequence)) = reader.read_contig_converted()? {

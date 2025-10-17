@@ -7,23 +7,22 @@ use std::collections::HashSet;
 
 /// Build a splitter set from reference contigs
 ///
-/// Splitters are singleton k-mers (k-mers that appear exactly once) in the
-/// reference genome. They are used to segment sequences for compression.
+/// This implements the C++ AGC three-pass algorithm:
+/// 1. Find all singleton k-mers in reference (candidates)
+/// 2. Scan reference to find which candidates are ACTUALLY used as splitters
+/// 3. Return only the actually-used splitters
+///
+/// This ensures all genomes split at the SAME positions!
 ///
 /// # Arguments
 /// * `contigs` - Vector of reference contigs
 /// * `k` - K-mer length
+/// * `segment_size` - Minimum segment size
 ///
 /// # Returns
-/// HashSet of splitter k-mer values
-///
-/// # Algorithm
-/// 1. Enumerate all k-mers from all contigs
-/// 2. Sort the k-mers
-/// 3. Remove non-singletons (keep only k-mers appearing exactly once)
-/// 4. Return as a HashSet for fast lookup
-pub fn determine_splitters(contigs: &[Contig], k: usize) -> HashSet<u64> {
-    // Collect all k-mers from all contigs
+/// HashSet of actually-used splitter k-mer values (much smaller than candidates)
+pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) -> HashSet<u64> {
+    // Pass 1: Find candidate k-mers (singletons from reference)
     let mut all_kmers = Vec::new();
 
     for contig in contigs {
@@ -34,11 +33,73 @@ pub fn determine_splitters(contigs: &[Contig], k: usize) -> HashSet<u64> {
     // Sort k-mers
     all_kmers.sort_unstable();
 
-    // Remove non-singletons
+    // Remove non-singletons to get candidates
     remove_non_singletons(&mut all_kmers, 0);
 
-    // Convert to HashSet for fast lookup
-    all_kmers.into_iter().collect()
+    let candidates: HashSet<u64> = all_kmers.into_iter().collect();
+
+    // Pass 2: Scan reference again to find which candidates are ACTUALLY used
+    let mut actually_used_splitters = HashSet::new();
+
+    for contig in contigs {
+        let splitters_in_contig = find_actual_splitters_in_contig(contig, &candidates, k, segment_size);
+        actually_used_splitters.extend(splitters_in_contig);
+    }
+
+    actually_used_splitters
+}
+
+/// Find which candidate k-mers are actually used as splitters in a contig
+///
+/// This matches C++ AGC's find_splitters_in_contig function
+fn find_actual_splitters_in_contig(
+    contig: &Contig,
+    candidates: &HashSet<u64>,
+    k: usize,
+    segment_size: usize
+) -> Vec<u64> {
+    use crate::kmer::{Kmer, KmerMode};
+
+    let mut used_splitters = Vec::new();
+    let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
+    let mut current_len = segment_size; // Start ready to split
+    let mut recent_kmers = Vec::new();
+
+    for &base in contig {
+        if base > 3 {
+            kmer.reset();
+            recent_kmers.clear();
+        } else {
+            kmer.insert(base as u64);
+
+            if kmer.is_full() {
+                let kmer_value = kmer.data();
+                recent_kmers.push(kmer_value);
+
+                if current_len >= segment_size {
+                    if candidates.contains(&kmer_value) {
+                        // This candidate is actually used!
+                        used_splitters.push(kmer_value);
+                        current_len = 0;
+                        kmer.reset();
+                        recent_kmers.clear();
+                    }
+                }
+            }
+        }
+
+        current_len += 1;
+    }
+
+    // Try to add rightmost candidate k-mer
+    for &kmer_value in recent_kmers.iter().rev() {
+        if candidates.contains(&kmer_value) {
+            used_splitters.push(kmer_value);
+            break;
+        }
+    }
+
+    used_splitters
 }
 
 /// Find candidate k-mers from multiple contigs (for reference genome)

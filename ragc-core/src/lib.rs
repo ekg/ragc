@@ -112,6 +112,7 @@
 //! - SHA256-verified roundtrip testing
 
 pub mod compressor;
+pub mod compressor_streaming;
 pub mod decompressor;
 pub mod genome_io;
 pub mod kmer;
@@ -123,6 +124,7 @@ pub mod splitters;
 
 // Re-export commonly used types
 pub use compressor::{Compressor, CompressorConfig};
+pub use compressor_streaming::{StreamingCompressor, StreamingCompressorConfig};
 pub use decompressor::{Decompressor, DecompressorConfig};
 pub use genome_io::{GenomeIO, GenomeWriter};
 pub use kmer::{
@@ -131,6 +133,6 @@ pub use kmer::{
 pub use kmer::{Kmer, KmerMode};
 pub use kmer_extract::{enumerate_kmers, find_candidate_kmers, remove_non_singletons};
 pub use lz_diff::LZDiff;
-pub use segment::{split_at_splitters, Segment};
+pub use segment::{split_at_splitters, split_at_splitters_with_size, Segment};
 pub use segment_compression::{compress_segment, compress_segment_with_level, decompress_segment};
 pub use splitters::{determine_splitters, find_candidate_kmers_multi, is_splitter};
