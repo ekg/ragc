@@ -27,6 +27,29 @@ const CNV_NUM: [u8; 128] = [
     30, 30, 5, 7, 3, 15, 14, 8, 30, 6, 30, 30, 30, 30, 30, 30,
 ];
 
+/// Parse sample name and contig name from FASTA header
+///
+/// Format: >sample#haplotype#chromosome_part or >sample#haplotype#chromosome
+/// Examples:
+///   "S288C#1#chrI" -> ("S288C#1", "chrI")
+///   "AAA#0#chrI_1" -> ("AAA#0", "chrI_1")
+///   "simple_name" -> ("unknown", "simple_name")
+///
+pub fn parse_sample_from_header(header: &str) -> (String, String) {
+    // Split by '#'
+    let parts: Vec<&str> = header.split('#').collect();
+
+    if parts.len() >= 3 {
+        // Format: sample#haplotype#chromosome
+        let sample_name = format!("{}#{}", parts[0], parts[1]);
+        let contig_name = parts[2..].join("#"); // Join remaining parts (handles chr#extra)
+        (sample_name, contig_name)
+    } else {
+        // No multi-sample format detected, use entire header as contig name
+        ("unknown".to_string(), header.to_string())
+    }
+}
+
 /// FASTA/FASTQ parser
 pub struct GenomeIO<R> {
     reader: Option<BufReader<R>>,
@@ -52,6 +75,23 @@ impl<R: Read> GenomeIO<R> {
     /// Read next contig with nucleotide conversion (ASCII -> numeric)
     pub fn read_contig_converted(&mut self) -> io::Result<Option<(String, Contig)>> {
         self.read_contig_impl(true)
+    }
+
+    /// Read next contig with parsed sample/contig names (for multi-sample FASTAs)
+    /// Returns: (full_header, sample_name, contig_name, sequence)
+    ///
+    /// Parses headers in format: >sample#haplotype#chromosome
+    /// Example: >S288C#1#chrI -> sample="S288C#1", contig="chrI"
+    pub fn read_contig_with_sample(&mut self) -> io::Result<Option<(String, String, String, Contig)>> {
+        let (full_header, sequence) = match self.read_contig_impl(true)? {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+
+        // Parse sample name from header
+        let (sample_name, contig_name) = parse_sample_from_header(&full_header);
+
+        Ok(Some((full_header, sample_name, contig_name, sequence)))
     }
 
     /// Read next contig preserving raw format (including newlines)

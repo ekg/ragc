@@ -35,6 +35,7 @@ pub struct Decompressor {
     // Archive parameters
     _segment_size: u32,
     kmer_length: u32,
+    min_match_len: u32,
 }
 
 impl Decompressor {
@@ -47,8 +48,8 @@ impl Decompressor {
 
         let mut collection = CollectionV3::new();
 
-        // Load segment_size and kmer_length from params stream
-        let (segment_size, kmer_length) = Self::load_params(&mut archive)?;
+        // Load segment_size, kmer_length, and min_match_len from params stream
+        let (segment_size, kmer_length, min_match_len) = Self::load_params(&mut archive)?;
 
         if config.verbosity > 1 {
             eprintln!("Loaded params: segment_size={segment_size}, kmer_length={kmer_length}");
@@ -77,11 +78,12 @@ impl Decompressor {
             segment_cache: HashMap::new(),
             _segment_size: segment_size,
             kmer_length,
+            min_match_len,
         })
     }
 
     /// Load archive parameters from the params stream
-    fn load_params(archive: &mut Archive) -> Result<(u32, u32)> {
+    fn load_params(archive: &mut Archive) -> Result<(u32, u32, u32)> {
         // Get params stream
         let stream_id = archive
             .get_stream_id("params")
@@ -106,11 +108,11 @@ impl Decompressor {
         }
 
         let kmer_length = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let _min_match_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let min_match_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let _pack_cardinality = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         let segment_size = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
 
-        Ok((segment_size, kmer_length))
+        Ok((segment_size, kmer_length, min_match_len))
     }
 
     /// Get list of samples in the archive
@@ -177,6 +179,24 @@ impl Decompressor {
             .collection
             .get_contig_desc(sample_name, contig_name)
             .ok_or_else(|| anyhow!("Contig not found: {sample_name}/{contig_name}"))?;
+
+        // Debug output for CFF samples - print BEFORE starting extraction
+        if sample_name.starts_with("CFF") {
+            eprintln!("\n=== CFF SAMPLE DEBUG ===");
+            eprintln!(
+                "Extracting {}/{} ({} segments)",
+                sample_name,
+                contig_name,
+                segments.len()
+            );
+            for (i, seg) in segments.iter().enumerate() {
+                eprintln!(
+                    "  Segment[{}]: group_id={}, in_group_id={}, is_rev_comp={}, raw_length={}",
+                    i, seg.group_id, seg.in_group_id, seg.is_rev_comp, seg.raw_length
+                );
+            }
+            eprintln!("=== END CFF DEBUG ===\n");
+        }
 
         if self.config.verbosity > 1 {
             eprintln!(
@@ -287,8 +307,13 @@ impl Decompressor {
 
     /// Get a single segment (handles reference and LZ diff decoding)
     /// Supports packed-contig mode where multiple contigs are stored in one part
+    ///
+    /// Two-stream architecture:
+    /// - Raw groups (0-15): All segments in delta stream
+    /// - LZ groups (16+): Reference in ref stream (part 0), LZ-encoded segments in delta stream
     fn get_segment(&mut self, desc: &SegmentDesc) -> Result<Contig> {
         const PACK_CARDINALITY: usize = 50; // C++ default
+        const NO_RAW_GROUPS: u32 = 16;
 
         let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
 
@@ -299,144 +324,143 @@ impl Decompressor {
             );
         }
 
-        // Calculate which pack and position within pack
-        let pack_id = desc.in_group_id as usize / PACK_CARDINALITY;
-        let position_in_pack = desc.in_group_id as usize % PACK_CARDINALITY;
+        // Handle LZ groups (>= 16) differently from raw groups (< 16)
+        if desc.group_id >= NO_RAW_GROUPS {
+            // LZ group: two-stream architecture
 
-        if self.config.verbosity > 1 {
-            eprintln!("  pack_id={pack_id}, position_in_pack={position_in_pack}");
-        }
+            // First, ensure we have the reference loaded
+            if !self.segment_cache.contains_key(&desc.group_id) {
+                // Load reference from ref stream (part 0)
+                let ref_stream_name = stream_ref_name(archive_version, desc.group_id);
+                let ref_stream_id = self.archive.get_stream_id(&ref_stream_name)
+                    .ok_or_else(|| anyhow!("Reference stream not found: {}", ref_stream_name))?;
 
-        // Get the pack containing our segment
-        let stream_name = stream_delta_name(archive_version, desc.group_id);
-        let stream_id = self.archive.get_stream_id(&stream_name).ok_or_else(|| {
-            // Try reference stream as fallback
-            let ref_stream_name = stream_ref_name(archive_version, desc.group_id);
-            if let Some(_ref_id) = self.archive.get_stream_id(&ref_stream_name) {
-                return anyhow!(
-                    "Found ref stream but not delta stream for group {}",
-                    desc.group_id
-                );
+                let (mut ref_data, ref_metadata) = self.archive.get_part_by_id(ref_stream_id, 0)?;
+
+                // Decompress if needed
+                let decompressed_ref = if ref_metadata == 0 {
+                    ref_data
+                } else {
+                    if ref_data.is_empty() {
+                        anyhow::bail!("Empty compressed reference data");
+                    }
+                    let _marker = ref_data.pop().unwrap();
+                    decompress_segment(&ref_data)?
+                };
+
+                if self.config.verbosity > 1 {
+                    eprintln!("Loaded reference for group {}: length={}", desc.group_id, decompressed_ref.len());
+                }
+
+                // Cache the reference
+                self.segment_cache.insert(desc.group_id, decompressed_ref);
             }
-            anyhow!("Delta stream not found: {stream_name}")
-        })?;
 
-        // Fetch pack at pack_id
-        let (mut data, metadata) = self.archive.get_part_by_id(stream_id, pack_id)?;
-
-        // C++ AGC logic:
-        // - If metadata == 0: data is uncompressed (no ZSTD)
-        // - If metadata > 0: data is compressed, decompress it
-        let decompressed_pack = if metadata == 0 {
-            // Data is uncompressed, use as-is
-            data
-        } else {
-            // Data is compressed
-            // Remove marker byte
-            if data.is_empty() {
-                anyhow::bail!("Empty compressed data for segment");
-            }
-            let _marker = data.pop().unwrap();
-
-            // Decompress the pack
-            decompress_segment(&data)?
-        };
-
-        if self.config.verbosity > 1 {
-            eprintln!(
-                "Decompressed pack (group {}, pack {}): length={}",
-                desc.group_id,
-                pack_id,
-                decompressed_pack.len()
-            );
-            eprintln!(
-                "Pack bytes: {:?}",
-                &decompressed_pack[..decompressed_pack.len().min(50)]
-            );
-        }
-
-        // Unpack to extract the specific contig
-        let contig_data = Self::unpack_contig(&decompressed_pack, position_in_pack)?;
-
-        if self.config.verbosity > 1 {
-            eprintln!(
-                "Unpacked contig at position {}: length={}, first 20 bytes: {:?}",
-                position_in_pack,
-                contig_data.len(),
-                &contig_data[..contig_data.len().min(20)]
-            );
-        }
-
-        // Determine if this needs LZ decoding
-        // Key insights:
-        // 1. C++ has 16 "raw-only" groups (0-15) where ALL segments are raw (no LZ encoding)
-        // 2. Groups 16+ can use LZ encoding with first segment as reference
-        // 3. C++ vs Rust archives differ:
-        //    - C++: Each contig often in different groups, with in_group_id=1 (raw)
-        //    - Rust: Multiple contigs in same group
-        //
-        // Detection strategy:
-        // - If group_id < 16: Always raw (C++ raw-only groups)
-        // - If in_group_id=0: Always raw (reference), cache it
-        // - If in_group_id>=1 in groups 16+: Check if group already has cached reference
-        //   - Has reference: This is LZ-encoded (Rust format with LZ)
-        //   - No reference: This is raw data (C++ format), cache it
-
-        const NO_RAW_GROUPS: u32 = 16; // C++ constant
-
-        if desc.group_id < NO_RAW_GROUPS {
-            // Groups 0-15 are raw-only, never apply LZ decoding
-            // Cache first segment as reference for consistency
+            // If this IS the reference (in_group_id == 0), return it directly
             if desc.in_group_id == 0 {
-                self.segment_cache
-                    .insert(desc.group_id, contig_data.clone());
+                return Ok(self.segment_cache.get(&desc.group_id).unwrap().clone());
             }
-            Ok(contig_data)
-        } else if desc.in_group_id == 0 {
-            // Position 0 in groups 16+ is raw reference data
-            self.segment_cache
-                .insert(desc.group_id, contig_data.clone());
-            Ok(contig_data)
-        } else if let std::collections::hash_map::Entry::Vacant(e) =
-            self.segment_cache.entry(desc.group_id)
-        {
-            // No cached reference for this group, so this must be raw data (C++ format)
-            // Cache it as the reference
-            e.insert(contig_data.clone());
-            Ok(contig_data)
-        } else {
-            // We have a reference cached for this group (16+), so this must be LZ-encoded
-            let reference = self.segment_cache.get(&desc.group_id).ok_or_else(|| {
-                anyhow!("Reference segment not loaded for group {}", desc.group_id)
-            })?;
+
+            // Otherwise, load LZ-encoded segment from delta stream
+            // For delta stream: in_group_id 1 is at position 0, in_group_id 2 is at position 1, etc.
+            let delta_position = (desc.in_group_id - 1) as usize;
+            let pack_id = delta_position / PACK_CARDINALITY;
+            let position_in_pack = delta_position % PACK_CARDINALITY;
 
             if self.config.verbosity > 1 {
-                eprintln!(
-                    "Applying LZ decoding with reference: length={}, first 20 bytes: {:?}",
-                    reference.len(),
-                    &reference[..reference.len().min(20)]
-                );
-                eprintln!(
-                    "Encoded data: length={}, first 20 bytes: {:?}",
-                    contig_data.len(),
-                    &contig_data[..contig_data.len().min(20)]
-                );
+                eprintln!("  LZ group: delta_position={}, pack_id={}, position_in_pack={}",
+                    delta_position, pack_id, position_in_pack);
             }
 
-            // Apply LZ diff decoding
-            let mut lz_diff = LZDiff::new(15);
+            let delta_stream_name = stream_delta_name(archive_version, desc.group_id);
+            let delta_stream_id = self.archive.get_stream_id(&delta_stream_name)
+                .ok_or_else(|| anyhow!("Delta stream not found: {}", delta_stream_name))?;
+
+            eprintln!("DEBUG: Trying to read delta stream {}, pack_id={}, in_group_id={}, delta_position={}",
+                delta_stream_name, pack_id, desc.in_group_id, delta_position);
+
+            // Check how many parts this stream has
+            let num_parts = self.archive.get_num_parts(delta_stream_id);
+            eprintln!("DEBUG: Delta stream has {} parts total", num_parts);
+
+            if pack_id >= num_parts {
+                anyhow::bail!("Pack ID {} out of range (stream has only {} parts). in_group_id={}, delta_position={}",
+                    pack_id, num_parts, desc.in_group_id, delta_position);
+            }
+
+            let (mut delta_data, delta_metadata) = self.archive.get_part_by_id(delta_stream_id, pack_id)?;
+
+            // Decompress if needed
+            let decompressed_pack = if delta_metadata == 0 {
+                delta_data
+            } else {
+                if delta_data.is_empty() {
+                    anyhow::bail!("Empty compressed delta data");
+                }
+                let _marker = delta_data.pop().unwrap();
+                decompress_segment(&delta_data)?
+            };
+
+            // Unpack the specific LZ-encoded segment
+            let lz_encoded = Self::unpack_contig(&decompressed_pack, position_in_pack)?;
+
+            if self.config.verbosity > 1 {
+                eprintln!("Unpacked LZ-encoded segment: length={}", lz_encoded.len());
+            }
+
+            // Decode using reference
+            let reference = self.segment_cache.get(&desc.group_id)
+                .ok_or_else(|| anyhow!("Reference not loaded for group {}", desc.group_id))?;
+
+            let mut lz_diff = LZDiff::new(self.min_match_len);
             lz_diff.prepare(reference);
-            let reconstructed = lz_diff.decode(&contig_data);
+
+            // Handle empty encoding (segment equals reference)
+            let decoded = if lz_encoded.is_empty() {
+                reference.clone()
+            } else {
+                lz_diff.decode(&lz_encoded)
+            };
 
             if self.config.verbosity > 1 {
-                eprintln!(
-                    "Reconstructed: length={}, first 20 bytes: {:?}",
-                    reconstructed.len(),
-                    &reconstructed[..reconstructed.len().min(20)]
-                );
+                eprintln!("Decoded segment: length={}", decoded.len());
             }
 
-            Ok(reconstructed)
+            Ok(decoded)
+        } else {
+            // Raw-only group (0-15): all segments in delta stream
+            let pack_id = desc.in_group_id as usize / PACK_CARDINALITY;
+            let position_in_pack = desc.in_group_id as usize % PACK_CARDINALITY;
+
+            if self.config.verbosity > 1 {
+                eprintln!("  Raw group: pack_id={}, position_in_pack={}", pack_id, position_in_pack);
+            }
+
+            let stream_name = stream_delta_name(archive_version, desc.group_id);
+            let stream_id = self.archive.get_stream_id(&stream_name)
+                .ok_or_else(|| anyhow!("Delta stream not found: {}", stream_name))?;
+
+            let (mut data, metadata) = self.archive.get_part_by_id(stream_id, pack_id)?;
+
+            // Decompress if needed
+            let decompressed_pack = if metadata == 0 {
+                data
+            } else {
+                if data.is_empty() {
+                    anyhow::bail!("Empty compressed data");
+                }
+                let _marker = data.pop().unwrap();
+                decompress_segment(&data)?
+            };
+
+            // Unpack the raw segment
+            let contig_data = Self::unpack_contig(&decompressed_pack, position_in_pack)?;
+
+            if self.config.verbosity > 1 {
+                eprintln!("Unpacked raw segment: length={}", contig_data.len());
+            }
+
+            Ok(contig_data)
         }
     }
 

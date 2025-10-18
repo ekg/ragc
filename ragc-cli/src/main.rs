@@ -28,15 +28,15 @@ enum Commands {
         inputs: Vec<PathBuf>,
 
         /// K-mer length for splitter identification
-        #[arg(short = 'k', long, default_value_t = 21)]
+        #[arg(short = 'k', long, default_value_t = 31)]
         kmer_length: u32,
 
         /// Segment size for splitting contigs
-        #[arg(short = 's', long, default_value_t = 1000)]
+        #[arg(short = 's', long, default_value_t = 60000)]
         segment_size: u32,
 
         /// Minimum match length for LZ encoding
-        #[arg(short = 'm', long, default_value_t = 15)]
+        #[arg(short = 'm', long, default_value_t = 20)]
         min_match_len: u32,
 
         /// Verbosity level (0=quiet, 1=normal, 2=verbose)
@@ -176,6 +176,7 @@ fn create_archive(
         eprintln!("  k-mer length: {kmer_length}");
         eprintln!("  segment size: {segment_size}");
         eprintln!("  min match length: {min_match_len}");
+        eprintln!();
     }
 
     let config = StreamingCompressorConfig {
@@ -193,26 +194,58 @@ fn create_archive(
 
     let mut compressor = StreamingCompressor::new(output_str, config)?;
 
-    // Prepare input files with sample names
-    let mut fasta_files = Vec::new();
-    for input_path in &inputs {
+    // Detect if we have multi-sample FASTAs (sample names in headers)
+    // or separate files (sample names from filenames)
+    if inputs.len() == 1 {
+        // Single input file - check if it's multi-sample
+        let input_path = &inputs[0];
         if !input_path.exists() {
-            eprintln!("Warning: Input file not found: {input_path:?}");
-            continue;
+            anyhow::bail!("Input file not found: {input_path:?}");
         }
 
-        // Extract sample name from file path (without extensions)
-        // Strip all genomic file extensions: .gz, .fa, .fasta, etc.
-        let sample_name = extract_sample_name(input_path);
+        let is_multi_sample = StreamingCompressor::detect_multi_sample_fasta(input_path)?;
 
-        fasta_files.push((sample_name, input_path.as_path()));
+        if is_multi_sample {
+            // Multi-sample FASTA: group by sample names in headers
+            if verbosity > 0 {
+                eprintln!("Detected multi-sample FASTA format (sample#haplotype#chromosome)");
+                eprintln!("Will group contigs by sample names extracted from headers");
+                eprintln!();
+            }
+            compressor.add_multi_sample_fasta_with_splitters(input_path)?;
+        } else {
+            // Single-sample file: use filename as sample name
+            if verbosity > 0 {
+                eprintln!("Processing as single-sample file (sample name from filename)");
+                eprintln!();
+            }
+            let sample_name = extract_sample_name(input_path);
+            compressor.add_fasta_files_with_splitters(&[(sample_name, input_path.as_path())])?;
+        }
+    } else {
+        // Multiple input files: use filenames as sample names
+        if verbosity > 0 {
+            eprintln!("Processing multiple files (sample names from filenames)");
+            eprintln!();
+        }
+
+        let mut fasta_files = Vec::new();
+        for input_path in &inputs {
+            if !input_path.exists() {
+                eprintln!("Warning: Input file not found: {input_path:?}");
+                continue;
+            }
+
+            let sample_name = extract_sample_name(input_path);
+            fasta_files.push((sample_name, input_path.as_path()));
+        }
+
+        compressor.add_fasta_files_with_splitters(&fasta_files)?;
     }
-
-    // Use splitter-based compression for better compression ratios
-    compressor.add_fasta_files_with_splitters(&fasta_files)?;
 
     // Finalize the archive
     if verbosity > 0 {
+        eprintln!();
         eprintln!("Finalizing archive...");
     }
 

@@ -318,7 +318,7 @@ impl CollectionV3 {
         Ok(())
     }
 
-    /// Register a sample and contig
+    /// Register a sample and contig (idempotent - adds contig to existing sample if needed)
     pub fn register_sample_contig(&mut self, sample_name: &str, contig_name: &str) -> Result<bool> {
         let mut stored_sample_name = sample_name.to_string();
 
@@ -326,26 +326,28 @@ impl CollectionV3 {
             stored_sample_name = Self::extract_contig_name(contig_name);
         }
 
-        if stored_sample_name != self.prev_sample_name {
-            // Check if sample was already registered
-            if self.sample_ids.contains_key(&stored_sample_name) {
-                return Ok(false); // Already exists
-            }
+        // Get or create sample
+        let sample_id = if let Some(&id) = self.sample_ids.get(&stored_sample_name) {
+            // Sample already exists
+            id
+        } else {
+            // New sample
+            let id = self.sample_ids.len();
+            self.sample_ids.insert(stored_sample_name.clone(), id);
+            self.sample_desc.push(SampleDesc::new(stored_sample_name.clone()));
+            id
+        };
 
-            let sample_id = self.sample_ids.len();
-            self.sample_ids
-                .insert(stored_sample_name.clone(), sample_id);
-            self.sample_desc
-                .push(SampleDesc::new(stored_sample_name.clone()));
-            self.prev_sample_name = stored_sample_name;
+        self.prev_sample_name = stored_sample_name;
+
+        // Add contig to the sample (avoid duplicates)
+        let sample = &mut self.sample_desc[sample_id];
+        if !sample.contigs.iter().any(|c| c.name == contig_name) {
+            sample.contigs.push(ContigDesc::new(contig_name.to_string()));
+            Ok(true)
+        } else {
+            Ok(false) // Contig already registered
         }
-
-        self.sample_desc
-            .last_mut()
-            .unwrap()
-            .contigs
-            .push(ContigDesc::new(contig_name.to_string()));
-        Ok(true)
     }
 
     /// Add segment placement information
@@ -814,6 +816,8 @@ impl CollectionV3 {
 
         // Collect all decoded segments first
         let mut decoded_segments = Vec::new();
+        // Collect in_group_id updates to apply AFTER decoding (like serialize does)
+        let mut in_group_updates = Vec::new();
 
         for contig_seg_counts in &structure {
             let mut sample_segs = Vec::new();
@@ -848,8 +852,9 @@ impl CollectionV3 {
                         c_raw_length,
                     ));
 
+                    // Collect updates instead of applying immediately (like serialize does)
                     if c_in_group_id as i32 > prev_in_group_id && c_in_group_id > 0 {
-                        self.set_in_group_id(c_group_id as usize, c_in_group_id as i32);
+                        in_group_updates.push((c_group_id as usize, c_in_group_id as i32));
                     }
 
                     item_idx += 1;
@@ -859,6 +864,11 @@ impl CollectionV3 {
             }
 
             decoded_segments.push(sample_segs);
+        }
+
+        // Apply in_group_id updates AFTER decoding all segments (matching serialize behavior)
+        for (pos, val) in in_group_updates {
+            self.set_in_group_id(pos, val);
         }
 
         // Second pass: assign to sample_desc
@@ -1136,5 +1146,67 @@ mod tests {
 
         let samples = coll.get_samples_list(false);
         assert_eq!(samples, vec!["sample1", "sample2"]);
+    }
+
+    /// Test that in_group_id delta encoding/decoding works correctly
+    /// This specifically tests the bug where deserialize updates in_group_id
+    /// during the loop instead of after (like serialize does)
+    #[test]
+    fn test_in_group_id_delta_encoding_roundtrip() {
+        let mut coll = CollectionV3::new();
+        coll.set_config(60000, 31, None);
+
+        // Register samples and contigs
+        coll.register_sample_contig("sample1", "contig1").unwrap();
+        coll.register_sample_contig("sample1", "contig2").unwrap();
+        coll.register_sample_contig("sample2", "contig1").unwrap();
+
+        // Add multiple segments from the same group (group 93) with consecutive in_group_ids
+        // This reproduces the real-world scenario where multiple contigs have segments in the same group
+        let test_segments = vec![
+            ("sample1", "contig1", 0, 93, 0, false, 61000),   // group 93, in_group_id 0
+            ("sample1", "contig1", 1, 93, 1, false, 61000),   // group 93, in_group_id 1
+            ("sample1", "contig2", 0, 93, 2, false, 61000),   // group 93, in_group_id 2
+            ("sample1", "contig2", 1, 93, 3, false, 61000),   // group 93, in_group_id 3
+            ("sample2", "contig1", 0, 93, 4, false, 61000),   // group 93, in_group_id 4
+            ("sample2", "contig1", 1, 93, 5, false, 61000),   // group 93, in_group_id 5
+            ("sample2", "contig1", 2, 93, 6, false, 61000),   // group 93, in_group_id 6
+        ];
+
+        for (sample, contig, place, group_id, in_group_id, is_rev_comp, raw_len) in &test_segments {
+            coll.add_segment_placed(sample, contig, *place, *group_id, *in_group_id, *is_rev_comp, *raw_len).unwrap();
+        }
+
+        // Serialize the collection details
+        let serialized = coll.serialize_contig_details(0, 2);
+
+        // Create a new collection and deserialize
+        let mut coll2 = CollectionV3::new();
+        coll2.set_config(60000, 31, None);
+
+        // Must set up the same sample structure
+        coll2.register_sample_contig("sample1", "contig1").unwrap();
+        coll2.register_sample_contig("sample1", "contig2").unwrap();
+        coll2.register_sample_contig("sample2", "contig1").unwrap();
+
+        // Deserialize
+        coll2.deserialize_contig_details(&serialized, 0).unwrap();
+
+        // Verify all in_group_ids match original values
+        let sample1_contig1 = coll2.get_contig_desc("sample1", "contig1").unwrap();
+        assert_eq!(sample1_contig1.len(), 2, "sample1/contig1 should have 2 segments");
+        assert_eq!(sample1_contig1[0].in_group_id, 0, "sample1/contig1 segment 0 should have in_group_id=0");
+        assert_eq!(sample1_contig1[1].in_group_id, 1, "sample1/contig1 segment 1 should have in_group_id=1");
+
+        let sample1_contig2 = coll2.get_contig_desc("sample1", "contig2").unwrap();
+        assert_eq!(sample1_contig2.len(), 2, "sample1/contig2 should have 2 segments");
+        assert_eq!(sample1_contig2[0].in_group_id, 2, "sample1/contig2 segment 0 should have in_group_id=2");
+        assert_eq!(sample1_contig2[1].in_group_id, 3, "sample1/contig2 segment 1 should have in_group_id=3");
+
+        let sample2_contig1 = coll2.get_contig_desc("sample2", "contig1").unwrap();
+        assert_eq!(sample2_contig1.len(), 3, "sample2/contig1 should have 3 segments");
+        assert_eq!(sample2_contig1[0].in_group_id, 4, "sample2/contig1 segment 0 should have in_group_id=4");
+        assert_eq!(sample2_contig1[1].in_group_id, 5, "sample2/contig1 segment 1 should have in_group_id=5");
+        assert_eq!(sample2_contig1[2].in_group_id, 6, "sample2/contig1 segment 2 should have in_group_id=6");
     }
 }

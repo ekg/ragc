@@ -2,7 +2,7 @@
 // Memory-efficient implementation that flushes groups incrementally
 
 use crate::{
-    genome_io::GenomeIO,
+    genome_io::{GenomeIO, parse_sample_from_header},
     kmer::{Kmer, KmerMode},
     lz_diff::LZDiff,
     segment::split_at_splitters_with_size,
@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use ragc_common::{
-    stream_delta_name, Archive, CollectionV3, Contig, AGC_FILE_MAJOR, AGC_FILE_MINOR,
+    stream_delta_name, stream_ref_name, Archive, CollectionV3, Contig, AGC_FILE_MAJOR, AGC_FILE_MINOR,
     CONTIG_SEPARATOR,
 };
 use std::collections::HashMap;
@@ -64,9 +64,12 @@ struct SegmentGroupKey {
 /// Group metadata for tracking what's been written
 struct GroupMetadata {
     group_id: u32,
-    stream_id: usize,
-    reference: Option<Contig>, // First segment (for LZ encoding)
-    segments_written: usize,
+    stream_id: usize,              // Delta stream ID
+    ref_stream_id: Option<usize>,  // Reference stream ID (for LZ groups)
+    reference: Option<Contig>,     // First segment (for LZ encoding)
+    ref_written: bool,             // Whether reference has been written to archive
+    segments_written: usize,       // Number of segments written to archive (not including buffered)
+    pending_segments: Vec<SegmentInfo>, // Buffered segments waiting for complete pack
     is_flushed: bool,
 }
 
@@ -146,6 +149,160 @@ impl StreamingCompressor {
 
         if self.config.verbosity > 0 {
             println!("  Processed {contigs_processed} contigs from {sample_name}");
+        }
+
+        Ok(())
+    }
+
+    /// Detect if a FASTA file contains multiple samples in headers
+    /// (format: >sample#haplotype#chromosome)
+    pub fn detect_multi_sample_fasta(fasta_path: &Path) -> Result<bool> {
+        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
+            .context("Failed to open FASTA for detection")?;
+
+        // Read first few headers to check format
+        for _ in 0..5 {
+            if let Some((header, _, _, _)) = reader.read_contig_with_sample()? {
+                let parts: Vec<&str> = header.split('#').collect();
+                if parts.len() >= 3 {
+                    return Ok(true); // Multi-sample format detected
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(false) // No multi-sample format detected
+    }
+
+    /// Add a multi-sample FASTA file with splitter-based segmentation
+    /// This handles files where samples are encoded in headers (>sample#hap#chr format)
+    pub fn add_multi_sample_fasta_with_splitters(&mut self, fasta_path: &Path) -> Result<()> {
+        if self.config.verbosity > 0 {
+            println!("=== Processing multi-sample FASTA (grouping by sample names in headers) ===");
+            println!("Input: {:?}", fasta_path);
+            println!();
+        }
+
+        // Pass 1: Collect reference contigs for splitter finding
+        if self.config.verbosity > 0 {
+            println!("=== Pass 1: Finding splitter k-mers from reference ===");
+        }
+
+        let mut reference_contigs = Vec::new();
+        let mut reference_sample = String::new();
+
+        {
+            let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
+                .context("Failed to open multi-sample FASTA")?;
+
+            let mut contig_count = 0;
+            while let Some((_full_header, sample_name, _contig_name, sequence)) = reader.read_contig_with_sample()? {
+                if !sequence.is_empty() {
+                    if reference_sample.is_empty() {
+                        reference_sample = sample_name.clone();
+                        if self.config.verbosity > 0 {
+                            println!("Using {} as reference to find splitters...", reference_sample);
+                        }
+                    }
+
+                    // Only collect contigs from the first sample
+                    if sample_name == reference_sample {
+                        reference_contigs.push(sequence);
+                        contig_count += 1;
+                    }
+                }
+            }
+
+            if self.config.verbosity > 0 {
+                println!("Collected {} reference contigs from {}", contig_count, reference_sample);
+            }
+        }
+
+        // Find splitters
+        let splitters = determine_splitters(
+            &reference_contigs,
+            self.config.kmer_length as usize,
+            self.config.segment_size as usize
+        );
+
+        if self.config.verbosity > 0 {
+            println!("Found {} actually-used splitter k-mers", splitters.len());
+            println!();
+            println!("=== Pass 2: Segmenting and compressing all samples ===");
+        }
+
+        drop(reference_contigs); // Free memory
+
+        // Pass 2: Re-read file and process all samples
+        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
+            .context("Failed to re-open multi-sample FASTA")?;
+
+        let mut samples_seen = std::collections::HashSet::new();
+        let mut contigs_processed = 0;
+
+        while let Some((_full_header, sample_name, contig_name, sequence)) = reader.read_contig_with_sample()? {
+            if sequence.is_empty() {
+                continue;
+            }
+
+            // Track unique samples
+            if samples_seen.insert(sample_name.clone()) && self.config.verbosity > 0 {
+                println!("Processing sample: {}", sample_name);
+            }
+
+            // Register in collection
+            self.collection.register_sample_contig(&sample_name, &contig_name)?;
+
+            // Split at splitters
+            let segments = split_at_splitters_with_size(
+                &sequence,
+                &splitters,
+                self.config.kmer_length as usize,
+                self.config.segment_size as usize
+            );
+
+            if self.config.verbosity > 1 {
+                println!("  Contig {}/{} split into {} segments", sample_name, contig_name, segments.len());
+            }
+
+            // Add each segment
+            for (seg_idx, segment) in segments.iter().enumerate() {
+                self.total_bases_processed += segment.data.len();
+
+                if self.config.verbosity > 2 {
+                    println!("    Segment {}: front_kmer={}, back_kmer={}, len={}",
+                        seg_idx, segment.front_kmer, segment.back_kmer, segment.data.len());
+                }
+
+                self.add_segment_with_kmers(
+                    &sample_name,
+                    &contig_name,
+                    seg_idx,
+                    segment.data.clone(),
+                    segment.front_kmer,
+                    segment.back_kmer,
+                    false, // is_rev_comp
+                )?;
+            }
+
+            contigs_processed += 1;
+            self.contigs_since_flush += 1;
+
+            // Periodic flush
+            if self.config.periodic_flush_interval > 0 &&
+               self.contigs_since_flush >= self.config.periodic_flush_interval {
+                self.flush_all_groups()?;
+            }
+
+            if self.config.verbosity > 1 && contigs_processed % 100 == 0 {
+                println!("  Processed {} contigs, {} groups in memory, {} flushed",
+                    contigs_processed, self.segment_groups.len(), self.total_groups_flushed);
+            }
+        }
+
+        if self.config.verbosity > 0 {
+            println!("Processed {} unique samples, {} total contigs", samples_seen.len(), contigs_processed);
         }
 
         Ok(())
@@ -429,49 +586,147 @@ impl StreamingCompressor {
             }
 
             let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
+
+            // Register delta stream (always)
             let stream_name = stream_delta_name(archive_version, group_id);
             let stream_id = self.archive.register_stream(&stream_name);
+
+            // Register ref stream for LZ groups (groups >= 16)
+            const NO_RAW_GROUPS: u32 = 16;
+            let ref_stream_id = if group_id >= NO_RAW_GROUPS {
+                let ref_stream_name = stream_ref_name(archive_version, group_id);
+                Some(self.archive.register_stream(&ref_stream_name))
+            } else {
+                None
+            };
 
             GroupMetadata {
                 group_id,
                 stream_id,
+                ref_stream_id,
                 reference: None,
+                ref_written: false,
                 segments_written: 0,
+                pending_segments: Vec::new(),
                 is_flushed: false,
             }
         });
 
         let group_id = metadata.group_id;
         let stream_id = metadata.stream_id;
-        // CRITICAL: Don't use LZ encoding since we don't write no_raw_groups metadata
-        // C++ AGC defaults to no_raw_groups=0, meaning all groups use `get` (LZ path)
-        // But we're writing raw segments, so disable LZ to use raw-only path
-        let use_lz_encoding = false; // All groups are raw-only
 
-        // Set reference if not set yet
-        if metadata.reference.is_none() && !segments.is_empty() {
-            metadata.reference = Some(segments[0].data.clone());
+        // Use LZ encoding for groups >= 16 (matches C++ AGC default)
+        // Groups 0-15 are raw-only for better random access
+        // Groups 16+ use LZ encoding with reference for better compression
+        const NO_RAW_GROUPS: u32 = 16;
+        let use_lz_encoding = group_id >= NO_RAW_GROUPS;
+
+        // Remember if we need to skip first segment (before we write ref and set ref_written=true)
+        let skip_first_segment = use_lz_encoding && !metadata.ref_written;
+
+        // For LZ groups: write reference segment to separate ref stream
+        if skip_first_segment && !segments.is_empty() {
+            let ref_segment = &segments[0];
+
+            // Store as reference for LZ encoding
+            metadata.reference = Some(ref_segment.data.clone());
+
+            // Write to ref stream
+            if let Some(ref_stream_id) = metadata.ref_stream_id {
+                // Try compressing the reference
+                let compressed = compress_segment(&ref_segment.data)?;
+
+                if compressed.len() + 1 < ref_segment.data.len() {
+                    let mut compressed_with_marker = compressed;
+                    compressed_with_marker.push(0); // Marker byte: 0 = standard ZSTD
+                    self.archive.add_part(ref_stream_id, &compressed_with_marker, ref_segment.data.len() as u64)?;
+                } else {
+                    // Uncompressed
+                    self.archive.add_part(ref_stream_id, &ref_segment.data, 0)?;
+                }
+
+                // Register reference in collection (in_group_id = 0)
+                self.collection.add_segment_placed(
+                    &ref_segment.sample_name,
+                    &ref_segment.contig_name,
+                    ref_segment.seg_part_no,
+                    group_id,
+                    0, // Reference is always at position 0
+                    ref_segment.is_rev_comp,
+                    ref_segment.data.len() as u32,
+                )?;
+
+                metadata.ref_written = true;
+
+                if self.config.verbosity > 2 {
+                    eprintln!("DEBUG: Group {} wrote reference segment to ref stream, len={}",
+                        group_id, ref_segment.data.len());
+                }
+            }
         }
 
         const PACK_CARDINALITY: usize = 50;
 
-        // Pack and write segments
-        for pack_segments in segments.chunks(PACK_CARDINALITY) {
+        // Determine which segments to pack into delta stream
+        // IMPORTANT: Only skip first segment if this is the first flush for an LZ group!
+        let mut new_delta_segments: Vec<SegmentInfo> = if skip_first_segment {
+            // Skip first segment (just written to ref stream above)
+            segments.into_iter().skip(1).collect()
+        } else {
+            // Include all segments for raw-only groups OR if ref already written
+            segments
+        };
+
+        // Add new segments to pending buffer
+        metadata.pending_segments.append(&mut new_delta_segments);
+
+        // Only write complete packs (multiples of PACK_CARDINALITY)
+        let num_complete_packs = metadata.pending_segments.len() / PACK_CARDINALITY;
+        let segments_to_write = num_complete_packs * PACK_CARDINALITY;
+
+        if segments_to_write == 0 {
+            // Not enough for a full pack yet, keep buffering
+            if self.config.verbosity > 2 {
+                eprintln!("Group {} buffering {} segments (need {} for complete pack)",
+                    group_id, metadata.pending_segments.len(), PACK_CARDINALITY);
+            }
+            return Ok(());
+        }
+
+        // Split off segments to write now
+        let segments_to_pack: Vec<SegmentInfo> = metadata.pending_segments.drain(..segments_to_write).collect();
+
+        if self.config.verbosity > 2 {
+            eprintln!("Group {} writing {} complete packs ({} segments), {} segments remain buffered",
+                group_id, num_complete_packs, segments_to_write, metadata.pending_segments.len());
+        }
+
+        // Pack and write delta segments in complete packs
+        let mut pack_count = 0;
+        for pack_segments in segments_to_pack.chunks(PACK_CARDINALITY) {
             let mut packed_data = Vec::new();
 
             for (idx_in_pack, seg_info) in pack_segments.iter().enumerate() {
-                let global_in_group_id = metadata.segments_written + idx_in_pack;
+                // For LZ groups: in_group_id starts at 1 (reference is 0)
+                // For raw groups: in_group_id starts at 0
+                let global_in_group_id = if use_lz_encoding {
+                    metadata.segments_written + idx_in_pack + 1
+                } else {
+                    metadata.segments_written + idx_in_pack
+                };
 
-                if self.config.verbosity > 2 && (group_id == 16 || group_id == 17) {
-                    eprintln!("DEBUG: Group {} adding segment: contig={}, seg_part={}, data_len={}",
-                        group_id, seg_info.contig_name, seg_info.seg_part_no, seg_info.data.len());
+                if (group_id < 50 || group_id == 93) && idx_in_pack < 3 {
+                    eprintln!("REGISTER_NORMAL: group={}, in_group_id={}, idx_in_pack={}, segments_written={}",
+                        group_id, global_in_group_id, idx_in_pack, metadata.segments_written);
                 }
 
-                let contig_data = if !use_lz_encoding || global_in_group_id == 0 {
-                    // Raw segment
-                    seg_info.data.clone()
-                } else {
-                    // LZ-encoded segment
+                if self.config.verbosity > 2 && (group_id == 16 || group_id == 17) {
+                    eprintln!("DEBUG: Group {} adding segment: contig={}, seg_part={}, in_group_id={}, data_len={}",
+                        group_id, seg_info.contig_name, seg_info.seg_part_no, global_in_group_id, seg_info.data.len());
+                }
+
+                let contig_data = if use_lz_encoding {
+                    // LZ-encoded segment (all delta segments are encoded)
                     let mut lz_diff = LZDiff::new(self.config.min_match_len);
                     if let Some(ref reference) = metadata.reference {
                         lz_diff.prepare(reference);
@@ -479,6 +734,9 @@ impl StreamingCompressor {
                     } else {
                         seg_info.data.clone()
                     }
+                } else {
+                    // Raw segment
+                    seg_info.data.clone()
                 };
 
                 if self.config.verbosity > 2 && (group_id == 16 || group_id == 17) {
@@ -489,6 +747,10 @@ impl StreamingCompressor {
                 packed_data.push(CONTIG_SEPARATOR);
 
                 // Register in collection
+                if self.config.verbosity > 2 && group_id == 801 {
+                    eprintln!("REGISTER: group={}, in_group_id={}, pack_id would be {}, contig={}, seg_part={}",
+                        group_id, global_in_group_id, (global_in_group_id - 1) / 50, seg_info.contig_name, seg_info.seg_part_no);
+                }
                 self.collection.add_segment_placed(
                     &seg_info.sample_name,
                     &seg_info.contig_name,
@@ -530,7 +792,13 @@ impl StreamingCompressor {
                 self.archive.add_part(stream_id, &packed_data, 0)?;
             }
 
+            pack_count += 1;
             metadata.segments_written += pack_segments.len();
+        }
+
+        if group_id < 50 || group_id == 93 {
+            eprintln!("FLUSH_NORMAL: group={} wrote {} packs, segments_written now={}",
+                group_id, pack_count, metadata.segments_written);
         }
 
         metadata.is_flushed = true;
@@ -554,6 +822,99 @@ impl StreamingCompressor {
         Ok(())
     }
 
+    /// Flush any remaining buffered segments for a group (called at finalize)
+    /// This writes partial packs for groups with buffered segments
+    fn flush_group_final(&mut self, key: &SegmentGroupKey) -> Result<()> {
+        const PACK_CARDINALITY: usize = 50;
+
+        // Get metadata and check if there are pending segments
+        let metadata = match self.group_metadata.get_mut(key) {
+            Some(m) if !m.pending_segments.is_empty() => m,
+            _ => return Ok(()), // No pending segments
+        };
+
+        let group_id = metadata.group_id;
+        let stream_id = metadata.stream_id;
+        let use_lz_encoding = group_id >= 16; // NO_RAW_GROUPS
+
+        eprintln!("Final flush for group {}: {} pending segments, segments_written={}",
+            group_id, metadata.pending_segments.len(), metadata.segments_written);
+
+        // Take all pending segments (even if less than PACK_CARDINALITY)
+        let segments_to_pack: Vec<SegmentInfo> = metadata.pending_segments.drain(..).collect();
+
+        eprintln!("Group {} will write {} packs in final flush",
+            group_id, (segments_to_pack.len() + PACK_CARDINALITY - 1) / PACK_CARDINALITY);
+
+        // Pack and write segments (may be partial pack)
+        // Track the base in_group_id for this flush operation
+        let mut current_segments_written = metadata.segments_written;
+
+        for pack_segments in segments_to_pack.chunks(PACK_CARDINALITY) {
+            let mut packed_data = Vec::new();
+
+            for (idx_in_pack, seg_info) in pack_segments.iter().enumerate() {
+                let global_in_group_id = if use_lz_encoding {
+                    current_segments_written + idx_in_pack + 1
+                } else {
+                    current_segments_written + idx_in_pack
+                };
+
+                let contig_data = if use_lz_encoding {
+                    let mut lz_diff = LZDiff::new(self.config.min_match_len);
+                    if let Some(ref reference) = metadata.reference {
+                        lz_diff.prepare(reference);
+                        lz_diff.encode(&seg_info.data)
+                    } else {
+                        seg_info.data.clone()
+                    }
+                } else {
+                    seg_info.data.clone()
+                };
+
+                packed_data.extend_from_slice(&contig_data);
+                packed_data.push(CONTIG_SEPARATOR);
+
+                if group_id < 50 || group_id == 93 {
+                    eprintln!("REGISTER_FINAL: group={}, in_group_id={}, contig={}, seg_part={}, idx_in_pack={}, current_segments_written={}",
+                        group_id, global_in_group_id, seg_info.contig_name, seg_info.seg_part_no, idx_in_pack, current_segments_written);
+                }
+
+                self.collection.add_segment_placed(
+                    &seg_info.sample_name,
+                    &seg_info.contig_name,
+                    seg_info.seg_part_no,
+                    group_id,
+                    global_in_group_id as u32,
+                    seg_info.is_rev_comp,
+                    seg_info.data.len() as u32,
+                )?;
+            }
+
+            // Compress and write
+            let compressed = compress_segment(&packed_data)?;
+
+            if compressed.len() + 1 < packed_data.len() {
+                let mut compressed_with_marker = compressed;
+                compressed_with_marker.push(0);
+                self.archive.add_part(stream_id, &compressed_with_marker, packed_data.len() as u64)?;
+            } else {
+                self.archive.add_part(stream_id, &packed_data, 0)?;
+            }
+
+            eprintln!("Group {} wrote pack to archive (final flush), pack has {} segments", group_id, pack_segments.len());
+            current_segments_written += pack_segments.len();
+        }
+
+        eprintln!("Group {} final flush complete: wrote {} total segments in this flush, new segments_written={}",
+            group_id, current_segments_written - metadata.segments_written, current_segments_written);
+
+        // Update the metadata's segments_written counter
+        metadata.segments_written = current_segments_written;
+
+        Ok(())
+    }
+
     /// Store params stream (C++ compatibility)
     fn store_params_stream(&mut self) -> Result<()> {
         let mut params_data = Vec::new();
@@ -565,6 +926,7 @@ impl StreamingCompressor {
         append_u32(&mut params_data, self.config.min_match_len);
         append_u32(&mut params_data, 50); // pack_cardinality
         append_u32(&mut params_data, self.config.segment_size);
+        append_u32(&mut params_data, 16); // no_raw_groups (groups 0-15 are raw-only, 16+ use LZ)
 
         let stream_id = self.archive.register_stream("params");
         self.archive
@@ -669,6 +1031,15 @@ impl StreamingCompressor {
 
         if self.config.verbosity > 0 {
             println!("Actually flushed {} groups", groups_actually_flushed);
+        }
+
+        // Flush any remaining buffered segments (partial packs)
+        let all_group_keys: Vec<_> = self.group_metadata.keys().cloned().collect();
+        if self.config.verbosity > 1 {
+            println!("Flushing buffered segments for {} groups", all_group_keys.len());
+        }
+        for key in all_group_keys {
+            self.flush_group_final(&key)?;
         }
 
         // Store metadata streams
