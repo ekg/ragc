@@ -180,24 +180,6 @@ impl Decompressor {
             .get_contig_desc(sample_name, contig_name)
             .ok_or_else(|| anyhow!("Contig not found: {sample_name}/{contig_name}"))?;
 
-        // Debug output for CFF samples - print BEFORE starting extraction
-        if sample_name.starts_with("CFF") {
-            eprintln!("\n=== CFF SAMPLE DEBUG ===");
-            eprintln!(
-                "Extracting {}/{} ({} segments)",
-                sample_name,
-                contig_name,
-                segments.len()
-            );
-            for (i, seg) in segments.iter().enumerate() {
-                eprintln!(
-                    "  Segment[{}]: group_id={}, in_group_id={}, is_rev_comp={}, raw_length={}",
-                    i, seg.group_id, seg.in_group_id, seg.is_rev_comp, seg.raw_length
-                );
-            }
-            eprintln!("=== END CFF DEBUG ===\n");
-        }
-
         if self.config.verbosity > 1 {
             eprintln!(
                 "Extracting {}/{} ({} segments)",
@@ -376,12 +358,8 @@ impl Decompressor {
             let delta_stream_id = self.archive.get_stream_id(&delta_stream_name)
                 .ok_or_else(|| anyhow!("Delta stream not found: {}", delta_stream_name))?;
 
-            eprintln!("DEBUG: Trying to read delta stream {}, pack_id={}, in_group_id={}, delta_position={}",
-                delta_stream_name, pack_id, desc.in_group_id, delta_position);
-
             // Check how many parts this stream has
             let num_parts = self.archive.get_num_parts(delta_stream_id);
-            eprintln!("DEBUG: Delta stream has {} parts total", num_parts);
 
             if pack_id >= num_parts {
                 anyhow::bail!("Pack ID {} out of range (stream has only {} parts). in_group_id={}, delta_position={}",

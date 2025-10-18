@@ -715,11 +715,6 @@ impl StreamingCompressor {
                     metadata.segments_written + idx_in_pack
                 };
 
-                if (group_id < 50 || group_id == 93) && idx_in_pack < 3 {
-                    eprintln!("REGISTER_NORMAL: group={}, in_group_id={}, idx_in_pack={}, segments_written={}",
-                        group_id, global_in_group_id, idx_in_pack, metadata.segments_written);
-                }
-
                 if self.config.verbosity > 2 && (group_id == 16 || group_id == 17) {
                     eprintln!("DEBUG: Group {} adding segment: contig={}, seg_part={}, in_group_id={}, data_len={}",
                         group_id, seg_info.contig_name, seg_info.seg_part_no, global_in_group_id, seg_info.data.len());
@@ -796,11 +791,6 @@ impl StreamingCompressor {
             metadata.segments_written += pack_segments.len();
         }
 
-        if group_id < 50 || group_id == 93 {
-            eprintln!("FLUSH_NORMAL: group={} wrote {} packs, segments_written now={}",
-                group_id, pack_count, metadata.segments_written);
-        }
-
         metadata.is_flushed = true;
         self.total_groups_flushed += 1;
 
@@ -837,14 +827,8 @@ impl StreamingCompressor {
         let stream_id = metadata.stream_id;
         let use_lz_encoding = group_id >= 16; // NO_RAW_GROUPS
 
-        eprintln!("Final flush for group {}: {} pending segments, segments_written={}",
-            group_id, metadata.pending_segments.len(), metadata.segments_written);
-
         // Take all pending segments (even if less than PACK_CARDINALITY)
         let segments_to_pack: Vec<SegmentInfo> = metadata.pending_segments.drain(..).collect();
-
-        eprintln!("Group {} will write {} packs in final flush",
-            group_id, (segments_to_pack.len() + PACK_CARDINALITY - 1) / PACK_CARDINALITY);
 
         // Pack and write segments (may be partial pack)
         // Track the base in_group_id for this flush operation
@@ -875,11 +859,6 @@ impl StreamingCompressor {
                 packed_data.extend_from_slice(&contig_data);
                 packed_data.push(CONTIG_SEPARATOR);
 
-                if group_id < 50 || group_id == 93 {
-                    eprintln!("REGISTER_FINAL: group={}, in_group_id={}, contig={}, seg_part={}, idx_in_pack={}, current_segments_written={}",
-                        group_id, global_in_group_id, seg_info.contig_name, seg_info.seg_part_no, idx_in_pack, current_segments_written);
-                }
-
                 self.collection.add_segment_placed(
                     &seg_info.sample_name,
                     &seg_info.contig_name,
@@ -902,12 +881,8 @@ impl StreamingCompressor {
                 self.archive.add_part(stream_id, &packed_data, 0)?;
             }
 
-            eprintln!("Group {} wrote pack to archive (final flush), pack has {} segments", group_id, pack_segments.len());
             current_segments_written += pack_segments.len();
         }
-
-        eprintln!("Group {} final flush complete: wrote {} total segments in this flush, new segments_written={}",
-            group_id, current_segments_written - metadata.segments_written, current_segments_written);
 
         // Update the metadata's segments_written counter
         metadata.segments_written = current_segments_written;

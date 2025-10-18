@@ -37,7 +37,7 @@ impl Segment {
     }
 }
 
-/// Split a contig at splitter k-mer positions with minimum segment size
+/// Split a contig at splitter k-mer positions
 ///
 /// This implements the C++ AGC segment splitting algorithm.
 /// The splitters passed should be the ACTUALLY USED splitters from the reference
@@ -47,20 +47,23 @@ impl Segment {
 /// * `contig` - The contig to split
 /// * `splitters` - Set of splitter k-mer values (actually used on reference)
 /// * `k` - K-mer length
-/// * `min_segment_size` - Minimum number of bases before looking for next splitter
+/// * `_min_segment_size` - Unused (kept for API compatibility, see note below)
 ///
 /// # Returns
 /// Vector of segments
 ///
 /// # Algorithm (matching C++ AGC)
-/// 1. Scan through contig tracking distance since last split
-/// 2. Keep track of recent k-mers (for end-of-contig handling)
-/// 3. When distance >= min_segment_size:
-///    - Check if current k-mer IS IN the splitter set
-///    - If yes, split here and reset
-///    - If no, keep scanning
+/// 1. Scan through contig
+/// 2. Split at EVERY occurrence of a splitter k-mer (no distance check!)
+/// 3. Keep track of recent k-mers for end-of-contig handling
 /// 4. At contig end, look backward through recent k-mers to find rightmost splitter
-pub fn split_at_splitters_with_size(contig: &Contig, splitters: &HashSet<u64>, k: usize, min_segment_size: usize) -> Vec<Segment> {
+///
+/// # Note on min_segment_size
+/// The distance check only happens during SPLITTER FINDING (in splitters.rs) to select
+/// which k-mers become splitters. During SEGMENTATION (this function), C++ AGC splits
+/// at every occurrence of those splitters WITHOUT checking distance. This is the key
+/// difference that was causing 2.3x worse compression!
+pub fn split_at_splitters_with_size(contig: &Contig, splitters: &HashSet<u64>, k: usize, _min_segment_size: usize) -> Vec<Segment> {
     let mut segments = Vec::new();
 
     if contig.len() < k {
@@ -71,7 +74,6 @@ pub fn split_at_splitters_with_size(contig: &Contig, splitters: &HashSet<u64>, k
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
     let mut segment_start = 0;
     let mut front_kmer = 0u64;
-    let mut current_len = min_segment_size; // Start ready to split (C++ does this)
 
     // Track recent k-mers for end-of-contig handling
     // C++ AGC doesn't limit this - it accumulates all k-mers since last split
@@ -89,33 +91,30 @@ pub fn split_at_splitters_with_size(contig: &Contig, splitters: &HashSet<u64>, k
                 let kmer_value = kmer.data();
                 recent_kmers.push((pos, kmer_value));
 
-                // Only check for split if we've accumulated enough bases
-                if current_len >= min_segment_size {
-                    // Check if current k-mer is in the splitter set
-                    if splitters.contains(&kmer_value) {
-                        // Use this as a splitter
-                        let segment_end = pos + 1;
-                        let segment_data = contig[segment_start..segment_end].to_vec();
+                // CRITICAL FIX: C++ AGC splits at EVERY splitter occurrence!
+                // The distance check (current_len >= min_segment_size) only happens
+                // during SPLITTER FINDING to select which k-mers become splitters.
+                // During SEGMENTATION, we split at every occurrence without distance check.
+                if splitters.contains(&kmer_value) {
+                    // Use this as a splitter
+                    let segment_end = pos + 1;
+                    let segment_data = contig[segment_start..segment_end].to_vec();
 
-                        if !segment_data.is_empty() {
-                            segments.push(Segment::new(segment_data, front_kmer, kmer_value));
-                        }
-
-                        // Reset for next segment
-                        // CRITICAL: Create k-base overlap so decompressor can skip first k bases
-                        // The k-mer ends at position pos, occupies [pos-k+1, pos]
-                        // Next segment should start at pos-k+1 to create k-base overlap
-                        segment_start = (pos + 1).saturating_sub(k);
-                        front_kmer = kmer_value;
-                        current_len = 0;
-                        recent_kmers.clear();
-                        kmer.reset();
+                    if !segment_data.is_empty() {
+                        segments.push(Segment::new(segment_data, front_kmer, kmer_value));
                     }
+
+                    // Reset for next segment
+                    // CRITICAL: Create k-base overlap so decompressor can skip first k bases
+                    // The k-mer ends at position pos, occupies [pos-k+1, pos]
+                    // Next segment should start at pos-k+1 to create k-base overlap
+                    segment_start = (pos + 1).saturating_sub(k);
+                    front_kmer = kmer_value;
+                    recent_kmers.clear();
+                    kmer.reset();
                 }
             }
         }
-
-        current_len += 1;
     }
 
     // At end of contig, look backward through recent k-mers to find rightmost splitter
