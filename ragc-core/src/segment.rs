@@ -5,14 +5,18 @@ use crate::kmer::{Kmer, KmerMode};
 use ragc_common::Contig;
 use std::collections::HashSet;
 
+/// Missing k-mer sentinel value (matches C++ AGC's ~0ull)
+/// Used when a segment doesn't have a front or back k-mer (e.g., at contig boundaries)
+pub const MISSING_KMER: u64 = u64::MAX;
+
 /// A segment of a contig bounded by splitter k-mers
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     /// The sequence data of this segment
     pub data: Contig,
-    /// K-mer value at the start of the segment (or 0 if at contig start)
+    /// K-mer value at the start of the segment (or MISSING_KMER if at contig start)
     pub front_kmer: u64,
-    /// K-mer value at the end of the segment (or 0 if at contig end)
+    /// K-mer value at the end of the segment (or MISSING_KMER if at contig end)
     pub back_kmer: u64,
 }
 
@@ -68,12 +72,12 @@ pub fn split_at_splitters_with_size(contig: &Contig, splitters: &HashSet<u64>, k
 
     if contig.len() < k {
         // Contig too short for k-mers, return as single segment
-        return vec![Segment::new(contig.clone(), 0, 0)];
+        return vec![Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER)];
     }
 
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
     let mut segment_start = 0;
-    let mut front_kmer = 0u64;
+    let mut front_kmer = MISSING_KMER;
 
     // Track recent k-mers for end-of-contig handling
     // C++ AGC doesn't limit this - it accumulates all k-mers since last split
@@ -163,13 +167,13 @@ pub fn split_at_splitters_with_size(contig: &Contig, splitters: &HashSet<u64>, k
     if segment_start < contig.len() {
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
-            segments.push(Segment::new(segment_data, front_kmer, 0));
+            segments.push(Segment::new(segment_data, front_kmer, MISSING_KMER));
         }
     }
 
     // If no segments were created, return entire contig as one segment
     if segments.is_empty() {
-        segments.push(Segment::new(contig.clone(), 0, 0));
+        segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER));
     }
 
     // CRITICAL FIX: Merge final segment with previous if it's too short for overlap
@@ -200,12 +204,12 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
 
     if contig.len() < k {
         // Contig too short for k-mers, return as single segment
-        return vec![Segment::new(contig.clone(), 0, 0)];
+        return vec![Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER)];
     }
 
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
     let mut segment_start = 0;
-    let mut front_kmer = 0u64;
+    let mut front_kmer = MISSING_KMER;
 
     for (pos, &base) in contig.iter().enumerate() {
         if base > 3 {
@@ -239,13 +243,13 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
     if segment_start < contig.len() {
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
-            segments.push(Segment::new(segment_data, front_kmer, 0));
+            segments.push(Segment::new(segment_data, front_kmer, MISSING_KMER));
         }
     }
 
     // If no segments were created (no splitters), return entire contig as one segment
     if segments.is_empty() {
-        segments.push(Segment::new(contig.clone(), 0, 0));
+        segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER));
     }
 
     segments
@@ -273,8 +277,8 @@ mod tests {
         // Should return entire contig as one segment
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].data, contig);
-        assert_eq!(segments[0].front_kmer, 0);
-        assert_eq!(segments[0].back_kmer, 0);
+        assert_eq!(segments[0].front_kmer, MISSING_KMER);
+        assert_eq!(segments[0].back_kmer, MISSING_KMER);
     }
 
     #[test]

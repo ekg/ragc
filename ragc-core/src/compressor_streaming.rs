@@ -5,7 +5,7 @@ use crate::{
     genome_io::{GenomeIO, parse_sample_from_header},
     kmer::{Kmer, KmerMode},
     lz_diff::LZDiff,
-    segment::split_at_splitters_with_size,
+    segment::{split_at_splitters_with_size, MISSING_KMER},
     segment_compression::compress_segment,
     splitters::determine_splitters,
 };
@@ -494,7 +494,7 @@ impl StreamingCompressor {
                 }
                 front.insert(segment[i] as u64);
             }
-            let front_kmer_val = if front.is_full() { front.data() } else { 0 };
+            let front_kmer_val = if front.is_full() { front.data() } else { MISSING_KMER };
 
             // Extract back k-mer
             let mut back = Kmer::new(k, KmerMode::Canonical);
@@ -506,11 +506,11 @@ impl StreamingCompressor {
                 }
                 back.insert(segment[start + i] as u64);
             }
-            let back_kmer_val = if back.is_full() { back.data() } else { 0 };
+            let back_kmer_val = if back.is_full() { back.data() } else { MISSING_KMER };
 
             (front_kmer_val, back_kmer_val)
         } else {
-            (0u64, 0u64)
+            (MISSING_KMER, MISSING_KMER)
         };
 
         self.add_segment_with_kmers(
