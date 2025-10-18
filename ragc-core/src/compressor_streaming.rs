@@ -1017,6 +1017,20 @@ impl StreamingCompressor {
             self.flush_group_final(&key)?;
         }
 
+        // DEBUG: Print first 50 groups sorted by group_id to compare with C++
+        if self.config.verbosity > 0 {
+            println!("\n=== First 50 unique groups (sorted by group_id) ===");
+            let mut groups_with_ids: Vec<(u32, u64, u64)> = self.group_metadata
+                .iter()
+                .map(|(key, meta)| (meta.group_id, key.kmer_front, key.kmer_back))
+                .collect();
+            groups_with_ids.sort_by_key(|(id, _, _)| *id);
+
+            for (group_id, front_kmer, back_kmer) in groups_with_ids.iter().take(50) {
+                println!("  Group {}: front_kmer={}, back_kmer={}", group_id, front_kmer, back_kmer);
+            }
+        }
+
         // Store metadata streams
         self.store_params_stream()?;
         self.store_splitters_stream()?;
