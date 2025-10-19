@@ -5,14 +5,21 @@ use anyhow::{Context, Result};
 use ragc_common::types::{Contig, PackedBlock};
 
 /// Default ZSTD compression level
-/// Use level 9 for optimal balance: Better compression than C++ AGC (20MB vs 26MB)
-/// while maintaining practical compression/decompression speed
-/// File format compatibility is unaffected by compression level
-const DEFAULT_COMPRESSION_LEVEL: i32 = 9;
+/// Use level 17 to match C++ AGC's delta pack compression (segment.h:279)
+/// C++ AGC uses levels 13-19 depending on segment type:
+///   - Reference segments: level 13 (tuples) or 19 (plain) based on repetitiveness
+///   - Delta packs: level 17
+/// We use 17 as a good middle ground matching C++'s most common case
+const DEFAULT_COMPRESSION_LEVEL: i32 = 17;
 
-/// Compress a segment using ZSTD
+/// Compress a segment using ZSTD with default compression level
 pub fn compress_segment(data: &Contig) -> Result<PackedBlock> {
     compress_segment_with_level(data, DEFAULT_COMPRESSION_LEVEL)
+}
+
+/// Compress a segment using ZSTD with compression level from config
+pub fn compress_segment_configured(data: &Contig, level: i32) -> Result<PackedBlock> {
+    compress_segment_with_level(data, level)
 }
 
 /// Compress a segment using ZSTD with specified compression level

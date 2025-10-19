@@ -39,6 +39,10 @@ enum Commands {
         #[arg(short = 'm', long, default_value_t = 20)]
         min_match_len: u32,
 
+        /// ZSTD compression level (1-22, higher = better compression but slower)
+        #[arg(short = 'c', long, default_value_t = 17)]
+        compression_level: i32,
+
         /// Verbosity level (0=quiet, 1=normal, 2=verbose)
         #[arg(short = 'v', long, default_value_t = 1)]
         verbosity: u32,
@@ -127,6 +131,7 @@ fn main() -> Result<()> {
             kmer_length,
             segment_size,
             min_match_len,
+            compression_level,
             verbosity,
         } => create_archive(
             output,
@@ -134,6 +139,7 @@ fn main() -> Result<()> {
             kmer_length,
             segment_size,
             min_match_len,
+            compression_level,
             verbosity,
         )?,
 
@@ -167,6 +173,7 @@ fn create_archive(
     kmer_length: u32,
     segment_size: u32,
     min_match_len: u32,
+    compression_level: i32,
     verbosity: u32,
 ) -> Result<()> {
     if verbosity > 0 {
@@ -176,16 +183,18 @@ fn create_archive(
         eprintln!("  k-mer length: {kmer_length}");
         eprintln!("  segment size: {segment_size}");
         eprintln!("  min match length: {min_match_len}");
+        eprintln!("  compression level: {compression_level}");
         eprintln!();
     }
 
+    // Use default config (which auto-detects num_threads) and override CLI params
     let config = StreamingCompressorConfig {
         kmer_length,
         segment_size,
         min_match_len,
+        compression_level,
         verbosity,
-        group_flush_threshold: 100, // Flush after 100 segments per group
-        periodic_flush_interval: 500, // Flush all groups after 500 contigs
+        ..StreamingCompressorConfig::default()
     };
 
     let output_str = output
@@ -214,9 +223,10 @@ fn create_archive(
             }
             compressor.add_multi_sample_fasta_with_splitters(input_path)?;
         } else {
-            // Single-sample file: use filename as sample name
+            // Single-sample file: use filename as sample name, with splitter-based segmentation
             if verbosity > 0 {
                 eprintln!("Processing as single-sample file (sample name from filename)");
+                eprintln!("Using splitter-based segmentation (matching C++ AGC behavior)");
                 eprintln!();
             }
             let sample_name = extract_sample_name(input_path);

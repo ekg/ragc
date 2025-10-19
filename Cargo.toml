@@ -54,3 +54,6 @@ criterion = "0.5"
 
 # Hashing for tests
 sha2 = "0.10"
+
+# CPU detection
+num_cpus = "1.16"

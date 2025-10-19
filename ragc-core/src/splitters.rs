@@ -3,6 +3,8 @@
 
 use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
 use ragc_common::Contig;
+use rayon::prelude::*;
+use rdst::RadixSort;
 use std::collections::HashSet;
 
 /// Build a splitter set from reference contigs
@@ -23,15 +25,16 @@ use std::collections::HashSet;
 /// HashSet of actually-used splitter k-mer values (much smaller than candidates)
 pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) -> HashSet<u64> {
     // Pass 1: Find candidate k-mers (singletons from reference)
-    let mut all_kmers = Vec::new();
+    // Parallelize k-mer extraction across contigs (matching C++ AGC)
+    let all_kmers_vec: Vec<Vec<u64>> = contigs
+        .par_iter()
+        .map(|contig| enumerate_kmers(contig, k))
+        .collect();
 
-    for contig in contigs {
-        let kmers = enumerate_kmers(contig, k);
-        all_kmers.extend(kmers);
-    }
+    let mut all_kmers: Vec<u64> = all_kmers_vec.into_iter().flatten().collect();
 
-    // Sort k-mers
-    all_kmers.sort_unstable();
+    // Radix sort (matching C++ AGC's RadixSortMSD)
+    all_kmers.radix_sort_unstable();
 
     // Remove non-singletons to get candidates
     remove_non_singletons(&mut all_kmers, 0);
@@ -39,14 +42,13 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
     let candidates: HashSet<u64> = all_kmers.into_iter().collect();
 
     // Pass 2: Scan reference again to find which candidates are ACTUALLY used
-    let mut actually_used_splitters = HashSet::new();
+    // Parallelize splitter finding across contigs (matching C++ AGC)
+    let splitter_vecs: Vec<Vec<u64>> = contigs
+        .par_iter()
+        .map(|contig| find_actual_splitters_in_contig(contig, &candidates, k, segment_size))
+        .collect();
 
-    for contig in contigs {
-        let splitters_in_contig = find_actual_splitters_in_contig(contig, &candidates, k, segment_size);
-        actually_used_splitters.extend(splitters_in_contig);
-    }
-
-    actually_used_splitters
+    splitter_vecs.into_iter().flatten().collect()
 }
 
 /// Find which candidate k-mers are actually used as splitters in a contig
@@ -113,14 +115,16 @@ fn find_actual_splitters_in_contig(
 /// # Returns
 /// Sorted vector of singleton k-mers
 pub fn find_candidate_kmers_multi(contigs: &[Contig], k: usize) -> Vec<u64> {
-    let mut all_kmers = Vec::new();
+    // Parallelize k-mer extraction (matching C++ AGC)
+    let all_kmers_vec: Vec<Vec<u64>> = contigs
+        .par_iter()
+        .map(|contig| enumerate_kmers(contig, k))
+        .collect();
 
-    for contig in contigs {
-        let kmers = enumerate_kmers(contig, k);
-        all_kmers.extend(kmers);
-    }
+    let mut all_kmers: Vec<u64> = all_kmers_vec.into_iter().flatten().collect();
 
-    all_kmers.sort_unstable();
+    // Radix sort (matching C++ AGC RadixSortMSD)
+    all_kmers.radix_sort_unstable();
     remove_non_singletons(&mut all_kmers, 0);
 
     all_kmers

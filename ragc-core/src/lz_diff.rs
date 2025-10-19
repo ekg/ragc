@@ -427,6 +427,150 @@ impl LZDiff {
 
         (x, i)
     }
+
+    /// Get coding cost vector for target sequence
+    /// This computes the per-position cost of encoding the target against the reference
+    /// Returns a vector where v_costs[i] is the cost of encoding position i
+    /// If prefix_costs=true, match cost is placed at start of match; otherwise at end
+    pub fn get_coding_cost_vector(&self, target: &Contig, prefix_costs: bool) -> Vec<u32> {
+        let mut v_costs = Vec::with_capacity(target.len());
+
+        if self.reference.is_empty() {
+            return v_costs;
+        }
+
+        let text_size = target.len();
+        let mut i = 0;
+        let mut pred_pos = 0u32;
+        let mut no_prev_literals = 0usize;
+        let mut x_prev: Option<u64> = None;
+
+        while i + (self.key_len as usize) < text_size {
+            // Get k-mer code
+            let x = if let Some(prev) = x_prev {
+                if no_prev_literals > 0 {
+                    self.get_code_skip1(prev, &target[i..])
+                } else {
+                    self.get_code(&target[i..])
+                }
+            } else {
+                self.get_code(&target[i..])
+            };
+
+            x_prev = x;
+
+            if x.is_none() {
+                // Check for N-run
+                let nrun_len = self.get_nrun_len(&target[i..], text_size - i);
+
+                if nrun_len >= MIN_NRUN_LEN {
+                    let tc = self.coding_cost_nrun(nrun_len);
+                    if prefix_costs {
+                        v_costs.push(tc);
+                        for _ in 1..nrun_len {
+                            v_costs.push(0);
+                        }
+                    } else {
+                        for _ in 1..nrun_len {
+                            v_costs.push(0);
+                        }
+                        v_costs.push(tc);
+                    }
+                    i += nrun_len as usize;
+                    no_prev_literals = 0;
+                } else {
+                    // Single literal: cost is 1
+                    v_costs.push(1);
+                    i += 1;
+                    pred_pos += 1;
+                    no_prev_literals += 1;
+                }
+                continue;
+            }
+
+            // Try to find match
+            let hash = MurMur64Hash::hash(x.unwrap());
+            let max_len = text_size - i;
+
+            if let Some((match_pos, len_bck, len_fwd)) =
+                self.find_best_match(hash, target, i, max_len, no_prev_literals)
+            {
+                // Handle backward extension
+                if len_bck > 0 {
+                    for _ in 0..len_bck {
+                        v_costs.pop();
+                    }
+                    i -= len_bck as usize;
+                    pred_pos -= len_bck;
+                }
+
+                let total_len = len_bck + len_fwd;
+                let tc = self.coding_cost_match(match_pos - len_bck, total_len, pred_pos);
+
+                if prefix_costs {
+                    v_costs.push(tc);
+                    for _ in 1..total_len {
+                        v_costs.push(0);
+                    }
+                } else {
+                    for _ in 1..total_len {
+                        v_costs.push(0);
+                    }
+                    v_costs.push(tc);
+                }
+
+                pred_pos = match_pos - len_bck + total_len;
+                i += total_len as usize;
+                no_prev_literals = 0;
+            } else {
+                // No match, literal cost is 1
+                v_costs.push(1);
+                i += 1;
+                pred_pos += 1;
+                no_prev_literals += 1;
+            }
+        }
+
+        // Remaining bases are literals
+        while i < text_size {
+            v_costs.push(1);
+            i += 1;
+        }
+
+        v_costs
+    }
+
+    /// Compute coding cost for N-run
+    fn coding_cost_nrun(&self, len: u32) -> u32 {
+        // Cost: N_RUN_STARTER_CODE + decimal digits + N_CODE suffix
+        let delta = len - MIN_NRUN_LEN;
+        let digits = if delta == 0 {
+            1
+        } else {
+            ((delta as f64).log10().floor() as u32) + 1
+        };
+        1 + digits + 1 // starter + digits + suffix
+    }
+
+    /// Compute coding cost for match
+    fn coding_cost_match(&self, match_pos: u32, len: u32, pred_pos: u32) -> u32 {
+        // Cost: position_diff digits + ',' + length digits + '.'
+        let dif_pos = (match_pos as i32) - (pred_pos as i32);
+        let pos_digits = if dif_pos == 0 {
+            1
+        } else {
+            ((dif_pos.abs() as f64).log10().floor() as u32) + 1 + if dif_pos < 0 { 1 } else { 0 }
+        };
+
+        let delta = len - self.min_match_len;
+        let len_digits = if delta == 0 {
+            1
+        } else {
+            ((delta as f64).log10().floor() as u32) + 1
+        };
+
+        pos_digits + 1 + len_digits + 1 // pos + ',' + len + '.'
+    }
 }
 
 #[cfg(test)]
