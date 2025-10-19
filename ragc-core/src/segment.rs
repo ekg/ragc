@@ -307,9 +307,15 @@ mod tests {
         // Should split at the splitter position
         assert!(!segments.is_empty());
 
-        // Total length should equal original contig
-        let total_len: usize = segments.iter().map(|s| s.len()).sum();
-        assert_eq!(total_len, contig.len());
+        // Verify reconstructed length (accounting for k-base overlaps)
+        // First segment contributes all its bytes, subsequent segments skip first k bytes
+        let k = 3;
+        let reconstructed_len: usize = if segments.is_empty() {
+            0
+        } else {
+            segments[0].len() + segments[1..].iter().map(|s| s.len().saturating_sub(k)).sum::<usize>()
+        };
+        assert_eq!(reconstructed_len, contig.len());
     }
 
     #[test]

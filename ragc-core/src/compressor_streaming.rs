@@ -288,73 +288,58 @@ impl StreamingCompressor {
 
         drop(reference_contigs); // Free memory
 
-        // Pass 2: Collect all contigs first (matching C++ AGC queue loading)
+        // Pass 2: TRUE STREAMING with producer-consumer channels (no buffering!)
+        // Producer thread: reads file → sends to channel
+        // Worker threads: receive from channel → process immediately
+        // This matches C++ AGC's architecture exactly
+
         if self.config.verbosity > 0 {
-            println!("Loading contigs into memory for parallel processing...");
+            println!("=== Pass 2: Streaming processing with {} worker threads ===", self.config.num_threads);
         }
 
-        let mut all_contigs = Vec::new();
-        {
-            let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
-                .context("Failed to re-open multi-sample FASTA")?;
+        use crossbeam::channel::{bounded, Sender, Receiver};
+        use std::thread;
 
+        type ContigTask = (String, String, Contig); // (sample_name, contig_name, sequence)
+
+        // Bounded channel matching C++ AGC's CBoundedQueue
+        // Queue capacity: allow 100 contigs in flight (balances memory vs throughput)
+        let (contig_tx, contig_rx): (Sender<ContigTask>, Receiver<ContigTask>) = bounded(100);
+
+        // Clone path for producer thread
+        let fasta_path_clone = fasta_path.to_path_buf();
+        let verbosity = self.config.verbosity;
+
+        // Producer thread: reads FASTA and feeds channel (like C++ AGC main thread)
+        let producer_handle = thread::spawn(move || -> Result<usize> {
+            let mut reader = GenomeIO::<Box<dyn Read>>::open(&fasta_path_clone)
+                .context("Failed to open multi-sample FASTA for streaming")?;
+
+            let mut contig_count = 0;
             while let Some((_full_header, sample_name, contig_name, sequence)) = reader.read_contig_with_sample()? {
                 if !sequence.is_empty() {
-                    all_contigs.push((sample_name, contig_name, sequence));
+                    // Send to workers (blocks if queue full - backpressure!)
+                    contig_tx.send((sample_name, contig_name, sequence))
+                        .context("Failed to send contig to workers")?;
+                    contig_count += 1;
+
+                    if verbosity > 1 && contig_count % 1000 == 0 {
+                        eprintln!("Producer: sent {} contigs to workers", contig_count);
+                    }
                 }
             }
-        }
 
-        if self.config.verbosity > 0 {
-            println!("Loaded {} contigs, processing in parallel with {} threads...",
-                all_contigs.len(), self.config.num_threads);
-        }
+            // Close channel to signal workers we're done
+            drop(contig_tx);
 
-        // Register all contigs in collection (must be sequential)
-        let mut samples_seen = std::collections::HashSet::new();
-        for (sample_name, contig_name, _) in &all_contigs {
-            if samples_seen.insert(sample_name.clone()) && self.config.verbosity > 0 {
-                println!("Processing sample: {}", sample_name);
+            if verbosity > 0 {
+                println!("Producer: finished sending {} contigs", contig_count);
             }
-            self.collection.register_sample_contig(sample_name, contig_name)?;
-        }
 
-        // Process all contigs in parallel (matching C++ AGC worker threads)
-        // Each rayon worker acts like a C++ worker thread
-        use rayon::prelude::*;
+            Ok(contig_count)
+        });
 
-        type SegmentTask = (String, String, usize, Contig, u64, u64);
-
-        let all_segment_tasks: Vec<SegmentTask> = all_contigs
-            .par_iter()
-            .flat_map(|(sample_name, contig_name, sequence)| {
-                // Split at splitters (this is the expensive part - parallel!)
-                let segments = split_at_splitters_with_size(
-                    sequence,
-                    &splitters,
-                    self.config.kmer_length as usize,
-                    self.config.segment_size as usize
-                );
-
-                // Collect segment tasks
-                segments.into_iter().enumerate().map(|(seg_idx, segment)| {
-                    (
-                        sample_name.clone(),
-                        contig_name.clone(),
-                        seg_idx,
-                        segment.data,
-                        segment.front_kmer,
-                        segment.back_kmer,
-                    )
-                }).collect::<Vec<_>>()
-            })
-            .collect();
-
-        if self.config.verbosity > 0 {
-            println!("Split into {} segments, adding to groups...", all_segment_tasks.len());
-        }
-
-        // Make shared state thread-safe for parallel segment processing
+        // Make shared state thread-safe for parallel processing
         // Using DashMap for fine-grained locking (per-shard), matching C++ AGC's per-group mutexes
         let segment_groups = {
             let dashmap = DashMap::new();
@@ -370,46 +355,128 @@ impl StreamingCompressor {
             }
             Arc::new(dashmap)
         };
+
+        // Collect contig registrations for sequential processing after workers finish
+        let contig_registrations = Arc::new(DashMap::new());
+
         let total_segments = Arc::new(AtomicUsize::new(self.total_segments));
         let total_bases = Arc::new(AtomicUsize::new(self.total_bases_processed));
         let config = Arc::new(self.config.clone());
+        let splitters_arc = Arc::new(splitters);
 
-        // Process all segments in parallel (matching C++ AGC worker threads)
-        all_segment_tasks.par_iter().try_for_each(
-            |(sample_name, contig_name, seg_idx, segment_data, front_kmer, back_kmer)| {
-                total_bases.fetch_add(segment_data.len(), Ordering::Relaxed);
+        // Worker threads: consume from channel and process (like C++ AGC worker threads)
+        let mut worker_handles = Vec::new();
+        for worker_id in 0..self.config.num_threads {
+            let rx = contig_rx.clone();
+            let seg_groups = segment_groups.clone();
+            let group_terms = group_terminators.clone();
+            let registrations = contig_registrations.clone();
+            let total_segs = total_segments.clone();
+            let total_b = total_bases.clone();
+            let cfg = config.clone();
+            let splitters = splitters_arc.clone();
 
-                Self::add_segment_with_kmers_threadsafe(
-                    &config,
-                    &segment_groups,
-                    &group_terminators,
-                    &total_segments,
-                    sample_name,
-                    contig_name,
-                    *seg_idx,
-                    segment_data.clone(),
-                    *front_kmer,
-                    *back_kmer,
-                    false, // is_rev_comp
-                )
-            }
-        )?;
+            let worker_handle = thread::spawn(move || -> Result<usize> {
+                let mut worker_contigs = 0;
+
+                // Consume from channel until closed
+                while let Ok((sample_name, contig_name, sequence)) = rx.recv() {
+                    worker_contigs += 1;
+
+                    // Record registration for later (collection registration must be sequential)
+                    registrations.insert((sample_name.clone(), contig_name.clone()), ());
+
+                    // Segment at splitters (parallel-safe, no shared state)
+                    let segments = split_at_splitters_with_size(
+                        &sequence,
+                        &splitters,
+                        cfg.kmer_length as usize,
+                        cfg.segment_size as usize
+                    );
+
+                    // Add each segment to groups (DashMap provides fine-grained locking)
+                    for (seg_idx, segment) in segments.into_iter().enumerate() {
+                        total_b.fetch_add(segment.data.len(), Ordering::Relaxed);
+
+                        Self::add_segment_with_kmers_threadsafe(
+                            &cfg,
+                            &seg_groups,
+                            &group_terms,
+                            &total_segs,
+                            &sample_name,
+                            &contig_name,
+                            seg_idx,
+                            segment.data,
+                            segment.front_kmer,
+                            segment.back_kmer,
+                            false, // is_rev_comp
+                        )?;
+                    }
+
+                    if cfg.verbosity > 2 && worker_contigs % 100 == 0 {
+                        eprintln!("Worker {}: processed {} contigs", worker_id, worker_contigs);
+                    }
+                }
+
+                if cfg.verbosity > 1 {
+                    println!("Worker {}: processed {} contigs", worker_id, worker_contigs);
+                }
+
+                Ok(worker_contigs)
+            });
+
+            worker_handles.push(worker_handle);
+        }
+
+        // Wait for producer to finish
+        let total_contigs = producer_handle.join()
+            .map_err(|e| anyhow::anyhow!("Producer thread panicked: {:?}", e))??;
+
+        // Wait for all workers to finish
+        let mut total_worker_contigs = 0;
+        for (worker_id, handle) in worker_handles.into_iter().enumerate() {
+            let worker_contigs = handle.join()
+                .map_err(|e| anyhow::anyhow!("Worker {} panicked: {:?}", worker_id, e))??;
+            total_worker_contigs += worker_contigs;
+        }
+
+        if self.config.verbosity > 0 {
+            println!("Streaming complete: {} contigs read, {} processed by workers",
+                total_contigs, total_worker_contigs);
+        }
+
+        // Register all contigs in collection (sequential, after workers finish)
+        let registrations_map = Arc::try_unwrap(contig_registrations)
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap contig_registrations Arc"))?;
+
+        if self.config.verbosity > 0 {
+            println!("Registering {} contigs in collection...", registrations_map.len());
+        }
+
+        for ((sample_name, contig_name), _) in registrations_map.into_iter() {
+            self.collection.register_sample_contig(&sample_name, &contig_name)?;
+        }
 
         // Move shared state back from DashMap to HashMap
         {
-            let dashmap = Arc::try_unwrap(segment_groups).unwrap();
+            let dashmap = Arc::try_unwrap(segment_groups)
+                .map_err(|_| anyhow::anyhow!("Failed to unwrap segment_groups Arc"))?;
             self.segment_groups = dashmap.into_iter().collect();
         }
         {
-            let dashmap = Arc::try_unwrap(group_terminators).unwrap();
+            let dashmap = Arc::try_unwrap(group_terminators)
+                .map_err(|_| anyhow::anyhow!("Failed to unwrap group_terminators Arc"))?;
             self.group_terminators = dashmap.into_iter().collect();
         }
-        self.total_segments = Arc::try_unwrap(total_segments).unwrap().into_inner();
-        self.total_bases_processed = Arc::try_unwrap(total_bases).unwrap().into_inner();
+        self.total_segments = Arc::try_unwrap(total_segments)
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap total_segments Arc"))?
+            .into_inner();
+        self.total_bases_processed = Arc::try_unwrap(total_bases)
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap total_bases Arc"))?
+            .into_inner();
 
         if self.config.verbosity > 0 {
-            println!("Processed {} unique samples, {} total contigs",
-                samples_seen.len(), all_contigs.len());
+            println!("Processed {} contigs total", total_contigs);
         }
 
         Ok(())
