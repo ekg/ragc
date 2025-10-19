@@ -14,10 +14,12 @@ use ragc_common::{
     stream_delta_name, stream_ref_name, Archive, CollectionV3, Contig, AGC_FILE_MAJOR, AGC_FILE_MINOR,
     CONTIG_SEPARATOR,
 };
+use dashmap::DashMap;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 
 /// Configuration for the streaming compressor
 #[derive(Debug, Clone)]
@@ -352,20 +354,58 @@ impl StreamingCompressor {
             println!("Split into {} segments, adding to groups...", all_segment_tasks.len());
         }
 
-        // Add all segments sequentially (this is fast - just hash map inserts)
-        for (sample_name, contig_name, seg_idx, segment_data, front_kmer, back_kmer) in all_segment_tasks {
-            self.total_bases_processed += segment_data.len();
+        // Make shared state thread-safe for parallel segment processing
+        // Using DashMap for fine-grained locking (per-shard), matching C++ AGC's per-group mutexes
+        let segment_groups = {
+            let dashmap = DashMap::new();
+            for (key, value) in std::mem::take(&mut self.segment_groups) {
+                dashmap.insert(key, value);
+            }
+            Arc::new(dashmap)
+        };
+        let group_terminators = {
+            let dashmap = DashMap::new();
+            for (key, value) in std::mem::take(&mut self.group_terminators) {
+                dashmap.insert(key, value);
+            }
+            Arc::new(dashmap)
+        };
+        let total_segments = Arc::new(AtomicUsize::new(self.total_segments));
+        let total_bases = Arc::new(AtomicUsize::new(self.total_bases_processed));
+        let config = Arc::new(self.config.clone());
 
-            self.add_segment_with_kmers(
-                &sample_name,
-                &contig_name,
-                seg_idx,
-                segment_data,
-                front_kmer,
-                back_kmer,
-                false, // is_rev_comp
-            )?;
+        // Process all segments in parallel (matching C++ AGC worker threads)
+        all_segment_tasks.par_iter().try_for_each(
+            |(sample_name, contig_name, seg_idx, segment_data, front_kmer, back_kmer)| {
+                total_bases.fetch_add(segment_data.len(), Ordering::Relaxed);
+
+                Self::add_segment_with_kmers_threadsafe(
+                    &config,
+                    &segment_groups,
+                    &group_terminators,
+                    &total_segments,
+                    sample_name,
+                    contig_name,
+                    *seg_idx,
+                    segment_data.clone(),
+                    *front_kmer,
+                    *back_kmer,
+                    false, // is_rev_comp
+                )
+            }
+        )?;
+
+        // Move shared state back from DashMap to HashMap
+        {
+            let dashmap = Arc::try_unwrap(segment_groups).unwrap();
+            self.segment_groups = dashmap.into_iter().collect();
         }
+        {
+            let dashmap = Arc::try_unwrap(group_terminators).unwrap();
+            self.group_terminators = dashmap.into_iter().collect();
+        }
+        self.total_segments = Arc::try_unwrap(total_segments).unwrap().into_inner();
+        self.total_bases_processed = Arc::try_unwrap(total_bases).unwrap().into_inner();
 
         if self.config.verbosity > 0 {
             println!("Processed {} unique samples, {} total contigs",
@@ -1081,6 +1121,118 @@ impl StreamingCompressor {
                 self.flush_group(&key)?;
             }
         }
+
+        Ok(())
+    }
+
+    /// Thread-safe version of add_segment_with_kmers for parallel processing
+    /// Matches C++ AGC worker thread behavior with fine-grained locking (DashMap)
+    #[allow(clippy::too_many_arguments)]
+    fn add_segment_with_kmers_threadsafe(
+        config: &StreamingCompressorConfig,
+        segment_groups: &Arc<DashMap<SegmentGroupKey, Vec<SegmentInfo>>>,
+        group_terminators: &Arc<DashMap<u64, Vec<u64>>>,
+        total_segments: &Arc<AtomicUsize>,
+        sample_name: &str,
+        contig_name: &str,
+        seg_part_no: usize,
+        segment: Contig,
+        kmer_front: u64,
+        kmer_back: u64,
+        is_rev_comp: bool,
+    ) -> Result<()> {
+        // K-mer orientation logic (matching add_segment_with_kmers)
+        let (final_front, final_back) = if kmer_front != MISSING_KMER && kmer_back == MISSING_KMER {
+            let k = config.kmer_length as usize;
+            if segment.len() >= k {
+                let mut front = Kmer::new(config.kmer_length, KmerMode::Canonical);
+                for i in 0..k {
+                    if segment[i] > 3 {
+                        front.reset();
+                        break;
+                    }
+                    front.insert(segment[i] as u64);
+                }
+
+                if front.is_full() && front.data() == kmer_front {
+                    if front.is_dir_oriented() {
+                        (kmer_front, MISSING_KMER)
+                    } else {
+                        (MISSING_KMER, kmer_front)
+                    }
+                } else {
+                    (kmer_front, kmer_back)
+                }
+            } else {
+                (kmer_front, kmer_back)
+            }
+        } else if kmer_front == MISSING_KMER && kmer_back != MISSING_KMER {
+            let k = config.kmer_length as usize;
+            if segment.len() >= k {
+                let mut back = Kmer::new(config.kmer_length, KmerMode::Canonical);
+                let start = segment.len() - k;
+                for i in 0..k {
+                    if segment[start + i] > 3 {
+                        back.reset();
+                        break;
+                    }
+                    back.insert(segment[start + i] as u64);
+                }
+
+                if back.is_full() && back.data() == kmer_back {
+                    if !back.is_dir_oriented() {
+                        (kmer_back, MISSING_KMER)
+                    } else {
+                        (MISSING_KMER, kmer_back)
+                    }
+                } else {
+                    (kmer_front, kmer_back)
+                }
+            } else {
+                (kmer_front, kmer_back)
+            }
+        } else {
+            (kmer_front, kmer_back)
+        };
+
+        // Normalize key
+        let (key, needs_rc) = SegmentGroupKey::new_normalized(final_front, final_back);
+        let final_is_rev_comp = is_rev_comp ^ needs_rc;
+
+        // Reverse complement if needed
+        let final_segment = if needs_rc {
+            segment.iter().rev().map(|&b| match b {
+                0 => 3, 1 => 2, 2 => 1, 3 => 0, _ => b,
+            }).collect()
+        } else {
+            segment
+        };
+
+        // Check if this is a new group (fine-grained locking with DashMap)
+        let is_new_group = !segment_groups.contains_key(&key);
+
+        let seg_info = SegmentInfo {
+            sample_name: sample_name.to_string(),
+            contig_name: contig_name.to_string(),
+            seg_part_no,
+            data: final_segment,
+            is_rev_comp: final_is_rev_comp,
+        };
+
+        // DashMap provides per-shard locking - only locks the shard containing this key!
+        // This matches C++ AGC's per-group mutex approach (line 220 in agc_compressor.h)
+        segment_groups.entry(key.clone()).or_default().push(seg_info);
+
+        // Update terminators if new group (also fine-grained locking via DashMap)
+        if is_new_group && key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+            group_terminators.entry(key.kmer_front).or_default().push(key.kmer_back);
+            if key.kmer_front != key.kmer_back {
+                group_terminators.entry(key.kmer_back).or_default().push(key.kmer_front);
+            }
+        }
+
+        // Update counter (lock-free atomic increment)
+        total_segments.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }

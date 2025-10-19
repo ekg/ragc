@@ -31,6 +31,7 @@ flate2 = "1.0"
 seahash = "4.1"
 ahash = "0.8"
 hashbrown = "0.14"
+dashmap = "6.1"
 
 # Parallel processing
 rayon = "1.8"
