@@ -1,7 +1,7 @@
 // AGC Decompressor
 // Extracts genomes from AGC archives
 
-use crate::{genome_io::GenomeWriter, lz_diff::LZDiff, segment_compression::decompress_segment};
+use crate::{genome_io::GenomeWriter, kmer::reverse_complement, lz_diff::LZDiff, segment_compression::decompress_segment};
 use anyhow::{anyhow, Context, Result};
 use ragc_common::{
     stream_delta_name, stream_ref_name, Archive, CollectionV3, Contig, SegmentDesc, AGC_FILE_MAJOR,
@@ -235,12 +235,26 @@ impl Decompressor {
         Ok(contigs)
     }
 
+    /// Apply reverse complement to a segment (reverse order and complement each base)
+    fn reverse_complement_segment(segment: &[u8]) -> Contig {
+        segment
+            .iter()
+            .rev()
+            .map(|&base| reverse_complement(base as u64) as u8)
+            .collect()
+    }
+
     /// Reconstruct a contig from its segment descriptors
     fn reconstruct_contig(&mut self, segments: &[SegmentDesc]) -> Result<Contig> {
         let mut contig = Contig::new();
 
         for (i, segment_desc) in segments.iter().enumerate() {
-            let segment_data = self.get_segment(segment_desc)?;
+            let mut segment_data = self.get_segment(segment_desc)?;
+
+            // Apply reverse complement if needed
+            if segment_desc.is_rev_comp {
+                segment_data = Self::reverse_complement_segment(&segment_data);
+            }
 
             if i == 0 {
                 // First segment: add completely
