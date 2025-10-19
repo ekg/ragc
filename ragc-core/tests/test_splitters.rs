@@ -29,7 +29,7 @@ fn main() {
             vec![2, 2, 2, 3], // GGGT
         ];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
         print_splitters(&splitters, 50);
     }
 
@@ -38,7 +38,7 @@ fn main() {
     {
         let contigs = vec![vec![0, 1, 2, 3], vec![0, 1, 2, 3]];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
         print_splitters(&splitters, 50);
     }
 
@@ -50,7 +50,7 @@ fn main() {
             vec![1, 1, 1, 1], // CCCC
         ];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
         print_splitters(&splitters, 50);
     }
 
@@ -62,7 +62,7 @@ fn main() {
             vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2], // AAAACCCCGGGG (unique patterns)
         ];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
         print_splitters(&splitters, 50);
     }
 
@@ -75,7 +75,7 @@ fn main() {
             vec![0, 0, 1, 1, 2, 2, 3, 3, 0, 0, 1, 1, 2, 2, 3, 3, 0, 0, 1, 1], // AACCGGTTAACCGGTTAACC
         ];
 
-        let splitters = determine_splitters(&contigs, 5);
+        let splitters = determine_splitters(&contigs, 5, 100);
         print_splitters(&splitters, 100);
     }
 
@@ -86,7 +86,7 @@ fn main() {
             vec![0, 1, 2, 3, 1, 0, 3, 2, 0, 2, 1, 3], // ACGTCATGACGT (mostly unique)
         ];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
         print_splitters(&splitters, 100);
     }
 }

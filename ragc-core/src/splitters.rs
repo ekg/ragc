@@ -155,7 +155,7 @@ mod tests {
             vec![2, 2, 2, 3], // GGGT
         ];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
 
         // AAA appears once, AAC appears once
         // GGG appears once, GGT appears once
@@ -168,7 +168,7 @@ mod tests {
         // Two identical contigs - all k-mers appear twice
         let contigs = vec![vec![0, 1, 2, 3], vec![0, 1, 2, 3]];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
 
         // No singletons since all k-mers appear twice
         assert_eq!(splitters.len(), 0);
@@ -182,7 +182,7 @@ mod tests {
             vec![1, 1, 1, 1], // CCCC
         ];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
 
         // All k-mers are unique, so all should be splitters
         // AAA appears 2 times in first contig, CCC appears 2 times in second
@@ -199,7 +199,7 @@ mod tests {
             vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2], // AAAACCCCGGGG (unique patterns)
         ];
 
-        let splitters = determine_splitters(&contigs, 3);
+        let splitters = determine_splitters(&contigs, 3, 100);
 
         // The second contig has unique patterns: AAA, AAC, CCC, CCG, GGG
         // All should be singletons (appear only once)
