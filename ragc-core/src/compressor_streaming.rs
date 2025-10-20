@@ -51,11 +51,11 @@ impl Default for StreamingCompressorConfig {
             min_match_len: 15,
             compression_level: 17,
             verbosity: 1,
-            // IMPORTANT: To match C++ AGC exactly, we need to keep all segments in memory
-            // until finalize(). This is required for the middle splitter optimization
-            // which needs to compute coding costs against existing segment data.
-            group_flush_threshold: 0, // 0 = disabled (was 100)
-            periodic_flush_interval: 0, // 0 = disabled (was 500)
+            // MEMORY OPTIMIZATION: Flush segments to disk immediately
+            // The middle splitter optimization only needs group_terminators (k-mer pairings),
+            // not the actual segment data. C++ AGC writes to disk immediately via v_segments[group_id]->add()
+            group_flush_threshold: 1, // Flush immediately (flush_group batches internally)
+            periodic_flush_interval: 0, // Not needed with immediate flushing
             num_threads,
             adaptive_mode: false, // Default matches C++ AGC (adaptive mode off)
         }
@@ -555,42 +555,25 @@ impl StreamingCompressor {
             println!("=== Pass 1: Finding splitter k-mers across all genomes ===");
         }
 
-        // Pass 1: Collect sequences from FIRST genome only to find splitters
+        // Pass 1: Stream through FIRST genome to find splitters
         // This is the reference-based approach: use splitters from first genome
         // to segment all genomes at the same positions
-        let mut reference_contigs = Vec::new();
-
-        if let Some((ref_sample_name, ref_fasta_path)) = fasta_paths.first() {
+        //
+        // MEMORY-EFFICIENT: Streams through file twice instead of loading all contigs
+        // For yeast (12MB genome): ~100MB Vec vs ~2.8GB loading all contigs!
+        let (splitters, singletons, duplicates) = if let Some((ref_sample_name, ref_fasta_path)) = fasta_paths.first() {
             if self.config.verbosity > 0 {
-                println!("Using {} as reference to find splitters...", ref_sample_name);
+                println!("Using {} as reference to find splitters (streaming)...", ref_sample_name);
             }
 
-            let mut reader = GenomeIO::<Box<dyn Read>>::open(ref_fasta_path)
-                .context(format!("Failed to open reference {}", ref_sample_name))?;
-
-            while let Some((_contig_name, sequence)) = reader.read_contig_converted()? {
-                if !sequence.is_empty() {
-                    reference_contigs.push(sequence);
-                }
-            }
-
-            if self.config.verbosity > 0 {
-                println!("Collected {} reference contigs, finding singleton k-mers...", reference_contigs.len());
-            }
+            crate::splitters::determine_splitters_streaming(
+                ref_fasta_path,
+                self.config.kmer_length as usize,
+                self.config.segment_size as usize
+            )?
         } else {
             anyhow::bail!("No input files provided");
-        }
-
-        // Find splitters (three-pass algorithm):
-        // 1. Find singletons (candidates)
-        // 2. Scan reference to find which candidates are actually used
-        // 3. Return only actually-used splitters
-        // Also get singleton and duplicate k-mers for adaptive mode
-        let (splitters, singletons, duplicates) = determine_splitters(
-            &reference_contigs,
-            self.config.kmer_length as usize,
-            self.config.segment_size as usize
-        );
+        };
 
         // Store reference k-mers for adaptive mode
         if self.config.adaptive_mode {
@@ -609,9 +592,6 @@ impl StreamingCompressor {
             println!();
             println!("=== Pass 2: Segmenting and compressing genomes ===");
         }
-
-        // Free memory from reference_contigs
-        drop(reference_contigs);
 
         // Pass 2: Re-read files and segment using splitters
         for (sample_name, fasta_path) in fasta_paths {
@@ -1312,12 +1292,10 @@ impl StreamingCompressor {
             }
         }
 
-        // Check if this group should be flushed
+        // MEMORY OPTIMIZATION: Flush immediately to write segments to disk
+        // This prevents buffering thousands of segments in memory
         if self.config.group_flush_threshold > 0 {
-            let group_size = self.segment_groups.get(&key).map(|v| v.len()).unwrap_or(0);
-            if group_size >= self.config.group_flush_threshold {
-                self.flush_group(&key)?;
-            }
+            self.flush_group(&key)?;
         }
 
         Ok(())
@@ -1548,28 +1526,21 @@ impl StreamingCompressor {
             segments
         };
 
-        // Add new segments to pending buffer
+        // MEMORY OPTIMIZATION: Write all segments immediately instead of waiting for packs of 50
+        // This matches C++ AGC's immediate write behavior
         metadata.pending_segments.append(&mut new_delta_segments);
 
-        // Only write complete packs (multiples of PACK_CARDINALITY)
-        let num_complete_packs = metadata.pending_segments.len() / PACK_CARDINALITY;
-        let segments_to_write = num_complete_packs * PACK_CARDINALITY;
-
-        if segments_to_write == 0 {
-            // Not enough for a full pack yet, keep buffering
-            if self.config.verbosity > 2 {
-                eprintln!("Group {} buffering {} segments (need {} for complete pack)",
-                    group_id, metadata.pending_segments.len(), PACK_CARDINALITY);
-            }
+        if metadata.pending_segments.is_empty() {
             return Ok(());
         }
 
-        // Split off segments to write now
-        let segments_to_pack: Vec<SegmentInfo> = metadata.pending_segments.drain(..segments_to_write).collect();
+        // Write ALL pending segments (drain completely for memory efficiency)
+        let segments_to_pack: Vec<SegmentInfo> = metadata.pending_segments.drain(..).collect();
+        let segments_to_write = segments_to_pack.len();
 
         if self.config.verbosity > 2 {
-            eprintln!("Group {} writing {} complete packs ({} segments), {} segments remain buffered",
-                group_id, num_complete_packs, segments_to_write, metadata.pending_segments.len());
+            eprintln!("Group {} writing {} segments immediately (memory-efficient mode)",
+                group_id, segments_to_write);
         }
 
         // Step 1: Build all packs (LZ encoding + concatenation)

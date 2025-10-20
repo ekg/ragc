@@ -135,4 +135,4 @@ pub use kmer_extract::{enumerate_kmers, find_candidate_kmers, remove_non_singlet
 pub use lz_diff::LZDiff;
 pub use segment::{split_at_splitters, split_at_splitters_with_size, Segment};
 pub use segment_compression::{compress_segment, compress_segment_with_level, decompress_segment};
-pub use splitters::{determine_splitters, find_candidate_kmers_multi, is_splitter};
+pub use splitters::{determine_splitters, determine_splitters_streaming, find_candidate_kmers_multi, is_splitter};
