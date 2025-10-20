@@ -506,71 +506,87 @@ impl StreamingCompressor {
             worker_handles.push(worker_handle);
         }
 
-        // Drop the sender so writer knows when workers are done
-        drop(segment_tx);
+        // MEMORY OPTIMIZATION: Write segments in real-time as they arrive from workers
+        // This keeps memory bounded to the channel buffer size (~100 segments)
+        // instead of accumulating all 93K segments before writing
 
-        // Writer thread: receive segments from workers and write to archive
-        // This runs concurrently with workers and performs sequential writes
-        let writer_segments = Arc::new(AtomicUsize::new(0));
-        let writer_segs_ref = writer_segments.clone();
-        let writer_verbosity = self.config.verbosity;
-
-        let writer_handle = thread::spawn(move || -> Result<()> {
-            let mut segments_written = 0;
-
-            while let Ok(compressed_seg) = segment_rx.recv() {
-                // TODO: Actually write to archive here
-                // For now, just count
-                segments_written += 1;
-
-                if writer_verbosity > 2 && segments_written % 10000 == 0 {
-                    eprintln!("Writer: wrote {} segments", segments_written);
-                }
+        // Spawn a thread to signal when workers finish
+        let (workers_done_tx, workers_done_rx) = bounded(1);
+        thread::spawn(move || {
+            let _ = producer_handle.join();
+            for handle in worker_handles {
+                let _ = handle.join();
             }
-
-            writer_segs_ref.store(segments_written, Ordering::Relaxed);
-
-            if writer_verbosity > 0 {
-                println!("Writer: finished writing {} segments", segments_written);
-            }
-
-            Ok(())
+            drop(segment_tx); // Close channel
+            let _ = workers_done_tx.send(());
         });
 
-        // Wait for producer to finish
-        let total_contigs = producer_handle.join()
-            .map_err(|e| anyhow::anyhow!("Producer thread panicked: {:?}", e))??;
+        // Write segments as they arrive (interleaved with worker execution)
+        let mut segments_written = 0;
+        let mut registered_contigs = HashSet::new();
 
-        // Wait for all workers to finish
-        let mut total_worker_contigs = 0;
-        for (worker_id, handle) in worker_handles.into_iter().enumerate() {
-            let worker_contigs = handle.join()
-                .map_err(|e| anyhow::anyhow!("Worker {} panicked: {:?}", worker_id, e))??;
-            total_worker_contigs += worker_contigs;
+        loop {
+            match segment_rx.try_recv() {
+                Ok(seg) => {
+                    // Register contig if first time seeing it
+                    let contig_key = (seg.sample_name.clone(), seg.contig_name.clone());
+                    if registered_contigs.insert(contig_key.clone()) {
+                        self.collection.register_sample_contig(&seg.sample_name, &seg.contig_name)?;
+                    }
+
+                    // Write segment immediately to archive
+                    self.add_segment_with_kmers(
+                        &seg.sample_name,
+                        &seg.contig_name,
+                        seg.seg_part_no,
+                        seg.data,
+                        seg.key.kmer_front,
+                        seg.key.kmer_back,
+                        seg.is_rev_comp,
+                    )?;
+
+                    segments_written += 1;
+
+                    if self.config.verbosity > 2 && segments_written % 10000 == 0 {
+                        eprintln!("Wrote {} segments", segments_written);
+                    }
+                }
+                Err(_) => {
+                    // Channel empty - check if workers finished
+                    if workers_done_rx.try_recv().is_ok() {
+                        // Drain any remaining segments
+                        while let Ok(seg) = segment_rx.recv() {
+                            // Register contig if first time
+                            let contig_key = (seg.sample_name.clone(), seg.contig_name.clone());
+                            if registered_contigs.insert(contig_key) {
+                                self.collection.register_sample_contig(&seg.sample_name, &seg.contig_name)?;
+                            }
+
+                            self.add_segment_with_kmers(
+                                &seg.sample_name,
+                                &seg.contig_name,
+                                seg.seg_part_no,
+                                seg.data,
+                                seg.key.kmer_front,
+                                seg.key.kmer_back,
+                                seg.is_rev_comp,
+                            )?;
+                            segments_written += 1;
+                        }
+                        break; // All done!
+                    }
+                    // Workers still running, yield and retry
+                    std::thread::yield_now();
+                }
+            }
         }
-
-        // Wait for writer to finish
-        writer_handle.join()
-            .map_err(|e| anyhow::anyhow!("Writer thread panicked: {:?}", e))??;
-
-        let segments_written = writer_segments.load(Ordering::Relaxed);
 
         if self.config.verbosity > 0 {
-            println!("Streaming complete: {} contigs read, {} processed by workers, {} segments written",
-                total_contigs, total_worker_contigs, segments_written);
+            println!("Streaming complete: wrote {} segments", segments_written);
         }
 
-        // Register all contigs in collection (sequential, after workers finish)
-        let registrations_map = Arc::try_unwrap(contig_registrations)
-            .map_err(|_| anyhow::anyhow!("Failed to unwrap contig_registrations Arc"))?;
-
-        if self.config.verbosity > 0 {
-            println!("Registering {} contigs in collection...", registrations_map.len());
-        }
-
-        for ((sample_name, contig_name), _) in registrations_map.into_iter() {
-            self.collection.register_sample_contig(&sample_name, &contig_name)?;
-        }
+        // Drop registration tracking (already registered during segment writing)
+        drop(contig_registrations);
 
         // Move shared state back from DashMap to HashMap
         {
@@ -586,7 +602,7 @@ impl StreamingCompressor {
             .into_inner();
 
         if self.config.verbosity > 0 {
-            println!("Processed {} contigs total", total_contigs);
+            println!("Processed {} contigs total", registered_contigs.len());
         }
 
         Ok(())
