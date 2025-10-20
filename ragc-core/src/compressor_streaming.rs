@@ -518,9 +518,7 @@ impl StreamingCompressor {
                     if reference_sample.is_empty() {
                         reference_sample = sample_name.clone();
                         if self.config.verbosity > 0 {
-                            println!(
-                                "Using {reference_sample} as reference to find splitters..."
-                            );
+                            println!("Using {reference_sample} as reference to find splitters...");
                         }
                     }
 
@@ -533,9 +531,7 @@ impl StreamingCompressor {
             }
 
             if self.config.verbosity > 0 {
-                println!(
-                    "Collected {contig_count} reference contigs from {reference_sample}"
-                );
+                println!("Collected {contig_count} reference contigs from {reference_sample}");
             }
         }
 
@@ -588,7 +584,6 @@ impl StreamingCompressor {
         }
 
         use crossbeam::channel::{bounded, Receiver, Sender};
-        
 
         type ContigTask = (String, String, Contig); // (sample_name, contig_name, sequence)
 
@@ -854,9 +849,7 @@ impl StreamingCompressor {
                     segments_written += pack.segments.len();
 
                     if self.config.verbosity > 1 && packs_written % 100 == 0 {
-                        eprintln!(
-                            "Wrote {packs_written} packs ({segments_written} segments)"
-                        );
+                        eprintln!("Wrote {packs_written} packs ({segments_written} segments)");
                     }
                 }
                 Err(_) => {
@@ -961,22 +954,21 @@ impl StreamingCompressor {
         //
         // MEMORY-EFFICIENT: Streams through file twice instead of loading all contigs
         // For yeast (12MB genome): ~100MB Vec vs ~2.8GB loading all contigs!
-        let (splitters, singletons, duplicates) =
-            if let Some((ref_sample_name, ref_fasta_path)) = fasta_paths.first() {
-                if self.config.verbosity > 0 {
-                    println!(
-                        "Using {ref_sample_name} as reference to find splitters (streaming)..."
-                    );
-                }
+        let (splitters, singletons, duplicates) = if let Some((ref_sample_name, ref_fasta_path)) =
+            fasta_paths.first()
+        {
+            if self.config.verbosity > 0 {
+                println!("Using {ref_sample_name} as reference to find splitters (streaming)...");
+            }
 
-                crate::splitters::determine_splitters_streaming(
-                    ref_fasta_path,
-                    self.config.kmer_length as usize,
-                    self.config.segment_size as usize,
-                )?
-            } else {
-                anyhow::bail!("No input files provided");
-            };
+            crate::splitters::determine_splitters_streaming(
+                ref_fasta_path,
+                self.config.kmer_length as usize,
+                self.config.segment_size as usize,
+            )?
+        } else {
+            anyhow::bail!("No input files provided");
+        };
 
         // Store reference k-mers for adaptive mode
         if self.config.adaptive_mode {
@@ -1123,9 +1115,7 @@ impl StreamingCompressor {
             }
 
             if self.config.verbosity > 0 {
-                println!(
-                    "  Processed {contigs_processed} contigs from {sample_name}"
-                );
+                println!("  Processed {contigs_processed} contigs from {sample_name}");
             }
 
             // Adaptive mode: after sample completes, find and add new splitters
@@ -1443,11 +1433,11 @@ impl StreamingCompressor {
         // C++ lines 1553-1578
         let mut v_costs2 = if middle_kmer < kmer_back {
             // Use forward segment with prefix_costs=false
-            
+
             lz_diff2.get_coding_cost_vector(segment, false)
         } else {
             // Use RC segment with prefix_costs=true
-            
+
             lz_diff2.get_coding_cost_vector(&segment_rc, true)
         };
 
@@ -1620,9 +1610,7 @@ impl StreamingCompressor {
             {
                 // DEBUG: Log when middle splitter succeeds
                 if self.total_segments < 10 {
-                    eprintln!(
-                        "RUST_MS_SUCCESS: middle_kmer={middle_kmer}, split_pos={split_pos}"
-                    );
+                    eprintln!("RUST_MS_SUCCESS: middle_kmer={middle_kmer}, split_pos={split_pos}");
                 }
 
                 // Matching C++ lines 1400-1444: handle zero-size cases
@@ -2457,9 +2445,7 @@ impl StreamingCompressor {
             groups_with_ids.sort_by_key(|(id, _, _)| *id);
 
             for (group_id, front_kmer, back_kmer) in groups_with_ids.iter().take(50) {
-                println!(
-                    "  Group {group_id}: front_kmer={front_kmer}, back_kmer={back_kmer}"
-                );
+                println!("  Group {group_id}: front_kmer={front_kmer}, back_kmer={back_kmer}");
             }
         }
 

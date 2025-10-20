@@ -448,9 +448,7 @@ impl Decompressor {
             let position_in_pack = desc.in_group_id as usize % PACK_CARDINALITY;
 
             if self.config.verbosity > 1 {
-                eprintln!(
-                    "  Raw group: pack_id={pack_id}, position_in_pack={position_in_pack}"
-                );
+                eprintln!("  Raw group: pack_id={pack_id}, position_in_pack={position_in_pack}");
             }
 
             let stream_name = stream_delta_name(archive_version, desc.group_id);

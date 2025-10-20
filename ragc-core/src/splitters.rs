@@ -221,14 +221,13 @@ fn find_actual_splitters_in_contig(
                 let kmer_value = kmer.data();
                 recent_kmers.push(kmer_value);
 
-                if current_len >= segment_size
-                    && candidates.contains(&kmer_value) {
-                        // This candidate is actually used!
-                        used_splitters.push(kmer_value);
-                        current_len = 0;
-                        kmer.reset();
-                        recent_kmers.clear();
-                    }
+                if current_len >= segment_size && candidates.contains(&kmer_value) {
+                    // This candidate is actually used!
+                    used_splitters.push(kmer_value);
+                    current_len = 0;
+                    kmer.reset();
+                    recent_kmers.clear();
+                }
             }
         }
 
