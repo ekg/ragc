@@ -22,8 +22,11 @@ use std::collections::HashSet;
 /// * `segment_size` - Minimum segment size
 ///
 /// # Returns
-/// HashSet of actually-used splitter k-mer values (much smaller than candidates)
-pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) -> HashSet<u64> {
+/// Tuple of (splitters, singletons, duplicates) HashSets
+/// - splitters: Actually-used splitter k-mers (for segmentation)
+/// - singletons: All singleton k-mers from reference (for adaptive mode exclusion)
+/// - duplicates: All duplicate k-mers from reference (for adaptive mode exclusion)
+pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) -> (HashSet<u64>, HashSet<u64>, HashSet<u64>) {
     // Pass 1: Find candidate k-mers (singletons from reference)
     // Parallelize k-mer extraction across contigs (matching C++ AGC)
     let all_kmers_vec: Vec<Vec<u64>> = contigs
@@ -36,11 +39,35 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
     // Radix sort (matching C++ AGC's RadixSortMSD)
     all_kmers.radix_sort_unstable();
 
+    // BEFORE removing non-singletons, save duplicates for adaptive mode
+    // Duplicates are k-mers that appear MORE than once
+    let mut duplicates = HashSet::new();
+    let mut i = 0;
+    while i < all_kmers.len() {
+        let kmer = all_kmers[i];
+        let mut count = 1;
+        let mut j = i + 1;
+
+        // Count consecutive identical k-mers
+        while j < all_kmers.len() && all_kmers[j] == kmer {
+            count += 1;
+            j += 1;
+        }
+
+        // If appears more than once, it's a duplicate
+        if count > 1 {
+            duplicates.insert(kmer);
+        }
+
+        i = j;
+    }
+
     // Remove non-singletons to get candidates
     remove_non_singletons(&mut all_kmers, 0);
 
     let candidates: HashSet<u64> = all_kmers.into_iter().collect();
     eprintln!("DEBUG: Found {} candidate singleton k-mers from reference", candidates.len());
+    eprintln!("DEBUG: Found {} duplicate k-mers from reference", duplicates.len());
 
     // Pass 2: Scan reference again to find which candidates are ACTUALLY used
     // Parallelize splitter finding across contigs (matching C++ AGC)
@@ -52,7 +79,7 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
     let splitters: HashSet<u64> = splitter_vecs.into_iter().flatten().collect();
     eprintln!("DEBUG: {} actually-used splitters (after distance check)", splitters.len());
 
-    splitters
+    (splitters, candidates, duplicates)
 }
 
 /// Find which candidate k-mers are actually used as splitters in a contig
@@ -159,7 +186,7 @@ mod tests {
             vec![2, 2, 2, 3], // GGGT
         ];
 
-        let splitters = determine_splitters(&contigs, 3, 100);
+        let (splitters, _singletons, _duplicates) = determine_splitters(&contigs, 3, 100);
 
         // AAA appears once, AAC appears once
         // GGG appears once, GGT appears once
@@ -172,10 +199,13 @@ mod tests {
         // Two identical contigs - all k-mers appear twice
         let contigs = vec![vec![0, 1, 2, 3], vec![0, 1, 2, 3]];
 
-        let splitters = determine_splitters(&contigs, 3, 100);
+        let (splitters, singletons, duplicates) = determine_splitters(&contigs, 3, 100);
 
         // No singletons since all k-mers appear twice
         assert_eq!(splitters.len(), 0);
+        assert_eq!(singletons.len(), 0);
+        // All k-mers should be duplicates
+        assert!(!duplicates.is_empty());
     }
 
     #[test]
@@ -186,12 +216,14 @@ mod tests {
             vec![1, 1, 1, 1], // CCCC
         ];
 
-        let splitters = determine_splitters(&contigs, 3, 100);
+        let (splitters, _singletons, duplicates) = determine_splitters(&contigs, 3, 100);
 
         // All k-mers are unique, so all should be splitters
         // AAA appears 2 times in first contig, CCC appears 2 times in second
         // So we expect 0 singletons
         assert_eq!(splitters.len(), 0);
+        // AAA and CCC are duplicates (appear 2 times each)
+        assert!(!duplicates.is_empty());
     }
 
     #[test]
@@ -203,13 +235,13 @@ mod tests {
             vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2], // AAAACCCCGGGG (unique patterns)
         ];
 
-        let splitters = determine_splitters(&contigs, 3, 100);
+        let (splitters, singletons, duplicates) = determine_splitters(&contigs, 3, 100);
 
         // The second contig has unique patterns: AAA, AAC, CCC, CCG, GGG
         // All should be singletons (appear only once)
         // The function should find at least some splitters
         // Note: May be 0 if canonical causes matches, so we just verify it runs without crashing
-        let _ = splitters; // Test passes if determine_splitters() doesn't panic
+        let _ = (splitters, singletons, duplicates); // Test passes if determine_splitters() doesn't panic
     }
 
     #[test]

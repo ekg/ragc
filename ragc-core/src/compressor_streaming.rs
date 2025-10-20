@@ -313,12 +313,24 @@ impl StreamingCompressor {
             }
         }
 
-        // Find splitters
-        let splitters = determine_splitters(
+        // Find splitters (also get singleton and duplicate k-mers for adaptive mode)
+        let (splitters, singletons, duplicates) = determine_splitters(
             &reference_contigs,
             self.config.kmer_length as usize,
             self.config.segment_size as usize
         );
+
+        // Store reference k-mers for adaptive mode
+        if self.config.adaptive_mode {
+            self.reference_kmers_singletons = singletons;
+            self.reference_kmers_duplicates = duplicates;
+            self.current_splitters = splitters.clone();
+
+            if self.config.verbosity > 0 {
+                println!("Adaptive mode: Stored {} singleton k-mers and {} duplicate k-mers from reference",
+                    self.reference_kmers_singletons.len(), self.reference_kmers_duplicates.len());
+            }
+        }
 
         if self.config.verbosity > 0 {
             println!("Found {} actually-used splitter k-mers", splitters.len());
@@ -573,11 +585,24 @@ impl StreamingCompressor {
         // 1. Find singletons (candidates)
         // 2. Scan reference to find which candidates are actually used
         // 3. Return only actually-used splitters
-        let splitters = determine_splitters(
+        // Also get singleton and duplicate k-mers for adaptive mode
+        let (splitters, singletons, duplicates) = determine_splitters(
             &reference_contigs,
             self.config.kmer_length as usize,
             self.config.segment_size as usize
         );
+
+        // Store reference k-mers for adaptive mode
+        if self.config.adaptive_mode {
+            self.reference_kmers_singletons = singletons;
+            self.reference_kmers_duplicates = duplicates;
+            self.current_splitters = splitters.clone();
+
+            if self.config.verbosity > 0 {
+                println!("Adaptive mode: Stored {} singleton k-mers and {} duplicate k-mers from reference",
+                    self.reference_kmers_singletons.len(), self.reference_kmers_duplicates.len());
+            }
+        }
 
         if self.config.verbosity > 0 {
             println!("Found {} actually-used splitter k-mers", splitters.len());
