@@ -73,16 +73,31 @@ struct SegmentInfo {
     is_rev_comp: bool,
 }
 
-/// Segment ready to be written to archive (sent from workers to writer)
+/// A compressed pack ready to write to archive (sent from workers to writer)
 #[derive(Debug)]
-struct CompressedSegment {
-    key: SegmentGroupKey,
+struct CompressedPack {
+    group_id: u32,
+    stream_id: usize,
+    compressed_data: Vec<u8>,    // Compressed pack (with marker byte if compressed)
+    uncompressed_size: u64,      // Original packed size (0 if writing uncompressed)
+    segments: Vec<SegmentMetadata>, // Metadata for collection registration
+}
+
+/// Segment metadata for collection registration
+#[derive(Debug, Clone)]
+struct SegmentMetadata {
     sample_name: String,
     contig_name: String,
     seg_part_no: usize,
-    data: Contig,
+    in_group_id: u32,
     is_rev_comp: bool,
-    is_new_group: bool, // Whether this created a new group (for terminators)
+    data_len: u32,
+}
+
+/// Prepared segment with normalized key, ready to add to group buffer
+struct PreparedSegment {
+    key: SegmentGroupKey,
+    segment: SegmentInfo,
 }
 
 /// Segment group identified by flanking k-mers
@@ -126,6 +141,169 @@ struct GroupMetadata {
     segments_written: usize,       // Number of segments written to archive (not including buffered)
     pending_segments: Vec<SegmentInfo>, // Buffered segments waiting for complete pack
     is_flushed: bool,
+}
+
+/// Per-group writer state for parallel segment writing
+/// Each group has its own buffer and writes packs when buffer reaches PACK_CARDINALITY
+struct GroupWriter {
+    group_id: u32,
+    stream_id: usize,
+    ref_stream_id: Option<usize>,
+    reference: Option<Contig>,
+    ref_written: bool,
+    segments_written: usize,
+    pending_segments: Vec<SegmentInfo>,
+}
+
+impl GroupWriter {
+    fn new(
+        group_id: u32,
+        stream_id: usize,
+        ref_stream_id: Option<usize>,
+    ) -> Self {
+        GroupWriter {
+            group_id,
+            stream_id,
+            ref_stream_id,
+            reference: None,
+            ref_written: false,
+            segments_written: 0,
+            pending_segments: Vec::new(),
+        }
+    }
+
+    /// Add a segment to this group's buffer
+    /// Returns Some(CompressedPack) if buffer is full and pack should be written
+    /// Returns Some(reference pack) if this is the first segment of an LZ group
+    fn add_segment(
+        &mut self,
+        segment: SegmentInfo,
+        config: &StreamingCompressorConfig,
+    ) -> Result<Option<CompressedPack>> {
+        const PACK_CARDINALITY: usize = 50;
+        const NO_RAW_GROUPS: u32 = 16;
+
+        let use_lz_encoding = self.group_id >= NO_RAW_GROUPS;
+
+        // For LZ groups: prepare reference pack on first segment
+        if use_lz_encoding && !self.ref_written {
+            self.reference = Some(segment.data.clone());
+            self.ref_written = true;
+
+            if let Some(ref_stream_id) = self.ref_stream_id {
+                let compressed = compress_segment_configured(&segment.data, config.compression_level)?;
+
+                let (compressed_data, uncompressed_size) = if compressed.len() + 1 < segment.data.len() {
+                    let mut compressed_with_marker = compressed;
+                    compressed_with_marker.push(0);
+                    (compressed_with_marker, segment.data.len() as u64)
+                } else {
+                    (segment.data.clone(), 0)
+                };
+
+                // Create metadata for reference segment
+                let segments = vec![SegmentMetadata {
+                    sample_name: segment.sample_name.clone(),
+                    contig_name: segment.contig_name.clone(),
+                    seg_part_no: segment.seg_part_no,
+                    in_group_id: 0,
+                    is_rev_comp: segment.is_rev_comp,
+                    data_len: segment.data.len() as u32,
+                }];
+
+                return Ok(Some(CompressedPack {
+                    group_id: self.group_id,
+                    stream_id: ref_stream_id,
+                    compressed_data,
+                    uncompressed_size,
+                    segments,
+                }));
+            }
+        }
+
+        // Buffer the segment
+        self.pending_segments.push(segment);
+
+        // Prepare pack if buffer is full
+        if self.pending_segments.len() >= PACK_CARDINALITY {
+            return self.prepare_pack(config);
+        }
+
+        Ok(None)
+    }
+
+    /// Prepare a compressed pack from buffered segments
+    /// This can be called by workers (compute-bound) before sending to writer (I/O-bound)
+    fn prepare_pack(&mut self, config: &StreamingCompressorConfig) -> Result<Option<CompressedPack>> {
+        if self.pending_segments.is_empty() {
+            return Ok(None);
+        }
+
+        const NO_RAW_GROUPS: u32 = 16;
+        let use_lz_encoding = self.group_id >= NO_RAW_GROUPS;
+
+        // Build pack (LZ encoding + concatenation)
+        let mut packed_data = Vec::new();
+
+        for seg_info in &self.pending_segments {
+            let contig_data = if use_lz_encoding {
+                let mut lz_diff = LZDiff::new(config.min_match_len);
+                if let Some(ref reference) = self.reference {
+                    lz_diff.prepare(reference);
+                    lz_diff.encode(&seg_info.data)
+                } else {
+                    seg_info.data.clone()
+                }
+            } else {
+                seg_info.data.clone()
+            };
+
+            packed_data.extend_from_slice(&contig_data);
+            packed_data.push(CONTIG_SEPARATOR);
+        }
+
+        // Compress pack
+        let compressed = compress_segment_configured(&packed_data, config.compression_level)?;
+
+        // Build segment metadata
+        let mut segments = Vec::new();
+        for (idx_in_pack, seg_info) in self.pending_segments.iter().enumerate() {
+            let global_in_group_id = if use_lz_encoding {
+                self.segments_written + idx_in_pack + 1 // +1 because reference is at 0
+            } else {
+                self.segments_written + idx_in_pack
+            };
+
+            segments.push(SegmentMetadata {
+                sample_name: seg_info.sample_name.clone(),
+                contig_name: seg_info.contig_name.clone(),
+                seg_part_no: seg_info.seg_part_no,
+                in_group_id: global_in_group_id as u32,
+                is_rev_comp: seg_info.is_rev_comp,
+                data_len: seg_info.data.len() as u32,
+            });
+        }
+
+        // Determine what to write
+        let (compressed_data, uncompressed_size) = if compressed.len() + 1 < packed_data.len() {
+            let mut compressed_with_marker = compressed;
+            compressed_with_marker.push(0);
+            (compressed_with_marker, packed_data.len() as u64)
+        } else {
+            (packed_data, 0)
+        };
+
+        self.segments_written += self.pending_segments.len();
+        self.pending_segments.clear();
+
+        Ok(Some(CompressedPack {
+            group_id: self.group_id,
+            stream_id: self.stream_id,
+            compressed_data,
+            uncompressed_size,
+            segments,
+        }))
+    }
 }
 
 /// Streaming AGC Compressor
@@ -380,16 +558,17 @@ impl StreamingCompressor {
         // Queue capacity: allow 100 contigs in flight (balances memory vs throughput)
         let (contig_tx, contig_rx): (Sender<ContigTask>, Receiver<ContigTask>) = bounded(100);
 
-        // Bounded channel for compressed segments (workers -> writer thread)
-        // This prevents memory buildup - backpressure if writer is slow
-        let (segment_tx, segment_rx): (Sender<CompressedSegment>, Receiver<CompressedSegment>) = bounded(1000);
+        // Bounded channel for compressed packs (workers -> writer thread)
+        // Workers send compressed packs (50 segments each), not individual segments
+        // This reduces write operations from 93K to ~1,860 for yeast235
+        let (pack_tx, pack_rx): (Sender<CompressedPack>, Receiver<CompressedPack>) = bounded(100);
 
         // Clone path for producer thread
         let fasta_path_clone = fasta_path.to_path_buf();
         let verbosity = self.config.verbosity;
 
         // Producer thread: reads FASTA and feeds channel (like C++ AGC main thread)
-        let producer_handle = thread::spawn(move || -> Result<usize> {
+        let producer_handle = std::thread::spawn(move || -> Result<usize> {
             let mut reader = GenomeIO::<Box<dyn Read>>::open(&fasta_path_clone)
                 .context("Failed to open multi-sample FASTA for streaming")?;
 
@@ -426,8 +605,14 @@ impl StreamingCompressor {
             Arc::new(dashmap)
         };
 
-        // Track which groups exist (for new group detection)
-        let existing_groups = Arc::new(DashMap::<SegmentGroupKey, ()>::new());
+        // Per-group buffers for segment writing (key innovation!)
+        // Each group has its own GroupWriter that buffers up to 50 segments
+        // When buffer is full, worker prepares compressed pack and sends to writer thread
+        // This achieves C++ AGC's architecture: per-group locking + batched writes
+        let group_writers = Arc::new(DashMap::<SegmentGroupKey, std::sync::Mutex<GroupWriter>>::new());
+
+        // Group ID counter (atomic, shared across workers)
+        let next_group_id = Arc::new(AtomicUsize::new(self.next_group_id as usize));
 
         // Collect contig registrations for sequential processing after workers finish
         let contig_registrations = Arc::new(DashMap::new());
@@ -437,20 +622,24 @@ impl StreamingCompressor {
         let config = Arc::new(self.config.clone());
         let splitters_arc = Arc::new(splitters);
 
+        // Keep a reference to contig_registrations for later
+        let contig_registrations_ref = contig_registrations.clone();
+
         // Worker threads: consume from channel and process (like C++ AGC worker threads)
         let mut worker_handles = Vec::new();
         for worker_id in 0..self.config.num_threads {
             let rx = contig_rx.clone();
-            let seg_tx = segment_tx.clone();
-            let groups = existing_groups.clone();
+            let pack_tx = pack_tx.clone();
+            let writers = group_writers.clone();
             let group_terms = group_terminators.clone();
             let registrations = contig_registrations.clone();
             let total_segs = total_segments.clone();
             let total_b = total_bases.clone();
             let cfg = config.clone();
             let splitters = splitters_arc.clone();
+            let group_id_counter = next_group_id.clone();
 
-            let worker_handle = thread::spawn(move || -> Result<usize> {
+            let worker_handle = std::thread::spawn(move || -> Result<usize> {
                 let mut worker_contigs = 0;
 
                 // Consume from channel until closed
@@ -468,15 +657,14 @@ impl StreamingCompressor {
                         cfg.segment_size as usize
                     );
 
-                    // Process each segment and send to writer thread
+                    // Process each segment: buffer in per-group writers
                     for (seg_idx, segment) in segments.into_iter().enumerate() {
                         total_b.fetch_add(segment.data.len(), Ordering::Relaxed);
                         total_segs.fetch_add(1, Ordering::Relaxed);
 
-                        // Prepare segment (k-mer normalization, RC if needed)
-                        let compressed_seg = Self::prepare_segment_for_writing(
+                        // Prepare segment info (k-mer normalization, RC if needed)
+                        let seg_info = Self::prepare_segment_info(
                             &cfg,
-                            &groups,
                             &group_terms,
                             &sample_name,
                             &contig_name,
@@ -484,11 +672,35 @@ impl StreamingCompressor {
                             segment.data,
                             segment.front_kmer,
                             segment.back_kmer,
-                            false, // is_rev_comp
                         )?;
 
-                        // Send to writer thread (blocks if channel full - backpressure!)
-                        seg_tx.send(compressed_seg).context("Failed to send segment to writer")?;
+                        // Get or create group writer (per-group locking via DashMap)
+                        let group_writer = writers.entry(seg_info.key.clone()).or_insert_with(|| {
+                            let gid = group_id_counter.fetch_add(1, Ordering::SeqCst) as u32;
+                            let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
+
+                            // Register streams for this group
+                            // NOTE: We can't actually register in archive here because Archive isn't thread-safe
+                            // So we'll use predictable stream IDs and register in writer thread
+                            let stream_id = gid; // Simplified: stream_id = group_id
+
+                            const NO_RAW_GROUPS: u32 = 16;
+                            let ref_stream_id = if gid >= NO_RAW_GROUPS {
+                                Some(10000 + gid as usize) // Ref streams at offset 10000
+                            } else {
+                                None
+                            };
+
+                            std::sync::Mutex::new(GroupWriter::new(gid, stream_id as usize, ref_stream_id))
+                        });
+
+                        // Add segment to group buffer (per-group locking!)
+                        let mut writer_guard = group_writer.lock().unwrap();
+                        if let Some(pack) = writer_guard.add_segment(seg_info.segment, &cfg)? {
+                            // Buffer is full - send compressed pack to writer thread
+                            drop(writer_guard); // Release lock before I/O
+                            pack_tx.send(pack).context("Failed to send pack to writer")?;
+                        }
                     }
 
                     if cfg.verbosity > 2 && worker_contigs % 100 == 0 {
@@ -510,68 +722,118 @@ impl StreamingCompressor {
         // This keeps memory bounded to the channel buffer size (~100 segments)
         // instead of accumulating all 93K segments before writing
 
-        // Spawn a thread to signal when workers finish
+        // Spawn a thread to signal when workers finish and flush remaining packs
+        let writers_for_flush = group_writers.clone();
+        let pack_tx_for_flush = pack_tx.clone();
+        let cfg_for_flush = config.clone();
         let (workers_done_tx, workers_done_rx) = bounded(1);
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             let _ = producer_handle.join();
             for handle in worker_handles {
                 let _ = handle.join();
             }
-            drop(segment_tx); // Close channel
+
+            // Workers done - flush all remaining buffers
+            for entry in writers_for_flush.iter() {
+                let key = entry.key();
+                let mut writer = entry.value().lock().unwrap();
+                if let Ok(Some(pack)) = writer.prepare_pack(&cfg_for_flush) {
+                    let _ = pack_tx_for_flush.send(pack);
+                }
+            }
+
+            drop(pack_tx); // Close channel after flushing
             let _ = workers_done_tx.send(());
         });
 
-        // Write segments as they arrive (interleaved with worker execution)
+        // Register streams in archive (must be done sequentially on main thread)
+        // Build mapping: stream_id -> stream_name
+        let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
+        let mut stream_registered = HashSet::new();
+
+        // Write packs as they arrive from workers (I/O-bound, sequential)
+        // KEY OPTIMIZATION: We're writing packs of 50 segments, not individual segments!
+        // For yeast235: ~1,860 write operations instead of 93,000
+        let mut packs_written = 0;
         let mut segments_written = 0;
-        let mut registered_contigs = HashSet::new();
 
         loop {
-            match segment_rx.try_recv() {
-                Ok(seg) => {
-                    // Register contig if first time seeing it
-                    let contig_key = (seg.sample_name.clone(), seg.contig_name.clone());
-                    if registered_contigs.insert(contig_key.clone()) {
-                        self.collection.register_sample_contig(&seg.sample_name, &seg.contig_name)?;
+            match pack_rx.try_recv() {
+                Ok(pack) => {
+                    // Register stream if first time seeing it
+                    if stream_registered.insert(pack.stream_id) {
+                        let stream_name = if pack.stream_id >= 10000 {
+                            // Reference stream
+                            let group_id = (pack.stream_id - 10000) as u32;
+                            stream_ref_name(archive_version, group_id)
+                        } else {
+                            // Delta stream
+                            stream_delta_name(archive_version, pack.group_id)
+                        };
+                        self.archive.register_stream(&stream_name);
                     }
 
-                    // Write segment immediately to archive
-                    self.add_segment_with_kmers(
-                        &seg.sample_name,
-                        &seg.contig_name,
-                        seg.seg_part_no,
-                        seg.data,
-                        seg.key.kmer_front,
-                        seg.key.kmer_back,
-                        seg.is_rev_comp,
-                    )?;
+                    // Register segments in collection
+                    for seg_meta in &pack.segments {
+                        // Register contig if first time
+                        self.collection.register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
 
-                    segments_written += 1;
+                        // Register segment placement
+                        self.collection.add_segment_placed(
+                            &seg_meta.sample_name,
+                            &seg_meta.contig_name,
+                            seg_meta.seg_part_no,
+                            pack.group_id,
+                            seg_meta.in_group_id,
+                            seg_meta.is_rev_comp,
+                            seg_meta.data_len,
+                        )?;
+                    }
 
-                    if self.config.verbosity > 2 && segments_written % 10000 == 0 {
-                        eprintln!("Wrote {} segments", segments_written);
+                    // Write pack to archive
+                    self.archive.add_part(pack.stream_id, &pack.compressed_data, pack.uncompressed_size)?;
+
+                    packs_written += 1;
+                    segments_written += pack.segments.len();
+
+                    if self.config.verbosity > 1 && packs_written % 100 == 0 {
+                        eprintln!("Wrote {} packs ({} segments)", packs_written, segments_written);
                     }
                 }
                 Err(_) => {
                     // Channel empty - check if workers finished
                     if workers_done_rx.try_recv().is_ok() {
-                        // Drain any remaining segments
-                        while let Ok(seg) = segment_rx.recv() {
-                            // Register contig if first time
-                            let contig_key = (seg.sample_name.clone(), seg.contig_name.clone());
-                            if registered_contigs.insert(contig_key) {
-                                self.collection.register_sample_contig(&seg.sample_name, &seg.contig_name)?;
+                        // Drain any remaining packs
+                        while let Ok(pack) = pack_rx.recv() {
+                            // Register stream if needed
+                            if stream_registered.insert(pack.stream_id) {
+                                let stream_name = if pack.stream_id >= 10000 {
+                                    let group_id = (pack.stream_id - 10000) as u32;
+                                    stream_ref_name(archive_version, group_id)
+                                } else {
+                                    stream_delta_name(archive_version, pack.group_id)
+                                };
+                                self.archive.register_stream(&stream_name);
                             }
 
-                            self.add_segment_with_kmers(
-                                &seg.sample_name,
-                                &seg.contig_name,
-                                seg.seg_part_no,
-                                seg.data,
-                                seg.key.kmer_front,
-                                seg.key.kmer_back,
-                                seg.is_rev_comp,
-                            )?;
-                            segments_written += 1;
+                            // Register segments
+                            for seg_meta in &pack.segments {
+                                self.collection.register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
+                                self.collection.add_segment_placed(
+                                    &seg_meta.sample_name,
+                                    &seg_meta.contig_name,
+                                    seg_meta.seg_part_no,
+                                    pack.group_id,
+                                    seg_meta.in_group_id,
+                                    seg_meta.is_rev_comp,
+                                    seg_meta.data_len,
+                                )?;
+                            }
+
+                            // Write pack
+                            self.archive.add_part(pack.stream_id, &pack.compressed_data, pack.uncompressed_size)?;
+                            packs_written += 1;
+                            segments_written += pack.segments.len();
                         }
                         break; // All done!
                     }
@@ -582,11 +844,8 @@ impl StreamingCompressor {
         }
 
         if self.config.verbosity > 0 {
-            println!("Streaming complete: wrote {} segments", segments_written);
+            println!("Streaming complete: wrote {} packs ({} segments)", packs_written, segments_written);
         }
-
-        // Drop registration tracking (already registered during segment writing)
-        drop(contig_registrations);
 
         // Move shared state back from DashMap to HashMap
         {
@@ -602,7 +861,7 @@ impl StreamingCompressor {
             .into_inner();
 
         if self.config.verbosity > 0 {
-            println!("Processed {} contigs total", registered_contigs.len());
+            println!("Processed {} contigs total", contig_registrations_ref.len());
         }
 
         Ok(())
@@ -1366,12 +1625,11 @@ impl StreamingCompressor {
         Ok(())
     }
 
-    /// Prepare segment for writing (parallel-safe, returns CompressedSegment for channel)
-    /// This replaces add_segment_with_kmers_threadsafe - segments are sent to writer instead of buffered
+    /// Prepare segment info for buffering (k-mer normalization, RC, terminator tracking)
+    /// Returns the normalized segment ready to add to a group buffer
     #[allow(clippy::too_many_arguments)]
-    fn prepare_segment_for_writing(
+    fn prepare_segment_info(
         config: &StreamingCompressorConfig,
-        existing_groups: &Arc<DashMap<SegmentGroupKey, ()>>,
         group_terminators: &Arc<DashMap<u64, Vec<u64>>>,
         sample_name: &str,
         contig_name: &str,
@@ -1379,8 +1637,7 @@ impl StreamingCompressor {
         segment: Contig,
         kmer_front: u64,
         kmer_back: u64,
-        is_rev_comp: bool,
-    ) -> Result<CompressedSegment> {
+    ) -> Result<PreparedSegment> {
         // K-mer orientation logic (matching add_segment_with_kmers)
         let (final_front, final_back) = if kmer_front != MISSING_KMER && kmer_back == MISSING_KMER {
             let k = config.kmer_length as usize;
@@ -1437,7 +1694,7 @@ impl StreamingCompressor {
 
         // Normalize key
         let (key, needs_rc) = SegmentGroupKey::new_normalized(final_front, final_back);
-        let final_is_rev_comp = is_rev_comp ^ needs_rc;
+        let final_is_rev_comp = needs_rc; // Original is_rev_comp removed since segments come from splitters (not RC'd yet)
 
         // Reverse complement if needed
         let final_segment = if needs_rc {
@@ -1448,26 +1705,25 @@ impl StreamingCompressor {
             segment
         };
 
-        // Check if this is a new group (atomic check-and-set)
-        let is_new_group = existing_groups.insert(key.clone(), ()).is_none();
-
-        // Update terminators if new group (fine-grained locking via DashMap)
-        if is_new_group && key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+        // Update terminators (fine-grained locking via DashMap)
+        // This happens on first use of each group, tracked in DashMap
+        if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
             group_terminators.entry(key.kmer_front).or_default().push(key.kmer_back);
             if key.kmer_front != key.kmer_back {
                 group_terminators.entry(key.kmer_back).or_default().push(key.kmer_front);
             }
         }
 
-        // Return segment ready for writing
-        Ok(CompressedSegment {
+        // Return prepared segment
+        Ok(PreparedSegment {
             key,
-            sample_name: sample_name.to_string(),
-            contig_name: contig_name.to_string(),
-            seg_part_no,
-            data: final_segment,
-            is_rev_comp: final_is_rev_comp,
-            is_new_group,
+            segment: SegmentInfo {
+                sample_name: sample_name.to_string(),
+                contig_name: contig_name.to_string(),
+                seg_part_no,
+                data: final_segment,
+                is_rev_comp: final_is_rev_comp,
+            },
         })
     }
 
