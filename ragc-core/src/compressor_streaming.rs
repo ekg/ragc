@@ -175,6 +175,44 @@ impl StreamingCompressor {
         })
     }
 
+    /// Find new splitters for contigs that can't be segmented well (adaptive mode)
+    ///
+    /// This implements C++ AGC's find_new_splitters function (lines 2046-2077):
+    /// 1. Extract all k-mers from contig
+    /// 2. Find singletons
+    /// 3. Exclude k-mers from reference genome (both singletons and duplicates)
+    /// 4. Return remaining k-mers as new splitters
+    ///
+    /// # Arguments
+    /// * `contig` - The contig sequence to find new splitters from
+    ///
+    /// # Returns
+    /// HashSet of new splitter k-mers (not in reference)
+    fn find_new_splitters(&self, contig: &Contig) -> HashSet<u64> {
+        use crate::kmer_extract::enumerate_kmers;
+        use rdst::RadixSort;
+
+        // 1. Extract all k-mers from this contig
+        let mut contig_kmers = enumerate_kmers(contig, self.config.kmer_length as usize);
+
+        // 2. Sort and find singletons
+        contig_kmers.radix_sort_unstable();
+        crate::kmer_extract::remove_non_singletons(&mut contig_kmers, 0);
+
+        // 3. Exclude k-mers from reference genome
+        let mut new_splitters = HashSet::new();
+
+        for kmer in contig_kmers {
+            // Exclude if in reference singletons OR reference duplicates
+            if !self.reference_kmers_singletons.contains(&kmer) &&
+               !self.reference_kmers_duplicates.contains(&kmer) {
+                new_splitters.insert(kmer);
+            }
+        }
+
+        new_splitters
+    }
+
     /// Add a FASTA file to the archive (streaming mode)
     pub fn add_fasta_file(&mut self, sample_name: &str, fasta_path: &Path) -> Result<()> {
         if self.config.verbosity > 0 {
