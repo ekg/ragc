@@ -274,10 +274,9 @@ fn test_roundtrip_with_checksum_verification() {
 
     // Verify each contig individually
     for (contig, original_seq) in &original_sequences {
-        let decompressed_seq = decompressed_sequences.get(contig).expect(&format!(
-            "Contig {} missing in decompressed output",
-            contig
-        ));
+        let decompressed_seq = decompressed_sequences
+            .get(contig)
+            .expect(&format!("Contig {} missing in decompressed output", contig));
 
         assert_eq!(
             original_seq.to_uppercase(),

@@ -1,4 +1,4 @@
-use ragc_core::{StreamingCompressor, StreamingCompressorConfig, Decompressor, DecompressorConfig};
+use ragc_core::{Decompressor, DecompressorConfig, StreamingCompressor, StreamingCompressorConfig};
 use std::fs;
 
 #[test]

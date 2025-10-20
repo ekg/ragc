@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ragc_core::{StreamingCompressor, StreamingCompressorConfig, Decompressor, DecompressorConfig};
+use ragc_core::{Decompressor, DecompressorConfig, StreamingCompressor, StreamingCompressorConfig};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -115,7 +115,15 @@ fn extract_sample_name(path: &PathBuf) -> String {
         .to_string();
 
     // Strip known genomic file extensions (in order)
-    let extensions = [".fa.gz", ".fasta.gz", ".fna.gz", ".fa", ".fasta", ".fna", ".gz"];
+    let extensions = [
+        ".fa.gz",
+        ".fasta.gz",
+        ".fna.gz",
+        ".fa",
+        ".fasta",
+        ".fna",
+        ".gz",
+    ];
     for ext in &extensions {
         if name.ends_with(ext) {
             name = name[..name.len() - ext.len()].to_string();

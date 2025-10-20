@@ -30,7 +30,11 @@ use std::path::Path;
 /// - splitters: Actually-used splitter k-mers (for segmentation)
 /// - singletons: All singleton k-mers from reference (for adaptive mode exclusion)
 /// - duplicates: All duplicate k-mers from reference (for adaptive mode exclusion)
-pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) -> (HashSet<u64>, HashSet<u64>, HashSet<u64>) {
+pub fn determine_splitters(
+    contigs: &[Contig],
+    k: usize,
+    segment_size: usize,
+) -> (HashSet<u64>, HashSet<u64>, HashSet<u64>) {
     // Pass 1: Find candidate k-mers (singletons from reference)
     // Parallelize k-mer extraction across contigs (matching C++ AGC)
     let all_kmers_vec: Vec<Vec<u64>> = contigs
@@ -70,8 +74,14 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
     remove_non_singletons(&mut all_kmers, 0);
 
     let candidates: HashSet<u64> = all_kmers.into_iter().collect();
-    eprintln!("DEBUG: Found {} candidate singleton k-mers from reference", candidates.len());
-    eprintln!("DEBUG: Found {} duplicate k-mers from reference", duplicates.len());
+    eprintln!(
+        "DEBUG: Found {} candidate singleton k-mers from reference",
+        candidates.len()
+    );
+    eprintln!(
+        "DEBUG: Found {} duplicate k-mers from reference",
+        duplicates.len()
+    );
 
     // Pass 2: Scan reference again to find which candidates are ACTUALLY used
     // Parallelize splitter finding across contigs (matching C++ AGC)
@@ -81,7 +91,10 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
         .collect();
 
     let splitters: HashSet<u64> = splitter_vecs.into_iter().flatten().collect();
-    eprintln!("DEBUG: {} actually-used splitters (after distance check)", splitters.len());
+    eprintln!(
+        "DEBUG: {} actually-used splitters (after distance check)",
+        splitters.len()
+    );
 
     (splitters, candidates, duplicates)
 }
@@ -103,7 +116,7 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
 pub fn determine_splitters_streaming(
     fasta_path: &Path,
     k: usize,
-    segment_size: usize
+    segment_size: usize,
 ) -> Result<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> {
     // Pass 1a: Stream through file to collect ALL k-mers (with duplicates) into Vec
     eprintln!("DEBUG: Pass 1 - Collecting k-mers from reference (streaming)...");
@@ -119,8 +132,14 @@ pub fn determine_splitters_streaming(
         }
     }
 
-    eprintln!("DEBUG: Collected {} k-mers (with duplicates)", all_kmers.len());
-    eprintln!("DEBUG: Vec memory usage: ~{} MB", all_kmers.len() * 8 / 1_000_000);
+    eprintln!(
+        "DEBUG: Collected {} k-mers (with duplicates)",
+        all_kmers.len()
+    );
+    eprintln!(
+        "DEBUG: Vec memory usage: ~{} MB",
+        all_kmers.len() * 8 / 1_000_000
+    );
 
     // Pass 1b: Sort and identify duplicates/singletons
     eprintln!("DEBUG: Sorting k-mers...");
@@ -151,7 +170,10 @@ pub fn determine_splitters_streaming(
     // Remove non-singletons
     remove_non_singletons(&mut all_kmers, 0);
     let candidates: HashSet<u64> = all_kmers.into_iter().collect();
-    eprintln!("DEBUG: Found {} candidate singleton k-mers", candidates.len());
+    eprintln!(
+        "DEBUG: Found {} candidate singleton k-mers",
+        candidates.len()
+    );
 
     // Pass 2: Stream through file again to find actually-used splitters
     eprintln!("DEBUG: Pass 2 - Finding actually-used splitters (streaming)...");
@@ -179,7 +201,7 @@ fn find_actual_splitters_in_contig(
     contig: &Contig,
     candidates: &HashSet<u64>,
     k: usize,
-    segment_size: usize
+    segment_size: usize,
 ) -> Vec<u64> {
     use crate::kmer::{Kmer, KmerMode};
 

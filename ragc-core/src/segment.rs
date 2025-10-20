@@ -67,7 +67,12 @@ impl Segment {
 /// which k-mers become splitters. During SEGMENTATION (this function), C++ AGC splits
 /// at every occurrence of those splitters WITHOUT checking distance. This is the key
 /// difference that was causing 2.3x worse compression!
-pub fn split_at_splitters_with_size(contig: &Contig, splitters: &HashSet<u64>, k: usize, _min_segment_size: usize) -> Vec<Segment> {
+pub fn split_at_splitters_with_size(
+    contig: &Contig,
+    splitters: &HashSet<u64>,
+    k: usize,
+    _min_segment_size: usize,
+) -> Vec<Segment> {
     let mut segments = Vec::new();
 
     if contig.len() < k {
@@ -313,7 +318,11 @@ mod tests {
         let reconstructed_len: usize = if segments.is_empty() {
             0
         } else {
-            segments[0].len() + segments[1..].iter().map(|s| s.len().saturating_sub(k)).sum::<usize>()
+            segments[0].len()
+                + segments[1..]
+                    .iter()
+                    .map(|s| s.len().saturating_sub(k))
+                    .sum::<usize>()
         };
         assert_eq!(reconstructed_len, contig.len());
     }
