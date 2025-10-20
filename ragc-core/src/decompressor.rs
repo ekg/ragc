@@ -342,7 +342,7 @@ impl Decompressor {
                 let ref_stream_id = self
                     .archive
                     .get_stream_id(&ref_stream_name)
-                    .ok_or_else(|| anyhow!("Reference stream not found: {}", ref_stream_name))?;
+                    .ok_or_else(|| anyhow!("Reference stream not found: {ref_stream_name}"))?;
 
                 let (mut ref_data, ref_metadata) = self.archive.get_part_by_id(ref_stream_id, 0)?;
 
@@ -382,8 +382,7 @@ impl Decompressor {
 
             if self.config.verbosity > 1 {
                 eprintln!(
-                    "  LZ group: delta_position={}, pack_id={}, position_in_pack={}",
-                    delta_position, pack_id, position_in_pack
+                    "  LZ group: delta_position={delta_position}, pack_id={pack_id}, position_in_pack={position_in_pack}"
                 );
             }
 
@@ -391,7 +390,7 @@ impl Decompressor {
             let delta_stream_id = self
                 .archive
                 .get_stream_id(&delta_stream_name)
-                .ok_or_else(|| anyhow!("Delta stream not found: {}", delta_stream_name))?;
+                .ok_or_else(|| anyhow!("Delta stream not found: {delta_stream_name}"))?;
 
             // Check how many parts this stream has
             let num_parts = self.archive.get_num_parts(delta_stream_id);
@@ -450,8 +449,7 @@ impl Decompressor {
 
             if self.config.verbosity > 1 {
                 eprintln!(
-                    "  Raw group: pack_id={}, position_in_pack={}",
-                    pack_id, position_in_pack
+                    "  Raw group: pack_id={pack_id}, position_in_pack={position_in_pack}"
                 );
             }
 
@@ -459,7 +457,7 @@ impl Decompressor {
             let stream_id = self
                 .archive
                 .get_stream_id(&stream_name)
-                .ok_or_else(|| anyhow!("Delta stream not found: {}", stream_name))?;
+                .ok_or_else(|| anyhow!("Delta stream not found: {stream_name}"))?;
 
             let (mut data, metadata) = self.archive.get_part_by_id(stream_id, pack_id)?;
 

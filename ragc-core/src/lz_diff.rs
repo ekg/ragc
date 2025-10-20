@@ -1,6 +1,8 @@
 // LZ Diff Encoding
 // Encodes a target sequence as differences from a reference sequence
 
+#![allow(clippy::same_item_push)]
+
 use ragc_common::{hash::MurMur64Hash, types::Contig};
 use std::collections::HashMap;
 

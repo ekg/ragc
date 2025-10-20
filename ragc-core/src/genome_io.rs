@@ -1,6 +1,8 @@
 // FASTA/FASTQ genome I/O
 // Rust equivalent of genome_io.cpp
 
+#![allow(dead_code)]
+
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;

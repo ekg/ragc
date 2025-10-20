@@ -9,6 +9,7 @@ use ragc_common::types::{Contig, PackedBlock};
 /// C++ AGC uses levels 13-19 depending on segment type:
 ///   - Reference segments: level 13 (tuples) or 19 (plain) based on repetitiveness
 ///   - Delta packs: level 17
+///
 /// We use 17 as it matches C++ AGC's most common case and provides good balance
 const DEFAULT_COMPRESSION_LEVEL: i32 = 17;
 
