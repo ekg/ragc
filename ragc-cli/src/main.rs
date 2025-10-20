@@ -46,6 +46,11 @@ enum Commands {
         /// Verbosity level (0=quiet, 1=normal, 2=verbose)
         #[arg(short = 'v', long, default_value_t = 1)]
         verbosity: u32,
+
+        /// Adaptive mode: find new splitters for samples with poor segmentation
+        /// (matches C++ AGC -a flag for pangenome-aware compression)
+        #[arg(short = 'a', long)]
+        adaptive: bool,
     },
 
     /// Display information about an AGC archive
@@ -133,6 +138,7 @@ fn main() -> Result<()> {
             min_match_len,
             compression_level,
             verbosity,
+            adaptive,
         } => create_archive(
             output,
             inputs,
@@ -141,6 +147,7 @@ fn main() -> Result<()> {
             min_match_len,
             compression_level,
             verbosity,
+            adaptive,
         )?,
 
         Commands::Info { archive } => {
@@ -175,6 +182,7 @@ fn create_archive(
     min_match_len: u32,
     compression_level: i32,
     verbosity: u32,
+    adaptive: bool,
 ) -> Result<()> {
     if verbosity > 0 {
         eprintln!("Creating AGC archive: {output:?}");
@@ -184,6 +192,9 @@ fn create_archive(
         eprintln!("  segment size: {segment_size}");
         eprintln!("  min match length: {min_match_len}");
         eprintln!("  compression level: {compression_level}");
+        if adaptive {
+            eprintln!("  adaptive mode: enabled (pangenome-aware splitters)");
+        }
         eprintln!();
     }
 
@@ -194,6 +205,7 @@ fn create_archive(
         min_match_len,
         compression_level,
         verbosity,
+        adaptive_mode: adaptive,
         ..StreamingCompressorConfig::default()
     };
 
