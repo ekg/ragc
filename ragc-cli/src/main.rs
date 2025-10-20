@@ -40,7 +40,7 @@ enum Commands {
         min_match_len: u32,
 
         /// ZSTD compression level (1-22, higher = better compression but slower)
-        #[arg(short = 'c', long, default_value_t = 22)]
+        #[arg(short = 'c', long, default_value_t = 17)]
         compression_level: i32,
 
         /// Verbosity level (0=quiet, 1=normal, 2=verbose)

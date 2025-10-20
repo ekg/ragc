@@ -5,12 +5,12 @@ use anyhow::{Context, Result};
 use ragc_common::types::{Contig, PackedBlock};
 
 /// Default ZSTD compression level
+/// Use level 17 to match C++ AGC's delta pack compression (segment.h:279)
 /// C++ AGC uses levels 13-19 depending on segment type:
 ///   - Reference segments: level 13 (tuples) or 19 (plain) based on repetitiveness
 ///   - Delta packs: level 17
-/// We use level 22 for better compression ratio (benchmarked: 33MB vs 111MB at level 17)
-/// Higher levels use more CPU but dramatically improve compression for genomic data
-const DEFAULT_COMPRESSION_LEVEL: i32 = 22;
+/// We use 17 as it matches C++ AGC's most common case and provides good balance
+const DEFAULT_COMPRESSION_LEVEL: i32 = 17;
 
 /// Compress a segment using ZSTD with default compression level
 pub fn compress_segment(data: &Contig) -> Result<PackedBlock> {
