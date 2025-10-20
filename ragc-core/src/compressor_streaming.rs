@@ -747,9 +747,9 @@ impl StreamingCompressor {
         });
 
         // Register streams in archive (must be done sequentially on main thread)
-        // Build mapping: stream_id -> stream_name
+        // Map temporary worker-assigned stream_id to actual archive stream_id
         let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
-        let mut stream_registered = HashSet::new();
+        let mut stream_id_map = HashMap::new();
 
         // Write packs as they arrive from workers (I/O-bound, sequential)
         // KEY OPTIMIZATION: We're writing packs of 50 segments, not individual segments!
@@ -759,9 +759,11 @@ impl StreamingCompressor {
 
         loop {
             match pack_rx.try_recv() {
-                Ok(pack) => {
-                    // Register stream if first time seeing it
-                    if stream_registered.insert(pack.stream_id) {
+                Ok(mut pack) => {
+                    // Register stream if first time seeing it and get actual stream_id
+                    let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
+                        id
+                    } else {
                         let stream_name = if pack.stream_id >= 10000 {
                             // Reference stream
                             let group_id = (pack.stream_id - 10000) as u32;
@@ -770,8 +772,10 @@ impl StreamingCompressor {
                             // Delta stream
                             stream_delta_name(archive_version, pack.group_id)
                         };
-                        self.archive.register_stream(&stream_name);
-                    }
+                        let actual_id = self.archive.register_stream(&stream_name);
+                        stream_id_map.insert(pack.stream_id, actual_id);
+                        actual_id
+                    };
 
                     // Register segments in collection
                     for seg_meta in &pack.segments {
@@ -790,8 +794,8 @@ impl StreamingCompressor {
                         )?;
                     }
 
-                    // Write pack to archive
-                    self.archive.add_part(pack.stream_id, &pack.compressed_data, pack.uncompressed_size)?;
+                    // Write pack to archive using actual stream_id
+                    self.archive.add_part(actual_stream_id, &pack.compressed_data, pack.uncompressed_size)?;
 
                     packs_written += 1;
                     segments_written += pack.segments.len();
@@ -805,16 +809,20 @@ impl StreamingCompressor {
                     if workers_done_rx.try_recv().is_ok() {
                         // Drain any remaining packs
                         while let Ok(pack) = pack_rx.recv() {
-                            // Register stream if needed
-                            if stream_registered.insert(pack.stream_id) {
+                            // Register stream if needed and get actual stream_id
+                            let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
+                                id
+                            } else {
                                 let stream_name = if pack.stream_id >= 10000 {
                                     let group_id = (pack.stream_id - 10000) as u32;
                                     stream_ref_name(archive_version, group_id)
                                 } else {
                                     stream_delta_name(archive_version, pack.group_id)
                                 };
-                                self.archive.register_stream(&stream_name);
-                            }
+                                let actual_id = self.archive.register_stream(&stream_name);
+                                stream_id_map.insert(pack.stream_id, actual_id);
+                                actual_id
+                            };
 
                             // Register segments
                             for seg_meta in &pack.segments {
@@ -830,8 +838,8 @@ impl StreamingCompressor {
                                 )?;
                             }
 
-                            // Write pack
-                            self.archive.add_part(pack.stream_id, &pack.compressed_data, pack.uncompressed_size)?;
+                            // Write pack using actual stream_id
+                            self.archive.add_part(actual_stream_id, &pack.compressed_data, pack.uncompressed_size)?;
                             packs_written += 1;
                             segments_written += pack.segments.len();
                         }
