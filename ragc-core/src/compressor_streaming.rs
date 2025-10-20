@@ -16,7 +16,7 @@ use ragc_common::{
 };
 use dashmap::DashMap;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
@@ -35,6 +35,8 @@ pub struct StreamingCompressorConfig {
     pub periodic_flush_interval: usize,
     /// Number of worker threads (matching C++ AGC: no_threads or no_threads-1 if >8)
     pub num_threads: usize,
+    /// Adaptive mode: find new splitters for samples that can't be segmented well (matches C++ AGC -a flag)
+    pub adaptive_mode: bool,
 }
 
 impl Default for StreamingCompressorConfig {
@@ -55,6 +57,7 @@ impl Default for StreamingCompressorConfig {
             group_flush_threshold: 0, // 0 = disabled (was 100)
             periodic_flush_interval: 0, // 0 = disabled (was 500)
             num_threads,
+            adaptive_mode: false, // Default matches C++ AGC (adaptive mode off)
         }
     }
 }
@@ -130,6 +133,11 @@ pub struct StreamingCompressor {
     // This enables splitting segments to reuse existing groups
     group_terminators: HashMap<u64, Vec<u64>>,
 
+    // Adaptive mode: reference k-mers for exclusion (matching C++ AGC v_candidate_kmers and v_duplicated_kmers)
+    reference_kmers_singletons: HashSet<u64>,  // Singleton k-mers from reference (candidates)
+    reference_kmers_duplicates: HashSet<u64>,  // Duplicate k-mers from reference (non-singletons)
+    current_splitters: HashSet<u64>,           // Mutable splitter set (grows in adaptive mode)
+
     // Statistics
     total_bases_processed: usize,
     total_segments: usize,
@@ -157,6 +165,9 @@ impl StreamingCompressor {
             group_metadata: HashMap::new(),
             next_group_id: 0,
             group_terminators: HashMap::new(),
+            reference_kmers_singletons: HashSet::new(),
+            reference_kmers_duplicates: HashSet::new(),
+            current_splitters: HashSet::new(),
             total_bases_processed: 0,
             total_segments: 0,
             total_groups_flushed: 0,
