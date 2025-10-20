@@ -1780,8 +1780,14 @@ impl StreamingCompressor {
 
         // Flush any remaining buffered segments (partial packs)
         let all_group_keys: Vec<_> = self.group_metadata.keys().cloned().collect();
-        if self.config.verbosity > 1 {
+        if self.config.verbosity > 0 {
             println!("Flushing buffered segments for {} groups", all_group_keys.len());
+
+            // Count how many have pending segments
+            let pending_count: usize = all_group_keys.iter()
+                .filter(|k| self.group_metadata.get(k).map(|m| !m.pending_segments.is_empty()).unwrap_or(false))
+                .count();
+            println!("  Groups with pending segments: {}", pending_count);
         }
         for key in all_group_keys {
             self.flush_group_final(&key)?;

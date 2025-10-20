@@ -40,6 +40,7 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
     remove_non_singletons(&mut all_kmers, 0);
 
     let candidates: HashSet<u64> = all_kmers.into_iter().collect();
+    eprintln!("DEBUG: Found {} candidate singleton k-mers from reference", candidates.len());
 
     // Pass 2: Scan reference again to find which candidates are ACTUALLY used
     // Parallelize splitter finding across contigs (matching C++ AGC)
@@ -48,7 +49,10 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
         .map(|contig| find_actual_splitters_in_contig(contig, &candidates, k, segment_size))
         .collect();
 
-    splitter_vecs.into_iter().flatten().collect()
+    let splitters: HashSet<u64> = splitter_vecs.into_iter().flatten().collect();
+    eprintln!("DEBUG: {} actually-used splitters (after distance check)", splitters.len());
+
+    splitters
 }
 
 /// Find which candidate k-mers are actually used as splitters in a contig
