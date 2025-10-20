@@ -624,6 +624,17 @@ impl StreamingCompressor {
 
             let mut contigs_processed = 0;
 
+            // Adaptive mode: track contigs that need new splitters for this sample
+            let mut contigs_needing_splitters: Vec<Contig> = Vec::new();
+
+            // Clone the active splitters to avoid holding an immutable borrow of self
+            // (needed so we can mutably borrow self later in the loop)
+            let active_splitters = if self.config.adaptive_mode {
+                self.current_splitters.clone()
+            } else {
+                splitters.clone()
+            };
+
             while let Some((contig_name, sequence)) = reader.read_contig_converted()? {
                 if sequence.is_empty() {
                     continue;
@@ -635,10 +646,26 @@ impl StreamingCompressor {
                 // Split at splitter positions with minimum segment size
                 let segments = split_at_splitters_with_size(
                     &sequence,
-                    &splitters,
+                    &active_splitters,
                     self.config.kmer_length as usize,
                     self.config.segment_size as usize
                 );
+
+                // Adaptive mode: check if this contig needs new splitters
+                // Matching C++ AGC lines 2033-2039: find_new_splitters called for contigs >= segment_size
+                if self.config.adaptive_mode && sequence.len() >= self.config.segment_size as usize {
+                    // Check if segmentation is poor (max segment > 10x segment_size)
+                    let max_segment_len = segments.iter().map(|s| s.data.len()).max().unwrap_or(0);
+                    if max_segment_len > (self.config.segment_size as usize) * 10 {
+                        // This contig needs new splitters
+                        contigs_needing_splitters.push(sequence.clone());
+
+                        if self.config.verbosity > 1 {
+                            println!("  Contig {} has poor segmentation (max segment {} > {}), will find new splitters",
+                                contig_name, max_segment_len, self.config.segment_size * 10);
+                        }
+                    }
+                }
 
                 if self.config.verbosity > 1 {
                     println!("  Contig {} split into {} segments", contig_name, segments.len());
@@ -690,6 +717,36 @@ impl StreamingCompressor {
 
             if self.config.verbosity > 0 {
                 println!("  Processed {} contigs from {}", contigs_processed, sample_name);
+            }
+
+            // Adaptive mode: after sample completes, find and add new splitters
+            // Matching C++ AGC synchronization (lines 2186-2191 and 1154-1177)
+            if self.config.adaptive_mode && !contigs_needing_splitters.is_empty() {
+                if self.config.verbosity > 0 {
+                    println!("Adaptive mode: Finding new splitters from {} problematic contigs...",
+                        contigs_needing_splitters.len());
+                }
+
+                let mut new_splitters_for_sample = HashSet::new();
+
+                for contig in &contigs_needing_splitters {
+                    let contig_new_splitters = self.find_new_splitters(contig);
+                    new_splitters_for_sample.extend(contig_new_splitters);
+                }
+
+                if !new_splitters_for_sample.is_empty() {
+                    if self.config.verbosity > 0 {
+                        println!("Adaptive mode: Adding {} new splitters to global set (was {} splitters)",
+                            new_splitters_for_sample.len(), self.current_splitters.len());
+                    }
+
+                    // Add new splitters to current set for use with next sample
+                    self.current_splitters.extend(new_splitters_for_sample);
+
+                    if self.config.verbosity > 0 {
+                        println!("Adaptive mode: Now have {} total splitters", self.current_splitters.len());
+                    }
+                }
             }
         }
 
