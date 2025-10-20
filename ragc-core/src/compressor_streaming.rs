@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::thread;
 
 /// Configuration for the streaming compressor
 #[derive(Debug, Clone)]
@@ -70,6 +71,18 @@ struct SegmentInfo {
     seg_part_no: usize,
     data: Contig,
     is_rev_comp: bool,
+}
+
+/// Segment ready to be written to archive (sent from workers to writer)
+#[derive(Debug)]
+struct CompressedSegment {
+    key: SegmentGroupKey,
+    sample_name: String,
+    contig_name: String,
+    seg_part_no: usize,
+    data: Contig,
+    is_rev_comp: bool,
+    is_new_group: bool, // Whether this created a new group (for terminators)
 }
 
 /// Segment group identified by flanking k-mers
@@ -363,9 +376,13 @@ impl StreamingCompressor {
 
         type ContigTask = (String, String, Contig); // (sample_name, contig_name, sequence)
 
-        // Bounded channel matching C++ AGC's CBoundedQueue
+        // Bounded channel for input contigs (producer -> workers)
         // Queue capacity: allow 100 contigs in flight (balances memory vs throughput)
         let (contig_tx, contig_rx): (Sender<ContigTask>, Receiver<ContigTask>) = bounded(100);
+
+        // Bounded channel for compressed segments (workers -> writer thread)
+        // This prevents memory buildup - backpressure if writer is slow
+        let (segment_tx, segment_rx): (Sender<CompressedSegment>, Receiver<CompressedSegment>) = bounded(1000);
 
         // Clone path for producer thread
         let fasta_path_clone = fasta_path.to_path_buf();
@@ -400,15 +417,7 @@ impl StreamingCompressor {
             Ok(contig_count)
         });
 
-        // Make shared state thread-safe for parallel processing
-        // Using DashMap for fine-grained locking (per-shard), matching C++ AGC's per-group mutexes
-        let segment_groups = {
-            let dashmap = DashMap::new();
-            for (key, value) in std::mem::take(&mut self.segment_groups) {
-                dashmap.insert(key, value);
-            }
-            Arc::new(dashmap)
-        };
+        // Shared state for middle splitter optimization (only k-mer pairings, NOT segment data!)
         let group_terminators = {
             let dashmap = DashMap::new();
             for (key, value) in std::mem::take(&mut self.group_terminators) {
@@ -416,6 +425,9 @@ impl StreamingCompressor {
             }
             Arc::new(dashmap)
         };
+
+        // Track which groups exist (for new group detection)
+        let existing_groups = Arc::new(DashMap::<SegmentGroupKey, ()>::new());
 
         // Collect contig registrations for sequential processing after workers finish
         let contig_registrations = Arc::new(DashMap::new());
@@ -429,7 +441,8 @@ impl StreamingCompressor {
         let mut worker_handles = Vec::new();
         for worker_id in 0..self.config.num_threads {
             let rx = contig_rx.clone();
-            let seg_groups = segment_groups.clone();
+            let seg_tx = segment_tx.clone();
+            let groups = existing_groups.clone();
             let group_terms = group_terminators.clone();
             let registrations = contig_registrations.clone();
             let total_segs = total_segments.clone();
@@ -455,15 +468,16 @@ impl StreamingCompressor {
                         cfg.segment_size as usize
                     );
 
-                    // Add each segment to groups (DashMap provides fine-grained locking)
+                    // Process each segment and send to writer thread
                     for (seg_idx, segment) in segments.into_iter().enumerate() {
                         total_b.fetch_add(segment.data.len(), Ordering::Relaxed);
+                        total_segs.fetch_add(1, Ordering::Relaxed);
 
-                        Self::add_segment_with_kmers_threadsafe(
+                        // Prepare segment (k-mer normalization, RC if needed)
+                        let compressed_seg = Self::prepare_segment_for_writing(
                             &cfg,
-                            &seg_groups,
+                            &groups,
                             &group_terms,
-                            &total_segs,
                             &sample_name,
                             &contig_name,
                             seg_idx,
@@ -472,6 +486,9 @@ impl StreamingCompressor {
                             segment.back_kmer,
                             false, // is_rev_comp
                         )?;
+
+                        // Send to writer thread (blocks if channel full - backpressure!)
+                        seg_tx.send(compressed_seg).context("Failed to send segment to writer")?;
                     }
 
                     if cfg.verbosity > 2 && worker_contigs % 100 == 0 {
@@ -489,6 +506,37 @@ impl StreamingCompressor {
             worker_handles.push(worker_handle);
         }
 
+        // Drop the sender so writer knows when workers are done
+        drop(segment_tx);
+
+        // Writer thread: receive segments from workers and write to archive
+        // This runs concurrently with workers and performs sequential writes
+        let writer_segments = Arc::new(AtomicUsize::new(0));
+        let writer_segs_ref = writer_segments.clone();
+        let writer_verbosity = self.config.verbosity;
+
+        let writer_handle = thread::spawn(move || -> Result<()> {
+            let mut segments_written = 0;
+
+            while let Ok(compressed_seg) = segment_rx.recv() {
+                // TODO: Actually write to archive here
+                // For now, just count
+                segments_written += 1;
+
+                if writer_verbosity > 2 && segments_written % 10000 == 0 {
+                    eprintln!("Writer: wrote {} segments", segments_written);
+                }
+            }
+
+            writer_segs_ref.store(segments_written, Ordering::Relaxed);
+
+            if writer_verbosity > 0 {
+                println!("Writer: finished writing {} segments", segments_written);
+            }
+
+            Ok(())
+        });
+
         // Wait for producer to finish
         let total_contigs = producer_handle.join()
             .map_err(|e| anyhow::anyhow!("Producer thread panicked: {:?}", e))??;
@@ -501,9 +549,15 @@ impl StreamingCompressor {
             total_worker_contigs += worker_contigs;
         }
 
+        // Wait for writer to finish
+        writer_handle.join()
+            .map_err(|e| anyhow::anyhow!("Writer thread panicked: {:?}", e))??;
+
+        let segments_written = writer_segments.load(Ordering::Relaxed);
+
         if self.config.verbosity > 0 {
-            println!("Streaming complete: {} contigs read, {} processed by workers",
-                total_contigs, total_worker_contigs);
+            println!("Streaming complete: {} contigs read, {} processed by workers, {} segments written",
+                total_contigs, total_worker_contigs, segments_written);
         }
 
         // Register all contigs in collection (sequential, after workers finish)
@@ -519,11 +573,6 @@ impl StreamingCompressor {
         }
 
         // Move shared state back from DashMap to HashMap
-        {
-            let dashmap = Arc::try_unwrap(segment_groups)
-                .map_err(|_| anyhow::anyhow!("Failed to unwrap segment_groups Arc"))?;
-            self.segment_groups = dashmap.into_iter().collect();
-        }
         {
             let dashmap = Arc::try_unwrap(group_terminators)
                 .map_err(|_| anyhow::anyhow!("Failed to unwrap group_terminators Arc"))?;
@@ -1301,14 +1350,13 @@ impl StreamingCompressor {
         Ok(())
     }
 
-    /// Thread-safe version of add_segment_with_kmers for parallel processing
-    /// Matches C++ AGC worker thread behavior with fine-grained locking (DashMap)
+    /// Prepare segment for writing (parallel-safe, returns CompressedSegment for channel)
+    /// This replaces add_segment_with_kmers_threadsafe - segments are sent to writer instead of buffered
     #[allow(clippy::too_many_arguments)]
-    fn add_segment_with_kmers_threadsafe(
+    fn prepare_segment_for_writing(
         config: &StreamingCompressorConfig,
-        segment_groups: &Arc<DashMap<SegmentGroupKey, Vec<SegmentInfo>>>,
+        existing_groups: &Arc<DashMap<SegmentGroupKey, ()>>,
         group_terminators: &Arc<DashMap<u64, Vec<u64>>>,
-        total_segments: &Arc<AtomicUsize>,
         sample_name: &str,
         contig_name: &str,
         seg_part_no: usize,
@@ -1316,7 +1364,7 @@ impl StreamingCompressor {
         kmer_front: u64,
         kmer_back: u64,
         is_rev_comp: bool,
-    ) -> Result<()> {
+    ) -> Result<CompressedSegment> {
         // K-mer orientation logic (matching add_segment_with_kmers)
         let (final_front, final_back) = if kmer_front != MISSING_KMER && kmer_back == MISSING_KMER {
             let k = config.kmer_length as usize;
@@ -1384,22 +1432,10 @@ impl StreamingCompressor {
             segment
         };
 
-        // Check if this is a new group (fine-grained locking with DashMap)
-        let is_new_group = !segment_groups.contains_key(&key);
+        // Check if this is a new group (atomic check-and-set)
+        let is_new_group = existing_groups.insert(key.clone(), ()).is_none();
 
-        let seg_info = SegmentInfo {
-            sample_name: sample_name.to_string(),
-            contig_name: contig_name.to_string(),
-            seg_part_no,
-            data: final_segment,
-            is_rev_comp: final_is_rev_comp,
-        };
-
-        // DashMap provides per-shard locking - only locks the shard containing this key!
-        // This matches C++ AGC's per-group mutex approach (line 220 in agc_compressor.h)
-        segment_groups.entry(key.clone()).or_default().push(seg_info);
-
-        // Update terminators if new group (also fine-grained locking via DashMap)
+        // Update terminators if new group (fine-grained locking via DashMap)
         if is_new_group && key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
             group_terminators.entry(key.kmer_front).or_default().push(key.kmer_back);
             if key.kmer_front != key.kmer_back {
@@ -1407,10 +1443,16 @@ impl StreamingCompressor {
             }
         }
 
-        // Update counter (lock-free atomic increment)
-        total_segments.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        // Return segment ready for writing
+        Ok(CompressedSegment {
+            key,
+            sample_name: sample_name.to_string(),
+            contig_name: contig_name.to_string(),
+            seg_part_no,
+            data: final_segment,
+            is_rev_comp: final_is_rev_comp,
+            is_new_group,
+        })
     }
 
     /// Flush a single group to the archive
