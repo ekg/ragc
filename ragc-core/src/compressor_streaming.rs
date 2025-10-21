@@ -100,7 +100,7 @@ struct CompressedPack {
 /// Either an uncompressed or compressed pack (returned from add_segment)
 #[derive(Debug)]
 enum PackToWrite {
-    Compressed(CompressedPack),    // Reference packs (compressed immediately)
+    Compressed(CompressedPack),     // Reference packs (compressed immediately)
     Uncompressed(UncompressedPack), // Buffered packs (will be compressed by thread pool)
 }
 
@@ -599,10 +599,14 @@ impl StreamingCompressor {
         // Workers → uncompressed packs → Compression Pool → compressed packs → Writer
         //
         // Stage 1: Workers → Compression Pool (uncompressed)
-        let (uncompressed_tx, uncompressed_rx): (Sender<UncompressedPack>, Receiver<UncompressedPack>) = bounded(100);
+        let (uncompressed_tx, uncompressed_rx): (
+            Sender<UncompressedPack>,
+            Receiver<UncompressedPack>,
+        ) = bounded(100);
         //
         // Stage 2: Compression Pool → Writer (compressed)
-        let (compressed_tx, compressed_rx): (Sender<CompressedPack>, Receiver<CompressedPack>) = bounded(100);
+        let (compressed_tx, compressed_rx): (Sender<CompressedPack>, Receiver<CompressedPack>) =
+            bounded(100);
 
         // Clone path for producer thread
         let fasta_path_clone = fasta_path.to_path_buf();
@@ -752,15 +756,15 @@ impl StreamingCompressor {
                             match pack {
                                 PackToWrite::Compressed(compressed_pack) => {
                                     // Reference pack - already compressed, send to writer
-                                    compressed_tx
-                                        .send(compressed_pack)
-                                        .context("Failed to send compressed reference pack to writer")?;
+                                    compressed_tx.send(compressed_pack).context(
+                                        "Failed to send compressed reference pack to writer",
+                                    )?;
                                 }
                                 PackToWrite::Uncompressed(uncompressed_pack) => {
                                     // Buffer is full - send to compression pool
-                                    uncompressed_tx
-                                        .send(uncompressed_pack)
-                                        .context("Failed to send uncompressed pack to compression pool")?;
+                                    uncompressed_tx.send(uncompressed_pack).context(
+                                        "Failed to send uncompressed pack to compression pool",
+                                    )?;
                                 }
                             }
                         }
@@ -799,14 +803,18 @@ impl StreamingCompressor {
 
                     if let Ok(compressed_data) = compressed {
                         // Decide whether to use compressed or raw data
-                        let (final_data, uncompressed_size) =
-                            if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
-                                let mut data_with_marker = compressed_data;
-                                data_with_marker.push(0); // Marker byte
-                                (data_with_marker, uncompressed_pack.uncompressed_data.len() as u64)
-                            } else {
-                                (uncompressed_pack.uncompressed_data, 0)
-                            };
+                        let (final_data, uncompressed_size) = if compressed_data.len() + 1
+                            < uncompressed_pack.uncompressed_data.len()
+                        {
+                            let mut data_with_marker = compressed_data;
+                            data_with_marker.push(0); // Marker byte
+                            (
+                                data_with_marker,
+                                uncompressed_pack.uncompressed_data.len() as u64,
+                            )
+                        } else {
+                            (uncompressed_pack.uncompressed_data, 0)
+                        };
 
                         // Send compressed pack to writer
                         let compressed_pack = CompressedPack {
