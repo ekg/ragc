@@ -334,7 +334,8 @@ impl CollectionV3 {
             // New sample
             let id = self.sample_ids.len();
             self.sample_ids.insert(stored_sample_name.clone(), id);
-            self.sample_desc.push(SampleDesc::new(stored_sample_name.clone()));
+            self.sample_desc
+                .push(SampleDesc::new(stored_sample_name.clone()));
             id
         };
 
@@ -343,7 +344,9 @@ impl CollectionV3 {
         // Add contig to the sample (avoid duplicates)
         let sample = &mut self.sample_desc[sample_id];
         if !sample.contigs.iter().any(|c| c.name == contig_name) {
-            sample.contigs.push(ContigDesc::new(contig_name.to_string()));
+            sample
+                .contigs
+                .push(ContigDesc::new(contig_name.to_string()));
             Ok(true)
         } else {
             Ok(false) // Contig already registered
@@ -1164,17 +1167,26 @@ mod tests {
         // Add multiple segments from the same group (group 93) with consecutive in_group_ids
         // This reproduces the real-world scenario where multiple contigs have segments in the same group
         let test_segments = vec![
-            ("sample1", "contig1", 0, 93, 0, false, 61000),   // group 93, in_group_id 0
-            ("sample1", "contig1", 1, 93, 1, false, 61000),   // group 93, in_group_id 1
-            ("sample1", "contig2", 0, 93, 2, false, 61000),   // group 93, in_group_id 2
-            ("sample1", "contig2", 1, 93, 3, false, 61000),   // group 93, in_group_id 3
-            ("sample2", "contig1", 0, 93, 4, false, 61000),   // group 93, in_group_id 4
-            ("sample2", "contig1", 1, 93, 5, false, 61000),   // group 93, in_group_id 5
-            ("sample2", "contig1", 2, 93, 6, false, 61000),   // group 93, in_group_id 6
+            ("sample1", "contig1", 0, 93, 0, false, 61000), // group 93, in_group_id 0
+            ("sample1", "contig1", 1, 93, 1, false, 61000), // group 93, in_group_id 1
+            ("sample1", "contig2", 0, 93, 2, false, 61000), // group 93, in_group_id 2
+            ("sample1", "contig2", 1, 93, 3, false, 61000), // group 93, in_group_id 3
+            ("sample2", "contig1", 0, 93, 4, false, 61000), // group 93, in_group_id 4
+            ("sample2", "contig1", 1, 93, 5, false, 61000), // group 93, in_group_id 5
+            ("sample2", "contig1", 2, 93, 6, false, 61000), // group 93, in_group_id 6
         ];
 
         for (sample, contig, place, group_id, in_group_id, is_rev_comp, raw_len) in &test_segments {
-            coll.add_segment_placed(sample, contig, *place, *group_id, *in_group_id, *is_rev_comp, *raw_len).unwrap();
+            coll.add_segment_placed(
+                sample,
+                contig,
+                *place,
+                *group_id,
+                *in_group_id,
+                *is_rev_comp,
+                *raw_len,
+            )
+            .unwrap();
         }
 
         // Serialize the collection details
@@ -1194,19 +1206,52 @@ mod tests {
 
         // Verify all in_group_ids match original values
         let sample1_contig1 = coll2.get_contig_desc("sample1", "contig1").unwrap();
-        assert_eq!(sample1_contig1.len(), 2, "sample1/contig1 should have 2 segments");
-        assert_eq!(sample1_contig1[0].in_group_id, 0, "sample1/contig1 segment 0 should have in_group_id=0");
-        assert_eq!(sample1_contig1[1].in_group_id, 1, "sample1/contig1 segment 1 should have in_group_id=1");
+        assert_eq!(
+            sample1_contig1.len(),
+            2,
+            "sample1/contig1 should have 2 segments"
+        );
+        assert_eq!(
+            sample1_contig1[0].in_group_id, 0,
+            "sample1/contig1 segment 0 should have in_group_id=0"
+        );
+        assert_eq!(
+            sample1_contig1[1].in_group_id, 1,
+            "sample1/contig1 segment 1 should have in_group_id=1"
+        );
 
         let sample1_contig2 = coll2.get_contig_desc("sample1", "contig2").unwrap();
-        assert_eq!(sample1_contig2.len(), 2, "sample1/contig2 should have 2 segments");
-        assert_eq!(sample1_contig2[0].in_group_id, 2, "sample1/contig2 segment 0 should have in_group_id=2");
-        assert_eq!(sample1_contig2[1].in_group_id, 3, "sample1/contig2 segment 1 should have in_group_id=3");
+        assert_eq!(
+            sample1_contig2.len(),
+            2,
+            "sample1/contig2 should have 2 segments"
+        );
+        assert_eq!(
+            sample1_contig2[0].in_group_id, 2,
+            "sample1/contig2 segment 0 should have in_group_id=2"
+        );
+        assert_eq!(
+            sample1_contig2[1].in_group_id, 3,
+            "sample1/contig2 segment 1 should have in_group_id=3"
+        );
 
         let sample2_contig1 = coll2.get_contig_desc("sample2", "contig1").unwrap();
-        assert_eq!(sample2_contig1.len(), 3, "sample2/contig1 should have 3 segments");
-        assert_eq!(sample2_contig1[0].in_group_id, 4, "sample2/contig1 segment 0 should have in_group_id=4");
-        assert_eq!(sample2_contig1[1].in_group_id, 5, "sample2/contig1 segment 1 should have in_group_id=5");
-        assert_eq!(sample2_contig1[2].in_group_id, 6, "sample2/contig1 segment 2 should have in_group_id=6");
+        assert_eq!(
+            sample2_contig1.len(),
+            3,
+            "sample2/contig1 should have 3 segments"
+        );
+        assert_eq!(
+            sample2_contig1[0].in_group_id, 4,
+            "sample2/contig1 segment 0 should have in_group_id=4"
+        );
+        assert_eq!(
+            sample2_contig1[1].in_group_id, 5,
+            "sample2/contig1 segment 1 should have in_group_id=5"
+        );
+        assert_eq!(
+            sample2_contig1[2].in_group_id, 6,
+            "sample2/contig1 segment 2 should have in_group_id=6"
+        );
     }
 }

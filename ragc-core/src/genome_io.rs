@@ -1,6 +1,8 @@
 // FASTA/FASTQ genome I/O
 // Rust equivalent of genome_io.cpp
 
+#![allow(dead_code)]
+
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -82,7 +84,9 @@ impl<R: Read> GenomeIO<R> {
     ///
     /// Parses headers in format: >sample#haplotype#chromosome
     /// Example: >S288C#1#chrI -> sample="S288C#1", contig="chrI"
-    pub fn read_contig_with_sample(&mut self) -> io::Result<Option<(String, String, String, Contig)>> {
+    pub fn read_contig_with_sample(
+        &mut self,
+    ) -> io::Result<Option<(String, String, String, Contig)>> {
         let (full_header, sequence) = match self.read_contig_impl(true)? {
             Some(result) => result,
             None => return Ok(None),

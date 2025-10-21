@@ -1,11 +1,15 @@
 // Splitter identification
 // Rust equivalent of determine_splitters logic in agc_compressor.cpp
 
+use crate::genome_io::GenomeIO;
 use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
+use anyhow::Result;
 use ragc_common::Contig;
 use rayon::prelude::*;
 use rdst::RadixSort;
 use std::collections::HashSet;
+use std::io::Read;
+use std::path::Path;
 
 /// Build a splitter set from reference contigs
 ///
@@ -26,7 +30,11 @@ use std::collections::HashSet;
 /// - splitters: Actually-used splitter k-mers (for segmentation)
 /// - singletons: All singleton k-mers from reference (for adaptive mode exclusion)
 /// - duplicates: All duplicate k-mers from reference (for adaptive mode exclusion)
-pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) -> (HashSet<u64>, HashSet<u64>, HashSet<u64>) {
+pub fn determine_splitters(
+    contigs: &[Contig],
+    k: usize,
+    segment_size: usize,
+) -> (HashSet<u64>, HashSet<u64>, HashSet<u64>) {
     // Pass 1: Find candidate k-mers (singletons from reference)
     // Parallelize k-mer extraction across contigs (matching C++ AGC)
     let all_kmers_vec: Vec<Vec<u64>> = contigs
@@ -66,8 +74,14 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
     remove_non_singletons(&mut all_kmers, 0);
 
     let candidates: HashSet<u64> = all_kmers.into_iter().collect();
-    eprintln!("DEBUG: Found {} candidate singleton k-mers from reference", candidates.len());
-    eprintln!("DEBUG: Found {} duplicate k-mers from reference", duplicates.len());
+    eprintln!(
+        "DEBUG: Found {} candidate singleton k-mers from reference",
+        candidates.len()
+    );
+    eprintln!(
+        "DEBUG: Found {} duplicate k-mers from reference",
+        duplicates.len()
+    );
 
     // Pass 2: Scan reference again to find which candidates are ACTUALLY used
     // Parallelize splitter finding across contigs (matching C++ AGC)
@@ -77,9 +91,107 @@ pub fn determine_splitters(contigs: &[Contig], k: usize, segment_size: usize) ->
         .collect();
 
     let splitters: HashSet<u64> = splitter_vecs.into_iter().flatten().collect();
-    eprintln!("DEBUG: {} actually-used splitters (after distance check)", splitters.len());
+    eprintln!(
+        "DEBUG: {} actually-used splitters (after distance check)",
+        splitters.len()
+    );
 
     (splitters, candidates, duplicates)
+}
+
+/// Build a splitter set by streaming through a FASTA file (memory-efficient!)
+///
+/// This matches C++ AGC's approach but streams the file twice instead of loading
+/// all contigs into memory. For yeast (12MB genome):
+/// - Max memory: ~100MB (Vec of 12M k-mers)
+/// - vs loading all contigs: ~2.8GB
+///
+/// # Arguments
+/// * `fasta_path` - Path to reference FASTA file (can be gzipped)
+/// * `k` - K-mer length
+/// * `segment_size` - Minimum segment size
+///
+/// # Returns
+/// Tuple of (splitters, singletons, duplicates) HashSets
+pub fn determine_splitters_streaming(
+    fasta_path: &Path,
+    k: usize,
+    segment_size: usize,
+) -> Result<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> {
+    // Pass 1a: Stream through file to collect ALL k-mers (with duplicates) into Vec
+    eprintln!("DEBUG: Pass 1 - Collecting k-mers from reference (streaming)...");
+    let mut all_kmers = Vec::new();
+
+    {
+        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
+        while let Some((_contig_name, sequence)) = reader.read_contig_converted()? {
+            if !sequence.is_empty() {
+                let contig_kmers = enumerate_kmers(&sequence, k);
+                all_kmers.extend(contig_kmers);
+            }
+        }
+    }
+
+    eprintln!(
+        "DEBUG: Collected {} k-mers (with duplicates)",
+        all_kmers.len()
+    );
+    eprintln!(
+        "DEBUG: Vec memory usage: ~{} MB",
+        all_kmers.len() * 8 / 1_000_000
+    );
+
+    // Pass 1b: Sort and identify duplicates/singletons
+    eprintln!("DEBUG: Sorting k-mers...");
+    all_kmers.radix_sort_unstable();
+
+    // Extract duplicates before removing them
+    let mut duplicates = HashSet::new();
+    let mut i = 0;
+    while i < all_kmers.len() {
+        let kmer = all_kmers[i];
+        let mut count = 1;
+        let mut j = i + 1;
+
+        while j < all_kmers.len() && all_kmers[j] == kmer {
+            count += 1;
+            j += 1;
+        }
+
+        if count > 1 {
+            duplicates.insert(kmer);
+        }
+
+        i = j;
+    }
+
+    eprintln!("DEBUG: Found {} duplicate k-mers", duplicates.len());
+
+    // Remove non-singletons
+    remove_non_singletons(&mut all_kmers, 0);
+    let candidates: HashSet<u64> = all_kmers.into_iter().collect();
+    eprintln!(
+        "DEBUG: Found {} candidate singleton k-mers",
+        candidates.len()
+    );
+
+    // Pass 2: Stream through file again to find actually-used splitters
+    eprintln!("DEBUG: Pass 2 - Finding actually-used splitters (streaming)...");
+    let mut splitters = HashSet::new();
+
+    {
+        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
+        while let Some((_contig_name, sequence)) = reader.read_contig_converted()? {
+            if !sequence.is_empty() {
+                let used = find_actual_splitters_in_contig(&sequence, &candidates, k, segment_size);
+                splitters.extend(used);
+            }
+        }
+    }
+
+    eprintln!("DEBUG: {} actually-used splitters", splitters.len());
+
+    Ok((splitters, candidates, duplicates))
 }
 
 /// Find which candidate k-mers are actually used as splitters in a contig
@@ -89,7 +201,7 @@ fn find_actual_splitters_in_contig(
     contig: &Contig,
     candidates: &HashSet<u64>,
     k: usize,
-    segment_size: usize
+    segment_size: usize,
 ) -> Vec<u64> {
     use crate::kmer::{Kmer, KmerMode};
 
@@ -109,14 +221,12 @@ fn find_actual_splitters_in_contig(
                 let kmer_value = kmer.data();
                 recent_kmers.push(kmer_value);
 
-                if current_len >= segment_size {
-                    if candidates.contains(&kmer_value) {
-                        // This candidate is actually used!
-                        used_splitters.push(kmer_value);
-                        current_len = 0;
-                        kmer.reset();
-                        recent_kmers.clear();
-                    }
+                if current_len >= segment_size && candidates.contains(&kmer_value) {
+                    // This candidate is actually used!
+                    used_splitters.push(kmer_value);
+                    current_len = 0;
+                    kmer.reset();
+                    recent_kmers.clear();
                 }
             }
         }

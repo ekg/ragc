@@ -3,9 +3,9 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ragc_core::{StreamingCompressor, StreamingCompressorConfig, Decompressor, DecompressorConfig};
+use ragc_core::{Decompressor, DecompressorConfig, StreamingCompressor, StreamingCompressorConfig};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "agc")]
@@ -107,7 +107,7 @@ enum Commands {
 ///   scerevisiae8.fa.gz -> scerevisiae8
 ///   genome.fasta       -> genome
 ///   data.fa            -> data
-fn extract_sample_name(path: &PathBuf) -> String {
+fn extract_sample_name(path: &Path) -> String {
     let mut name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -115,7 +115,15 @@ fn extract_sample_name(path: &PathBuf) -> String {
         .to_string();
 
     // Strip known genomic file extensions (in order)
-    let extensions = [".fa.gz", ".fasta.gz", ".fna.gz", ".fa", ".fasta", ".fna", ".gz"];
+    let extensions = [
+        ".fa.gz",
+        ".fasta.gz",
+        ".fna.gz",
+        ".fa",
+        ".fasta",
+        ".fna",
+        ".gz",
+    ];
     for ext in &extensions {
         if name.ends_with(ext) {
             name = name[..name.len() - ext.len()].to_string();
@@ -174,6 +182,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_archive(
     output: PathBuf,
     inputs: Vec<PathBuf>,

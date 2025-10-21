@@ -1,7 +1,10 @@
 // AGC Decompressor
 // Extracts genomes from AGC archives
 
-use crate::{genome_io::GenomeWriter, kmer::reverse_complement, lz_diff::LZDiff, segment_compression::decompress_segment};
+use crate::{
+    genome_io::GenomeWriter, kmer::reverse_complement, lz_diff::LZDiff,
+    segment_compression::decompress_segment,
+};
 use anyhow::{anyhow, Context, Result};
 use ragc_common::{
     stream_delta_name, stream_ref_name, Archive, CollectionV3, Contig, SegmentDesc, AGC_FILE_MAJOR,
@@ -262,8 +265,16 @@ impl Decompressor {
             } else {
                 // Subsequent segments: skip first kmer_length bases (overlap with previous segment)
                 if segment_data.len() < self.kmer_length as usize {
-                    eprintln!("ERROR: Segment {} too short! Length={}, kmer_length={}", i, segment_data.len(), self.kmer_length);
-                    eprintln!("  Segment desc: group_id={}, in_group_id={}, raw_length={}", segment_desc.group_id, segment_desc.in_group_id, segment_desc.raw_length);
+                    eprintln!(
+                        "ERROR: Segment {} too short! Length={}, kmer_length={}",
+                        i,
+                        segment_data.len(),
+                        self.kmer_length
+                    );
+                    eprintln!(
+                        "  Segment desc: group_id={}, in_group_id={}, raw_length={}",
+                        segment_desc.group_id, segment_desc.in_group_id, segment_desc.raw_length
+                    );
                     anyhow::bail!("Corrupted archive: segment too short (segment {}, got {} bytes, need at least {} bytes)", i, segment_data.len(), self.kmer_length);
                 }
                 contig.extend_from_slice(&segment_data[self.kmer_length as usize..]);
@@ -328,8 +339,10 @@ impl Decompressor {
             if !self.segment_cache.contains_key(&desc.group_id) {
                 // Load reference from ref stream (part 0)
                 let ref_stream_name = stream_ref_name(archive_version, desc.group_id);
-                let ref_stream_id = self.archive.get_stream_id(&ref_stream_name)
-                    .ok_or_else(|| anyhow!("Reference stream not found: {}", ref_stream_name))?;
+                let ref_stream_id = self
+                    .archive
+                    .get_stream_id(&ref_stream_name)
+                    .ok_or_else(|| anyhow!("Reference stream not found: {ref_stream_name}"))?;
 
                 let (mut ref_data, ref_metadata) = self.archive.get_part_by_id(ref_stream_id, 0)?;
 
@@ -345,7 +358,11 @@ impl Decompressor {
                 };
 
                 if self.config.verbosity > 1 {
-                    eprintln!("Loaded reference for group {}: length={}", desc.group_id, decompressed_ref.len());
+                    eprintln!(
+                        "Loaded reference for group {}: length={}",
+                        desc.group_id,
+                        decompressed_ref.len()
+                    );
                 }
 
                 // Cache the reference
@@ -364,13 +381,16 @@ impl Decompressor {
             let position_in_pack = delta_position % PACK_CARDINALITY;
 
             if self.config.verbosity > 1 {
-                eprintln!("  LZ group: delta_position={}, pack_id={}, position_in_pack={}",
-                    delta_position, pack_id, position_in_pack);
+                eprintln!(
+                    "  LZ group: delta_position={delta_position}, pack_id={pack_id}, position_in_pack={position_in_pack}"
+                );
             }
 
             let delta_stream_name = stream_delta_name(archive_version, desc.group_id);
-            let delta_stream_id = self.archive.get_stream_id(&delta_stream_name)
-                .ok_or_else(|| anyhow!("Delta stream not found: {}", delta_stream_name))?;
+            let delta_stream_id = self
+                .archive
+                .get_stream_id(&delta_stream_name)
+                .ok_or_else(|| anyhow!("Delta stream not found: {delta_stream_name}"))?;
 
             // Check how many parts this stream has
             let num_parts = self.archive.get_num_parts(delta_stream_id);
@@ -380,7 +400,8 @@ impl Decompressor {
                     pack_id, num_parts, desc.in_group_id, delta_position);
             }
 
-            let (mut delta_data, delta_metadata) = self.archive.get_part_by_id(delta_stream_id, pack_id)?;
+            let (mut delta_data, delta_metadata) =
+                self.archive.get_part_by_id(delta_stream_id, pack_id)?;
 
             // Decompress if needed
             let decompressed_pack = if delta_metadata == 0 {
@@ -401,7 +422,9 @@ impl Decompressor {
             }
 
             // Decode using reference
-            let reference = self.segment_cache.get(&desc.group_id)
+            let reference = self
+                .segment_cache
+                .get(&desc.group_id)
                 .ok_or_else(|| anyhow!("Reference not loaded for group {}", desc.group_id))?;
 
             let mut lz_diff = LZDiff::new(self.min_match_len);
@@ -425,12 +448,14 @@ impl Decompressor {
             let position_in_pack = desc.in_group_id as usize % PACK_CARDINALITY;
 
             if self.config.verbosity > 1 {
-                eprintln!("  Raw group: pack_id={}, position_in_pack={}", pack_id, position_in_pack);
+                eprintln!("  Raw group: pack_id={pack_id}, position_in_pack={position_in_pack}");
             }
 
             let stream_name = stream_delta_name(archive_version, desc.group_id);
-            let stream_id = self.archive.get_stream_id(&stream_name)
-                .ok_or_else(|| anyhow!("Delta stream not found: {}", stream_name))?;
+            let stream_id = self
+                .archive
+                .get_stream_id(&stream_name)
+                .ok_or_else(|| anyhow!("Delta stream not found: {stream_name}"))?;
 
             let (mut data, metadata) = self.archive.get_part_by_id(stream_id, pack_id)?;
 

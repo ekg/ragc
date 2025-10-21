@@ -163,15 +163,14 @@ fn extract_sequences_with_checksums(fasta_path: &Path) -> BTreeMap<String, Strin
 
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with('>') {
+        if let Some(header) = line.strip_prefix('>') {
             // Save previous contig
             if let Some(contig) = current_contig.take() {
                 sequences.insert(contig, current_seq.clone());
                 current_seq.clear();
             }
             // Start new contig - remove '>' and any sample prefix (e.g., "sample#0#chr1" -> "chr1")
-            let header = &line[1..];
-            let contig_name = header.split('#').last().unwrap_or(header).to_string();
+            let contig_name = header.split('#').next_back().unwrap_or(header).to_string();
             current_contig = Some(contig_name);
         } else {
             current_seq.push_str(line);
@@ -221,7 +220,7 @@ fn test_roundtrip_with_checksum_verification() {
     for (contig, seq) in &original_sequences {
         eprintln!("  {}: {} bases", contig, seq.len());
     }
-    eprintln!("Original checksum: {}", original_checksum);
+    eprintln!("Original checksum: {original_checksum}");
 
     // Compress
     {
@@ -257,7 +256,7 @@ fn test_roundtrip_with_checksum_verification() {
     for (contig, seq) in &decompressed_sequences {
         eprintln!("  {}: {} bases", contig, seq.len());
     }
-    eprintln!("Decompressed checksum: {}", decompressed_checksum);
+    eprintln!("Decompressed checksum: {decompressed_checksum}");
 
     // Verify checksums match
     assert_eq!(
@@ -274,16 +273,14 @@ fn test_roundtrip_with_checksum_verification() {
 
     // Verify each contig individually
     for (contig, original_seq) in &original_sequences {
-        let decompressed_seq = decompressed_sequences.get(contig).expect(&format!(
-            "Contig {} missing in decompressed output",
-            contig
-        ));
+        let decompressed_seq = decompressed_sequences
+            .get(contig)
+            .unwrap_or_else(|| panic!("Contig {contig} missing in decompressed output"));
 
         assert_eq!(
             original_seq.to_uppercase(),
             decompressed_seq.to_uppercase(),
-            "Sequence for contig {} should match exactly",
-            contig
+            "Sequence for contig {contig} should match exactly"
         );
     }
 
