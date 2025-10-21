@@ -25,8 +25,9 @@ ragc (Rust + AGC) is a ground-up rewrite of AGC in Rust that:
 - ✅ Parallel multi-threaded compression (3-stage pipeline: workers → compression pool → writer)
 
 **Not Yet Implemented:**
-- ⚠️ Some CLI commands (getcol, listsamples, etc.)
+- ⚠️ Some CLI commands (getcol, etc.)
 - ⚠️ Minimizers and advanced compression optimizations
+- ⚠️ Full segment grouping and LZ encoding (compression is suboptimal)
 
 ## Installation
 
@@ -213,10 +214,16 @@ This implementation was created as a guided development with Claude Code. The co
 - ✅ Collection metadata (V3 format)
 
 ### Current Limitations
-- No splitter-based segmentation (treats whole contigs as segments)
+
+**Compression Efficiency:**
+- Segment grouping and LZ encoding are not yet fully functional
+- Archives are ~30-100% larger than C++ AGC for the same input
+- Single-file input works better than multi-file input currently
+- Working on unifying input handling and fixing group-based compression
+
+**Other:**
 - No minimizers (future optimization)
-- Single-threaded operation
-- Limited CLI commands (only create/getset implemented)
+- Limited CLI commands (only create/getset/listset implemented)
 
 ### Format Compatibility
 - Archive version: 3.0 (matches C++ AGC)
