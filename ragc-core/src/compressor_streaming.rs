@@ -78,7 +78,16 @@ struct SegmentInfo {
     is_rev_comp: bool,
 }
 
-/// A compressed pack ready to write to archive (sent from workers to writer)
+/// An uncompressed pack ready for compression (sent from workers to compression pool)
+#[derive(Debug)]
+struct UncompressedPack {
+    group_id: u32,
+    stream_id: usize,
+    uncompressed_data: Vec<u8>, // LZ-encoded segments concatenated (NOT yet ZSTD compressed)
+    segments: Vec<SegmentMetadata>, // Metadata for collection registration
+}
+
+/// A compressed pack ready to write to archive (sent from compression pool to writer)
 #[derive(Debug)]
 struct CompressedPack {
     group_id: u32,
@@ -86,6 +95,13 @@ struct CompressedPack {
     compressed_data: Vec<u8>, // Compressed pack (with marker byte if compressed)
     uncompressed_size: u64,   // Original packed size (0 if writing uncompressed)
     segments: Vec<SegmentMetadata>, // Metadata for collection registration
+}
+
+/// Either an uncompressed or compressed pack (returned from add_segment)
+#[derive(Debug)]
+enum PackToWrite {
+    Compressed(CompressedPack),    // Reference packs (compressed immediately)
+    Uncompressed(UncompressedPack), // Buffered packs (will be compressed by thread pool)
 }
 
 /// Segment metadata for collection registration
@@ -193,12 +209,12 @@ impl GroupWriter {
 
     /// Add a segment to this group's buffer
     /// Returns Some(CompressedPack) if buffer is full and pack should be written
-    /// Returns Some(reference pack) if this is the first segment of an LZ group
+    /// Returns Some(pack) if this is the first segment of an LZ group or if buffer is full
     fn add_segment(
         &mut self,
         segment: SegmentInfo,
         config: &StreamingCompressorConfig,
-    ) -> Result<Option<CompressedPack>> {
+    ) -> Result<Option<PackToWrite>> {
         const PACK_CARDINALITY: usize = 50;
         const NO_RAW_GROUPS: u32 = 16;
 
@@ -232,13 +248,13 @@ impl GroupWriter {
                     data_len: segment.data.len() as u32,
                 }];
 
-                return Ok(Some(CompressedPack {
+                return Ok(Some(PackToWrite::Compressed(CompressedPack {
                     group_id: self.group_id,
                     stream_id: ref_stream_id,
                     compressed_data,
                     uncompressed_size,
                     segments,
-                }));
+                })));
             }
         }
 
@@ -247,18 +263,18 @@ impl GroupWriter {
 
         // Prepare pack if buffer is full
         if self.pending_segments.len() >= PACK_CARDINALITY {
-            return self.prepare_pack(config);
+            return Ok(self.prepare_pack(config)?.map(PackToWrite::Uncompressed));
         }
 
         Ok(None)
     }
 
-    /// Prepare a compressed pack from buffered segments
-    /// This can be called by workers (compute-bound) before sending to writer (I/O-bound)
+    /// Prepare an UNCOMPRESSED pack from buffered segments (LZ encoding only, NO ZSTD compression)
+    /// Compression will happen in separate compression thread pool
     fn prepare_pack(
         &mut self,
         config: &StreamingCompressorConfig,
-    ) -> Result<Option<CompressedPack>> {
+    ) -> Result<Option<UncompressedPack>> {
         if self.pending_segments.is_empty() {
             return Ok(None);
         }
@@ -286,10 +302,7 @@ impl GroupWriter {
             packed_data.push(CONTIG_SEPARATOR);
         }
 
-        // Compress pack
-        let compressed = compress_segment_configured(&packed_data, config.compression_level)?;
-
-        // Build segment metadata
+        // Build segment metadata (NO COMPRESSION HERE!)
         let mut segments = Vec::new();
         for (idx_in_pack, seg_info) in self.pending_segments.iter().enumerate() {
             let global_in_group_id = if use_lz_encoding {
@@ -308,23 +321,14 @@ impl GroupWriter {
             });
         }
 
-        // Determine what to write
-        let (compressed_data, uncompressed_size) = if compressed.len() + 1 < packed_data.len() {
-            let mut compressed_with_marker = compressed;
-            compressed_with_marker.push(0);
-            (compressed_with_marker, packed_data.len() as u64)
-        } else {
-            (packed_data, 0)
-        };
-
         self.segments_written += self.pending_segments.len();
         self.pending_segments.clear();
 
-        Ok(Some(CompressedPack {
+        // Return UNCOMPRESSED pack - compression will happen in compression thread pool!
+        Ok(Some(UncompressedPack {
             group_id: self.group_id,
             stream_id: self.stream_id,
-            compressed_data,
-            uncompressed_size,
+            uncompressed_data: packed_data,
             segments,
         }))
     }
@@ -591,10 +595,14 @@ impl StreamingCompressor {
         // Queue capacity: allow 100 contigs in flight (balances memory vs throughput)
         let (contig_tx, contig_rx): (Sender<ContigTask>, Receiver<ContigTask>) = bounded(100);
 
-        // Bounded channel for compressed packs (workers -> writer thread)
-        // Workers send compressed packs (50 segments each), not individual segments
-        // This reduces write operations from 93K to ~1,860 for yeast235
-        let (pack_tx, pack_rx): (Sender<CompressedPack>, Receiver<CompressedPack>) = bounded(100);
+        // THREE-STAGE PIPELINE for parallel compression:
+        // Workers → uncompressed packs → Compression Pool → compressed packs → Writer
+        //
+        // Stage 1: Workers → Compression Pool (uncompressed)
+        let (uncompressed_tx, uncompressed_rx): (Sender<UncompressedPack>, Receiver<UncompressedPack>) = bounded(100);
+        //
+        // Stage 2: Compression Pool → Writer (compressed)
+        let (compressed_tx, compressed_rx): (Sender<CompressedPack>, Receiver<CompressedPack>) = bounded(100);
 
         // Clone path for producer thread
         let fasta_path_clone = fasta_path.to_path_buf();
@@ -666,7 +674,8 @@ impl StreamingCompressor {
         let mut worker_handles = Vec::new();
         for worker_id in 0..self.config.num_threads {
             let rx = contig_rx.clone();
-            let pack_tx = pack_tx.clone();
+            let uncompressed_tx = uncompressed_tx.clone(); // Send UNcompressed packs to compression pool
+            let compressed_tx = compressed_tx.clone(); // Send already-compressed reference packs to writer
             let writers = group_writers.clone();
             let group_terms = group_terminators.clone();
             let registrations = contig_registrations.clone();
@@ -738,11 +747,22 @@ impl StreamingCompressor {
                         // Add segment to group buffer (per-group locking!)
                         let mut writer_guard = group_writer.lock().unwrap();
                         if let Some(pack) = writer_guard.add_segment(seg_info.segment, &cfg)? {
-                            // Buffer is full - send compressed pack to writer thread
-                            drop(writer_guard); // Release lock before I/O
-                            pack_tx
-                                .send(pack)
-                                .context("Failed to send pack to writer")?;
+                            drop(writer_guard); // Release lock before sending
+
+                            match pack {
+                                PackToWrite::Compressed(compressed_pack) => {
+                                    // Reference pack - already compressed, send to writer
+                                    compressed_tx
+                                        .send(compressed_pack)
+                                        .context("Failed to send compressed reference pack to writer")?;
+                                }
+                                PackToWrite::Uncompressed(uncompressed_pack) => {
+                                    // Buffer is full - send to compression pool
+                                    uncompressed_tx
+                                        .send(uncompressed_pack)
+                                        .context("Failed to send uncompressed pack to compression pool")?;
+                                }
+                            }
                         }
                     }
 
@@ -761,13 +781,54 @@ impl StreamingCompressor {
             worker_handles.push(worker_handle);
         }
 
-        // MEMORY OPTIMIZATION: Write segments in real-time as they arrive from workers
+        // Compression thread pool: receives uncompressed packs and compresses in parallel!
+        // This is the KEY to getting parallel ZSTD compression
+        let compression_level = config.compression_level;
+        let num_compressors = self.config.num_threads; // Same as workers
+        for _compressor_id in 0..num_compressors {
+            let uncompressed_rx = uncompressed_rx.clone();
+            let compressed_tx = compressed_tx.clone();
+
+            std::thread::spawn(move || {
+                while let Ok(uncompressed_pack) = uncompressed_rx.recv() {
+                    // Compress the pack (THIS HAPPENS IN PARALLEL!)
+                    let compressed = compress_segment_configured(
+                        &uncompressed_pack.uncompressed_data,
+                        compression_level,
+                    );
+
+                    if let Ok(compressed_data) = compressed {
+                        // Decide whether to use compressed or raw data
+                        let (final_data, uncompressed_size) =
+                            if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
+                                let mut data_with_marker = compressed_data;
+                                data_with_marker.push(0); // Marker byte
+                                (data_with_marker, uncompressed_pack.uncompressed_data.len() as u64)
+                            } else {
+                                (uncompressed_pack.uncompressed_data, 0)
+                            };
+
+                        // Send compressed pack to writer
+                        let compressed_pack = CompressedPack {
+                            group_id: uncompressed_pack.group_id,
+                            stream_id: uncompressed_pack.stream_id,
+                            compressed_data: final_data,
+                            uncompressed_size,
+                            segments: uncompressed_pack.segments,
+                        };
+
+                        let _ = compressed_tx.send(compressed_pack);
+                    }
+                }
+            });
+        }
+
+        // MEMORY OPTIMIZATION: Write segments in real-time as they arrive from compression pool
         // This keeps memory bounded to the channel buffer size (~100 segments)
         // instead of accumulating all 93K segments before writing
 
         // Spawn a thread to signal when workers finish and flush remaining packs
         let writers_for_flush = group_writers.clone();
-        let pack_tx_for_flush = pack_tx.clone();
         let cfg_for_flush = config.clone();
         let (workers_done_tx, workers_done_rx) = bounded(1);
         std::thread::spawn(move || {
@@ -776,32 +837,37 @@ impl StreamingCompressor {
                 let _ = handle.join();
             }
 
-            // Workers done - flush all remaining buffers
+            // Workers done - flush all remaining buffers (send uncompressed to compression pool)
             for entry in writers_for_flush.iter() {
                 let _key = entry.key();
                 let mut writer = entry.value().lock().unwrap();
-                if let Ok(Some(pack)) = writer.prepare_pack(&cfg_for_flush) {
-                    let _ = pack_tx_for_flush.send(pack);
+                if let Ok(Some(uncompressed_pack)) = writer.prepare_pack(&cfg_for_flush) {
+                    let _ = uncompressed_tx.send(uncompressed_pack);
                 }
             }
 
-            drop(pack_tx); // Close channel after flushing
+            drop(uncompressed_tx); // Close uncompressed channel - signals compression pool to exit
             let _ = workers_done_tx.send(());
         });
+
+        // Drop original compressed_tx so compression pool has the only remaining senders
+        // When compression pool exits (after uncompressed channel closes), their clones drop
+        // and the writer will see the compressed channel as closed
+        drop(compressed_tx);
 
         // Register streams in archive (must be done sequentially on main thread)
         // Map temporary worker-assigned stream_id to actual archive stream_id
         let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
         let mut stream_id_map = HashMap::new();
 
-        // Write packs as they arrive from workers (I/O-bound, sequential)
+        // Write packs as they arrive from COMPRESSION POOL (I/O-bound, sequential)
         // KEY OPTIMIZATION: We're writing packs of 50 segments, not individual segments!
         // For yeast235: ~1,860 write operations instead of 93,000
         let mut packs_written = 0;
         let mut segments_written = 0;
 
         loop {
-            match pack_rx.try_recv() {
+            match compressed_rx.try_recv() {
                 Ok(pack) => {
                     // Register stream if first time seeing it and get actual stream_id
                     let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
@@ -855,8 +921,8 @@ impl StreamingCompressor {
                 Err(_) => {
                     // Channel empty - check if workers finished
                     if workers_done_rx.try_recv().is_ok() {
-                        // Drain any remaining packs
-                        while let Ok(pack) = pack_rx.recv() {
+                        // Drain any remaining packs from compression pool
+                        while let Ok(pack) = compressed_rx.recv() {
                             // Register stream if needed and get actual stream_id
                             let actual_stream_id =
                                 if let Some(&id) = stream_id_map.get(&pack.stream_id) {
