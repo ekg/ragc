@@ -21,12 +21,12 @@ ragc (Rust + AGC) is a ground-up rewrite of AGC in Rust that:
 - ✅ Comprehensive test suite (68 tests)
 - ✅ Continuous Integration with C++ compatibility verification
 - ✅ Multi-sample, multi-contig support
+- ✅ Splitter-based segmentation with per-group buffering
+- ✅ Parallel multi-threaded compression (3-stage pipeline: workers → compression pool → writer)
 
 **Not Yet Implemented:**
-- ⚠️ Splitter-based segmentation (currently treats each contig as single segment)
 - ⚠️ Some CLI commands (getcol, listsamples, etc.)
 - ⚠️ Minimizers and advanced compression optimizations
-- ⚠️ Multi-threading for compression
 
 ## Installation
 
