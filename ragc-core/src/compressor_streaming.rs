@@ -2359,6 +2359,7 @@ impl StreamingCompressor {
     }
 
     /// Store params stream (C++ compatibility)
+    /// Format: kmer_length (u32) + min_match_len (u32) + pack_cardinality (u32) + segment_size (u32)
     fn store_params_stream(&mut self) -> Result<()> {
         let mut params_data = Vec::new();
         let append_u32 = |data: &mut Vec<u8>, value: u32| {
@@ -2369,7 +2370,7 @@ impl StreamingCompressor {
         append_u32(&mut params_data, self.config.min_match_len);
         append_u32(&mut params_data, 50); // pack_cardinality
         append_u32(&mut params_data, self.config.segment_size);
-        append_u32(&mut params_data, 16); // no_raw_groups (groups 0-15 are raw-only, 16+ use LZ)
+        // Note: no_raw_groups is not included (C++ AGC doesn't store this)
 
         let stream_id = self.archive.register_stream("params");
         self.archive

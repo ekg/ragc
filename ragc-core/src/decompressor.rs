@@ -86,6 +86,11 @@ impl Decompressor {
     }
 
     /// Load archive parameters from the params stream
+    ///
+    /// Supports multiple params formats for C++ AGC compatibility:
+    /// - 12 bytes: kmer_length, min_match_len, pack_cardinality (older C++ AGC)
+    /// - 16 bytes: kmer_length, min_match_len, pack_cardinality, segment_size (newer C++ AGC)
+    /// - 20 bytes: kmer_length, min_match_len, pack_cardinality, segment_size, no_raw_groups (ragc)
     fn load_params(archive: &mut Archive) -> Result<(u32, u32, u32)> {
         // Get params stream
         let stream_id = archive
@@ -101,11 +106,10 @@ impl Decompressor {
         // Read the params part
         let (data, _metadata) = archive.get_part_by_id(stream_id, 0)?;
 
-        // Parse 4 little-endian u32 values:
-        // kmer_length, min_match_len, pack_cardinality, segment_size
-        if data.len() < 16 {
+        // Parse based on length
+        if data.len() < 12 {
             anyhow::bail!(
-                "params stream too short: {} bytes (expected 16)",
+                "params stream too short: {} bytes (expected at least 12)",
                 data.len()
             );
         }
@@ -113,7 +117,16 @@ impl Decompressor {
         let kmer_length = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let min_match_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let _pack_cardinality = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let segment_size = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+
+        // segment_size is optional (not present in older C++ AGC archives)
+        let segment_size = if data.len() >= 16 {
+            u32::from_le_bytes([data[12], data[13], data[14], data[15]])
+        } else {
+            // Default segment_size for older archives (matches C++ AGC default)
+            60000
+        };
+
+        // no_raw_groups is optional (only in ragc archives) - ignored if present
 
         Ok((segment_size, kmer_length, min_match_len))
     }
