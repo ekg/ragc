@@ -59,7 +59,37 @@ Function: `add_contigs_parallel_streaming` (line ~600)
 
 ## Status
 - [x] Problem identified
-- [x] Root cause found  
+- [x] Root cause found
 - [x] Solution designed
-- [ ] Implementation in progress
-- [ ] Testing
+- [x] Implementation complete
+- [x] Testing complete
+
+## Results (After Parallelization Fix)
+- **Before refactor**: 67s @ 100% CPU (single-threaded with mutex contention)
+- **After refactor**: 11.8s @ 467% CPU (parallel, **5.7x speedup!**)
+- **C++ AGC baseline**: 1.44s @ 694% CPU
+
+## Remaining 8x Performance Gap
+Despite successful parallelization, we're still **8.2x slower** than C++ AGC.
+
+### System Time Analysis
+- **RAGC**: 27s system time / 56s total CPU = **48% system time**
+- **C++ AGC**: ~0.04s system time / 1.0s total CPU = **4% system time**
+- **675x more system calls** in RAGC!
+
+### Attempted Optimizations (No improvement)
+1. Thread-local ZSTD encoders - Made things worse (12.7s)
+2. Zero-copy segment passing - Made things worse (14.2s)
+3. ZSTD crate already has internal context pooling
+
+### Likely Root Causes
+1. **Memory allocations**: Rust Vec/HashMap vs C++ raw pointers
+2. **Data structure overhead**: More granular allocations
+3. **Archive I/O**: Sequential write phase may be inefficient
+4. **Fundamental algorithm difference**: Need deeper C++ AGC analysis
+
+### Next Steps
+- Profile with `perf` to identify exact syscall sources
+- Compare memory allocation patterns
+- Investigate archive writing performance
+- Consider using jemalloc or mimalloc allocator
