@@ -1,17 +1,20 @@
 // Minimal test to pinpoint memory corruption bug
 
+use anyhow::Result;
 use ragc_core::{
     contig_iterator::{ContigIterator, PansnFileIterator},
-    StreamingCompressor, StreamingCompressorConfig, Decompressor, DecompressorConfig,
+    Decompressor, DecompressorConfig, StreamingCompressor, StreamingCompressorConfig,
 };
 use std::path::Path;
-use anyhow::Result;
 use tempfile::NamedTempFile;
 
 fn validate_bases(data: &[u8], label: &str) -> bool {
     for (i, &base) in data.iter().enumerate() {
         if base > 3 {
-            println!("❌ {} Invalid base at position {}: {} (0x{:02X})", label, i, base, base);
+            println!(
+                "❌ {} Invalid base at position {}: {} (0x{:02X})",
+                label, i, base, base
+            );
             // Show context
             let start = i.saturating_sub(10);
             let end = (i + 10).min(data.len());
@@ -34,7 +37,13 @@ fn main() -> Result<()> {
 
     while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
         if !sequence.is_empty() {
-            print!("Contig {}: {} / {} ({} bases) ", count, sample_name, contig_name, sequence.len());
+            print!(
+                "Contig {}: {} / {} ({} bases) ",
+                count,
+                sample_name,
+                contig_name,
+                sequence.len()
+            );
             if validate_bases(&sequence, &format!("INPUT {}", count)) {
                 println!("✓");
             }
@@ -72,10 +81,12 @@ fn main() -> Result<()> {
     // Decompress and validate
     println!("\n=== Decompressing and validating ===");
     let decompressor_config = DecompressorConfig::default();
-    let mut decompressor = Decompressor::open(archive.path().to_str().unwrap(), decompressor_config)?;
+    let mut decompressor =
+        Decompressor::open(archive.path().to_str().unwrap(), decompressor_config)?;
 
     // Get unique sample names from test contigs
-    let mut samples_to_check: Vec<String> = test_contigs.iter().map(|(s, _, _)| s.clone()).collect();
+    let mut samples_to_check: Vec<String> =
+        test_contigs.iter().map(|(s, _, _)| s.clone()).collect();
     samples_to_check.sort();
     samples_to_check.dedup();
 
@@ -85,20 +96,35 @@ fn main() -> Result<()> {
 
         for (contig_name, decompressed) in contigs {
             // Find expected sequence
-            if let Some((_, _, expected_seq)) = test_contigs.iter().find(|(s, c, _)| s == &sample_name && c == &contig_name) {
+            if let Some((_, _, expected_seq)) = test_contigs
+                .iter()
+                .find(|(s, c, _)| s == &sample_name && c == &contig_name)
+            {
                 print!("  {} ... ", contig_name);
 
-                if validate_bases(&decompressed, &format!("OUTPUT {}/{}", sample_name, contig_name)) {
+                if validate_bases(
+                    &decompressed,
+                    &format!("OUTPUT {}/{}", sample_name, contig_name),
+                ) {
                     if decompressed == *expected_seq {
                         println!("✓ Matches input");
                     } else {
                         println!("❌ Mismatch with input!");
-                        println!("   Expected len: {}, got len: {}", expected_seq.len(), decompressed.len());
+                        println!(
+                            "   Expected len: {}, got len: {}",
+                            expected_seq.len(),
+                            decompressed.len()
+                        );
 
                         // Find first difference
-                        for (i, (exp, got)) in expected_seq.iter().zip(decompressed.iter()).enumerate() {
+                        for (i, (exp, got)) in
+                            expected_seq.iter().zip(decompressed.iter()).enumerate()
+                        {
                             if exp != got {
-                                println!("   First diff at position {}: expected {}, got {}", i, exp, got);
+                                println!(
+                                    "   First diff at position {}: expected {}, got {}",
+                                    i, exp, got
+                                );
                                 break;
                             }
                         }

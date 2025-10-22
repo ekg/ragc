@@ -717,7 +717,10 @@ impl CollectionV3 {
             for contig_idx in 0..self.sample_desc[sample_idx].contigs.len() {
                 let mut contig_encoded = Vec::new();
 
-                for seg_idx in 0..self.sample_desc[sample_idx].contigs[contig_idx].segments.len() {
+                for seg_idx in 0..self.sample_desc[sample_idx].contigs[contig_idx]
+                    .segments
+                    .len()
+                {
                     let seg = &self.sample_desc[sample_idx].contigs[contig_idx].segments[seg_idx];
                     let prev_in_group_id = self.get_in_group_id(seg.group_id as usize);
 

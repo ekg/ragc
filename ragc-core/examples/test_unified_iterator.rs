@@ -1,12 +1,12 @@
 // Test program to verify PansnFileIterator and MultiFileIterator produce identical results
 
+use anyhow::Result;
 use ragc_core::{
     contig_iterator::{ContigIterator, MultiFileIterator, PansnFileIterator},
     StreamingCompressor, StreamingCompressorConfig,
 };
 use std::path::Path;
 use std::path::PathBuf;
-use anyhow::Result;
 
 fn main() -> Result<()> {
     let test_dir = Path::new("/home/erik/scrapy/yeast10_test");
@@ -91,7 +91,10 @@ fn main() -> Result<()> {
     } else {
         let diff = (size1 as i64 - size2 as i64).abs();
         let pct = (diff as f64 / size1 as f64) * 100.0;
-        println!("\n⚠ WARNING: Archives differ by {} bytes ({:.2}%)", diff, pct);
+        println!(
+            "\n⚠ WARNING: Archives differ by {} bytes ({:.2}%)",
+            diff, pct
+        );
     }
 
     Ok(())

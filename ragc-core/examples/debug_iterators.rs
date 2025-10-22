@@ -1,12 +1,10 @@
 // Debug program to compare what the two iterators produce
 
-use ragc_core::{
-    contig_iterator::{ContigIterator, MultiFileIterator, PansnFileIterator},
-};
+use anyhow::Result;
+use ragc_core::contig_iterator::{ContigIterator, MultiFileIterator, PansnFileIterator};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use anyhow::Result;
-use sha2::{Sha256, Digest};
 
 fn main() -> Result<()> {
     let test_dir = Path::new("/home/erik/scrapy/yeast10_test");
@@ -81,16 +79,29 @@ fn main() -> Result<()> {
                 multi_hasher.update(multi_seq);
                 let multi_hash = format!("{:x}", multi_hasher.finalize());
 
-                println!("❌ DIFFERENT: {} / {} (pansn len: {}, multi len: {})",
-                    key.0, key.1, pansn_seq.len(), multi_seq.len());
+                println!(
+                    "❌ DIFFERENT: {} / {} (pansn len: {}, multi len: {})",
+                    key.0,
+                    key.1,
+                    pansn_seq.len(),
+                    multi_seq.len()
+                );
                 println!("   Pansn SHA256: {}", pansn_hash);
                 println!("   Multi SHA256: {}", multi_hash);
 
                 if differences <= 3 {
                     // Show first few bytes
                     let show_bytes = 50.min(pansn_seq.len()).min(multi_seq.len());
-                    println!("   Pansn first {} bytes: {:?}", show_bytes, &pansn_seq[..show_bytes]);
-                    println!("   Multi first {} bytes: {:?}", show_bytes, &multi_seq[..show_bytes]);
+                    println!(
+                        "   Pansn first {} bytes: {:?}",
+                        show_bytes,
+                        &pansn_seq[..show_bytes]
+                    );
+                    println!(
+                        "   Multi first {} bytes: {:?}",
+                        show_bytes,
+                        &multi_seq[..show_bytes]
+                    );
                 }
             }
         }

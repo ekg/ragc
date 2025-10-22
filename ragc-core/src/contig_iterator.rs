@@ -122,7 +122,9 @@ impl MultiFileIterator {
             .and_then(|s| s.to_str())
             .map(|s| {
                 // Remove .fa or .fasta extensions if present
-                s.trim_end_matches(".fa").trim_end_matches(".fasta").to_string()
+                s.trim_end_matches(".fa")
+                    .trim_end_matches(".fasta")
+                    .to_string()
             })
             .unwrap_or_else(|| "unknown".to_string());
 
@@ -157,7 +159,11 @@ impl ContigIterator for MultiFileIterator {
             match reader.read_contig_with_sample()? {
                 Some((_full_header, _sample_from_header, contig_name, sequence)) => {
                     // Use sample name from filename, not from header
-                    return Ok(Some((self.current_sample_name.clone(), contig_name, sequence)));
+                    return Ok(Some((
+                        self.current_sample_name.clone(),
+                        contig_name,
+                        sequence,
+                    )));
                 }
                 None => {
                     // Current file exhausted, move to next file

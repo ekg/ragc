@@ -1,11 +1,11 @@
 // Debug program to check contig processing order during compression
 
+use anyhow::Result;
 use ragc_core::{
     contig_iterator::{MultiFileIterator, PansnFileIterator},
     StreamingCompressor, StreamingCompressorConfig,
 };
 use std::path::{Path, PathBuf};
-use anyhow::Result;
 use tempfile::NamedTempFile;
 
 fn main() -> Result<()> {
@@ -41,7 +41,8 @@ fn main() -> Result<()> {
     println!("=== Compressing with PansnFileIterator (single thread) ===");
     let pansn_archive = NamedTempFile::new()?;
     {
-        let mut compressor = StreamingCompressor::new(pansn_archive.path().to_str().unwrap(), config.clone())?;
+        let mut compressor =
+            StreamingCompressor::new(pansn_archive.path().to_str().unwrap(), config.clone())?;
         let iterator = Box::new(PansnFileIterator::new(&pansn_file)?);
         compressor.add_contigs_with_splitters(iterator)?;
         compressor.finalize()?;
@@ -50,7 +51,8 @@ fn main() -> Result<()> {
     println!("\n=== Compressing with MultiFileIterator (single thread) ===");
     let multi_archive = NamedTempFile::new()?;
     {
-        let mut compressor = StreamingCompressor::new(multi_archive.path().to_str().unwrap(), config.clone())?;
+        let mut compressor =
+            StreamingCompressor::new(multi_archive.path().to_str().unwrap(), config.clone())?;
         let iterator = Box::new(MultiFileIterator::new(fasta_files)?);
         compressor.add_contigs_with_splitters(iterator)?;
         compressor.finalize()?;
@@ -66,7 +68,10 @@ fn main() -> Result<()> {
     if pansn_size == multi_size {
         println!("✓ Sizes match!");
     } else {
-        println!("❌ Sizes differ by {} bytes", (pansn_size as i64 - multi_size as i64).abs());
+        println!(
+            "❌ Sizes differ by {} bytes",
+            (pansn_size as i64 - multi_size as i64).abs()
+        );
     }
 
     Ok(())

@@ -66,7 +66,9 @@ fn test_unified_iterator_equivalence() {
 
     // Compress using PansnFileIterator
     {
-        let mut compressor = StreamingCompressor::new(pansn_archive.path().to_str().unwrap(), config.clone()).unwrap();
+        let mut compressor =
+            StreamingCompressor::new(pansn_archive.path().to_str().unwrap(), config.clone())
+                .unwrap();
         let iterator = Box::new(PansnFileIterator::new(&pansn_file).unwrap());
         compressor.add_contigs_with_splitters(iterator).unwrap();
         compressor.finalize().unwrap();
@@ -74,7 +76,9 @@ fn test_unified_iterator_equivalence() {
 
     // Compress using MultiFileIterator
     {
-        let mut compressor = StreamingCompressor::new(multi_archive.path().to_str().unwrap(), config.clone()).unwrap();
+        let mut compressor =
+            StreamingCompressor::new(multi_archive.path().to_str().unwrap(), config.clone())
+                .unwrap();
         let iterator = Box::new(MultiFileIterator::new(fasta_files).unwrap());
         compressor.add_contigs_with_splitters(iterator).unwrap();
         compressor.finalize().unwrap();
@@ -99,20 +103,31 @@ fn test_unified_iterator_equivalence() {
     let decompressor_config = DecompressorConfig::default();
 
     let pansn_samples = {
-        let mut decompressor = Decompressor::open(pansn_archive.path().to_str().unwrap(), decompressor_config.clone()).unwrap();
+        let mut decompressor = Decompressor::open(
+            pansn_archive.path().to_str().unwrap(),
+            decompressor_config.clone(),
+        )
+        .unwrap();
         extract_all_samples(&mut decompressor)
     };
 
     let multi_samples = {
-        let mut decompressor = Decompressor::open(multi_archive.path().to_str().unwrap(), decompressor_config).unwrap();
+        let mut decompressor =
+            Decompressor::open(multi_archive.path().to_str().unwrap(), decompressor_config)
+                .unwrap();
         extract_all_samples(&mut decompressor)
     };
 
     // Verify same samples
-    assert_eq!(pansn_samples.len(), multi_samples.len(), "Different number of samples");
+    assert_eq!(
+        pansn_samples.len(),
+        multi_samples.len(),
+        "Different number of samples"
+    );
 
     for (sample_name, pansn_contigs) in &pansn_samples {
-        let multi_contigs = multi_samples.get(sample_name)
+        let multi_contigs = multi_samples
+            .get(sample_name)
             .unwrap_or_else(|| panic!("Sample {} missing from multi-file archive", sample_name));
 
         assert_eq!(
@@ -124,28 +139,38 @@ fn test_unified_iterator_equivalence() {
 
         // Compare contigs (order-independent)
         for (contig_name, pansn_seq) in pansn_contigs {
-            let multi_seq = multi_contigs.get(contig_name)
-                .unwrap_or_else(|| panic!("Contig {} missing from sample {} in multi-file archive", contig_name, sample_name));
+            let multi_seq = multi_contigs.get(contig_name).unwrap_or_else(|| {
+                panic!(
+                    "Contig {} missing from sample {} in multi-file archive",
+                    contig_name, sample_name
+                )
+            });
 
             assert_eq!(
-                pansn_seq,
-                multi_seq,
+                pansn_seq, multi_seq,
                 "Contig {} in sample {} has different sequence",
-                contig_name,
-                sample_name
+                contig_name, sample_name
             );
         }
     }
 
     println!("✓ Both iterators produce equivalent archives");
     println!("  Pansn size: {} bytes", pansn_size);
-    println!("  Multi size: {} bytes ({:.2}% difference)", multi_size, size_diff_pct);
+    println!(
+        "  Multi size: {} bytes ({:.2}% difference)",
+        multi_size, size_diff_pct
+    );
     println!("  Samples: {}", pansn_samples.len());
-    println!("  Total contigs: {}", pansn_samples.values().map(|c| c.len()).sum::<usize>());
+    println!(
+        "  Total contigs: {}",
+        pansn_samples.values().map(|c| c.len()).sum::<usize>()
+    );
 }
 
 /// Extract all samples and contigs from an archive
-fn extract_all_samples(decompressor: &mut Decompressor) -> HashMap<String, HashMap<String, Vec<u8>>> {
+fn extract_all_samples(
+    decompressor: &mut Decompressor,
+) -> HashMap<String, HashMap<String, Vec<u8>>> {
     let mut result = HashMap::new();
 
     for sample_name in decompressor.list_samples() {

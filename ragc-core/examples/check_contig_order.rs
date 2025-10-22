@@ -1,10 +1,8 @@
 // Check if contig order differs between iterators
 
-use ragc_core::{
-    contig_iterator::{ContigIterator, MultiFileIterator, PansnFileIterator},
-};
-use std::path::{Path, PathBuf};
 use anyhow::Result;
+use ragc_core::contig_iterator::{ContigIterator, MultiFileIterator, PansnFileIterator};
+use std::path::{Path, PathBuf};
 
 fn main() -> Result<()> {
     let test_dir = Path::new("/home/erik/scrapy/yeast10_test");
@@ -66,10 +64,20 @@ fn main() -> Result<()> {
         println!("   Pansn: {} / {}", pansn_order[i].0, pansn_order[i].1);
         println!("   Multi: {} / {}", multi_order[i].0, multi_order[i].1);
 
-        println!("\nContext (positions {} to {}):", i.saturating_sub(2), (i + 3).min(pansn_order.len()));
+        println!(
+            "\nContext (positions {} to {}):",
+            i.saturating_sub(2),
+            (i + 3).min(pansn_order.len())
+        );
         for j in i.saturating_sub(2)..(i + 3).min(pansn_order.len()) {
-            println!("  Pansn[{}]: {} / {}", j, pansn_order[j].0, pansn_order[j].1);
-            println!("  Multi[{}]: {} / {}", j, multi_order[j].0, multi_order[j].1);
+            println!(
+                "  Pansn[{}]: {} / {}",
+                j, pansn_order[j].0, pansn_order[j].1
+            );
+            println!(
+                "  Multi[{}]: {} / {}",
+                j, multi_order[j].0, multi_order[j].1
+            );
             println!();
         }
     } else {
