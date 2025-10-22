@@ -113,6 +113,7 @@
 
 pub mod compressor;
 pub mod compressor_streaming;
+pub mod contig_iterator;
 pub mod decompressor;
 pub mod genome_io;
 pub mod kmer;
