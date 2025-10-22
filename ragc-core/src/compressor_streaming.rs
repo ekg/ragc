@@ -6,7 +6,7 @@
 
 /// Helper to estimate memory usage of a data structure
 fn estimate_memory_mb<T>(items: &[T]) -> f64 {
-    (items.len() * std::mem::size_of::<T>()) as f64 / (1024.0 * 1024.0)
+    std::mem::size_of_val(items) as f64 / (1024.0 * 1024.0)
 }
 
 use crate::{
@@ -678,8 +678,7 @@ impl StreamingCompressor {
 
         if self.config.verbosity > 0 {
             println!(
-                "Phase 1 complete: {} contigs → {} segments ({} bases)",
-                contig_count, total_segments_count, total_bases_count
+                "Phase 1 complete: {contig_count} contigs → {total_segments_count} segments ({total_bases_count} bases)"
             );
         }
 
@@ -694,13 +693,13 @@ impl StreamingCompressor {
         for segment in all_segments {
             groups
                 .entry(segment.key.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(segment);
         }
 
         let num_groups = groups.len();
         if self.config.verbosity > 0 {
-            println!("Phase 2 complete: {} unique groups", num_groups);
+            println!("Phase 2 complete: {num_groups} unique groups");
         }
 
         // Convert to Vec for partitioning across workers
@@ -910,7 +909,7 @@ impl StreamingCompressor {
             .into_inner() as u32;
 
         if self.config.verbosity > 0 {
-            println!("Processed {} contigs total", contig_count);
+            println!("Processed {contig_count} contigs total");
         }
 
         Ok(())
@@ -1130,13 +1129,13 @@ impl StreamingCompressor {
                                 // if seg_info.key.kmer_front != MISSING_KMER && seg_info.key.kmer_back != MISSING_KMER {
                                 //     let mut map = group_terms.write().unwrap();
                                 //     map.entry(seg_info.key.kmer_front)
-                                //         .or_insert_with(Vec::new)
+                                //         .or_default()
                                 //         .push(seg_info.key.kmer_back);
                                 //     map.get_mut(&seg_info.key.kmer_front).unwrap().sort_unstable();
                                 //
                                 //     if seg_info.key.kmer_front != seg_info.key.kmer_back {
                                 //         map.entry(seg_info.key.kmer_back)
-                                //             .or_insert_with(Vec::new)
+                                //             .or_default()
                                 //             .push(seg_info.key.kmer_front);
                                 //         map.get_mut(&seg_info.key.kmer_back).unwrap().sort_unstable();
                                 //     }
@@ -1707,8 +1706,7 @@ impl StreamingCompressor {
 
         if self.config.verbosity > 0 {
             println!(
-                "Phase 1 complete: collected {} segments ({} bases)",
-                total_segments_count, total_bases_count
+                "Phase 1 complete: collected {total_segments_count} segments ({total_bases_count} bases)"
             );
 
             // Memory profiling
@@ -1726,7 +1724,7 @@ impl StreamingCompressor {
                 .map(|s| s.segment.data.len())
                 .sum::<usize>() as f64
                 / (1024.0 * 1024.0);
-            eprintln!("[MEMORY] Segment data payload: {:.2} MB", total_data_mb);
+            eprintln!("[MEMORY] Segment data payload: {total_data_mb:.2} MB");
         }
 
         // ==================================================================
@@ -1740,7 +1738,7 @@ impl StreamingCompressor {
         for segment in all_segments {
             groups
                 .entry(segment.key.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(segment);
         }
 
@@ -1748,7 +1746,7 @@ impl StreamingCompressor {
         let groups_vec: Vec<(SegmentGroupKey, Vec<PreparedSegment>)> = groups.into_iter().collect();
 
         if self.config.verbosity > 0 {
-            println!("Phase 2 complete: created {} groups", num_groups);
+            println!("Phase 2 complete: created {num_groups} groups");
 
             // Memory profiling
             let groups_mem = estimate_memory_mb(&groups_vec);
@@ -1892,7 +1890,7 @@ impl StreamingCompressor {
 
         // First pass: Register all streams and build ID mapping
         for pack in &all_packs {
-            if !stream_id_map.contains_key(&pack.stream_id) {
+            if let std::collections::hash_map::Entry::Vacant(e) = stream_id_map.entry(pack.stream_id) {
                 let stream_name = if pack.stream_id >= 10000 {
                     // Reference stream
                     let group_id = (pack.stream_id - 10000) as u32;
@@ -1902,7 +1900,7 @@ impl StreamingCompressor {
                     stream_delta_name(archive_version, pack.group_id)
                 };
                 let actual_id = self.archive.register_stream(&stream_name);
-                stream_id_map.insert(pack.stream_id, actual_id);
+                e.insert(actual_id);
 
                 // Also create group metadata entry for delta streams
                 if pack.stream_id < 10000 {
@@ -1974,12 +1972,12 @@ impl StreamingCompressor {
 
             packs_written += 1;
             if self.config.verbosity > 1 && packs_written % 100 == 0 {
-                println!("  Written {} packs...", packs_written);
+                println!("  Written {packs_written} packs...");
             }
         }
 
         if self.config.verbosity > 0 {
-            println!("Phase 4 complete: wrote {} packs", packs_written);
+            println!("Phase 4 complete: wrote {packs_written} packs");
         }
 
         // Update state
@@ -1993,8 +1991,7 @@ impl StreamingCompressor {
 
         if self.config.verbosity > 0 {
             println!(
-                "Compression complete!\nTotal bases: {}\nTotal groups: {}",
-                total_bases_count, num_groups
+                "Compression complete!\nTotal bases: {total_bases_count}\nTotal groups: {num_groups}"
             );
         }
 
@@ -2612,7 +2609,7 @@ impl StreamingCompressor {
             let vec = self
                 .group_terminators
                 .entry(key.kmer_front)
-                .or_insert_with(Vec::new);
+                .or_default();
             vec.push(key.kmer_back);
             vec.sort_unstable();
 
@@ -2621,7 +2618,7 @@ impl StreamingCompressor {
                 let vec = self
                     .group_terminators
                     .entry(key.kmer_back)
-                    .or_insert_with(Vec::new);
+                    .or_default();
                 vec.push(key.kmer_front);
                 vec.sort_unstable();
             }

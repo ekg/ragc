@@ -12,8 +12,7 @@ fn validate_bases(data: &[u8], label: &str) -> bool {
     for (i, &base) in data.iter().enumerate() {
         if base > 3 {
             println!(
-                "❌ {} Invalid base at position {}: {} (0x{:02X})",
-                label, i, base, base
+                "❌ {label} Invalid base at position {i}: {base} (0x{base:02X})"
             );
             // Show context
             let start = i.saturating_sub(10);
@@ -44,7 +43,7 @@ fn main() -> Result<()> {
                 contig_name,
                 sequence.len()
             );
-            if validate_bases(&sequence, &format!("INPUT {}", count)) {
+            if validate_bases(&sequence, &format!("INPUT {count}")) {
                 println!("✓");
             }
             test_contigs.push((sample_name.clone(), contig_name.clone(), sequence));
@@ -91,7 +90,7 @@ fn main() -> Result<()> {
     samples_to_check.dedup();
 
     for sample_name in samples_to_check {
-        println!("Sample: {}", sample_name);
+        println!("Sample: {sample_name}");
         let contigs = decompressor.get_sample(&sample_name)?;
 
         for (contig_name, decompressed) in contigs {
@@ -100,11 +99,11 @@ fn main() -> Result<()> {
                 .iter()
                 .find(|(s, c, _)| s == &sample_name && c == &contig_name)
             {
-                print!("  {} ... ", contig_name);
+                print!("  {contig_name} ... ");
 
                 if validate_bases(
                     &decompressed,
-                    &format!("OUTPUT {}/{}", sample_name, contig_name),
+                    &format!("OUTPUT {sample_name}/{contig_name}"),
                 ) {
                     if decompressed == *expected_seq {
                         println!("✓ Matches input");
@@ -122,8 +121,7 @@ fn main() -> Result<()> {
                         {
                             if exp != got {
                                 println!(
-                                    "   First diff at position {}: expected {}, got {}",
-                                    i, exp, got
+                                    "   First diff at position {i}: expected {exp}, got {got}"
                                 );
                                 break;
                             }

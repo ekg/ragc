@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     println!("Pansn iterator produced {} contigs", pansn_order.len());
     println!("First 10 contigs:");
     for (i, (sample, contig)) in pansn_order.iter().take(10).enumerate() {
-        println!("  {}: {} / {}", i, sample, contig);
+        println!("  {i}: {sample} / {contig}");
     }
 
     println!("\n=== Collecting contig order from MultiFileIterator ===");
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     println!("Multi iterator produced {} contigs", multi_order.len());
     println!("First 10 contigs:");
     for (i, (sample, contig)) in multi_order.iter().take(10).enumerate() {
-        println!("  {}: {} / {}", i, sample, contig);
+        println!("  {i}: {sample} / {contig}");
     }
 
     println!("\n=== Comparing Orders ===");
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(i) = first_diff {
-        println!("❌ First difference at position {}", i);
+        println!("❌ First difference at position {i}");
         println!("   Pansn: {} / {}", pansn_order[i].0, pansn_order[i].1);
         println!("   Multi: {} / {}", multi_order[i].0, multi_order[i].1);
 

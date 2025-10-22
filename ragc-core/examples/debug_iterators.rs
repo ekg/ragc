@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         pansn_data.insert(key, sequence);
         pansn_count += 1;
     }
-    println!("Pansn iterator produced {} contigs", pansn_count);
+    println!("Pansn iterator produced {pansn_count} contigs");
 
     println!("\n=== Testing MultiFileIterator ===");
     let mut multi_data: HashMap<(String, String), Vec<u8>> = HashMap::new();
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
         multi_data.insert(key, sequence);
         multi_count += 1;
     }
-    println!("Multi iterator produced {} contigs", multi_count);
+    println!("Multi iterator produced {multi_count} contigs");
 
     println!("\n=== Comparing Results ===");
 
@@ -86,8 +86,8 @@ fn main() -> Result<()> {
                     pansn_seq.len(),
                     multi_seq.len()
                 );
-                println!("   Pansn SHA256: {}", pansn_hash);
-                println!("   Multi SHA256: {}", multi_hash);
+                println!("   Pansn SHA256: {pansn_hash}");
+                println!("   Multi SHA256: {multi_hash}");
 
                 if differences <= 3 {
                     // Show first few bytes
@@ -110,7 +110,7 @@ fn main() -> Result<()> {
     if differences == 0 {
         println!("✓ All sequences match!");
     } else {
-        println!("\n❌ Found {} sequences with differences", differences);
+        println!("\n❌ Found {differences} sequences with differences");
     }
 
     Ok(())

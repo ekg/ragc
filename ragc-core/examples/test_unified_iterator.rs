@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use ragc_core::{
-    contig_iterator::{ContigIterator, MultiFileIterator, PansnFileIterator},
+    contig_iterator::{MultiFileIterator, PansnFileIterator},
     StreamingCompressor, StreamingCompressorConfig,
 };
 use std::path::Path;
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     compressor1.add_contigs_with_splitters(iterator1)?;
     compressor1.finalize()?;
 
-    println!("✓ Pansn archive created: {}", output1);
+    println!("✓ Pansn archive created: {output1}");
 
     // Test 2: Multiple files (one per sample#hap)
     println!("\nTest 2: Creating archive from multiple sample files...");
@@ -76,15 +76,15 @@ fn main() -> Result<()> {
     compressor2.add_contigs_with_splitters(iterator2)?;
     compressor2.finalize()?;
 
-    println!("✓ Multi-file archive created: {}", output2);
+    println!("✓ Multi-file archive created: {output2}");
 
     // Compare file sizes
     let size1 = std::fs::metadata(output1)?.len();
     let size2 = std::fs::metadata(output2)?.len();
 
     println!("\n=== Results ===");
-    println!("Pansn archive size:     {} bytes", size1);
-    println!("Multi-file archive size: {} bytes", size2);
+    println!("Pansn archive size:     {size1} bytes");
+    println!("Multi-file archive size: {size2} bytes");
 
     if size1 == size2 {
         println!("\n✓ SUCCESS: Archives are identical in size!");
@@ -92,8 +92,7 @@ fn main() -> Result<()> {
         let diff = (size1 as i64 - size2 as i64).abs();
         let pct = (diff as f64 / size1 as f64) * 100.0;
         println!(
-            "\n⚠ WARNING: Archives differ by {} bytes ({:.2}%)",
-            diff, pct
+            "\n⚠ WARNING: Archives differ by {diff} bytes ({pct:.2}%)"
         );
     }
 

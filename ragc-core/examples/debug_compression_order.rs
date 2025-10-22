@@ -62,8 +62,8 @@ fn main() -> Result<()> {
     let pansn_size = std::fs::metadata(pansn_archive.path())?.len();
     let multi_size = std::fs::metadata(multi_archive.path())?.len();
 
-    println!("Pansn: {} bytes", pansn_size);
-    println!("Multi: {} bytes", multi_size);
+    println!("Pansn: {pansn_size} bytes");
+    println!("Multi: {multi_size} bytes");
 
     if pansn_size == multi_size {
         println!("✓ Sizes match!");

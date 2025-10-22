@@ -16,7 +16,7 @@ fn test_unified_iterator_equivalence() {
     // Skip if test data doesn't exist
     let test_dir = std::path::Path::new("/home/erik/scrapy/yeast10_test");
     if !test_dir.exists() {
-        eprintln!("Skipping test: test data not found at {:?}", test_dir);
+        eprintln!("Skipping test: test data not found at {test_dir:?}");
         return;
     }
 
@@ -93,10 +93,7 @@ fn test_unified_iterator_equivalence() {
 
     assert!(
         size_diff_pct < 1.0,
-        "Archive sizes differ by more than 1%: pansn={} multi={} diff={:.2}%",
-        pansn_size,
-        multi_size,
-        size_diff_pct
+        "Archive sizes differ by more than 1%: pansn={pansn_size} multi={multi_size} diff={size_diff_pct:.2}%"
     );
 
     // Decompress and verify content is identical (order-independent)
@@ -128,37 +125,33 @@ fn test_unified_iterator_equivalence() {
     for (sample_name, pansn_contigs) in &pansn_samples {
         let multi_contigs = multi_samples
             .get(sample_name)
-            .unwrap_or_else(|| panic!("Sample {} missing from multi-file archive", sample_name));
+            .unwrap_or_else(|| panic!("Sample {sample_name} missing from multi-file archive"));
 
         assert_eq!(
             pansn_contigs.len(),
             multi_contigs.len(),
-            "Sample {} has different number of contigs",
-            sample_name
+            "Sample {sample_name} has different number of contigs"
         );
 
         // Compare contigs (order-independent)
         for (contig_name, pansn_seq) in pansn_contigs {
             let multi_seq = multi_contigs.get(contig_name).unwrap_or_else(|| {
                 panic!(
-                    "Contig {} missing from sample {} in multi-file archive",
-                    contig_name, sample_name
+                    "Contig {contig_name} missing from sample {sample_name} in multi-file archive"
                 )
             });
 
             assert_eq!(
                 pansn_seq, multi_seq,
-                "Contig {} in sample {} has different sequence",
-                contig_name, sample_name
+                "Contig {contig_name} in sample {sample_name} has different sequence"
             );
         }
     }
 
     println!("✓ Both iterators produce equivalent archives");
-    println!("  Pansn size: {} bytes", pansn_size);
+    println!("  Pansn size: {pansn_size} bytes");
     println!(
-        "  Multi size: {} bytes ({:.2}% difference)",
-        multi_size, size_diff_pct
+        "  Multi size: {multi_size} bytes ({size_diff_pct:.2}% difference)"
     );
     println!("  Samples: {}", pansn_samples.len());
     println!(
