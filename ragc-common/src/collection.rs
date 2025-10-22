@@ -708,16 +708,17 @@ impl CollectionV3 {
         let pred_raw_length = self.segment_size + self.kmer_length;
 
         // First pass: compute encoded values
+        // IMPORTANT: Update in_group_ids IMMEDIATELY after encoding each segment (matching C++ AGC)
         let mut encoded_segments = Vec::new();
-        let mut in_group_updates = Vec::new();
 
-        for sample in &self.sample_desc[id_from..id_to] {
+        for sample_idx in id_from..id_to {
             let mut sample_encoded = Vec::new();
 
-            for contig in &sample.contigs {
+            for contig_idx in 0..self.sample_desc[sample_idx].contigs.len() {
                 let mut contig_encoded = Vec::new();
 
-                for seg in &contig.segments {
+                for seg_idx in 0..self.sample_desc[sample_idx].contigs[contig_idx].segments.len() {
+                    let seg = &self.sample_desc[sample_idx].contigs[contig_idx].segments[seg_idx];
                     let prev_in_group_id = self.get_in_group_id(seg.group_id as usize);
 
                     let e_group_id = seg.group_id;
@@ -737,8 +738,9 @@ impl CollectionV3 {
 
                     contig_encoded.push((e_group_id, e_in_group_id, e_raw_length, seg.is_rev_comp));
 
+                    // Apply update IMMEDIATELY (matching C++ AGC behavior at collection_v3.cpp:581-582)
                     if seg.in_group_id as i32 > prev_in_group_id && seg.in_group_id > 0 {
-                        in_group_updates.push((seg.group_id as usize, seg.in_group_id as i32));
+                        self.set_in_group_id(seg.group_id as usize, seg.in_group_id as i32);
                     }
                 }
 
@@ -746,11 +748,6 @@ impl CollectionV3 {
             }
 
             encoded_segments.push(sample_encoded);
-        }
-
-        // Apply in_group_id updates
-        for (pos, val) in in_group_updates {
-            self.set_in_group_id(pos, val);
         }
 
         // Second pass: write to output streams
@@ -818,9 +815,8 @@ impl CollectionV3 {
         let mut item_idx = 0;
 
         // Collect all decoded segments first
+        // IMPORTANT: Update in_group_ids IMMEDIATELY after decoding each segment (matching C++ AGC)
         let mut decoded_segments = Vec::new();
-        // Collect in_group_id updates to apply AFTER decoding (like serialize does)
-        let mut in_group_updates = Vec::new();
 
         for contig_seg_counts in &structure {
             let mut sample_segs = Vec::new();
@@ -855,9 +851,9 @@ impl CollectionV3 {
                         c_raw_length,
                     ));
 
-                    // Collect updates instead of applying immediately (like serialize does)
+                    // Apply update IMMEDIATELY (matching C++ AGC behavior at collection_v3.cpp:674-675)
                     if c_in_group_id as i32 > prev_in_group_id && c_in_group_id > 0 {
-                        in_group_updates.push((c_group_id as usize, c_in_group_id as i32));
+                        self.set_in_group_id(c_group_id as usize, c_in_group_id as i32);
                     }
 
                     item_idx += 1;
@@ -867,11 +863,6 @@ impl CollectionV3 {
             }
 
             decoded_segments.push(sample_segs);
-        }
-
-        // Apply in_group_id updates AFTER decoding all segments (matching serialize behavior)
-        for (pos, val) in in_group_updates {
-            self.set_in_group_id(pos, val);
         }
 
         // Second pass: assign to sample_desc

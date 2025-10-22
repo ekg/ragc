@@ -4,6 +4,11 @@
 #![allow(clippy::manual_is_multiple_of)]
 #![allow(clippy::needless_range_loop)]
 
+/// Helper to estimate memory usage of a data structure
+fn estimate_memory_mb<T>(items: &[T]) -> f64 {
+    (items.len() * std::mem::size_of::<T>()) as f64 / (1024.0 * 1024.0)
+}
+
 use crate::{
     contig_iterator::ContigIterator,
     genome_io::GenomeIO,
@@ -286,7 +291,11 @@ impl GroupWriter {
         // Build pack (LZ encoding + concatenation)
         let mut packed_data = Vec::new();
 
-        for seg_info in &self.pending_segments {
+        if config.verbosity > 2 {
+            eprintln!("[PACK] Creating pack for group {} with {} segments", self.group_id, self.pending_segments.len());
+        }
+
+        for (idx, seg_info) in self.pending_segments.iter().enumerate() {
             let contig_data = if use_lz_encoding {
                 let mut lz_diff = LZDiff::new(config.min_match_len);
                 if let Some(ref reference) = self.reference {
@@ -299,8 +308,17 @@ impl GroupWriter {
                 seg_info.data.clone()
             };
 
+            if config.verbosity > 2 {
+                eprintln!("[PACK]   Segment {}: {} bytes ({}:{}), adding separator",
+                    idx, contig_data.len(), seg_info.sample_name, seg_info.contig_name);
+            }
+
             packed_data.extend_from_slice(&contig_data);
             packed_data.push(CONTIG_SEPARATOR);
+        }
+
+        if config.verbosity > 2 {
+            eprintln!("[PACK] Total pack size: {} bytes", packed_data.len());
         }
 
         // Build segment metadata (NO COMPRESSION HERE!)
@@ -1655,6 +1673,17 @@ impl StreamingCompressor {
                 "Phase 1 complete: collected {} segments ({} bases)",
                 total_segments_count, total_bases_count
             );
+
+            // Memory profiling
+            let segment_mem = estimate_memory_mb(&all_segments);
+            eprintln!("[MEMORY] all_segments: {:.2} MB ({} items × {} bytes)",
+                segment_mem, all_segments.len(), std::mem::size_of::<PreparedSegment>());
+
+            // Estimate actual data size
+            let total_data_mb: f64 = all_segments.iter()
+                .map(|s| s.segment.data.len())
+                .sum::<usize>() as f64 / (1024.0 * 1024.0);
+            eprintln!("[MEMORY] Segment data payload: {:.2} MB", total_data_mb);
         }
 
         // ==================================================================
@@ -1678,6 +1707,11 @@ impl StreamingCompressor {
 
         if self.config.verbosity > 0 {
             println!("Phase 2 complete: created {} groups", num_groups);
+
+            // Memory profiling
+            let groups_mem = estimate_memory_mb(&groups_vec);
+            eprintln!("[MEMORY] groups_vec: {:.2} MB ({} groups × {} bytes)",
+                groups_mem, groups_vec.len(), std::mem::size_of::<(SegmentGroupKey, Vec<PreparedSegment>)>());
         }
 
         // ==================================================================
@@ -1806,21 +1840,76 @@ impl StreamingCompressor {
             println!("Phase 4: Writing packs to archive sequentially...");
         }
 
+        // Map logical stream IDs (from Phase 3) → actual archive stream IDs
+        let mut stream_id_map: HashMap<usize, usize> = HashMap::new();
+        let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
+
+        // First pass: Register all streams and build ID mapping
+        for pack in &all_packs {
+            if !stream_id_map.contains_key(&pack.stream_id) {
+                let stream_name = if pack.stream_id >= 10000 {
+                    // Reference stream
+                    let group_id = (pack.stream_id - 10000) as u32;
+                    stream_ref_name(archive_version, group_id)
+                } else {
+                    // Delta stream
+                    stream_delta_name(archive_version, pack.group_id)
+                };
+                let actual_id = self.archive.register_stream(&stream_name);
+                stream_id_map.insert(pack.stream_id, actual_id);
+
+                // Also create group metadata entry for delta streams
+                if pack.stream_id < 10000 {
+                    let group_id = pack.group_id;
+                    let key = SegmentGroupKey {
+                        kmer_front: 0, // We don't have access to the key here, but it's not needed for finalization
+                        kmer_back: 0,
+                    };
+
+                    const NO_RAW_GROUPS: u32 = 16;
+                    let ref_stream_id = if group_id >= NO_RAW_GROUPS {
+                        let ref_name = stream_ref_name(archive_version, group_id);
+                        // Check if ref stream is already registered
+                        let ref_logical = 10000 + group_id as usize;
+                        stream_id_map.get(&ref_logical).copied()
+                    } else {
+                        None
+                    };
+
+                    self.group_metadata.entry(key).or_insert_with(|| GroupMetadata {
+                        group_id,
+                        stream_id: actual_id,
+                        ref_stream_id,
+                        reference: None,
+                        ref_written: false,
+                        segments_written: 0,
+                        pending_segments: Vec::new(),
+                        is_flushed: false,
+                    });
+                }
+            }
+        }
+
+        // Second pass: Write packs and register segments
         let mut packs_written = 0;
         for pack in all_packs {
-            // Register stream for this group
-            let stream_name = format!("group_{}", pack.group_id);
-            let actual_stream_id = self.archive.register_stream(&stream_name);
+            let actual_stream_id = *stream_id_map.get(&pack.stream_id)
+                .expect("Stream ID should be registered");
 
-            // Register segments in collection
+            // Register segments in collection (use logical group_id, not actual_stream_id!)
             for seg_meta in &pack.segments {
+                if self.config.verbosity > 2 {
+                    eprintln!("[DEBUG] Registering segment: sample={}, contig={}, part={}, group_id={}, in_group={}",
+                        seg_meta.sample_name, seg_meta.contig_name, seg_meta.seg_part_no,
+                        pack.group_id, seg_meta.in_group_id);
+                }
                 self.collection
                     .register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
                 self.collection.add_segment_placed(
                     &seg_meta.sample_name,
                     &seg_meta.contig_name,
                     seg_meta.seg_part_no,
-                    pack.group_id,
+                    pack.group_id, // Use logical group_id, collection will compute stream name from this
                     seg_meta.in_group_id,
                     seg_meta.is_rev_comp,
                     seg_meta.data_len,
