@@ -24,3 +24,10 @@ ragc-core = { path = "../ragc-core" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
+
+# Optional: Alternative memory allocators
+tikv-jemallocator = { version = "0.5", optional = true }
+
+[features]
+default = []
+jemalloc = ["tikv-jemallocator"]

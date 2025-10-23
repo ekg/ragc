@@ -1,6 +1,11 @@
 // AGC CLI - Rust implementation
 // Compatible with C++ AGC format
 
+// Use jemalloc if enabled (reduces memory overhead and fragmentation)
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ragc_core::{Decompressor, DecompressorConfig, StreamingCompressor, StreamingCompressorConfig};

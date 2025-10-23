@@ -1015,16 +1015,19 @@ impl StreamingCompressor {
 
         type ContigTask = (String, String, Contig);
 
-        let (contig_tx, contig_rx): (Sender<ContigTask>, Receiver<ContigTask>) = bounded(100);
+        // Reduced buffer sizes from 100 → 10 to lower memory pressure
+        // Each buffered item contains Vec<u8> with segment data (~10KB+)
+        // 100 slots × 3 channels = significant memory overhead
+        let (contig_tx, contig_rx): (Sender<ContigTask>, Receiver<ContigTask>) = bounded(10);
 
         // THREE-STAGE PIPELINE for parallel compression
         let (uncompressed_tx, uncompressed_rx): (
             Sender<UncompressedPack>,
             Receiver<UncompressedPack>,
-        ) = bounded(100);
+        ) = bounded(10);
 
         let (compressed_tx, compressed_rx): (Sender<CompressedPack>, Receiver<CompressedPack>) =
-            bounded(100);
+            bounded(10);
 
         let verbosity = self.config.verbosity;
 
