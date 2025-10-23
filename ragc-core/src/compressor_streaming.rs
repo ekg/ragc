@@ -29,9 +29,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc, RwLock,
 };
+use crossbeam::channel::bounded;
 
 /// Configuration for the streaming compressor
 #[derive(Debug, Clone)]
@@ -1457,8 +1458,8 @@ impl StreamingCompressor {
             // Adaptive mode: must process samples sequentially (each sample may add splitters)
             self.add_fasta_files_sequential_adaptive(fasta_paths, &splitters)?;
         } else {
-            // Non-adaptive mode: use 3-phase parallel architecture (like C++ AGC!)
-            self.add_fasta_files_parallel_non_adaptive(fasta_paths, &splitters)?;
+            // Non-adaptive mode: use streaming architecture for minimal memory usage
+            self.add_fasta_files_streaming(fasta_paths, &splitters)?;
         }
 
         Ok(())
@@ -2009,6 +2010,320 @@ impl StreamingCompressor {
         if self.config.verbosity > 0 {
             println!(
                 "Compression complete!\nTotal bases: {total_bases_count}\nTotal groups: {num_groups}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Streaming architecture: process segments as they're read, write immediately
+    /// This replaces the batch loading approach to reduce memory from 731 MB → ~235 MB
+    fn add_fasta_files_streaming(
+        &mut self,
+        fasta_paths: &[(String, &Path)],
+        splitters: &HashSet<u64>,
+    ) -> Result<()> {
+        if self.config.verbosity > 0 {
+            println!("Starting streaming compression pipeline...");
+        }
+
+        // Create segment streaming channels - one per worker for direct routing
+        let worker_channels: Vec<_> = (0..self.config.num_threads)
+            .map(|_| bounded::<PreparedSegment>(100))
+            .collect();
+        let worker_senders: Vec<_> = worker_channels.iter().map(|(tx, _rx)| tx.clone()).collect();
+        let worker_receivers: Vec<_> = worker_channels.into_iter().map(|(_tx, rx)| rx).collect();
+
+        // ================================================================
+        // SEGMENTATION THREAD: Read FASTAs and stream segments
+        // ================================================================
+        let segmentation_handle = {
+            // Convert &Path to PathBuf for 'static lifetime
+            let fasta_paths: Vec<(String, std::path::PathBuf)> = fasta_paths
+                .iter()
+                .map(|(name, path)| (name.clone(), path.to_path_buf()))
+                .collect();
+            let splitters = splitters.clone();
+            let config = self.config.clone();
+            let worker_senders = worker_senders.clone();
+
+            std::thread::spawn(move || -> Result<(usize, usize)> {
+                let mut total_segments = 0;
+                let mut total_bases = 0;
+
+                for (sample_name, fasta_path) in &fasta_paths {
+                    if config.verbosity > 0 {
+                        println!("  Reading sample: {sample_name} from {fasta_path:?}");
+                    }
+
+                    let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
+                        .context(format!("Failed to open {sample_name}"))?;
+
+                    while let Some((contig_name, sequence)) = reader.read_contig_converted()? {
+                        if sequence.is_empty() {
+                            continue;
+                        }
+
+                        // Split at splitter positions with minimum segment size
+                        let segments = split_at_splitters_with_size(
+                            &sequence,
+                            &splitters,
+                            config.kmer_length as usize,
+                            config.segment_size as usize,
+                        );
+
+                        for (seg_idx, segment) in segments.into_iter().enumerate() {
+                            total_bases += segment.data.len();
+                            total_segments += 1;
+
+                            // CRITICAL: Check for segments < k (will cause C++ AGC errors)
+                            if seg_idx > 0 && segment.data.len() < config.kmer_length as usize {
+                                eprintln!(
+                                    "WARNING: Segment {} of contig {} has size {} < k={} bytes!",
+                                    seg_idx,
+                                    contig_name,
+                                    segment.data.len(),
+                                    config.kmer_length
+                                );
+                                eprintln!("  This will cause 'Corrupted archive!' errors in C++ AGC");
+                            }
+
+                            // Prepare segment info
+                            let seg_info = Self::prepare_segment_info(
+                                &config,
+                                &sample_name,
+                                &contig_name,
+                                seg_idx,
+                                segment.data,
+                                segment.front_kmer,
+                                segment.back_kmer,
+                            )?;
+
+                            // Route to correct worker based on key hash
+                            let key_hash = {
+                                use std::collections::hash_map::DefaultHasher;
+                                use std::hash::{Hash, Hasher};
+                                let mut hasher = DefaultHasher::new();
+                                seg_info.key.hash(&mut hasher);
+                                hasher.finish()
+                            };
+                            let worker_id = (key_hash as usize) % config.num_threads;
+
+                            // Send to specific worker
+                            worker_senders[worker_id]
+                                .send(seg_info)
+                                .context("Failed to send segment to worker")?;
+                        }
+                    }
+                }
+
+                // Signal completion to all workers
+                drop(worker_senders);
+                if config.verbosity > 0 {
+                    println!("Segmentation complete: {total_segments} segments ({total_bases} bases)");
+                }
+                Ok((total_segments, total_bases))
+            })
+        };
+
+        // ================================================================
+        // WRITE CHANNEL: Workers send packs here for immediate writing
+        // Note: Writer runs in main thread because Archive/Collection aren't Send
+        // ================================================================
+        let (write_tx, write_rx) = bounded::<CompressedPack>(10);
+
+        // ================================================================
+        // WORKER THREADS: Process segments by group, send packs to writer
+        // ================================================================
+        let next_group_id = Arc::new(AtomicU32::new(self.next_group_id));
+        let config = self.config.clone();
+
+        let worker_handles: Vec<_> = (0..self.config.num_threads)
+            .map(|worker_id| {
+                let segment_rx = worker_receivers[worker_id].clone();
+                let write_tx = write_tx.clone();
+                let next_group_id = next_group_id.clone();
+                let config = config.clone();
+
+                std::thread::spawn(move || -> Result<()> {
+                    // Each worker maintains its own groups
+                    let mut my_groups: HashMap<SegmentGroupKey, (u32, GroupWriter)> = HashMap::new();
+
+                    while let Ok(prepared_seg) = segment_rx.recv() {
+                        // No filtering needed - routing is done by segmentation thread
+
+                        // Get or create group
+                        let (_group_id, group_writer) = my_groups
+                            .entry(prepared_seg.key.clone())
+                            .or_insert_with(|| {
+                                let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                                let stream_id = gid as usize;
+                                let ref_stream_id = if gid >= 16 {
+                                    Some(10000 + gid as usize)
+                                } else {
+                                    None
+                                };
+                                (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
+                            });
+
+                        // Add segment, may produce pack
+                        if let Some(pack) = group_writer.add_segment(prepared_seg.segment.clone(), &config)? {
+                            match pack {
+                                PackToWrite::Compressed(compressed_pack) => {
+                                    write_tx.send(compressed_pack).context("Failed to send pack to writer")?;
+                                }
+                                PackToWrite::Uncompressed(uncompressed_pack) => {
+                                    // Compress immediately
+                                    let compressed_data = compress_segment_configured(
+                                        &uncompressed_pack.uncompressed_data,
+                                        config.compression_level,
+                                    )?;
+
+                                    let (final_data, uncompressed_size) = if compressed_data.len() + 1
+                                        < uncompressed_pack.uncompressed_data.len()
+                                    {
+                                        let mut data_with_marker = compressed_data;
+                                        data_with_marker.push(0);
+                                        (
+                                            data_with_marker,
+                                            uncompressed_pack.uncompressed_data.len() as u64,
+                                        )
+                                    } else {
+                                        (uncompressed_pack.uncompressed_data, 0)
+                                    };
+
+                                    let compressed_pack = CompressedPack {
+                                        group_id: uncompressed_pack.group_id,
+                                        stream_id: uncompressed_pack.stream_id,
+                                        compressed_data: final_data,
+                                        uncompressed_size,
+                                        segments: uncompressed_pack.segments,
+                                    };
+                                    write_tx.send(compressed_pack).context("Failed to send pack to writer")?;
+                                }
+                            }
+                        }
+                    }
+
+                    // Flush all groups
+                    for (_key, (_gid, mut group_writer)) in my_groups {
+                        if let Some(uncompressed_pack) = group_writer.prepare_pack(&config)? {
+                            // Compress final pack
+                            let compressed_data = compress_segment_configured(
+                                &uncompressed_pack.uncompressed_data,
+                                config.compression_level,
+                            )?;
+
+                            let (final_data, uncompressed_size) = if compressed_data.len() + 1
+                                < uncompressed_pack.uncompressed_data.len()
+                            {
+                                let mut data_with_marker = compressed_data;
+                                data_with_marker.push(0);
+                                (
+                                    data_with_marker,
+                                    uncompressed_pack.uncompressed_data.len() as u64,
+                                )
+                            } else {
+                                (uncompressed_pack.uncompressed_data, 0)
+                            };
+
+                            let compressed_pack = CompressedPack {
+                                group_id: uncompressed_pack.group_id,
+                                stream_id: uncompressed_pack.stream_id,
+                                compressed_data: final_data,
+                                uncompressed_size,
+                                segments: uncompressed_pack.segments,
+                            };
+                            write_tx.send(compressed_pack).context("Failed to send pack to writer")?;
+                        }
+                    }
+
+                    Ok(())
+                })
+            })
+            .collect();
+
+        // Drop write_tx so channel closes when workers are done
+        drop(write_tx);
+
+        // ================================================================
+        // MAIN THREAD WRITING: Receive and write packs as they arrive
+        // ================================================================
+        let mut stream_id_map: HashMap<usize, usize> = HashMap::new();
+        let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
+        let mut packs_written = 0;
+
+        // Write packs as they arrive from workers
+        while let Ok(pack) = write_rx.recv() {
+            // Register stream on-demand
+            let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
+                id
+            } else {
+                let stream_name = if pack.stream_id >= 10000 {
+                    // Reference stream
+                    let group_id = (pack.stream_id - 10000) as u32;
+                    stream_ref_name(archive_version, group_id)
+                } else {
+                    // Delta stream
+                    stream_delta_name(archive_version, pack.group_id)
+                };
+                let id = self.archive.register_stream(&stream_name);
+                stream_id_map.insert(pack.stream_id, id);
+                id
+            };
+
+            // Register segments in collection
+            for seg_meta in &pack.segments {
+                self.collection
+                    .register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
+                self.collection.add_segment_placed(
+                    &seg_meta.sample_name,
+                    &seg_meta.contig_name,
+                    seg_meta.seg_part_no,
+                    pack.group_id,
+                    seg_meta.in_group_id,
+                    seg_meta.is_rev_comp,
+                    seg_meta.data_len,
+                )?;
+            }
+
+            // Write pack data to archive immediately
+            self.archive.add_part(
+                actual_stream_id,
+                &pack.compressed_data,
+                pack.uncompressed_size,
+            )?;
+
+            packs_written += 1;
+            if self.config.verbosity > 1 && packs_written % 100 == 0 {
+                println!("  Written {packs_written} packs...");
+            }
+        }
+
+        if self.config.verbosity > 0 {
+            println!("Writing complete: wrote {packs_written} packs");
+        }
+
+        // Wait for segmentation to complete
+        let (total_segments, total_bases) = segmentation_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Segmentation thread panicked"))??;
+
+        // Wait for all workers
+        for (idx, handle) in worker_handles.into_iter().enumerate() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("Worker thread {} panicked", idx))??;
+        }
+
+        // Update state
+        self.next_group_id = next_group_id.load(Ordering::SeqCst);
+        self.total_segments = total_segments;
+        self.total_bases_processed = total_bases;
+
+        if self.config.verbosity > 0 {
+            println!(
+                "Streaming compression complete!\nTotal bases: {total_bases}\nTotal segments: {total_segments}\nPacks written: {packs_written}"
             );
         }
 
