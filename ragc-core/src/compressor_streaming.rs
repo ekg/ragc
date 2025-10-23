@@ -1458,8 +1458,8 @@ impl StreamingCompressor {
             // Adaptive mode: must process samples sequentially (each sample may add splitters)
             self.add_fasta_files_sequential_adaptive(fasta_paths, &splitters)?;
         } else {
-            // Non-adaptive mode: use streaming architecture for minimal memory usage
-            self.add_fasta_files_streaming(fasta_paths, &splitters)?;
+            // Non-adaptive mode: use batch for profiling
+            self.add_fasta_files_parallel_non_adaptive(fasta_paths, &splitters)?;
         }
 
         Ok(())
@@ -1891,6 +1891,17 @@ impl StreamingCompressor {
                 num_groups,
                 all_packs.len()
             );
+
+            // Memory profiling
+            let packs_mem = estimate_memory_mb(&all_packs);
+            let total_compressed_data: usize = all_packs.iter().map(|p| p.compressed_data.len()).sum();
+            eprintln!(
+                "[MEMORY] all_packs Vec: {:.2} MB ({} packs × {} bytes struct)",
+                packs_mem,
+                all_packs.len(),
+                std::mem::size_of::<CompressedPack>()
+            );
+            eprintln!("[MEMORY] Compressed data payload: {:.2} MB", total_compressed_data as f64 / (1024.0 * 1024.0));
         }
 
         // ==================================================================
@@ -2027,12 +2038,8 @@ impl StreamingCompressor {
             println!("Starting streaming compression pipeline...");
         }
 
-        // Create segment streaming channels - one per worker for direct routing
-        let worker_channels: Vec<_> = (0..self.config.num_threads)
-            .map(|_| bounded::<PreparedSegment>(100))
-            .collect();
-        let worker_senders: Vec<_> = worker_channels.iter().map(|(tx, _rx)| tx.clone()).collect();
-        let worker_receivers: Vec<_> = worker_channels.into_iter().map(|(_tx, rx)| rx).collect();
+        // Create single shared segment channel - workers pull from it
+        let (segment_tx, segment_rx) = bounded::<PreparedSegment>(100);
 
         // ================================================================
         // SEGMENTATION THREAD: Read FASTAs and stream segments
@@ -2045,7 +2052,6 @@ impl StreamingCompressor {
                 .collect();
             let splitters = splitters.clone();
             let config = self.config.clone();
-            let worker_senders = worker_senders.clone();
 
             std::thread::spawn(move || -> Result<(usize, usize)> {
                 let mut total_segments = 0;
@@ -2099,26 +2105,16 @@ impl StreamingCompressor {
                                 segment.back_kmer,
                             )?;
 
-                            // Route to correct worker based on key hash
-                            let key_hash = {
-                                use std::collections::hash_map::DefaultHasher;
-                                use std::hash::{Hash, Hasher};
-                                let mut hasher = DefaultHasher::new();
-                                seg_info.key.hash(&mut hasher);
-                                hasher.finish()
-                            };
-                            let worker_id = (key_hash as usize) % config.num_threads;
-
-                            // Send to specific worker
-                            worker_senders[worker_id]
+                            // Send to shared channel - workers pull as available
+                            segment_tx
                                 .send(seg_info)
-                                .context("Failed to send segment to worker")?;
+                                .context("Failed to send segment")?;
                         }
                     }
                 }
 
-                // Signal completion to all workers
-                drop(worker_senders);
+                // Signal completion to workers
+                drop(segment_tx);
                 if config.verbosity > 0 {
                     println!("Segmentation complete: {total_segments} segments ({total_bases} bases)");
                 }
@@ -2139,18 +2135,21 @@ impl StreamingCompressor {
         let config = self.config.clone();
 
         let worker_handles: Vec<_> = (0..self.config.num_threads)
-            .map(|worker_id| {
-                let segment_rx = worker_receivers[worker_id].clone();
+            .map(|_worker_id| {
+                let segment_rx = segment_rx.clone();
                 let write_tx = write_tx.clone();
                 let next_group_id = next_group_id.clone();
                 let config = config.clone();
 
                 std::thread::spawn(move || -> Result<()> {
-                    // Each worker maintains its own groups
+                    // Each worker maintains its own groups (by key)
                     let mut my_groups: HashMap<SegmentGroupKey, (u32, GroupWriter)> = HashMap::new();
 
+                    let mut segments_processed = 0;
                     while let Ok(prepared_seg) = segment_rx.recv() {
-                        // No filtering needed - routing is done by segmentation thread
+                        segments_processed += 1;
+
+                        // Process segment - work stealing from shared channel
 
                         // Get or create group
                         let (_group_id, group_writer) = my_groups
@@ -2243,8 +2242,9 @@ impl StreamingCompressor {
             })
             .collect();
 
-        // Drop write_tx so channel closes when workers are done
-        drop(write_tx);
+        // Drop local references so channels close properly
+        drop(segment_rx); // Workers have their clones
+        drop(write_tx); // Workers have their clones
 
         // ================================================================
         // MAIN THREAD WRITING: Receive and write packs as they arrive
