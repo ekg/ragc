@@ -2363,6 +2363,11 @@ impl StreamingCompressor {
         // Shared state: groups, archive, collection (like C++ AGC's shared groups with mutex)
         let groups = Arc::new(Mutex::new(HashMap::<SegmentGroupKey, (u32, GroupWriter)>::new()));
         let next_group_id = Arc::new(AtomicU32::new(self.next_group_id));
+        let total_segments_counter = Arc::new(AtomicUsize::new(0));
+
+        // Move archive and collection to Arc<Mutex> so writer thread can access them
+        let archive = Arc::new(Mutex::new(std::mem::replace(&mut self.archive, Archive::new_writer())));
+        let collection = Arc::new(Mutex::new(std::mem::replace(&mut self.collection, CollectionV3::new())));
 
         // ================================================================
         // READER THREAD: Push contigs to bounded queue
@@ -2412,19 +2417,92 @@ impl StreamingCompressor {
         };
 
         // ================================================================
-        // WORKER THREADS: Pull contigs, segment, add to shared groups
+        // WRITER THREAD: Receives packs and writes immediately (no buffering!)
+        // ================================================================
+        let (pack_tx, pack_rx) = bounded::<CompressedPack>(10);  // Small buffer for immediate writes
+
+        let writer_handle = {
+            let archive = archive.clone();
+            let collection = collection.clone();
+            let config = self.config.clone();
+
+            thread::spawn(move || -> Result<usize> {
+                let mut stream_id_map: HashMap<usize, usize> = HashMap::new();
+                let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
+                let mut packs_written = 0;
+
+                while let Ok(pack) = pack_rx.recv() {
+                    // Lock archive and collection for writing
+                    let mut archive_lock = archive.lock()
+                        .map_err(|e| anyhow::anyhow!("Failed to lock archive: {}", e))?;
+                    let mut collection_lock = collection.lock()
+                        .map_err(|e| anyhow::anyhow!("Failed to lock collection: {}", e))?;
+
+                    // Register stream on-demand
+                    let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
+                        id
+                    } else {
+                        let stream_name = if pack.stream_id >= 10000 {
+                            stream_ref_name(archive_version, (pack.stream_id - 10000) as u32)
+                        } else {
+                            stream_delta_name(archive_version, pack.group_id)
+                        };
+                        let id = archive_lock.register_stream(&stream_name);
+                        stream_id_map.insert(pack.stream_id, id);
+                        id
+                    };
+
+                    // Register segments in collection
+                    for seg_meta in &pack.segments {
+                        collection_lock
+                            .register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
+                        collection_lock.add_segment_placed(
+                            &seg_meta.sample_name,
+                            &seg_meta.contig_name,
+                            seg_meta.seg_part_no,
+                            pack.group_id,
+                            seg_meta.in_group_id,
+                            seg_meta.is_rev_comp,
+                            seg_meta.data_len,
+                        )?;
+                    }
+
+                    // Write pack to archive immediately
+                    archive_lock.add_part(
+                        actual_stream_id,
+                        &pack.compressed_data,
+                        pack.uncompressed_size,
+                    )?;
+
+                    packs_written += 1;
+                    if config.verbosity > 1 && packs_written % 100 == 0 {
+                        println!("  Written {} packs...", packs_written);
+                    }
+
+                    // Locks released here automatically
+                }
+
+                if config.verbosity > 0 {
+                    println!("Writer thread complete: wrote {packs_written} packs immediately");
+                }
+                Ok(packs_written)
+            })
+        };
+
+        // ================================================================
+        // WORKER THREADS: Pull contigs, segment, add to shared groups, send packs to writer
         // ================================================================
         let worker_handles: Vec<_> = (0..self.config.num_threads)
             .map(|worker_id| {
                 let contig_rx = contig_rx.clone();
+                let pack_tx = pack_tx.clone();
                 let groups = groups.clone();
                 let next_group_id = next_group_id.clone();
+                let total_segments_counter = total_segments_counter.clone();
                 let splitters = splitters.clone();
                 let config = self.config.clone();
 
-                thread::spawn(move || -> Result<(usize, Vec<CompressedPack>)> {
-                    let mut segments_processed = 0;
-                    let mut packs_to_write = Vec::new();
+                thread::spawn(move || -> Result<()> {
 
                     // Per-thread reused buffers (like C++ AGC's per-thread ZSTD_CCtx)
                     // Currently not using buffer pooling, but this is where it would go
@@ -2439,7 +2517,7 @@ impl StreamingCompressor {
                         );
 
                         for (seg_idx, segment) in segments.into_iter().enumerate() {
-                            segments_processed += 1;
+                            total_segments_counter.fetch_add(1, Ordering::SeqCst);
 
                             // Check for segments < k
                             if seg_idx > 0 && segment.data.len() < config.kmer_length as usize {
@@ -2483,12 +2561,10 @@ impl StreamingCompressor {
                                 group_writer.add_segment(seg_info.segment, &config)?
                             };  // groups_lock released here
 
-                            // Process pack if ready (outside mutex!)
+                            // Process pack if ready (outside mutex!) - send to writer immediately
                             if let Some(pack) = pack_opt {
-                                match pack {
-                                    PackToWrite::Compressed(compressed_pack) => {
-                                        packs_to_write.push(compressed_pack);
-                                    }
+                                let compressed_pack = match pack {
+                                    PackToWrite::Compressed(cp) => cp,
                                     PackToWrite::Uncompressed(uncompressed_pack) => {
                                         // Compress immediately
                                         let compressed_data = compress_segment_configured(
@@ -2509,57 +2585,58 @@ impl StreamingCompressor {
                                             (uncompressed_pack.uncompressed_data, 0)
                                         };
 
-                                        let compressed_pack = CompressedPack {
+                                        CompressedPack {
                                             group_id: uncompressed_pack.group_id,
                                             stream_id: uncompressed_pack.stream_id,
                                             compressed_data: final_data,
                                             uncompressed_size,
                                             segments: uncompressed_pack.segments,
-                                        };
-                                        packs_to_write.push(compressed_pack);
+                                        }
                                     }
-                                }
+                                };
+                                // Send to writer immediately - no buffering!
+                                pack_tx.send(compressed_pack)
+                                    .context("Failed to send pack to writer")?;
                             }
                         }
                     }
 
                     if config.verbosity > 1 {
-                        println!("Worker {worker_id}: processed {segments_processed} segments, produced {} packs", packs_to_write.len());
+                        println!("Worker {worker_id}: completed");
                     }
 
-                    Ok((segments_processed, packs_to_write))
+                    Ok(())
                 })
             })
             .collect();
 
-        // Drop our receiver so workers know when no more contigs coming
+        // Drop contig receiver so workers know when no more contigs coming
         drop(contig_rx);
 
         // ================================================================
-        // WAIT FOR READER AND WORKERS
+        // WAIT FOR WORKERS TO COMPLETE
+        // ================================================================
+        for (idx, handle) in worker_handles.into_iter().enumerate() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("Worker thread {} panicked", idx))??;
+        }
+
+        let total_segments_processed = total_segments_counter.load(Ordering::SeqCst);
+
+        if self.config.verbosity > 0 {
+            println!("All workers complete: {total_segments_processed} segments processed");
+        }
+
+        // ================================================================
+        // WAIT FOR READER
         // ================================================================
         let (total_contigs, total_bases) = reader_handle
             .join()
             .map_err(|_| anyhow::anyhow!("Reader thread panicked"))??;
 
-        let mut all_packs = Vec::new();
-        let mut total_segments_processed = 0;
-
-        for (idx, handle) in worker_handles.into_iter().enumerate() {
-            let (segments, packs) = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("Worker thread {} panicked", idx))??;
-
-            total_segments_processed += segments;
-            all_packs.extend(packs);
-        }
-
-        if self.config.verbosity > 0 {
-            println!("All workers complete: {total_segments_processed} segments processed, {} packs", all_packs.len());
-        }
-
         // ================================================================
-        // FLUSH REMAINING GROUPS
+        // FLUSH REMAINING GROUPS - Send to writer thread
         // ================================================================
         // Take ownership of the groups HashMap
         let groups_map = Arc::try_unwrap(groups)
@@ -2567,6 +2644,7 @@ impl StreamingCompressor {
             .into_inner()
             .map_err(|e| anyhow::anyhow!("Failed to get groups mutex: {}", e))?;
 
+        let mut flush_packs_count = 0;
         for (_key, (_gid, mut group_writer)) in groups_map {
             if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
                 // Compress final pack
@@ -2595,71 +2673,46 @@ impl StreamingCompressor {
                     uncompressed_size,
                     segments: uncompressed_pack.segments,
                 };
-                all_packs.push(compressed_pack);
+
+                // Send flush pack to writer thread
+                pack_tx.send(compressed_pack)
+                    .context("Failed to send flush pack to writer")?;
+                flush_packs_count += 1;
             }
         }
 
         if self.config.verbosity > 0 {
-            println!("After flush: {} total packs to write", all_packs.len());
+            println!("Flush complete: sent {flush_packs_count} final packs to writer");
         }
 
+        // Drop pack_tx so writer thread knows there are no more packs
+        drop(pack_tx);
+
         // ================================================================
-        // WRITE ALL PACKS TO ARCHIVE
+        // WAIT FOR WRITER THREAD TO COMPLETE
         // ================================================================
-        let mut stream_id_map: HashMap<usize, usize> = HashMap::new();
-        let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
-        let mut packs_written = 0;
-
-        for pack in &all_packs {
-            // Register stream on-demand
-            let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
-                id
-            } else {
-                let stream_name = if pack.stream_id >= 10000 {
-                    stream_ref_name(archive_version, (pack.stream_id - 10000) as u32)
-                } else {
-                    stream_delta_name(archive_version, pack.group_id)
-                };
-                let id = self.archive.register_stream(&stream_name);
-                stream_id_map.insert(pack.stream_id, id);
-                id
-            };
-
-            // Register segments in collection
-            for seg_meta in &pack.segments {
-                // Ensure contig is registered (idempotent)
-                self.collection
-                    .register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
-
-                // Register the segment
-                self.collection.add_segment_placed(
-                    &seg_meta.sample_name,
-                    &seg_meta.contig_name,
-                    seg_meta.seg_part_no,
-                    pack.group_id,
-                    seg_meta.in_group_id,
-                    seg_meta.is_rev_comp,
-                    seg_meta.data_len,
-                )?;
-            }
-
-            // Write pack to archive
-            self.archive.add_part(
-                actual_stream_id,
-                &pack.compressed_data,
-                pack.uncompressed_size,
-            )?;
-
-            packs_written += 1;
-        }
+        let packs_written = writer_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
 
         if self.config.verbosity > 0 {
-            println!("Write complete: {packs_written} packs written");
+            println!("Writer thread complete: {packs_written} total packs written");
         }
 
         // ================================================================
         // UPDATE STATE
         // ================================================================
+        // Restore archive and collection from Arc<Mutex>
+        self.archive = Arc::try_unwrap(archive)
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap archive Arc"))?
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("Failed to get archive mutex: {}", e))?;
+
+        self.collection = Arc::try_unwrap(collection)
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap collection Arc"))?
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("Failed to get collection mutex: {}", e))?;
+
         self.next_group_id = next_group_id.load(Ordering::SeqCst);
         self.total_segments = total_segments_processed;
         self.total_bases_processed = total_bases;
