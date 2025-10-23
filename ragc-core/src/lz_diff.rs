@@ -47,6 +47,15 @@ impl LZDiff {
         // Add padding for key_len
         self.reference
             .resize(self.reference.len() + self.key_len as usize, 31);
+
+        // Pre-allocate hash table capacity based on reference length
+        // to avoid repeated rehashing (major source of page faults!)
+        // Each entry in ht corresponds to one k-mer position (every HASHING_STEP bases)
+        let expected_entries = (self.reference.len() / HASHING_STEP) + 1;
+        if self.ht.capacity() < expected_entries {
+            self.ht = HashMap::with_capacity(expected_entries);
+        }
+
         self.build_index();
     }
 

@@ -309,15 +309,22 @@ impl GroupWriter {
             );
         }
 
+        // CRITICAL FIX: Reuse ONE LZDiff instance for all segments in this pack!
+        // Creating a new LZDiff per segment causes massive allocations (116 GB for yeast235)
+        // because each prepare() clones reference and rebuilds the entire HashMap
+        let mut lz_diff = if use_lz_encoding {
+            let mut lzd = LZDiff::new(config.min_match_len);
+            if let Some(ref reference) = self.reference {
+                lzd.prepare(reference);
+            }
+            Some(lzd)
+        } else {
+            None
+        };
+
         for (idx, seg_info) in self.pending_segments.iter().enumerate() {
-            let contig_data = if use_lz_encoding {
-                let mut lz_diff = LZDiff::new(config.min_match_len);
-                if let Some(ref reference) = self.reference {
-                    lz_diff.prepare(reference);
-                    lz_diff.encode(&seg_info.data)
-                } else {
-                    seg_info.data.clone()
-                }
+            let contig_data = if let Some(ref mut lzd) = lz_diff {
+                lzd.encode(&seg_info.data)
             } else {
                 seg_info.data.clone()
             };
