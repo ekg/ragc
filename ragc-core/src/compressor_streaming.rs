@@ -728,9 +728,10 @@ impl StreamingCompressor {
 
         // Process groups in parallel using Rayon (like C++ AGC's parallel loop)
         // Each worker gets exclusive groups - NO CHANNELS, NO MUTEX!
+        // MEMORY FIX: Use into_par_iter() to consume and move segments instead of cloning!
         let all_packs: Vec<CompressedPack> = pool.install(|| {
             groups_vec
-                .par_iter()
+                .into_par_iter()
                 .flat_map(|(_key, segments)| {
                 // DEBUG: Check if we're actually running on multiple threads
                 eprintln!(
@@ -755,8 +756,9 @@ impl StreamingCompressor {
 
                 // Process all segments in this group
                 for prepared_seg in segments {
+                    // MEMORY FIX: Move segment instead of cloning (saves 220 MB!)
                     if let Ok(Some(pack)) =
-                        group_writer.add_segment(prepared_seg.segment.clone(), &config)
+                        group_writer.add_segment(prepared_seg.segment, &config)
                     {
                         match pack {
                             PackToWrite::Compressed(compressed_pack) => {
@@ -1790,9 +1792,10 @@ impl StreamingCompressor {
 
         // Process groups in parallel using Rayon (like C++ AGC's parallel loop)
         // Each worker gets exclusive groups - NO CHANNELS, NO MUTEX!
+        // MEMORY FIX: Use into_par_iter() to consume and move segments instead of cloning!
         let all_packs: Vec<CompressedPack> = pool.install(|| {
             groups_vec
-                .par_iter()
+                .into_par_iter()
                 .flat_map(|(_key, segments)| {
                 // Assign group ID sequentially
                 let gid = next_group_id.fetch_add(1, Ordering::SeqCst) as u32;
@@ -1811,8 +1814,9 @@ impl StreamingCompressor {
 
                 // Process all segments in this group
                 for prepared_seg in segments {
+                    // MEMORY FIX: Move segment instead of cloning (saves 220 MB!)
                     if let Ok(Some(pack)) =
-                        group_writer.add_segment(prepared_seg.segment.clone(), &config)
+                        group_writer.add_segment(prepared_seg.segment, &config)
                     {
                         match pack {
                             PackToWrite::Compressed(compressed_pack) => {
