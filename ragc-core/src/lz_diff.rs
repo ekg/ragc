@@ -60,9 +60,10 @@ impl LZDiff {
             if let Some(code) = self.get_code(&self.reference[i..]) {
                 let hash = MurMur64Hash::hash(code);
                 // Store i / HASHING_STEP (like C++ implementation)
+                // Pre-allocate capacity to avoid repeated 0→4→8→16 growths
                 self.ht
                     .entry(hash)
-                    .or_default()
+                    .or_insert_with(|| Vec::with_capacity(4))
                     .push((i / HASHING_STEP) as u32);
             }
             i += HASHING_STEP;
@@ -142,15 +143,15 @@ impl LZDiff {
             x = -x;
         }
 
-        let mut digits = Vec::new();
+        // Write digits directly to output (in reverse), then reverse just that portion
+        let start_pos = text.len();
         while x > 0 {
-            digits.push(b'0' + (x % 10) as u8);
+            text.push(b'0' + (x % 10) as u8);
             x /= 10;
         }
 
-        // Reverse to get correct order
-        digits.reverse();
-        text.extend(digits);
+        // Reverse just the digits we added
+        text[start_pos..].reverse();
     }
 
     /// Find best match in reference for the given position
@@ -224,7 +225,9 @@ impl LZDiff {
 
     /// Encode target sequence relative to reference
     pub fn encode(&mut self, target: &Contig) -> Vec<u8> {
-        let mut encoded = Vec::new();
+        // Pre-allocate capacity to avoid repeated reallocations
+        // Typical LZ compression achieves 2-4:1, so estimate capacity as target_len / 2
+        let mut encoded = Vec::with_capacity(target.len() / 2);
 
         // Optimization: if target equals reference, return empty
         if target.len() == self.reference.len() - (self.key_len as usize)
