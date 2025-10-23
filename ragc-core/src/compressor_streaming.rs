@@ -2361,7 +2361,8 @@ impl StreamingCompressor {
         let (contig_tx, contig_rx) = bounded::<ContigTask>(queue_capacity);
 
         // Shared state: groups, archive, collection (like C++ AGC's shared groups with mutex)
-        let groups = Arc::new(Mutex::new(HashMap::<SegmentGroupKey, (u32, GroupWriter)>::new()));
+        // Using DashMap for concurrent access (per-shard locking like C++ AGC's per-segment mutexes)
+        let groups = Arc::new(DashMap::<SegmentGroupKey, (u32, GroupWriter)>::new());
         let next_group_id = Arc::new(AtomicU32::new(self.next_group_id));
         let total_segments_counter = Arc::new(AtomicUsize::new(0));
 
@@ -2539,13 +2540,9 @@ impl StreamingCompressor {
                                 segment.back_kmer,
                             )?;
 
-                            // Lock shared groups, add segment, get pack if ready
+                            // Access shared groups with DashMap (per-shard locking, not global!)
                             let pack_opt = {
-                                let mut groups_lock = groups.lock()
-                                    .map_err(|e| anyhow::anyhow!("Failed to lock groups: {}", e))?;
-
-                                let (_group_id, group_writer) = groups_lock
-                                    .entry(seg_info.key.clone())
+                                let mut group_entry = groups.entry(seg_info.key.clone())
                                     .or_insert_with(|| {
                                         let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
                                         let stream_id = gid as usize;
@@ -2557,9 +2554,9 @@ impl StreamingCompressor {
                                         (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
                                     });
 
-                                // Add segment, may produce pack
-                                group_writer.add_segment(seg_info.segment, &config)?
-                            };  // groups_lock released here
+                                // Add segment, may produce pack (only this entry is locked!)
+                                group_entry.1.add_segment(seg_info.segment, &config)?
+                            };  // Entry lock released here
 
                             // Process pack if ready (outside mutex!) - send to writer immediately
                             if let Some(pack) = pack_opt {
@@ -2639,13 +2636,12 @@ impl StreamingCompressor {
         // FLUSH REMAINING GROUPS - Send to writer thread
         // ================================================================
         // Take ownership of the groups HashMap
+        // Take ownership of DashMap (no need for into_inner() - DashMap isn't wrapped in Mutex)
         let groups_map = Arc::try_unwrap(groups)
-            .map_err(|_| anyhow::anyhow!("Failed to unwrap Arc for groups"))?
-            .into_inner()
-            .map_err(|e| anyhow::anyhow!("Failed to get groups mutex: {}", e))?;
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap Arc for groups"))?;
 
         let mut flush_packs_count = 0;
-        for (_key, (_gid, mut group_writer)) in groups_map {
+        for (_key, (_gid, mut group_writer)) in groups_map.into_iter() {
             if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
                 // Compress final pack
                 let compressed_data = compress_segment_configured(
