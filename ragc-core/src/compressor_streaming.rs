@@ -691,10 +691,7 @@ impl StreamingCompressor {
 
         let mut groups: HashMap<SegmentGroupKey, Vec<PreparedSegment>> = HashMap::new();
         for segment in all_segments {
-            groups
-                .entry(segment.key.clone())
-                .or_default()
-                .push(segment);
+            groups.entry(segment.key.clone()).or_default().push(segment);
         }
 
         let num_groups = groups.len();
@@ -1736,10 +1733,7 @@ impl StreamingCompressor {
 
         let mut groups: HashMap<SegmentGroupKey, Vec<PreparedSegment>> = HashMap::new();
         for segment in all_segments {
-            groups
-                .entry(segment.key.clone())
-                .or_default()
-                .push(segment);
+            groups.entry(segment.key.clone()).or_default().push(segment);
         }
 
         let num_groups = groups.len();
@@ -1890,7 +1884,9 @@ impl StreamingCompressor {
 
         // First pass: Register all streams and build ID mapping
         for pack in &all_packs {
-            if let std::collections::hash_map::Entry::Vacant(e) = stream_id_map.entry(pack.stream_id) {
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                stream_id_map.entry(pack.stream_id)
+            {
                 let stream_name = if pack.stream_id >= 10000 {
                     // Reference stream
                     let group_id = (pack.stream_id - 10000) as u32;
@@ -2606,19 +2602,13 @@ impl StreamingCompressor {
         // Use NORMALIZED k-mers (matching C++ lines 1018-1025 which use pk.first/pk.second)
         if is_new_group && key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
             // Add back to front's terminator vector and sort
-            let vec = self
-                .group_terminators
-                .entry(key.kmer_front)
-                .or_default();
+            let vec = self.group_terminators.entry(key.kmer_front).or_default();
             vec.push(key.kmer_back);
             vec.sort_unstable();
 
             // Add front to back's terminator vector and sort (if different)
             if key.kmer_front != key.kmer_back {
-                let vec = self
-                    .group_terminators
-                    .entry(key.kmer_back)
-                    .or_default();
+                let vec = self.group_terminators.entry(key.kmer_back).or_default();
                 vec.push(key.kmer_front);
                 vec.sort_unstable();
             }

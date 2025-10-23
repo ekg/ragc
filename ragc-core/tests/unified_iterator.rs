@@ -150,9 +150,7 @@ fn test_unified_iterator_equivalence() {
 
     println!("✓ Both iterators produce equivalent archives");
     println!("  Pansn size: {pansn_size} bytes");
-    println!(
-        "  Multi size: {multi_size} bytes ({size_diff_pct:.2}% difference)"
-    );
+    println!("  Multi size: {multi_size} bytes ({size_diff_pct:.2}% difference)");
     println!("  Samples: {}", pansn_samples.len());
     println!(
         "  Total contigs: {}",

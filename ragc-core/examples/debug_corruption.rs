@@ -11,9 +11,7 @@ use tempfile::NamedTempFile;
 fn validate_bases(data: &[u8], label: &str) -> bool {
     for (i, &base) in data.iter().enumerate() {
         if base > 3 {
-            println!(
-                "❌ {label} Invalid base at position {i}: {base} (0x{base:02X})"
-            );
+            println!("❌ {label} Invalid base at position {i}: {base} (0x{base:02X})");
             // Show context
             let start = i.saturating_sub(10);
             let end = (i + 10).min(data.len());

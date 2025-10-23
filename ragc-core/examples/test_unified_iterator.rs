@@ -91,9 +91,7 @@ fn main() -> Result<()> {
     } else {
         let diff = (size1 as i64 - size2 as i64).abs();
         let pct = (diff as f64 / size1 as f64) * 100.0;
-        println!(
-            "\n⚠ WARNING: Archives differ by {diff} bytes ({pct:.2}%)"
-        );
+        println!("\n⚠ WARNING: Archives differ by {diff} bytes ({pct:.2}%)");
     }
 
     Ok(())
