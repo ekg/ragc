@@ -24,7 +24,7 @@ thread_local! {
     ///
     /// Note: We store (Compressor, level) to detect level changes.
     /// In practice, compression level rarely changes within a thread.
-    static ZSTD_ENCODER: RefCell<Option<(zstd::bulk::Compressor<'static>, i32)>> = RefCell::new(None);
+    static ZSTD_ENCODER: RefCell<Option<(zstd::bulk::Compressor<'static>, i32)>> = const { RefCell::new(None) };
 }
 
 /// Compress a segment using thread-local ZSTD context (MATCHING C++ AGC)
@@ -49,7 +49,7 @@ pub fn compress_segment_pooled(data: &Contig, level: i32) -> Result<PackedBlock>
             _ => {
                 // Create new encoder for this level
                 let new_encoder = zstd::bulk::Compressor::new(level)
-                    .map_err(|e| anyhow::anyhow!("Failed to create ZSTD encoder: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to create ZSTD encoder: {e}"))?;
                 *encoder_opt = Some((new_encoder, level));
                 &mut encoder_opt.as_mut().unwrap().0
             }
@@ -59,7 +59,7 @@ pub fn compress_segment_pooled(data: &Contig, level: i32) -> Result<PackedBlock>
         // and returns owned Vec (no clone needed!)
         encoder
             .compress(data.as_slice())
-            .map_err(|e| anyhow::anyhow!("ZSTD compression failed: {}", e))
+            .map_err(|e| anyhow::anyhow!("ZSTD compression failed: {e}"))
     })
 }
 
@@ -75,7 +75,7 @@ pub fn decompress_segment_pooled(compressed: &PackedBlock) -> Result<Contig> {
     // For now, use the existing decode_all
     // Decompression contexts are smaller and less critical to pool
     zstd::decode_all(compressed.as_slice())
-        .map_err(|e| anyhow::anyhow!("Failed to decompress segment with ZSTD: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to decompress segment with ZSTD: {e}"))
 }
 
 #[cfg(test)]

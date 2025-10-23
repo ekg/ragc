@@ -5,6 +5,7 @@
 #![allow(clippy::needless_range_loop)]
 
 /// Helper to estimate memory usage of a data structure
+#[allow(dead_code)]
 fn estimate_memory_mb<T>(items: &[T]) -> f64 {
     std::mem::size_of_val(items) as f64 / (1024.0 * 1024.0)
 }
@@ -1660,6 +1661,7 @@ impl StreamingCompressor {
     }
 
     /// Parallel non-adaptive mode processing (3-phase architecture matching C++ AGC!)
+    #[allow(dead_code)]
     fn add_fasta_files_parallel_non_adaptive(
         &mut self,
         fasta_paths: &[(String, &Path)],
@@ -2055,6 +2057,7 @@ impl StreamingCompressor {
 
     /// Streaming architecture: process segments as they're read, write immediately
     /// This replaces the batch loading approach to reduce memory from 731 MB → ~235 MB
+    #[allow(dead_code)]
     fn add_fasta_files_streaming(
         &mut self,
         fasta_paths: &[(String, &Path)],
@@ -2125,7 +2128,7 @@ impl StreamingCompressor {
                             // Prepare segment info
                             let seg_info = Self::prepare_segment_info(
                                 &config,
-                                &sample_name,
+                                sample_name,
                                 &contig_name,
                                 seg_idx,
                                 segment.data,
@@ -2176,9 +2179,9 @@ impl StreamingCompressor {
                     let mut my_groups: HashMap<SegmentGroupKey, (u32, GroupWriter)> =
                         HashMap::new();
 
-                    let mut segments_processed = 0;
+                    let mut _segments_processed = 0;
                     while let Ok(prepared_seg) = segment_rx.recv() {
-                        segments_processed += 1;
+                        _segments_processed += 1;
 
                         // Process segment - work stealing from shared channel
 
@@ -2353,7 +2356,7 @@ impl StreamingCompressor {
         for (idx, handle) in worker_handles.into_iter().enumerate() {
             handle
                 .join()
-                .map_err(|_| anyhow::anyhow!("Worker thread {} panicked", idx))??;
+                .map_err(|_| anyhow::anyhow!("Worker thread {idx} panicked"))??;
         }
 
         // Update state
@@ -2471,10 +2474,10 @@ impl StreamingCompressor {
                     // Lock archive and collection for writing
                     let mut archive_lock = archive
                         .lock()
-                        .map_err(|e| anyhow::anyhow!("Failed to lock archive: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Failed to lock archive: {e}"))?;
                     let mut collection_lock = collection
                         .lock()
-                        .map_err(|e| anyhow::anyhow!("Failed to lock collection: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Failed to lock collection: {e}"))?;
 
                     // Register stream on-demand
                     let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
@@ -2514,7 +2517,7 @@ impl StreamingCompressor {
 
                     packs_written += 1;
                     if config.verbosity > 1 && packs_written % 100 == 0 {
-                        println!("  Written {} packs...", packs_written);
+                        println!("  Written {packs_written} packs...");
                     }
 
                     // Locks released here automatically
@@ -2657,7 +2660,7 @@ impl StreamingCompressor {
         for (idx, handle) in worker_handles.into_iter().enumerate() {
             handle
                 .join()
-                .map_err(|_| anyhow::anyhow!("Worker thread {} panicked", idx))??;
+                .map_err(|_| anyhow::anyhow!("Worker thread {idx} panicked"))??;
         }
 
         let total_segments_processed = total_segments_counter.load(Ordering::SeqCst);
@@ -2743,12 +2746,12 @@ impl StreamingCompressor {
         self.archive = Arc::try_unwrap(archive)
             .map_err(|_| anyhow::anyhow!("Failed to unwrap archive Arc"))?
             .into_inner()
-            .map_err(|e| anyhow::anyhow!("Failed to get archive mutex: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to get archive mutex: {e}"))?;
 
         self.collection = Arc::try_unwrap(collection)
             .map_err(|_| anyhow::anyhow!("Failed to unwrap collection Arc"))?
             .into_inner()
-            .map_err(|e| anyhow::anyhow!("Failed to get collection mutex: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to get collection mutex: {e}"))?;
 
         self.next_group_id = next_group_id.load(Ordering::SeqCst);
         self.total_segments = total_segments_processed;
