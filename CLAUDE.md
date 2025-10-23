@@ -65,14 +65,23 @@
 - **Memory gap**: Now 731 MB vs C++ AGC 205 MB = 3.6x (was 4.8x)
 - **Key insight**: Proper thread control essential for memory management
 
-**Recommended Next Steps**:
+**Current Status (After Task 3)**:
+- Memory: 731 MB (vs C++ AGC 205 MB = **3.6x gap**)
+- Performance: 22s (vs C++ AGC 3s = **7.3x gap**)
 
-1. ✅ Task 1: Test thread performance - DONE
-2. ⚠️ Task 2: "Remove Channel 2" - Not applicable to active code paths
-3. 🔍 **NEW PRIORITY**: Investigate why performance is 20s not 14s (Rayon threading?)
-4. **Stream FASTA reading** - Eliminate all-in-memory loading
-5. **Eliminate .collect() buffering** - Write packs as produced (complex with Rayon)
-6. **Vec buffer pooling** - Reuse buffers for LZ/compression output
+⚠️ **Task 4 Investigation: FASTA Streaming**
+- Found: Phase 1 collects ALL segments in Vec<PreparedSegment> (line 1655)
+- For yeast10: ~12K segments × (data + metadata) held in memory
+- **Challenge**: Phase 2 groups by k-mer keys → needs all segments available
+- **Complexity**: Major architectural refactor required (multi-pass or disk temp storage)
+- **Decision**: Defer this optimization, focus on simpler wins first
+
+**Next Priorities**:
+
+1. ✅ Tasks 1-3: Threading optimizations - 36% memory reduction achieved!
+2. ⚠️ Task 4: FASTA streaming - Deferred (major refactor)
+3. **NEXT**: Vec buffer pooling for LZ encoding (simpler, measurable impact)
+4. **Then**: Profile remaining hotspots with updated baseline
 
 ---
 
