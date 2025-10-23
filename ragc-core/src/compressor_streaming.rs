@@ -718,11 +718,19 @@ impl StreamingCompressor {
         // Clone config so we don't borrow self in the parallel closure!
         let config = self.config.clone();
 
+        // Configure Rayon thread pool to respect num_threads setting
+        // CRITICAL: Default par_iter() uses ALL cores, ignoring our config!
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.num_threads)
+            .build()
+            .expect("Failed to build thread pool");
+
         // Process groups in parallel using Rayon (like C++ AGC's parallel loop)
         // Each worker gets exclusive groups - NO CHANNELS, NO MUTEX!
-        let all_packs: Vec<CompressedPack> = groups_vec
-            .par_iter()
-            .flat_map(|(_key, segments)| {
+        let all_packs: Vec<CompressedPack> = pool.install(|| {
+            groups_vec
+                .par_iter()
+                .flat_map(|(_key, segments)| {
                 // DEBUG: Check if we're actually running on multiple threads
                 eprintln!(
                     "Thread {:?} processing a group",
@@ -816,8 +824,9 @@ impl StreamingCompressor {
                 }
 
                 packs
-            })
-            .collect();
+                })
+                .collect()
+        });
 
         if self.config.verbosity > 0 {
             println!(
@@ -1771,11 +1780,19 @@ impl StreamingCompressor {
         // Clone config so we don't borrow self in the parallel closure!
         let config = self.config.clone();
 
+        // Configure Rayon thread pool to respect num_threads setting
+        // CRITICAL: Default par_iter() uses ALL cores, ignoring our config!
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.num_threads)
+            .build()
+            .expect("Failed to build thread pool");
+
         // Process groups in parallel using Rayon (like C++ AGC's parallel loop)
         // Each worker gets exclusive groups - NO CHANNELS, NO MUTEX!
-        let all_packs: Vec<CompressedPack> = groups_vec
-            .par_iter()
-            .flat_map(|(_key, segments)| {
+        let all_packs: Vec<CompressedPack> = pool.install(|| {
+            groups_vec
+                .par_iter()
+                .flat_map(|(_key, segments)| {
                 // Assign group ID sequentially
                 let gid = next_group_id.fetch_add(1, Ordering::SeqCst) as u32;
                 let stream_id = gid as usize;
@@ -1863,8 +1880,9 @@ impl StreamingCompressor {
                 }
 
                 packs
-            })
-            .collect();
+                })
+                .collect()
+        });
 
         if self.config.verbosity > 0 {
             println!(
@@ -2907,14 +2925,20 @@ impl StreamingCompressor {
         }
 
         // Step 2: Compress all packs in parallel
-        let compressed_packs: Vec<(Vec<SegmentInfo>, Vec<u8>, Vec<u8>)> = packs
-            .par_iter()
-            .map(|(seg_infos, packed_data)| {
-                let compressed = compress_segment_configured(packed_data, compression_level)
-                    .expect("Compression failed");
-                (seg_infos.clone(), packed_data.clone(), compressed)
-            })
-            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.num_threads)
+            .build()
+            .expect("Failed to build thread pool");
+        let compressed_packs: Vec<(Vec<SegmentInfo>, Vec<u8>, Vec<u8>)> = pool.install(|| {
+            packs
+                .par_iter()
+                .map(|(seg_infos, packed_data)| {
+                    let compressed = compress_segment_configured(packed_data, compression_level)
+                        .expect("Compression failed");
+                    (seg_infos.clone(), packed_data.clone(), compressed)
+                })
+                .collect()
+        });
 
         // Step 3: Write compressed packs and register segments sequentially
         for (pack_segments, packed_data, compressed) in compressed_packs {
@@ -3059,14 +3083,20 @@ impl StreamingCompressor {
         }
 
         // Step 2: Compress all packs in parallel
-        let compressed_packs: Vec<(Vec<SegmentInfo>, Vec<u8>, Vec<u8>)> = packs
-            .par_iter()
-            .map(|(seg_infos, packed_data)| {
-                let compressed = compress_segment_configured(packed_data, compression_level)
-                    .expect("Compression failed");
-                (seg_infos.clone(), packed_data.clone(), compressed)
-            })
-            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.num_threads)
+            .build()
+            .expect("Failed to build thread pool");
+        let compressed_packs: Vec<(Vec<SegmentInfo>, Vec<u8>, Vec<u8>)> = pool.install(|| {
+            packs
+                .par_iter()
+                .map(|(seg_infos, packed_data)| {
+                    let compressed = compress_segment_configured(packed_data, compression_level)
+                        .expect("Compression failed");
+                    (seg_infos.clone(), packed_data.clone(), compressed)
+                })
+                .collect()
+        });
 
         // Step 3: Write compressed packs and register segments sequentially
         for (pack_segments, packed_data, compressed) in compressed_packs {

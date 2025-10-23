@@ -55,11 +55,15 @@
 - Testing shows actual performance: ~20s wall time, ~1140 MB memory
 - **Conclusion**: UncompressedPack optimization had minimal impact (~2% faster)
 
-**CRITICAL INSIGHT: Performance Gap Mystery**
-- Current measurement: 20s vs C++ AGC 3s = **6.7x gap**
-- Rayon par_iter() may not respect num_threads=1 setting
-- The 14.33s "single-thread" result may have been using different code path
-- **Next step**: Need to understand actual parallelism behavior and identify real bottleneck
+✅ **Task 3 Complete: Fixed Rayon Threading**
+- **ROOT CAUSE FOUND**: Rayon's par_iter() was ignoring num_threads config!
+- Default par_iter() uses ALL CPU cores regardless of config setting
+- **Fix**: Added ThreadPoolBuilder.num_threads() to all par_iter() call sites
+- **Results with fix**:
+  - 1 thread: 485 MB, 63.7s (-57.5% memory vs 1140 MB baseline!)
+  - 6 threads: 731 MB, 22.1s (-36% memory, comparable speed)
+- **Memory gap**: Now 731 MB vs C++ AGC 205 MB = 3.6x (was 4.8x)
+- **Key insight**: Proper thread control essential for memory management
 
 **Recommended Next Steps**:
 
