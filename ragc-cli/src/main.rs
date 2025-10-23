@@ -56,6 +56,11 @@ enum Commands {
         /// (matches C++ AGC -a flag for pangenome-aware compression)
         #[arg(short = 'a', long)]
         adaptive: bool,
+
+        /// Number of threads for parallel compression (default: auto-detect)
+        /// Set to 1 for single-threaded compression
+        #[arg(short = 't', long)]
+        threads: Option<usize>,
     },
 
     /// Display information about an AGC archive
@@ -152,6 +157,7 @@ fn main() -> Result<()> {
             compression_level,
             verbosity,
             adaptive,
+            threads,
         } => create_archive(
             output,
             inputs,
@@ -161,6 +167,7 @@ fn main() -> Result<()> {
             compression_level,
             verbosity,
             adaptive,
+            threads,
         )?,
 
         Commands::Info { archive } => {
@@ -197,7 +204,14 @@ fn create_archive(
     compression_level: i32,
     verbosity: u32,
     adaptive: bool,
+    threads: Option<usize>,
 ) -> Result<()> {
+    // Determine thread count (use provided or auto-detect)
+    let num_threads = threads.unwrap_or_else(|| {
+        let num_cpus = num_cpus::get();
+        if num_cpus < 8 { num_cpus } else { num_cpus - 1 }
+    });
+
     if verbosity > 0 {
         eprintln!("Creating AGC archive: {output:?}");
         eprintln!("Input files: {} FASTA file(s)", inputs.len());
@@ -206,13 +220,14 @@ fn create_archive(
         eprintln!("  segment size: {segment_size}");
         eprintln!("  min match length: {min_match_len}");
         eprintln!("  compression level: {compression_level}");
+        eprintln!("  threads: {num_threads}");
         if adaptive {
             eprintln!("  adaptive mode: enabled (pangenome-aware splitters)");
         }
         eprintln!();
     }
 
-    // Use default config (which auto-detects num_threads) and override CLI params
+    // Use default config and override CLI params (including threads)
     let config = StreamingCompressorConfig {
         kmer_length,
         segment_size,
@@ -220,6 +235,7 @@ fn create_archive(
         compression_level,
         verbosity,
         adaptive_mode: adaptive,
+        num_threads,
         ..StreamingCompressorConfig::default()
     };
 
