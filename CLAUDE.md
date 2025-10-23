@@ -69,19 +69,50 @@
 - Memory: 731 MB (vs C++ AGC 205 MB = **3.6x gap**)
 - Performance: 22s (vs C++ AGC 3s = **7.3x gap**)
 
-⚠️ **Task 4 Investigation: FASTA Streaming**
-- Found: Phase 1 collects ALL segments in Vec<PreparedSegment> (line 1655)
-- For yeast10: ~12K segments × (data + metadata) held in memory
-- **Challenge**: Phase 2 groups by k-mer keys → needs all segments available
-- **Complexity**: Major architectural refactor required (multi-pass or disk temp storage)
-- **Decision**: Defer this optimization, focus on simpler wins first
+✅ **Root Cause Analysis Complete** (see `docs/ACTUAL_ARCHITECTURE.md`)
 
-**Next Priorities**:
+**RAGC vs C++ AGC - Core Architectural Difference**:
 
-1. ✅ Tasks 1-3: Threading optimizations - 36% memory reduction achieved!
-2. ⚠️ Task 4: FASTA streaming - Deferred (major refactor)
-3. **NEXT**: Vec buffer pooling for LZ encoding (simpler, measurable impact)
-4. **Then**: Profile remaining hotspots with updated baseline
+RAGC uses **Batch Mode**:
+1. Load ALL segments (Phase 1): **~216 MB**
+2. Group segments by k-mer keys
+3. Process with Rayon par_iter()
+4. Collect ALL packs: **~200 MB**
+5. Write sequentially
+
+C++ AGC uses **Streaming Mode**:
+1. Stream contigs one-at-a-time into priority queue
+2. Workers pull, process, **write immediately**
+3. Never holds everything in memory
+4. Queue limited by memory size (2GB or 192MB/thread)
+
+**Memory Gap Breakdown**:
+```
+ALL segments in Phase 1:        +216 MB
+Collect all packs in Phase 3:   +200 MB
+Rayon threading overhead:        +80 MB
+HashMap grouping overhead:       +50 MB
+                                --------
+Total extra:                    +546 MB
+C++ AGC baseline:                205 MB
+                                --------
+RAGC total:                      751 MB (measured: 731 MB ✓)
+```
+
+**The 3.6x gap is architectural** - batch vs streaming.
+
+**Path Forward** (willing to do major refactor):
+
+1. **Option A: Incremental** (~300-400 MB target)
+   - Eliminate .collect() in Phase 3: -200 MB
+   - Stream Phase 1 (complex): -216 MB
+   - Total: ~315 MB (vs 205 MB C++ = 1.5x)
+
+2. **Option B: Full Redesign** (~235 MB target)
+   - Replace 3-phase with C++ AGC-style streaming
+   - Priority queue + immediate writes
+   - Per-thread context reuse
+   - Total: ~235 MB (vs 205 MB C++ = 1.1x)
 
 ---
 
