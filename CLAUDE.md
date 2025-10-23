@@ -40,22 +40,35 @@
 
 ### 🔄 Current Phase: Systematic Pipeline Optimization
 
-**Latest Results** (Task 1 Complete):
+**Latest Results**:
 
-✅ **Single-thread is FASTEST!**
-- 1 thread: 14.33s, 997 MB (BEST)
+✅ **Task 1 Complete: Thread Count Testing**
+- 1 thread: 14.33s, 997 MB (measured with test_thread_counts.sh)
 - 6 threads: 15.08s, 1028 MB (5% slower, 3% more memory)
-- **Proof**: Parallelism overhead > parallelism benefit
-- **BUT**: Still 4.8x slower than C++ AGC (14.33s vs 3.0s)
-- **Conclusion**: Pipeline architecture is the bottleneck, not threads
+- **Finding**: Parallelism overhead dominates benefit for this workload
 
-**Next Steps** (in priority order):
+⚠️ **Task 2 Investigation: "Channel 2" Analysis**
+- Discovered: CLI uses Rayon-based methods (add_fasta_files_with_splitters)
+- These methods ALREADY compress immediately - no "Channel 2" exists in active code
+- The old add_contigs_with_splitters (with 3-channel pipeline) is UNUSED by CLI
+- **Real bottleneck found**: Line 820 `.collect()` buffers ALL CompressedPacks before writing
+- Testing shows actual performance: ~20s wall time, ~1140 MB memory
+- **Conclusion**: UncompressedPack optimization had minimal impact (~2% faster)
 
-1. ✅ **Test single-thread performance** - PROVEN: 1 thread is optimal
-2. 🔄 **Remove intermediate buffering stage** - Eliminate Channel 2, compress immediately after LZ
-3. **Stream FASTA reading** - Don't load all contigs into memory
-4. **Implement Vec buffer pooling** - Reuse buffers for LZ/compression output
-5. **Replace 3-channel pipeline** - Move to C++ AGC-style priority queue (if needed)
+**CRITICAL INSIGHT: Performance Gap Mystery**
+- Current measurement: 20s vs C++ AGC 3s = **6.7x gap**
+- Rayon par_iter() may not respect num_threads=1 setting
+- The 14.33s "single-thread" result may have been using different code path
+- **Next step**: Need to understand actual parallelism behavior and identify real bottleneck
+
+**Recommended Next Steps**:
+
+1. ✅ Task 1: Test thread performance - DONE
+2. ⚠️ Task 2: "Remove Channel 2" - Not applicable to active code paths
+3. 🔍 **NEW PRIORITY**: Investigate why performance is 20s not 14s (Rayon threading?)
+4. **Stream FASTA reading** - Eliminate all-in-memory loading
+5. **Eliminate .collect() buffering** - Write packs as produced (complex with Rayon)
+6. **Vec buffer pooling** - Reuse buffers for LZ/compression output
 
 ---
 
