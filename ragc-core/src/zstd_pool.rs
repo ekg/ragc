@@ -1,47 +1,64 @@
-// ZSTD Context Pooling
-// Reuses ZSTD compression contexts to avoid repeated allocation/deallocation
+// ZSTD Context Pooling - Matching C++ AGC Design
 //
-// C++ AGC creates one ZSTD_CCtx per thread and reuses it for all compressions.
-// RAGC was creating a new context for every segment (via zstd::encode_all),
-// causing massive allocation overhead (12K+ contexts for yeast10 dataset).
+// C++ AGC creates ONE ZSTD_CCtx per thread and reuses it for all compressions.
+// This module implements the exact same approach using zstd-safe bindings.
 //
-// This module implements a thread-local context pool matching C++ AGC's design.
+// CRITICAL FIX: Previous implementation used zstd::stream::copy_encode which:
+// 1. Created a new encoder context for each call (massive overhead!)
+// 2. Did internal buffering we don't need
+// 3. Cloned the output buffer (defeating pooling!)
+//
+// New implementation matches C++ AGC line-by-line:
+// - Thread-local ZSTD_CCtx reused for all compressions (like C++ line 176)
+// - Pre-allocated output buffer (like C++ new uint8_t[a_size])
+// - Direct compression into buffer (like ZSTD_compressCCtx)
 
 use anyhow::Result;
 use ragc_common::types::{Contig, PackedBlock};
 use std::cell::RefCell;
 
 thread_local! {
-    /// Thread-local output buffer for compression
-    /// Reused across compressions to avoid repeated allocations
-    static OUTPUT_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    /// Thread-local ZSTD compression context - EXACTLY like C++ AGC
+    /// C++ AGC: ZSTD_CCtx* zstd_ctx (reused per thread)
+    /// Rust: zstd::bulk::Compressor<'static> (same concept)
+    ///
+    /// Note: We store (Compressor, level) to detect level changes.
+    /// In practice, compression level rarely changes within a thread.
+    static ZSTD_ENCODER: RefCell<Option<(zstd::bulk::Compressor<'static>, i32)>> = RefCell::new(None);
 }
 
-/// Compress a segment using ZSTD with buffer reuse
+/// Compress a segment using thread-local ZSTD context (MATCHING C++ AGC)
 ///
-/// This reuses the output buffer instead of allocating new ones for each compression.
-/// While we still create encoder contexts (zstd-rs limitation), we avoid allocating
-/// output buffers which is a significant improvement.
+/// C++ AGC equivalent (segment.h:172-189):
+/// ```cpp
+/// size_t a_size = ZSTD_compressBound(data.size());
+/// uint8_t *packed = new uint8_t[a_size+1u];
+/// uint32_t packed_size = ZSTD_compressCCtx(zstd_ctx, packed, a_size, data.data(), data.size(), level);
+/// vector<uint8_t> v_packed(packed, packed + packed_size + 1);
+/// delete[] packed;
+/// ```
 ///
-/// # Performance Impact
-/// - Before: New Vec allocation for every compression (12K+ for yeast10)
-/// - After: Reuse single thread-local buffer
-/// - Expected: ~30% reduction in page faults
-///
-/// # Note
-/// Full context reuse would require zstd-sys, which is more complex.
-/// This is a pragmatic middle ground using the safe zstd crate.
+/// Our Rust implementation does the same but with thread-local context pooling.
 pub fn compress_segment_pooled(data: &Contig, level: i32) -> Result<PackedBlock> {
-    OUTPUT_BUFFER.with(|buffer| {
-        let mut buf = buffer.borrow_mut();
-        buf.clear();
+    ZSTD_ENCODER.with(|encoder_cell| {
+        let mut encoder_opt = encoder_cell.borrow_mut();
 
-        // Compress directly into reused buffer
-        zstd::stream::copy_encode(data.as_slice(), &mut *buf, level)
-            .map_err(|e| anyhow::anyhow!("ZSTD compression failed: {}", e))?;
+        // Get or create encoder for this level
+        let encoder = match encoder_opt.as_mut() {
+            Some((enc, cached_level)) if *cached_level == level => enc,
+            _ => {
+                // Create new encoder for this level
+                let new_encoder = zstd::bulk::Compressor::new(level)
+                    .map_err(|e| anyhow::anyhow!("Failed to create ZSTD encoder: {}", e))?;
+                *encoder_opt = Some((new_encoder, level));
+                &mut encoder_opt.as_mut().unwrap().0
+            }
+        };
 
-        // Return owned copy (caller needs ownership)
-        Ok(buf.clone())
+        // Compress directly - bulk::Compressor handles buffer internally
+        // and returns owned Vec (no clone needed!)
+        encoder.compress(data.as_slice())
+            .map_err(|e| anyhow::anyhow!("ZSTD compression failed: {}", e))
     })
 }
 
