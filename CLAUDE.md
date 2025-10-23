@@ -40,10 +40,19 @@
 
 ### 🔄 Current Phase: Systematic Pipeline Optimization
 
+**Latest Results** (Task 1 Complete):
+
+✅ **Single-thread is FASTEST!**
+- 1 thread: 14.33s, 997 MB (BEST)
+- 6 threads: 15.08s, 1028 MB (5% slower, 3% more memory)
+- **Proof**: Parallelism overhead > parallelism benefit
+- **BUT**: Still 4.8x slower than C++ AGC (14.33s vs 3.0s)
+- **Conclusion**: Pipeline architecture is the bottleneck, not threads
+
 **Next Steps** (in priority order):
 
-1. **Test single-thread performance** - Establish if parallelism helps or hurts
-2. **Remove intermediate buffering stage** - Eliminate Channel 2, compress immediately after LZ
+1. ✅ **Test single-thread performance** - PROVEN: 1 thread is optimal
+2. 🔄 **Remove intermediate buffering stage** - Eliminate Channel 2, compress immediately after LZ
 3. **Stream FASTA reading** - Don't load all contigs into memory
 4. **Implement Vec buffer pooling** - Reuse buffers for LZ/compression output
 5. **Replace 3-channel pipeline** - Move to C++ AGC-style priority queue (if needed)
