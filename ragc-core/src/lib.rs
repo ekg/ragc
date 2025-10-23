@@ -122,6 +122,7 @@ pub mod lz_diff;
 pub mod segment;
 pub mod segment_compression;
 pub mod splitters;
+pub mod zstd_pool;
 
 // Re-export commonly used types
 pub use compressor::{Compressor, CompressorConfig};

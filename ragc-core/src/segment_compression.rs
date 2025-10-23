@@ -1,8 +1,9 @@
 // Segment Compression
 // ZSTD compression/decompression for segments
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ragc_common::types::{Contig, PackedBlock};
+use crate::zstd_pool;
 
 /// Default ZSTD compression level
 /// Use level 17 to match C++ AGC's delta pack compression (segment.h:279)
@@ -24,13 +25,20 @@ pub fn compress_segment_configured(data: &Contig, level: i32) -> Result<PackedBl
 }
 
 /// Compress a segment using ZSTD with specified compression level
+///
+/// **IMPORTANT OPTIMIZATION**: Uses thread-local ZSTD context pooling to avoid
+/// creating a new context for every compression. This matches C++ AGC's design
+/// where each thread maintains a ZSTD_CCtx that's reused.
+///
+/// Before: zstd::encode_all() created 12K+ contexts for yeast10 (60-120 MB overhead)
+/// After: 1 context per thread (reused)
 pub fn compress_segment_with_level(data: &Contig, level: i32) -> Result<PackedBlock> {
-    zstd::encode_all(data.as_slice(), level).context("Failed to compress segment with ZSTD")
+    zstd_pool::compress_segment_pooled(data, level)
 }
 
 /// Decompress a segment using ZSTD
 pub fn decompress_segment(compressed: &PackedBlock) -> Result<Contig> {
-    zstd::decode_all(compressed.as_slice()).context("Failed to decompress segment with ZSTD")
+    zstd_pool::decompress_segment_pooled(compressed)
 }
 
 #[cfg(test)]
