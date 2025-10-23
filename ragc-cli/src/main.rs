@@ -209,7 +209,11 @@ fn create_archive(
     // Determine thread count (use provided or auto-detect)
     let num_threads = threads.unwrap_or_else(|| {
         let num_cpus = num_cpus::get();
-        if num_cpus < 8 { num_cpus } else { num_cpus - 1 }
+        if num_cpus < 8 {
+            num_cpus
+        } else {
+            num_cpus - 1
+        }
     });
 
     if verbosity > 0 {

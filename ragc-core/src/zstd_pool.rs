@@ -57,7 +57,8 @@ pub fn compress_segment_pooled(data: &Contig, level: i32) -> Result<PackedBlock>
 
         // Compress directly - bulk::Compressor handles buffer internally
         // and returns owned Vec (no clone needed!)
-        encoder.compress(data.as_slice())
+        encoder
+            .compress(data.as_slice())
             .map_err(|e| anyhow::anyhow!("ZSTD compression failed: {}", e))
     })
 }

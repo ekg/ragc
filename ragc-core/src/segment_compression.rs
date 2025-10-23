@@ -1,9 +1,9 @@
 // Segment Compression
 // ZSTD compression/decompression for segments
 
+use crate::zstd_pool;
 use anyhow::Result;
 use ragc_common::types::{Contig, PackedBlock};
-use crate::zstd_pool;
 
 /// Default ZSTD compression level
 /// Use level 17 to match C++ AGC's delta pack compression (segment.h:279)
