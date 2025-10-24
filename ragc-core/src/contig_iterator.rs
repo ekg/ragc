@@ -157,13 +157,14 @@ impl ContigIterator for MultiFileIterator {
             };
 
             match reader.read_contig_with_sample()? {
-                Some((_full_header, _sample_from_header, contig_name, sequence)) => {
-                    // Use sample name from filename, not from header
-                    return Ok(Some((
-                        self.current_sample_name.clone(),
-                        contig_name,
-                        sequence,
-                    )));
+                Some((_full_header, sample_from_header, contig_name, sequence)) => {
+                    // Use sample name from header (PanSN format) if available, else fallback to filename
+                    let sample_name = if sample_from_header != "unknown" {
+                        sample_from_header
+                    } else {
+                        self.current_sample_name.clone()
+                    };
+                    return Ok(Some((sample_name, contig_name, sequence)));
                 }
                 None => {
                     // Current file exhausted, move to next file

@@ -8,7 +8,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ragc_core::{Decompressor, DecompressorConfig, StreamingCompressor, StreamingCompressorConfig};
+use ragc_core::{Decompressor, DecompressorConfig, MultiFileIterator, PansnFileIterator, StreamingCompressor, StreamingCompressorConfig};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -267,7 +267,8 @@ fn create_archive(
                 eprintln!("Will group contigs by sample names extracted from headers");
                 eprintln!();
             }
-            compressor.add_multi_sample_fasta_with_splitters(input_path)?;
+            let iterator = PansnFileIterator::new(input_path)?;
+            compressor.add_contigs_with_splitters(Box::new(iterator))?;
         } else {
             // Single-sample file: use filename as sample name, with splitter-based segmentation
             if verbosity > 0 {
@@ -279,24 +280,23 @@ fn create_archive(
             compressor.add_fasta_files_with_splitters(&[(sample_name, input_path.as_path())])?;
         }
     } else {
-        // Multiple input files: use filenames as sample names
+        // Multiple input files: sample names from FASTA headers
         if verbosity > 0 {
-            eprintln!("Processing multiple files (sample names from filenames)");
+            eprintln!("Processing multiple files (sample names from FASTA headers)");
             eprintln!();
         }
 
-        let mut fasta_files = Vec::new();
+        let mut file_paths = Vec::new();
         for input_path in &inputs {
             if !input_path.exists() {
                 eprintln!("Warning: Input file not found: {input_path:?}");
                 continue;
             }
-
-            let sample_name = extract_sample_name(input_path);
-            fasta_files.push((sample_name, input_path.as_path()));
+            file_paths.push(input_path.clone());
         }
 
-        compressor.add_fasta_files_with_splitters(&fasta_files)?;
+        let iterator = MultiFileIterator::new(file_paths)?;
+        compressor.add_contigs_with_splitters(Box::new(iterator))?;
     }
 
     // Finalize the archive
