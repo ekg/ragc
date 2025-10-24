@@ -16,6 +16,7 @@ const HASHING_STEP: usize = 4; // USE_SPARSE_HT mode
 /// LZ Diff encoder/decoder (V2 implementation)
 pub struct LZDiff {
     reference: Vec<u8>,
+    reference_len: usize, // Original length before padding
     ht: HashMap<u64, Vec<u32>>, // Hash table: kmer_hash -> list of positions
     min_match_len: u32,
     key_len: u32,
@@ -34,6 +35,7 @@ impl LZDiff {
 
         LZDiff {
             reference: Vec::new(),
+            reference_len: 0,
             ht: HashMap::new(),
             min_match_len,
             key_len,
@@ -44,6 +46,7 @@ impl LZDiff {
     /// Prepare the encoder with a reference sequence
     pub fn prepare(&mut self, reference: &Contig) {
         self.reference = reference.clone();
+        self.reference_len = reference.len(); // Store original length before padding
         // Add padding for key_len
         self.reference
             .resize(self.reference.len() + self.key_len as usize, 31);
@@ -239,7 +242,7 @@ impl LZDiff {
         let mut encoded = Vec::with_capacity(target.len() / 2);
 
         // Optimization: if target equals reference, return empty
-        if target.len() == self.reference.len() - (self.key_len as usize)
+        if target.len() == self.reference_len
             && target
                 .iter()
                 .zip(self.reference.iter())
@@ -305,8 +308,7 @@ impl LZDiff {
                 // Check if this is a match to end of sequence
                 let total_len = len_bck + len_fwd;
                 let len_to_encode = if i + (total_len as usize) == text_size
-                    && (match_pos as usize) + (total_len as usize)
-                        == self.reference.len() - (self.key_len as usize)
+                    && (match_pos as usize) + (total_len as usize) == self.reference_len
                 {
                     None // Match to end
                 } else {
@@ -361,7 +363,8 @@ impl LZDiff {
                 // It's a match
                 let (ref_pos, len, consumed) = self.decode_match(&encoded[i..], pred_pos);
                 let actual_len = if len == u32::MAX {
-                    self.reference.len() - ref_pos
+                    // Match to end: use original reference length (before padding)
+                    self.reference_len - ref_pos
                 } else {
                     len as usize
                 };

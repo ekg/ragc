@@ -251,6 +251,25 @@ impl Decompressor {
         Ok(contigs)
     }
 
+    /// Unpack 2-bit encoded data (C++ AGC format) to 1-byte-per-base format
+    /// C++ AGC stores 4 bases per byte: bits [7:6][5:4][3:2][1:0] = bases [0][1][2][3]
+    /// Each 2-bit value: 00=A=0, 01=C=1, 10=G=2, 11=T=3
+    fn unpack_2bit(packed: &[u8], expected_length: usize) -> Contig {
+        let mut unpacked = Vec::with_capacity(expected_length);
+
+        for &byte in packed {
+            // Extract 4 bases from each byte (most significant bits first)
+            unpacked.push((byte >> 6) & 0x03);
+            unpacked.push((byte >> 4) & 0x03);
+            unpacked.push((byte >> 2) & 0x03);
+            unpacked.push(byte & 0x03);
+        }
+
+        // Truncate to expected length (last byte might not use all 4 slots)
+        unpacked.truncate(expected_length);
+        unpacked
+    }
+
     /// Apply reverse complement to a segment (reverse order and complement each base)
     fn reverse_complement_segment(segment: &[u8]) -> Contig {
         segment
@@ -360,7 +379,7 @@ impl Decompressor {
                 let (mut ref_data, ref_metadata) = self.archive.get_part_by_id(ref_stream_id, 0)?;
 
                 // Decompress if needed
-                let decompressed_ref = if ref_metadata == 0 {
+                let mut decompressed_ref = if ref_metadata == 0 {
                     ref_data
                 } else {
                     if ref_data.is_empty() {
@@ -370,9 +389,37 @@ impl Decompressor {
                     decompress_segment(&ref_data)?
                 };
 
-                if self.config.verbosity > 1 {
+                // Check if data is in 2-bit packed format (C++ AGC compatibility)
+                // If decompressed length is ~1/4 of raw_length, it's packed
+                // Allow small tolerance for rounding (last byte can encode 1-4 bases)
+                let is_packed = decompressed_ref.len() * 4 >= desc.raw_length as usize
+                    && decompressed_ref.len() * 4 < desc.raw_length as usize + 8;
+
+                if self.config.verbosity > 2 {
                     eprintln!(
-                        "Loaded reference for group {}: length={}",
+                        "  DEBUG: decompressed_len={}, raw_length={}, decompressed*4={}, is_packed={}",
+                        decompressed_ref.len(),
+                        desc.raw_length,
+                        decompressed_ref.len() * 4,
+                        is_packed
+                    );
+                }
+
+                if is_packed {
+                    // Unpack from 2-bit format to 1-byte-per-base format
+                    decompressed_ref = Self::unpack_2bit(&decompressed_ref, desc.raw_length as usize);
+
+                    if self.config.verbosity > 1 {
+                        eprintln!(
+                            "Loaded & unpacked reference for group {}: length={} (was {} bytes packed)",
+                            desc.group_id,
+                            decompressed_ref.len(),
+                            decompressed_ref.len() / 4
+                        );
+                    }
+                } else if self.config.verbosity > 1 {
+                    eprintln!(
+                        "Loaded reference for group {}: length={} (already unpacked)",
                         desc.group_id,
                         decompressed_ref.len()
                     );
