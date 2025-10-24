@@ -16,7 +16,7 @@ const HASHING_STEP: usize = 4; // USE_SPARSE_HT mode
 /// LZ Diff encoder/decoder (V2 implementation)
 pub struct LZDiff {
     reference: Vec<u8>,
-    reference_len: usize, // Original length before padding
+    reference_len: usize,       // Original length before padding
     ht: HashMap<u64, Vec<u32>>, // Hash table: kmer_hash -> list of positions
     min_match_len: u32,
     key_len: u32,
@@ -47,7 +47,7 @@ impl LZDiff {
     pub fn prepare(&mut self, reference: &Contig) {
         self.reference = reference.clone();
         self.reference_len = reference.len(); // Store original length before padding
-        // Add padding for key_len
+                                              // Add padding for key_len
         self.reference
             .resize(self.reference.len() + self.key_len as usize, 31);
 

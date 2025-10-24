@@ -407,7 +407,8 @@ impl Decompressor {
 
                 if is_packed {
                     // Unpack from 2-bit format to 1-byte-per-base format
-                    decompressed_ref = Self::unpack_2bit(&decompressed_ref, desc.raw_length as usize);
+                    decompressed_ref =
+                        Self::unpack_2bit(&decompressed_ref, desc.raw_length as usize);
 
                     if self.config.verbosity > 1 {
                         eprintln!(

@@ -300,16 +300,16 @@ mod with_cpp_agc {
 
         // Test various N-base patterns
         let test_cases = vec![
-            ("single_n", "ACGTACGTNACGTACGT"),           // Single N
-            ("short_n_run", "ACGTNNACGT"),                 // 2 N's (< MIN_NRUN_LEN)
-            ("medium_n_run", "ACGTNNNACGT"),               // 3 N's (< MIN_NRUN_LEN)
-            ("long_n_run", "ACGTNNNNNNNNACGT"),            // 8 N's (triggers run encoding)
+            ("single_n", "ACGTACGTNACGTACGT"),  // Single N
+            ("short_n_run", "ACGTNNACGT"),      // 2 N's (< MIN_NRUN_LEN)
+            ("medium_n_run", "ACGTNNNACGT"),    // 3 N's (< MIN_NRUN_LEN)
+            ("long_n_run", "ACGTNNNNNNNNACGT"), // 8 N's (triggers run encoding)
             ("very_long_n_run", "ACGTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNACGT"), // 32 N's
-            ("mixed", "ACGTNACGTNNNACGTNNNNNNNNACGT"),    // Mixed single + runs
-            ("all_n", "NNNNNNNNNNNN"),                     // All N's
-            ("start_n", "NNNACGTACGT"),                    // N's at start
-            ("end_n", "ACGTACGTNNN"),                      // N's at end
-            ("alternating", "NANANANANANA"),               // Alternating N/A
+            ("mixed", "ACGTNACGTNNNACGTNNNNNNNNACGT"), // Mixed single + runs
+            ("all_n", "NNNNNNNNNNNN"),          // All N's
+            ("start_n", "NNNACGTACGT"),         // N's at start
+            ("end_n", "ACGTACGTNNN"),           // N's at end
+            ("alternating", "NANANANANANA"),    // Alternating N/A
         ];
 
         for (name, sequence) in test_cases {
@@ -436,7 +436,9 @@ ACGTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNACGT
         compressor
             .add_contig("test_ragc", "n_test", test_seq.clone())
             .expect("Failed to add contig");
-        compressor.finalize().expect("Failed to finalize RAGC archive");
+        compressor
+            .finalize()
+            .expect("Failed to finalize RAGC archive");
 
         // Extract with C++ AGC
         let output = Command::new("agc")
@@ -446,19 +448,37 @@ ACGTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNACGT
             .output()
             .expect("Failed to run C++ agc getset");
 
-        eprintln!("C++ AGC stdout: {}", String::from_utf8_lossy(&output.stdout));
-        eprintln!("C++ AGC stderr: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "C++ AGC stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        eprintln!(
+            "C++ AGC stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         eprintln!("C++ AGC exit status: {}", output.status);
 
-        assert!(output.status.success(), "C++ agc failed to extract from RAGC archive");
+        assert!(
+            output.status.success(),
+            "C++ agc failed to extract from RAGC archive"
+        );
 
         let extracted = String::from_utf8_lossy(&output.stdout);
         eprintln!("RAGC → C++ AGC extraction:\n{extracted}");
 
         // Verify N's are present
-        assert!(!extracted.is_empty(), "C++ AGC extraction produced empty output");
-        assert!(extracted.contains('N'), "N-bases missing from C++ AGC extraction of RAGC archive");
-        assert!(extracted.contains("NNNN"), "N-run missing from C++ AGC extraction");
+        assert!(
+            !extracted.is_empty(),
+            "C++ AGC extraction produced empty output"
+        );
+        assert!(
+            extracted.contains('N'),
+            "N-bases missing from C++ AGC extraction of RAGC archive"
+        );
+        assert!(
+            extracted.contains("NNNN"),
+            "N-run missing from C++ AGC extraction"
+        );
 
         // Clean up
         let _ = fs::remove_file(&fasta_path);
