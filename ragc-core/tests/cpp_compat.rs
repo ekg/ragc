@@ -291,4 +291,178 @@ mod with_cpp_agc {
         let _ = fs::remove_file(&archive_path);
         let _ = fs::remove_file(&output_path);
     }
+
+    /// Test N-base handling in round-trip compression/decompression
+    #[test]
+    fn test_n_bases_round_trip() {
+        let test_dir = std::env::temp_dir();
+        let archive_path = test_dir.join("test_n_bases.agc");
+
+        // Test various N-base patterns
+        let test_cases = vec![
+            ("single_n", "ACGTACGTNACGTACGT"),           // Single N
+            ("short_n_run", "ACGTNNACGT"),                 // 2 N's (< MIN_NRUN_LEN)
+            ("medium_n_run", "ACGTNNNACGT"),               // 3 N's (< MIN_NRUN_LEN)
+            ("long_n_run", "ACGTNNNNNNNNACGT"),            // 8 N's (triggers run encoding)
+            ("very_long_n_run", "ACGTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNACGT"), // 32 N's
+            ("mixed", "ACGTNACGTNNNACGTNNNNNNNNACGT"),    // Mixed single + runs
+            ("all_n", "NNNNNNNNNNNN"),                     // All N's
+            ("start_n", "NNNACGTACGT"),                    // N's at start
+            ("end_n", "ACGTACGTNNN"),                      // N's at end
+            ("alternating", "NANANANANANA"),               // Alternating N/A
+        ];
+
+        for (name, sequence) in test_cases {
+            eprintln!("Testing N-base pattern: {name} ({sequence})");
+
+            // Create archive
+            let config = CompressorConfig::default();
+            let mut compressor = Compressor::new(archive_path.to_str().unwrap(), config)
+                .expect("Failed to create compressor");
+
+            // Convert sequence to numeric encoding
+            let numeric: Vec<u8> = sequence
+                .bytes()
+                .map(|b| match b {
+                    b'A' => 0,
+                    b'C' => 1,
+                    b'G' => 2,
+                    b'T' => 3,
+                    b'N' => 4,
+                    _ => panic!("Invalid base: {}", b as char),
+                })
+                .collect();
+
+            compressor
+                .add_contig("test_sample", name, numeric.clone())
+                .expect("Failed to add contig");
+            compressor.finalize().expect("Failed to finalize");
+
+            // Extract and verify
+            let config = DecompressorConfig::default();
+            let mut decompressor = Decompressor::open(archive_path.to_str().unwrap(), config)
+                .expect("Failed to open archive");
+
+            let extracted = decompressor
+                .get_contig("test_sample", name)
+                .expect("Failed to extract contig");
+
+            assert_eq!(
+                numeric, extracted,
+                "N-base round-trip failed for pattern '{name}'\nExpected: {:?}\nGot: {:?}",
+                numeric, extracted
+            );
+
+            // Also verify as string
+            let extracted_str = contig_to_string(&extracted);
+            assert_eq!(
+                sequence, extracted_str,
+                "N-base string round-trip failed for pattern '{name}'"
+            );
+
+            decompressor.close().expect("Failed to close decompressor");
+            let _ = fs::remove_file(&archive_path);
+        }
+    }
+
+    /// Test N-base compatibility with C++ AGC
+    #[test]
+    fn test_n_bases_cpp_compat() {
+        if !cpp_agc_available() {
+            eprintln!("Skipping C++ N-base compatibility test: C++ agc not found");
+            return;
+        }
+
+        let test_dir = std::env::temp_dir();
+        let fasta_path = test_dir.join("test_n_compat.fasta");
+        let cpp_archive = test_dir.join("test_n_cpp.agc");
+        let ragc_archive = test_dir.join("test_n_ragc.agc");
+
+        // Create test FASTA with various N patterns
+        let content = r#">test_n_sample#1#single_n
+ACGTACGTNACGTACGT
+>test_n_sample#1#short_n_run
+ACGTNNACGT
+>test_n_sample#1#long_n_run
+ACGTNNNNNNNNACGT
+>test_n_sample#1#mixed
+ACGTNACGTNNNACGTNNNNNNNNACGT
+>test_n_sample#1#very_long_n_run
+ACGTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNACGT
+"#;
+        fs::write(&fasta_path, content).expect("Failed to write test FASTA");
+
+        // Test 1: C++ AGC → RAGC
+        let status = Command::new("agc")
+            .arg("create")
+            .arg("-o")
+            .arg(cpp_archive.to_str().unwrap())
+            .arg(fasta_path.to_str().unwrap())
+            .status()
+            .expect("Failed to run C++ agc create");
+        assert!(status.success(), "C++ agc failed to create archive");
+
+        let config = DecompressorConfig::default();
+        let mut decompressor = Decompressor::open(cpp_archive.to_str().unwrap(), config)
+            .expect("Failed to open C++ archive");
+
+        let sequences = decompressor
+            .get_sample("test_n_compat")
+            .expect("Failed to extract sample from C++ archive");
+
+        for (name, contig) in sequences {
+            let contig_str = contig_to_string(&contig);
+            eprintln!("C++ AGC → RAGC: {name} = {contig_str}");
+            assert!(
+                !contig_str.contains('X'),
+                "Invalid base found in {name} extracted from C++ AGC"
+            );
+            // Verify N's are present where expected
+            if name.contains("_n") {
+                assert!(
+                    contig_str.contains('N'),
+                    "N-bases missing from {name} extracted from C++ AGC"
+                );
+            }
+        }
+
+        // Test 2: RAGC → C++ AGC
+        let config = CompressorConfig::default();
+        let mut compressor = Compressor::new(ragc_archive.to_str().unwrap(), config)
+            .expect("Failed to create RAGC compressor");
+
+        // Add test sequences with N's
+        let test_seq: Vec<u8> = vec![0, 1, 2, 3, 4, 4, 4, 4, 0, 1, 2, 3]; // ACGTNNNNACGT
+        compressor
+            .add_contig("test_ragc", "n_test", test_seq.clone())
+            .expect("Failed to add contig");
+        compressor.finalize().expect("Failed to finalize RAGC archive");
+
+        // Extract with C++ AGC
+        let output = Command::new("agc")
+            .arg("getset")
+            .arg(ragc_archive.to_str().unwrap())
+            .arg("test_ragc")
+            .output()
+            .expect("Failed to run C++ agc getset");
+
+        eprintln!("C++ AGC stdout: {}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("C++ AGC stderr: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!("C++ AGC exit status: {}", output.status);
+
+        assert!(output.status.success(), "C++ agc failed to extract from RAGC archive");
+
+        let extracted = String::from_utf8_lossy(&output.stdout);
+        eprintln!("RAGC → C++ AGC extraction:\n{extracted}");
+
+        // Verify N's are present
+        assert!(!extracted.is_empty(), "C++ AGC extraction produced empty output");
+        assert!(extracted.contains('N'), "N-bases missing from C++ AGC extraction of RAGC archive");
+        assert!(extracted.contains("NNNN"), "N-run missing from C++ AGC extraction");
+
+        // Clean up
+        let _ = fs::remove_file(&fasta_path);
+        let _ = fs::remove_file(&cpp_archive);
+        let _ = fs::remove_file(&ragc_archive);
+    }
 }
