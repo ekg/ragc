@@ -35,5 +35,6 @@ flate2 = "1.0"
 tikv-jemallocator = { version = "0.5", optional = true }
 
 [features]
-default = []
+default = ["indexed-fasta"]
+indexed-fasta = ["ragc-core/indexed-fasta"]
 jemalloc = ["tikv-jemallocator"]

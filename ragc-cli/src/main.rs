@@ -270,8 +270,37 @@ fn create_archive(
                 eprintln!("Will group contigs by sample names extracted from headers");
                 eprintln!();
             }
-            let iterator = PansnFileIterator::new(input_path)?;
-            compressor.add_contigs_with_splitters(Box::new(iterator))?;
+
+            // Try to use indexed iterator if .fai exists
+            #[cfg(feature = "indexed-fasta")]
+            {
+                use ragc_core::contig_iterator::IndexedPansnFileIterator;
+                match IndexedPansnFileIterator::new(input_path) {
+                    Ok(indexed_iter) => {
+                        if verbosity > 0 {
+                            eprintln!("Using indexed FASTA with random access (.fai index found)");
+                            eprintln!();
+                        }
+                        compressor.add_contigs_with_splitters(Box::new(indexed_iter))?;
+                    }
+                    Err(e) => {
+                        // No index or error loading it, use regular iterator
+                        if verbosity > 0 {
+                            eprintln!("Indexed iterator failed: {}", e);
+                            eprintln!("Falling back to regular iterator");
+                            eprintln!();
+                        }
+                        let iterator = PansnFileIterator::new(input_path)?;
+                        compressor.add_contigs_with_splitters(Box::new(iterator))?;
+                    }
+                }
+            }
+
+            #[cfg(not(feature = "indexed-fasta"))]
+            {
+                let iterator = PansnFileIterator::new(input_path)?;
+                compressor.add_contigs_with_splitters(Box::new(iterator))?;
+            }
         } else {
             // Single-sample file: use filename as sample name, with splitter-based segmentation
             if verbosity > 0 {
