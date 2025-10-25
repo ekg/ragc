@@ -872,9 +872,7 @@ impl CollectionV3 {
         let no_samples_in_curr_batch = CollectionVarInt::decode(&mut ptr0)? as usize;
 
         if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-            eprintln!(
-                "DESERIALIZE: Reading {no_samples_in_curr_batch} samples from collection"
-            );
+            eprintln!("DESERIALIZE: Reading {no_samples_in_curr_batch} samples from collection");
         }
 
         // First pass: decode structure and counts
