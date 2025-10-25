@@ -32,11 +32,11 @@ mod tests {
                     );
                     assert!(!sample.is_empty(), "Sample name should not be empty");
                     assert!(!header.is_empty(), "Header should not be empty");
-                    assert!(contig.len() > 0, "Contig should have non-zero length");
+                    assert!(!contig.is_empty(), "Contig should have non-zero length");
                     count += 1;
                 }
                 None => {
-                    panic!("Unexpected end of contigs at iteration {}", i);
+                    panic!("Unexpected end of contigs at iteration {i}");
                 }
             }
         }
@@ -83,7 +83,7 @@ mod tests {
             total_contigs,
             sample_transitions.len()
         );
-        println!("Sample order: {:?}", sample_transitions);
+        println!("Sample order: {sample_transitions:?}");
 
         // With proper sample grouping, we should have fewer transitions than total contigs
         assert!(

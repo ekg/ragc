@@ -349,8 +349,7 @@ mod with_cpp_agc {
 
             assert_eq!(
                 numeric, extracted,
-                "N-base round-trip failed for pattern '{name}'\nExpected: {:?}\nGot: {:?}",
-                numeric, extracted
+                "N-base round-trip failed for pattern '{name}'\nExpected: {numeric:?}\nGot: {extracted:?}"
             );
 
             // Also verify as string

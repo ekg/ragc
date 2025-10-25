@@ -592,7 +592,7 @@ impl CollectionV3 {
         CollectionVarInt::encode(&mut data, (id_to - id_from) as u32);
 
         if std::env::var("RAGC_DEBUG_CONTIG_NAMES").is_ok() {
-            eprintln!("SERIALIZE_CONTIG_NAMES: samples {}..{}", id_from, id_to);
+            eprintln!("SERIALIZE_CONTIG_NAMES: samples {id_from}..{id_to}");
         }
 
         for (sample_idx, sample) in self.sample_desc[id_from..id_to].iter().enumerate() {
@@ -847,7 +847,7 @@ impl CollectionV3 {
 
             if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
                 let total_segments: usize = sample_encoded.iter().map(|c| c.len()).sum();
-                eprintln!("  Sample {} total: {} segments", sample_idx, total_segments);
+                eprintln!("  Sample {sample_idx} total: {total_segments} segments");
             }
         }
 
@@ -873,8 +873,7 @@ impl CollectionV3 {
 
         if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
             eprintln!(
-                "DESERIALIZE: Reading {} samples from collection",
-                no_samples_in_curr_batch
+                "DESERIALIZE: Reading {no_samples_in_curr_batch} samples from collection"
             );
         }
 
@@ -885,7 +884,7 @@ impl CollectionV3 {
             let mut contig_seg_counts = Vec::new();
 
             if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-                eprintln!("  Sample {}: {} contigs", sample_idx, no_contigs);
+                eprintln!("  Sample {sample_idx}: {no_contigs} contigs");
             }
 
             for contig_idx in 0..no_contigs {
@@ -893,7 +892,7 @@ impl CollectionV3 {
                 contig_seg_counts.push(no_segments);
 
                 if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-                    eprintln!("    Contig {}: {} segments", contig_idx, no_segments);
+                    eprintln!("    Contig {contig_idx}: {no_segments} segments");
                 }
             }
 
@@ -953,8 +952,7 @@ impl CollectionV3 {
 
                     // DEBUG: Print encoded vs decoded values for investigation
                     if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-                        eprintln!("DECODE: item={}, group={}, e_in_group_id={}, prev={}, c_in_group_id={}",
-                            item_idx, c_group_id, e_in_group_id, prev_in_group_id, c_in_group_id);
+                        eprintln!("DECODE: item={item_idx}, group={c_group_id}, e_in_group_id={e_in_group_id}, prev={prev_in_group_id}, c_in_group_id={c_in_group_id}");
                     }
 
                     let c_raw_length =

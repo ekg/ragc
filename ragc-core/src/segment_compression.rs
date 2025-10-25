@@ -190,7 +190,7 @@ mod tests {
         let mixed = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1];
         let rep2 = check_repetitiveness(&mixed);
         assert!(
-            rep2 >= 0.0 && rep2 <= 1.0,
+            (0.0..=1.0).contains(&rep2),
             "Repetitiveness should be in [0, 1]"
         );
     }

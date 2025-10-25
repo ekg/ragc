@@ -66,7 +66,7 @@ impl SampleOrderInfo {
             // Track which sample this contig belongs to
             sample_contigs
                 .entry(sample_name.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(full_header);
 
             // Track when samples change (for contiguity check)
@@ -224,7 +224,6 @@ impl ContigIterator for PansnFileIterator {
 /// Uses faigz-rs to read contigs in sample-grouped order even if file is out-of-order
 #[cfg(feature = "indexed-fasta")]
 pub struct IndexedPansnFileIterator {
-    file_path: PathBuf,
     index: std::sync::Arc<FastaIndex>,
     order_info: SampleOrderInfo,
     current_sample_idx: usize,
@@ -259,7 +258,6 @@ impl IndexedPansnFileIterator {
         let order_info = SampleOrderInfo::analyze_file(file_path)?;
 
         Ok(IndexedPansnFileIterator {
-            file_path: file_path.to_path_buf(),
             index: std::sync::Arc::new(index),
             order_info,
             current_sample_idx: 0,
@@ -281,7 +279,7 @@ impl ContigIterator for IndexedPansnFileIterator {
             .order_info
             .sample_contigs
             .get(sample_name)
-            .ok_or_else(|| anyhow!("Sample not found: {}", sample_name))?;
+            .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))?;
 
         // Check if we've exhausted contigs for this sample
         if self.current_contig_idx >= contigs.len() {
@@ -301,7 +299,7 @@ impl ContigIterator for IndexedPansnFileIterator {
 
         let sequence = reader
             .fetch_seq_all(full_header)
-            .with_context(|| format!("Failed to fetch sequence for {}", full_header))?;
+            .with_context(|| format!("Failed to fetch sequence for {full_header}"))?;
 
         // Convert to Contig
         let contig = Contig::from(sequence.as_bytes());

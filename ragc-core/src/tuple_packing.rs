@@ -48,7 +48,7 @@ pub fn tuples_to_bytes(tuples: &[u8]) -> Vec<u8> {
         2 => unpack_tuples::<2, 16>(&tuples[..tuples.len() - 1], &mut result, output_size),
         3 => unpack_tuples::<3, 6>(&tuples[..tuples.len() - 1], &mut result, output_size),
         4 => unpack_tuples::<4, 4>(&tuples[..tuples.len() - 1], &mut result, output_size),
-        _ => panic!("Invalid no_bytes: {}", no_bytes),
+        _ => panic!("Invalid no_bytes: {no_bytes}"),
     }
 
     result
