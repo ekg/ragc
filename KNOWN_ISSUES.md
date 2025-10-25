@@ -101,21 +101,26 @@ After fixes:
    - Suggests C++ AGC may not support multi-contig PanSN samples properly
 6. **Split-file format works**: All 235 samples work when using yeast_split/*.fa (146M archive) - each file has 1 contig
 
-### Root Cause
+### Root Cause [PARTIALLY FIXED]
 
-**Contig name serialization issue** when samples have multiple contigs with PanSN headers:
+**Contig name storage issue** when samples have multiple contigs with PanSN headers:
 
-1. **RAGC correctly writes 17 contigs** for AAA#0 (chrI-chrXVI + chrMT)
-2. **C++ AGC's buffer overrun**: The `deserialize_contig_names()` function crashes at `read(p, enc)` when trying to read past the end of the decompressed buffer
-3. **Hypothesis**: RAGC's `encode_split()` function may be producing incorrect delta-encoded contig names, causing C++ AGC to:
-   - Read past buffer end looking for null terminators
-   - Interpret data incorrectly due to encoding mismatch
-4. **Why split-files work**: Each file has only 1 contig, so no delta encoding between contig names occurs
+1. **Fixed**: RAGC was storing partial contig names (e.g., 'chrI') instead of full PanSN headers (e.g., 'AAA#0#chrI')
+   - Root cause: `PansnFileIterator` and `MultiFileIterator` were discarding `full_header`
+   - Fix: Modified iterators to return full headers as contig names
+   - Commit: 9921cf3
 
-The issue is specifically in `ragc-common/src/collection.rs`:
-- `serialize_contig_names()` - lines 589-616
-- `encode_split()` - lines 503-540 (complex delta encoding logic)
-- Contig names like `AAA#0#chrI`, `AAA#0#chrII` are being delta-encoded incorrectly
+2. **Remaining**: C++ AGC still crashes on yeast235.fa.gz (235 samples, 17 contigs each)
+   - RAGC can read the archive correctly (all 17 contigs with full names)
+   - Simple tests work (2-contig, 17-contig with short sequences)
+   - Split-file archives work (235 samples, 1 contig each)
+   - Delta encoding logic matches C++ AGC exactly
+   - Null terminators are correctly added
+
+3. **Hypothesis**: C++ AGC may have an undocumented limitation with:
+   - Large number of segments per sample (yeast235 has many segments)
+   - Total metadata size exceeding some internal buffer
+   - Multi-contig samples in large archives (works for small tests)
 
 ### Workaround
 
@@ -130,11 +135,14 @@ ragc create -o output.agc -k 21 -s 10000 -m 20 yeast235.fa.gz
 
 ### Next Steps
 
-1. **Add debug logging** to RAGC's `serialize_contig_names()` and `encode_split()` to see exact bytes written
-2. **Compare with C++ AGC's encoding**: Look at C++ AGC's `serialize_contig_names()` in collection_v3.cpp (lines 465-495)
-3. **Test hypothesis**: Create a simple test with 2-3 contigs per sample and verify encoding/decoding
-4. **Fix encode_split()**: Ensure it matches C++ AGC's delta encoding logic exactly
-5. **Validate**: Re-test yeast235.fa.gz after fix
+1. **✓ COMPLETED**: Fixed contig name storage to use full PanSN headers (commit 9921cf3)
+2. **✓ COMPLETED**: Verified delta encoding matches C++ AGC exactly
+3. **✓ COMPLETED**: Confirmed null terminators are correctly added
+4. **✓ COMPLETED**: Tested with simple multi-contig files (2 and 17 contigs) - works with C++ AGC
+5. **IN PROGRESS**: Investigate C++ AGC crash on yeast235.fa.gz
+   - Possible C++ AGC limitation with large multi-contig archives
+   - May need to debug C++ AGC itself or accept this as a known limitation
+   - Workaround: Use split-file format (works perfectly)
 
 GDB backtrace confirmed crash location:
 ```
