@@ -58,3 +58,6 @@ sha2 = "0.10"
 
 # CPU detection
 num_cpus = "1.16"
+
+# FASTA indexing and random access
+faigz-rs = { git = "https://github.com/waveygang/faigz-rs.git" }

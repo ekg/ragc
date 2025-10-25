@@ -32,6 +32,11 @@ anyhow = { workspace = true }
 byteorder = "1.5"
 rdst = "0.20"
 num_cpus = { workspace = true }
+faigz-rs = { workspace = true, optional = true }
+
+[features]
+default = ["indexed-fasta"]
+indexed-fasta = ["faigz-rs"]
 
 [dev-dependencies]
 sha2 = { workspace = true }
