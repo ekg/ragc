@@ -122,6 +122,7 @@ pub mod lz_diff;
 pub mod segment;
 pub mod segment_compression;
 pub mod splitters;
+pub mod tuple_packing;
 pub mod zstd_pool;
 
 // Re-export commonly used types
@@ -137,7 +138,10 @@ pub use kmer::{Kmer, KmerMode};
 pub use kmer_extract::{enumerate_kmers, find_candidate_kmers, remove_non_singletons};
 pub use lz_diff::LZDiff;
 pub use segment::{split_at_splitters, split_at_splitters_with_size, Segment};
-pub use segment_compression::{compress_segment, compress_segment_with_level, decompress_segment};
+pub use segment_compression::{
+    compress_reference_segment, compress_segment, compress_segment_configured, decompress_segment,
+    decompress_segment_with_marker,
+};
 pub use splitters::{
     determine_splitters, determine_splitters_streaming, find_candidate_kmers_multi, is_splitter,
 };

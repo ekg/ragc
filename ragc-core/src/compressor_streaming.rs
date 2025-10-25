@@ -16,7 +16,7 @@ use crate::{
     kmer::{Kmer, KmerMode},
     lz_diff::LZDiff,
     segment::{split_at_splitters_with_size, MISSING_KMER},
-    segment_compression::compress_segment_configured,
+    segment_compression::{compress_reference_segment, compress_segment_configured},
     splitters::determine_splitters,
 };
 use anyhow::{Context, Result};
@@ -3576,13 +3576,13 @@ impl StreamingCompressor {
 
             // Write to ref stream
             if let Some(ref_stream_id) = metadata.ref_stream_id {
-                // Try compressing the reference with configured level
-                let compressed =
-                    compress_segment_configured(&ref_segment.data, self.config.compression_level)?;
+                // CRITICAL FIX: Use compress_reference_segment which checks repetitiveness
+                // and uses tuple packing for low-repetitiveness data (matching C++ AGC)
+                let (compressed, marker) = compress_reference_segment(&ref_segment.data)?;
 
                 if compressed.len() + 1 < ref_segment.data.len() {
                     let mut compressed_with_marker = compressed;
-                    compressed_with_marker.push(0); // Marker byte: 0 = standard ZSTD
+                    compressed_with_marker.push(marker); // Marker byte: 0 = plain ZSTD, 1 = tuple-packed
                     self.archive.add_part(
                         ref_stream_id,
                         &compressed_with_marker,

@@ -739,9 +739,17 @@ impl CollectionV3 {
                     let e_raw_length =
                         zigzag_encode(seg.raw_length as u64, pred_raw_length as u64) as u32;
 
+                    // DEBUG: Print encoded values during serialization
+                    if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+                        eprintln!("ENCODE: group={}, in_group_id={}, prev={}, e_in_group_id={}",
+                            seg.group_id, seg.in_group_id, prev_in_group_id, e_in_group_id);
+                    }
+
                     contig_encoded.push((e_group_id, e_in_group_id, e_raw_length, seg.is_rev_comp));
 
                     // Apply update IMMEDIATELY (matching C++ AGC behavior at collection_v3.cpp:581-582)
+                    // NOTE: C++ AGC condition is: c_in_group_id > prev_in_group_id && c_in_group_id > 0
+                    // We must match this EXACTLY even though it seems wrong!
                     if seg.in_group_id as i32 > prev_in_group_id && seg.in_group_id > 0 {
                         self.set_in_group_id(seg.group_id as usize, seg.in_group_id as i32);
                     }
@@ -754,11 +762,29 @@ impl CollectionV3 {
         }
 
         // Second pass: write to output streams
-        for sample_encoded in &encoded_segments {
-            CollectionVarInt::encode(&mut v_data[0], sample_encoded.len() as u32);
+        if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+            eprintln!("SERIALIZE: Writing {} samples to collection", encoded_segments.len());
+        }
 
-            for contig_encoded in sample_encoded {
+        for (sample_idx, sample_encoded) in encoded_segments.iter().enumerate() {
+            let before_len = v_data[0].len();
+            CollectionVarInt::encode(&mut v_data[0], sample_encoded.len() as u32);
+            let after_len = v_data[0].len();
+
+            if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+                eprintln!("  Sample {}: {} contigs", sample_idx, sample_encoded.len());
+                eprintln!("    Wrote bytes [{}..{}]: {:?}", before_len, after_len, &v_data[0][before_len..after_len]);
+            }
+
+            for (contig_idx, contig_encoded) in sample_encoded.iter().enumerate() {
+                let before_len = v_data[0].len();
                 CollectionVarInt::encode(&mut v_data[0], contig_encoded.len() as u32);
+                let after_len = v_data[0].len();
+
+                if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+                    eprintln!("    Contig {}: {} segments", contig_idx, contig_encoded.len());
+                    eprintln!("      Wrote bytes [{}..{}]: {:?}", before_len, after_len, &v_data[0][before_len..after_len]);
+                }
 
                 for &(e_group_id, e_in_group_id, e_raw_length, is_rev_comp) in contig_encoded {
                     CollectionVarInt::encode(&mut v_data[1], e_group_id);
@@ -767,6 +793,18 @@ impl CollectionV3 {
                     CollectionVarInt::encode(&mut v_data[4], is_rev_comp as u32);
                 }
             }
+
+            if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+                let total_segments: usize = sample_encoded.iter()
+                    .map(|c| c.len())
+                    .sum();
+                eprintln!("  Sample {} total: {} segments", sample_idx, total_segments);
+            }
+        }
+
+        if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+            eprintln!("Stream sizes: [0]={}, [1]={}, [2]={}, [3]={}, [4]={}",
+                v_data[0].len(), v_data[1].len(), v_data[2].len(), v_data[3].len(), v_data[4].len());
         }
 
         v_data
@@ -778,15 +816,27 @@ impl CollectionV3 {
 
         let no_samples_in_curr_batch = CollectionVarInt::decode(&mut ptr0)? as usize;
 
+        if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+            eprintln!("DESERIALIZE: Reading {} samples from collection", no_samples_in_curr_batch);
+        }
+
         // First pass: decode structure and counts
         let mut structure = Vec::new();
-        for _ in 0..no_samples_in_curr_batch {
+        for sample_idx in 0..no_samples_in_curr_batch {
             let no_contigs = CollectionVarInt::decode(&mut ptr0)? as usize;
             let mut contig_seg_counts = Vec::new();
 
-            for _ in 0..no_contigs {
+            if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+                eprintln!("  Sample {}: {} contigs", sample_idx, no_contigs);
+            }
+
+            for contig_idx in 0..no_contigs {
                 let no_segments = CollectionVarInt::decode(&mut ptr0)? as usize;
                 contig_seg_counts.push(no_segments);
+
+                if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+                    eprintln!("    Contig {}: {} segments", contig_idx, no_segments);
+                }
             }
 
             structure.push(contig_seg_counts);
@@ -843,6 +893,12 @@ impl CollectionV3 {
                             as u32
                     };
 
+                    // DEBUG: Print encoded vs decoded values for investigation
+                    if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
+                        eprintln!("DECODE: item={}, group={}, e_in_group_id={}, prev={}, c_in_group_id={}",
+                            item_idx, c_group_id, e_in_group_id, prev_in_group_id, c_in_group_id);
+                    }
+
                     let c_raw_length =
                         zigzag_decode(v_det[3][item_idx] as u64, pred_raw_length as u64) as u32;
                     let c_is_rev_comp = v_det[4][item_idx] != 0;
@@ -855,6 +911,8 @@ impl CollectionV3 {
                     ));
 
                     // Apply update IMMEDIATELY (matching C++ AGC behavior at collection_v3.cpp:674-675)
+                    // NOTE: C++ AGC condition is: c_in_group_id > prev_in_group_id && c_in_group_id > 0
+                    // We must match this EXACTLY even though it causes issues with multiple samples per group!
                     if c_in_group_id as i32 > prev_in_group_id && c_in_group_id > 0 {
                         self.set_in_group_id(c_group_id as usize, c_in_group_id as i32);
                     }
