@@ -181,12 +181,18 @@ mod tests {
         // Highly repetitive sequence (all zeros) - should get score of 1.0
         let repetitive = vec![0; 100];
         let rep1 = check_repetitiveness(&repetitive);
-        assert_eq!(rep1, 1.0, "All-zero sequence should have perfect repetitiveness");
+        assert_eq!(
+            rep1, 1.0,
+            "All-zero sequence should have perfect repetitiveness"
+        );
 
         // Test that the function returns a value between 0 and 1
         let mixed = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1];
         let rep2 = check_repetitiveness(&mixed);
-        assert!(rep2 >= 0.0 && rep2 <= 1.0, "Repetitiveness should be in [0, 1]");
+        assert!(
+            rep2 >= 0.0 && rep2 <= 1.0,
+            "Repetitiveness should be in [0, 1]"
+        );
     }
 
     #[test]
@@ -228,6 +234,9 @@ mod tests {
 
         // Test decompression with marker 1
         let decompressed = decompress_segment_with_marker(&compressed, 1).unwrap();
-        assert_eq!(original, decompressed, "Tuple packing roundtrip should work");
+        assert_eq!(
+            original, decompressed,
+            "Tuple packing roundtrip should work"
+        );
     }
 }

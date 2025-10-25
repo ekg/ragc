@@ -678,7 +678,7 @@ impl StreamingCompressor {
                         let seg_info = Self::prepare_segment_info(
                             &self.config,
                             &sample_name,
-                            &full_header,  // Use full header instead of parsed contig_name
+                            &full_header, // Use full header instead of parsed contig_name
                             seg_idx,
                             segment.data,
                             segment.front_kmer,

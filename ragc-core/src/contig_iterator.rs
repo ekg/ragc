@@ -17,7 +17,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "indexed-fasta")]
-use faigz_rs::{FastaIndex, FastaReader, FastaFormat};
+use faigz_rs::{FastaFormat, FastaIndex, FastaReader};
 
 /// Trait for iterating over contigs from various input sources
 pub trait ContigIterator {
@@ -47,7 +47,8 @@ impl SampleOrderInfo {
         let file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
 
-        let reader: Box<dyn Read> = if file_path.extension().and_then(|s| s.to_str()) == Some("gz") {
+        let reader: Box<dyn Read> = if file_path.extension().and_then(|s| s.to_str()) == Some("gz")
+        {
             Box::new(MultiGzDecoder::new(BufReader::new(file)))
         } else {
             Box::new(BufReader::new(file))
@@ -60,8 +61,8 @@ impl SampleOrderInfo {
 
         // Scan headers
         while let Some((full_header, sample_name, _contig_name, _sequence)) =
-            genome_io.read_contig_with_sample()? {
-
+            genome_io.read_contig_with_sample()?
+        {
             // Track which sample this contig belongs to
             sample_contigs
                 .entry(sample_name.clone())
@@ -160,8 +161,14 @@ impl PansnFileIterator {
                 file_path.display(),
                 file_path.display(),
                 file_path.display(),
-                file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("input"),
-                file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("input"),
+                file_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("input"),
+                file_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("input"),
                 order_info.sample_contigs.len()
             ));
         }
@@ -289,8 +296,8 @@ impl ContigIterator for IndexedPansnFileIterator {
         self.current_contig_idx += 1;
 
         // Use faigz-rs to fetch the sequence
-        let reader = FastaReader::new(&self.index)
-            .with_context(|| "Failed to create FASTA reader")?;
+        let reader =
+            FastaReader::new(&self.index).with_context(|| "Failed to create FASTA reader")?;
 
         let sequence = reader
             .fetch_seq_all(full_header)

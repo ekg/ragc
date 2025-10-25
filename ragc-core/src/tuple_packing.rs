@@ -88,7 +88,11 @@ fn pack_tuples<const N: usize, const MAX: u8>(bytes: &[u8]) -> Vec<u8> {
 
 /// Unpack N values per byte
 /// Matches C++ tuples2bytes_impl
-fn unpack_tuples<const N: usize, const MAX: u8>(tuples: &[u8], output: &mut [u8], output_size: usize) {
+fn unpack_tuples<const N: usize, const MAX: u8>(
+    tuples: &[u8],
+    output: &mut [u8],
+    output_size: usize,
+) {
     let mut i = 0; // tuple index
     let mut j = 0; // output index
 

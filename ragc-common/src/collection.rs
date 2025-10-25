@@ -599,7 +599,12 @@ impl CollectionV3 {
             CollectionVarInt::encode(&mut data, sample.contigs.len() as u32);
 
             if std::env::var("RAGC_DEBUG_CONTIG_NAMES").is_ok() {
-                eprintln!("  Sample {} ({}): {} contigs", id_from + sample_idx, sample.name, sample.contigs.len());
+                eprintln!(
+                    "  Sample {} ({}): {} contigs",
+                    id_from + sample_idx,
+                    sample.name,
+                    sample.contigs.len()
+                );
             }
 
             let mut prev_split = Vec::new();
@@ -612,7 +617,12 @@ impl CollectionV3 {
                     CollectionVarInt::encode_string(&mut data, &contig.name);
 
                     if std::env::var("RAGC_DEBUG_CONTIG_NAMES").is_ok() {
-                        eprintln!("    Contig {}: '{}' (FULL) -> {} bytes", contig_idx, contig.name, data.len() - before_len);
+                        eprintln!(
+                            "    Contig {}: '{}' (FULL) -> {} bytes",
+                            contig_idx,
+                            contig.name,
+                            data.len() - before_len
+                        );
                     }
                 } else {
                     let enc_bytes = Self::encode_split(&prev_split, &curr_split);
@@ -763,8 +773,10 @@ impl CollectionV3 {
 
                     // DEBUG: Print encoded values during serialization
                     if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-                        eprintln!("ENCODE: group={}, in_group_id={}, prev={}, e_in_group_id={}",
-                            seg.group_id, seg.in_group_id, prev_in_group_id, e_in_group_id);
+                        eprintln!(
+                            "ENCODE: group={}, in_group_id={}, prev={}, e_in_group_id={}",
+                            seg.group_id, seg.in_group_id, prev_in_group_id, e_in_group_id
+                        );
                     }
 
                     contig_encoded.push((e_group_id, e_in_group_id, e_raw_length, seg.is_rev_comp));
@@ -785,7 +797,10 @@ impl CollectionV3 {
 
         // Second pass: write to output streams
         if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-            eprintln!("SERIALIZE: Writing {} samples to collection", encoded_segments.len());
+            eprintln!(
+                "SERIALIZE: Writing {} samples to collection",
+                encoded_segments.len()
+            );
         }
 
         for (sample_idx, sample_encoded) in encoded_segments.iter().enumerate() {
@@ -795,7 +810,12 @@ impl CollectionV3 {
 
             if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
                 eprintln!("  Sample {}: {} contigs", sample_idx, sample_encoded.len());
-                eprintln!("    Wrote bytes [{}..{}]: {:?}", before_len, after_len, &v_data[0][before_len..after_len]);
+                eprintln!(
+                    "    Wrote bytes [{}..{}]: {:?}",
+                    before_len,
+                    after_len,
+                    &v_data[0][before_len..after_len]
+                );
             }
 
             for (contig_idx, contig_encoded) in sample_encoded.iter().enumerate() {
@@ -804,8 +824,17 @@ impl CollectionV3 {
                 let after_len = v_data[0].len();
 
                 if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-                    eprintln!("    Contig {}: {} segments", contig_idx, contig_encoded.len());
-                    eprintln!("      Wrote bytes [{}..{}]: {:?}", before_len, after_len, &v_data[0][before_len..after_len]);
+                    eprintln!(
+                        "    Contig {}: {} segments",
+                        contig_idx,
+                        contig_encoded.len()
+                    );
+                    eprintln!(
+                        "      Wrote bytes [{}..{}]: {:?}",
+                        before_len,
+                        after_len,
+                        &v_data[0][before_len..after_len]
+                    );
                 }
 
                 for &(e_group_id, e_in_group_id, e_raw_length, is_rev_comp) in contig_encoded {
@@ -817,16 +846,20 @@ impl CollectionV3 {
             }
 
             if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-                let total_segments: usize = sample_encoded.iter()
-                    .map(|c| c.len())
-                    .sum();
+                let total_segments: usize = sample_encoded.iter().map(|c| c.len()).sum();
                 eprintln!("  Sample {} total: {} segments", sample_idx, total_segments);
             }
         }
 
         if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-            eprintln!("Stream sizes: [0]={}, [1]={}, [2]={}, [3]={}, [4]={}",
-                v_data[0].len(), v_data[1].len(), v_data[2].len(), v_data[3].len(), v_data[4].len());
+            eprintln!(
+                "Stream sizes: [0]={}, [1]={}, [2]={}, [3]={}, [4]={}",
+                v_data[0].len(),
+                v_data[1].len(),
+                v_data[2].len(),
+                v_data[3].len(),
+                v_data[4].len()
+            );
         }
 
         v_data
@@ -839,7 +872,10 @@ impl CollectionV3 {
         let no_samples_in_curr_batch = CollectionVarInt::decode(&mut ptr0)? as usize;
 
         if std::env::var("RAGC_DEBUG_COLLECTION").is_ok() {
-            eprintln!("DESERIALIZE: Reading {} samples from collection", no_samples_in_curr_batch);
+            eprintln!(
+                "DESERIALIZE: Reading {} samples from collection",
+                no_samples_in_curr_batch
+            );
         }
 
         // First pass: decode structure and counts
