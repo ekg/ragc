@@ -591,25 +591,47 @@ impl CollectionV3 {
 
         CollectionVarInt::encode(&mut data, (id_to - id_from) as u32);
 
-        for sample in &self.sample_desc[id_from..id_to] {
+        if std::env::var("RAGC_DEBUG_CONTIG_NAMES").is_ok() {
+            eprintln!("SERIALIZE_CONTIG_NAMES: samples {}..{}", id_from, id_to);
+        }
+
+        for (sample_idx, sample) in self.sample_desc[id_from..id_to].iter().enumerate() {
             CollectionVarInt::encode(&mut data, sample.contigs.len() as u32);
+
+            if std::env::var("RAGC_DEBUG_CONTIG_NAMES").is_ok() {
+                eprintln!("  Sample {} ({}): {} contigs", id_from + sample_idx, sample.name, sample.contigs.len());
+            }
 
             let mut prev_split = Vec::new();
 
-            for contig in &sample.contigs {
+            for (contig_idx, contig) in sample.contigs.iter().enumerate() {
                 let curr_split = Self::split_string(&contig.name);
+                let before_len = data.len();
 
                 if curr_split.len() != prev_split.len() {
                     CollectionVarInt::encode_string(&mut data, &contig.name);
+
+                    if std::env::var("RAGC_DEBUG_CONTIG_NAMES").is_ok() {
+                        eprintln!("    Contig {}: '{}' (FULL) -> {} bytes", contig_idx, contig.name, data.len() - before_len);
+                    }
                 } else {
                     let enc_bytes = Self::encode_split(&prev_split, &curr_split);
                     // Write as raw bytes with null terminator
                     data.extend_from_slice(&enc_bytes);
                     data.push(0);
+
+                    if std::env::var("RAGC_DEBUG_CONTIG_NAMES").is_ok() {
+                        eprintln!("    Contig {}: '{}' (DELTA prev='{}') -> enc_bytes={:?}, {} bytes total",
+                            contig_idx, contig.name, prev_split.join(" "), enc_bytes, data.len() - before_len);
+                    }
                 }
 
                 prev_split = curr_split;
             }
+        }
+
+        if std::env::var("RAGC_DEBUG_CONTIG_NAMES").is_ok() {
+            eprintln!("  Total serialized size: {} bytes", data.len());
         }
 
         data

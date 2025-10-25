@@ -64,8 +64,10 @@ impl ContigIterator for PansnFileIterator {
         };
 
         match reader.read_contig_with_sample()? {
-            Some((_full_header, sample_name, contig_name, sequence)) => {
-                Ok(Some((sample_name, contig_name, sequence)))
+            Some((full_header, sample_name, _contig_name, sequence)) => {
+                // IMPORTANT: Use full_header as contig name to match C++ AGC expectations
+                // For PanSN format, this preserves the full "sample#hap#chr" in contig name
+                Ok(Some((sample_name, full_header, sequence)))
             }
             None => Ok(None),
         }
@@ -157,14 +159,15 @@ impl ContigIterator for MultiFileIterator {
             };
 
             match reader.read_contig_with_sample()? {
-                Some((_full_header, sample_from_header, contig_name, sequence)) => {
+                Some((full_header, sample_from_header, _contig_name, sequence)) => {
                     // Use sample name from header (PanSN format) if available, else fallback to filename
                     let sample_name = if sample_from_header != "unknown" {
                         sample_from_header
                     } else {
                         self.current_sample_name.clone()
                     };
-                    return Ok(Some((sample_name, contig_name, sequence)));
+                    // IMPORTANT: Use full_header as contig name to match C++ AGC expectations
+                    return Ok(Some((sample_name, full_header, sequence)));
                 }
                 None => {
                     // Current file exhausted, move to next file
@@ -210,20 +213,20 @@ mod tests {
 
         let mut iterator = PansnFileIterator::new(temp_file.path()).unwrap();
 
-        // First contig
+        // First contig (contig name is now the full header for C++ AGC compatibility)
         let (sample, contig, _seq) = iterator.next_contig().unwrap().unwrap();
         assert_eq!(sample, "sample1#1");
-        assert_eq!(contig, "chr1");
+        assert_eq!(contig, "sample1#1#chr1");
 
         // Second contig
         let (sample, contig, _seq) = iterator.next_contig().unwrap().unwrap();
         assert_eq!(sample, "sample1#1");
-        assert_eq!(contig, "chr2");
+        assert_eq!(contig, "sample1#1#chr2");
 
         // Third contig
         let (sample, contig, _seq) = iterator.next_contig().unwrap().unwrap();
         assert_eq!(sample, "sample2#0");
-        assert_eq!(contig, "chr1");
+        assert_eq!(contig, "sample2#0#chr1");
 
         // No more contigs
         assert!(iterator.next_contig().unwrap().is_none());
@@ -232,6 +235,6 @@ mod tests {
         iterator.reset().unwrap();
         let (sample, contig, _seq) = iterator.next_contig().unwrap().unwrap();
         assert_eq!(sample, "sample1#1");
-        assert_eq!(contig, "chr1");
+        assert_eq!(contig, "sample1#1#chr1");
     }
 }

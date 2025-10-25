@@ -654,7 +654,7 @@ impl StreamingCompressor {
             let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
                 .context("Failed to open multi-sample FASTA for segmentation")?;
 
-            while let Some((_full_header, sample_name, contig_name, sequence)) =
+            while let Some((full_header, sample_name, _contig_name, sequence)) =
                 reader.read_contig_with_sample()?
             {
                 if !sequence.is_empty() {
@@ -674,10 +674,11 @@ impl StreamingCompressor {
                         total_segments_count += 1;
 
                         // Prepare segment info (k-mer normalization, RC if needed)
+                        // IMPORTANT: Use full_header as contig name to match C++ AGC
                         let seg_info = Self::prepare_segment_info(
                             &self.config,
                             &sample_name,
-                            &contig_name,
+                            &full_header,  // Use full header instead of parsed contig_name
                             seg_idx,
                             segment.data,
                             segment.front_kmer,
