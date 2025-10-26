@@ -422,6 +422,9 @@ impl IndexedPansnFileIterator {
             ));
         }
 
+        // Analyze sample ordering FIRST (reads .fai file header-only, fast)
+        let order_info = SampleOrderInfo::analyze_file(file_path)?;
+
         // Load the index
         let index = FastaIndex::new(
             file_path.to_str().ok_or_else(|| anyhow!("Invalid path"))?,
@@ -432,9 +435,6 @@ impl IndexedPansnFileIterator {
         // Create the reader once and reuse it for all fetches
         let reader = FastaReader::new(&index)
             .with_context(|| "Failed to create FASTA reader")?;
-
-        // Analyze sample ordering
-        let order_info = SampleOrderInfo::analyze_file(file_path)?;
 
         Ok(IndexedPansnFileIterator {
             reader,
@@ -448,39 +448,42 @@ impl IndexedPansnFileIterator {
 #[cfg(feature = "indexed-fasta")]
 impl ContigIterator for IndexedPansnFileIterator {
     fn next_contig(&mut self) -> Result<Option<(String, String, Contig)>> {
-        // Check if we've exhausted all samples
-        if self.current_sample_idx >= self.order_info.sample_order.len() {
-            return Ok(None);
+        // Loop to find next sample with contigs (handles empty samples)
+        loop {
+            // Check if we've exhausted all samples
+            if self.current_sample_idx >= self.order_info.sample_order.len() {
+                return Ok(None);
+            }
+
+            let sample_name = &self.order_info.sample_order[self.current_sample_idx];
+            let contigs = self
+                .order_info
+                .sample_contigs
+                .get(sample_name)
+                .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))?;
+
+            // Check if we've exhausted contigs for this sample
+            if self.current_contig_idx >= contigs.len() {
+                // Move to next sample
+                self.current_sample_idx += 1;
+                self.current_contig_idx = 0;
+                continue; // Loop to next sample instead of recursion
+            }
+
+            // Fetch the contig using random access
+            let full_header = &contigs[self.current_contig_idx];
+            self.current_contig_idx += 1;
+
+            // Use faigz-rs to fetch the sequence (reusing the reader)
+            let sequence = self.reader
+                .fetch_seq_all(full_header)
+                .with_context(|| format!("Failed to fetch sequence for {full_header}"))?;
+
+            // Convert to Contig
+            let contig = Contig::from(sequence.as_bytes());
+
+            return Ok(Some((sample_name.clone(), full_header.clone(), contig)));
         }
-
-        let sample_name = &self.order_info.sample_order[self.current_sample_idx];
-        let contigs = self
-            .order_info
-            .sample_contigs
-            .get(sample_name)
-            .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))?;
-
-        // Check if we've exhausted contigs for this sample
-        if self.current_contig_idx >= contigs.len() {
-            // Move to next sample
-            self.current_sample_idx += 1;
-            self.current_contig_idx = 0;
-            return self.next_contig(); // Recursively get first contig of next sample
-        }
-
-        // Fetch the contig using random access
-        let full_header = &contigs[self.current_contig_idx];
-        self.current_contig_idx += 1;
-
-        // Use faigz-rs to fetch the sequence (reusing the reader)
-        let sequence = self.reader
-            .fetch_seq_all(full_header)
-            .with_context(|| format!("Failed to fetch sequence for {full_header}"))?;
-
-        // Convert to Contig
-        let contig = Contig::from(sequence.as_bytes());
-
-        Ok(Some((sample_name.clone(), full_header.clone(), contig)))
     }
 
     fn reset(&mut self) -> Result<()> {
