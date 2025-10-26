@@ -41,9 +41,79 @@ struct SampleOrderInfo {
 }
 
 impl SampleOrderInfo {
+    /// Analyze sample ordering from FAI index (fast - no decompression needed)
+    fn analyze_from_index(index_path: &str) -> Result<Self> {
+        use std::io::BufRead;
+
+        let file = File::open(index_path)
+            .with_context(|| format!("Failed to open index: {}", index_path))?;
+        let reader = BufReader::new(file);
+
+        let mut sample_contigs: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sample_order = Vec::new();
+        let mut last_sample = None;
+
+        // Read headers from first column of FAI file
+        for line in reader.lines() {
+            let line = line?;
+            let full_header = line.split('\t').next()
+                .ok_or_else(|| anyhow!("Invalid FAI format"))?
+                .to_string();
+
+            // Parse sample name (sample#hap format)
+            let sample_name = if let Some(parts) = full_header.split('#').nth(0) {
+                if let Some(hap) = full_header.split('#').nth(1) {
+                    format!("{}#{}", parts, hap)
+                } else {
+                    full_header.clone()
+                }
+            } else {
+                full_header.clone()
+            };
+
+            // Track which sample this contig belongs to
+            sample_contigs
+                .entry(sample_name.clone())
+                .or_default()
+                .push(full_header);
+
+            // Track when samples change (for contiguity check)
+            if last_sample.as_ref() != Some(&sample_name) {
+                sample_order.push(sample_name.clone());
+                last_sample = Some(sample_name);
+            }
+        }
+
+        // Check if samples are contiguous
+        let unique_samples: std::collections::HashSet<_> = sample_order.iter().collect();
+        let is_contiguous = unique_samples.len() == sample_order.len();
+
+        // If not contiguous, use sorted order
+        let final_sample_order = if is_contiguous {
+            sample_order
+        } else {
+            let mut sorted: Vec<_> = sample_contigs.keys().cloned().collect();
+            sorted.sort();
+            sorted
+        };
+
+        Ok(SampleOrderInfo {
+            sample_contigs,
+            sample_order: final_sample_order,
+            is_contiguous,
+        })
+    }
+
     /// Scan a PanSN file to determine sample ordering
     /// This does a fast header-only pass through the file
     fn analyze_file(file_path: &Path) -> Result<Self> {
+        // Check if FAI index exists - if so, use it for instant header reading
+        let index_path = format!("{}.fai", file_path.display());
+        if std::path::Path::new(&index_path).exists() {
+            return Self::analyze_from_index(&index_path);
+        }
+
+        // Otherwise fall back to decompressing (slow)
         let file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
 
