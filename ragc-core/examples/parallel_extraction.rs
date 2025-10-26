@@ -17,7 +17,10 @@ fn main() -> Result<()> {
         eprintln!("Usage: {} <archive.agc> [num_threads]", args[0]);
         eprintln!();
         eprintln!("Examples:");
-        eprintln!("  {} data.agc       # Use default threads (num_cpus)", args[0]);
+        eprintln!(
+            "  {} data.agc       # Use default threads (num_cpus)",
+            args[0]
+        );
         eprintln!("  {} data.agc 4     # Use 4 threads", args[0]);
         std::process::exit(1);
     }
@@ -121,7 +124,10 @@ fn extract_worker(
                 bases_extracted += sample_bases as u64;
             }
             Err(e) => {
-                eprintln!("[Thread {}] Error extracting {}: {}", thread_id, sample_name, e);
+                eprintln!(
+                    "[Thread {}] Error extracting {}: {}",
+                    thread_id, sample_name, e
+                );
             }
         }
     }

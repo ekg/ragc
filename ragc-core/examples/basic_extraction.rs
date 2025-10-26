@@ -38,18 +38,12 @@ fn main() -> Result<()> {
 
         println!("  Found {} contigs:", contigs.len());
         for (contig_name, sequence) in &contigs {
-            println!(
-                "    {}: {} bp",
-                contig_name,
-                sequence.len()
-            );
+            println!("    {}: {} bp", contig_name, sequence.len());
         }
 
         // Display first 100bp of first contig
         if let Some((contig_name, sequence)) = contigs.first() {
-            let preview = String::from_utf8_lossy(
-                &sequence[..sequence.len().min(100)]
-            );
+            let preview = String::from_utf8_lossy(&sequence[..sequence.len().min(100)]);
             println!("\nFirst 100bp of {}:", contig_name);
             println!("{}", preview);
         }

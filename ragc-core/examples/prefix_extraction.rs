@@ -15,8 +15,14 @@ fn main() -> Result<()> {
         eprintln!("Usage: {} <archive.agc> [prefix]", args[0]);
         eprintln!();
         eprintln!("Examples:");
-        eprintln!("  {} data.agc AAA         # Extract all samples starting with 'AAA'", args[0]);
-        eprintln!("  {} data.agc AAA#0       # Extract haplotype 0 of AAA", args[0]);
+        eprintln!(
+            "  {} data.agc AAA         # Extract all samples starting with 'AAA'",
+            args[0]
+        );
+        eprintln!(
+            "  {} data.agc AAA#0       # Extract haplotype 0 of AAA",
+            args[0]
+        );
         eprintln!("  {} data.agc             # List all samples", args[0]);
         std::process::exit(1);
     }
@@ -64,10 +70,12 @@ fn main() -> Result<()> {
             total_bases += sample_bases;
         }
 
-        println!("\nTotal: {} samples, {} contigs, {} bp",
-                 samples_data.len(),
-                 total_contigs,
-                 total_bases);
+        println!(
+            "\nTotal: {} samples, {} contigs, {} bp",
+            samples_data.len(),
+            total_contigs,
+            total_bases
+        );
 
         // Optionally write to FASTA
         if args.len() >= 4 && args[3] == "--output" {
