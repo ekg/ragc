@@ -73,6 +73,95 @@ agc create -o test.agc input.fasta
 ragc getset test.agc input > rust_output.fasta
 ```
 
+## Using as a Library
+
+ragc provides a simple, thread-safe API for embedding AGC compression/decompression in your Rust projects.
+
+### Add to your Cargo.toml
+
+```toml
+[dependencies]
+ragc-core = { git = "https://github.com/ekg/ragc.git" }
+```
+
+### Basic usage
+
+```rust
+use ragc_core::{Decompressor, DecompressorConfig};
+
+// Open an AGC archive
+let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+
+// List all samples
+let samples = dec.list_samples();
+println!("Found {} samples", samples.len());
+
+// Extract a sample
+let contigs = dec.get_sample("sample_name")?;
+for (contig_name, sequence) in contigs {
+    println!(">{}", contig_name);
+    println!("{}", String::from_utf8_lossy(&sequence));
+}
+
+dec.close()?;
+```
+
+### Prefix-based extraction
+
+```rust
+use ragc_core::{Decompressor, DecompressorConfig};
+
+let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+
+// Get all samples starting with "AAA"
+let aaa_samples = dec.list_samples_with_prefix("AAA");
+
+// Extract all haplotype 0 samples
+let hap0_samples = dec.get_samples_by_prefix("AAA#0")?;
+
+for (sample_name, contigs) in hap0_samples {
+    println!("Sample {}: {} contigs", sample_name, contigs.len());
+}
+```
+
+### Thread-safe parallel extraction
+
+```rust
+use ragc_core::{Decompressor, DecompressorConfig};
+use std::thread;
+
+let dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+let samples = dec.list_samples();
+
+// Spawn threads to extract samples in parallel
+let handles: Vec<_> = samples.into_iter().map(|sample_name| {
+    let mut thread_dec = dec.clone_for_thread().unwrap();
+    thread::spawn(move || {
+        thread_dec.get_sample(&sample_name)
+    })
+}).collect();
+
+// Collect results
+for handle in handles {
+    let contigs = handle.join().unwrap()?;
+    // Process contigs...
+}
+```
+
+### Examples
+
+See the [`ragc-core/examples/`](ragc-core/examples/) directory for complete working examples:
+- **basic_extraction.rs** - Simple archive opening and sample extraction
+- **prefix_extraction.rs** - Filtering samples by prefix with command-line interface
+- **parallel_extraction.rs** - Multi-threaded concurrent extraction
+
+Run examples with:
+```bash
+cargo run --release --example basic_extraction -- data.agc
+cargo run --release --example prefix_extraction -- data.agc AAA#0
+cargo run --release --example parallel_extraction -- data.agc 4
+```
+
 ## Project Structure
 
 The project is organized as a Cargo workspace:

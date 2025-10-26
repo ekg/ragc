@@ -77,9 +77,12 @@ enum Commands {
         /// Input archive file path
         archive: PathBuf,
 
-        /// Sample name(s) to extract
-        #[arg(required = true)]
+        /// Sample name(s) to extract (not required if --prefix is used)
         samples: Vec<String>,
+
+        /// Extract all samples matching this prefix
+        #[arg(short = 'p', long)]
+        prefix: Option<String>,
 
         /// Output file (default: stdout)
         #[arg(short = 'o', long)]
@@ -181,9 +184,10 @@ fn main() -> Result<()> {
         Commands::Getset {
             archive,
             samples,
+            prefix,
             output,
             verbosity,
-        } => getset_command(archive, samples, output, verbosity)?,
+        } => getset_command(archive, samples, prefix, output, verbosity)?,
 
         Commands::Listset { archive, output } => listset_command(archive, output)?,
 
@@ -355,6 +359,7 @@ fn create_archive(
 fn getset_command(
     archive: PathBuf,
     samples: Vec<String>,
+    prefix: Option<String>,
     output: Option<PathBuf>,
     verbosity: u32,
 ) -> Result<()> {
@@ -365,11 +370,32 @@ fn getset_command(
     let config = DecompressorConfig { verbosity };
     let mut decompressor = Decompressor::open(archive_str, config)?;
 
+    // Determine which samples to extract
+    let samples_to_extract = if let Some(prefix_str) = prefix {
+        // Extract by prefix
+        if verbosity > 0 {
+            eprintln!("Finding samples with prefix: {}", prefix_str);
+        }
+        let matching_samples = decompressor.list_samples_with_prefix(&prefix_str);
+        if matching_samples.is_empty() {
+            anyhow::bail!("No samples found matching prefix '{}'", prefix_str);
+        }
+        if verbosity > 0 {
+            eprintln!("Found {} matching samples", matching_samples.len());
+        }
+        matching_samples
+    } else if !samples.is_empty() {
+        // Extract specific samples
+        samples
+    } else {
+        anyhow::bail!("Must specify either sample names or --prefix");
+    };
+
     // If output file specified, extract to file
     // Otherwise, extract to stdout (via temp file for simplicity)
     if let Some(output_path) = output {
         // Extract each sample to the output file (append mode)
-        for sample_name in &samples {
+        for sample_name in &samples_to_extract {
             if verbosity > 0 {
                 eprintln!("Extracting sample: {sample_name}");
             }
@@ -379,7 +405,7 @@ fn getset_command(
         // Extract to temp file then write to stdout
         let temp_path =
             std::env::temp_dir().join(format!("agc_extract_{}.fasta", std::process::id()));
-        for sample_name in &samples {
+        for sample_name in &samples_to_extract {
             if verbosity > 0 {
                 eprintln!("Extracting sample: {sample_name}");
             }

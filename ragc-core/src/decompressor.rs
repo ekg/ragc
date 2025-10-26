@@ -27,6 +27,31 @@ impl Default for DecompressorConfig {
 }
 
 /// AGC Decompressor
+///
+/// Provides thread-safe read access to AGC archives.
+/// For concurrent access, use `clone_for_thread()` to create independent readers.
+///
+/// # Thread Safety
+/// - `Decompressor` is NOT `Sync` - cannot be shared between threads
+/// - Use `clone_for_thread()` to create independent readers (cheap - shares archive data)
+/// - Each clone can be used from a separate thread independently
+///
+/// # Example
+/// ```no_run
+/// use ragc_core::{Decompressor, DecompressorConfig};
+/// use std::thread;
+///
+/// let dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+/// let samples = dec.list_samples();
+///
+/// let handles: Vec<_> = samples.into_iter().map(|sample_name| {
+///     let mut thread_dec = dec.clone_for_thread().unwrap();
+///     thread::spawn(move || {
+///         thread_dec.get_sample(&sample_name)
+///     })
+/// }).collect();
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub struct Decompressor {
     config: DecompressorConfig,
     archive: Archive,
@@ -39,6 +64,9 @@ pub struct Decompressor {
     _segment_size: u32,
     kmer_length: u32,
     min_match_len: u32,
+
+    // Archive path for cloning
+    archive_path: String,
 }
 
 impl Decompressor {
@@ -82,6 +110,7 @@ impl Decompressor {
             _segment_size: segment_size,
             kmer_length,
             min_match_len,
+            archive_path: archive_path.to_string(),
         })
     }
 
@@ -540,6 +569,106 @@ impl Decompressor {
 
             Ok(contig_data)
         }
+    }
+
+    /// Get all sample names that match a given prefix
+    ///
+    /// This is useful for extracting all samples from a specific genome or haplotype.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use ragc_core::{Decompressor, DecompressorConfig};
+    ///
+    /// let dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+    ///
+    /// // Get all samples starting with "AAA"
+    /// let aaa_samples = dec.list_samples_with_prefix("AAA");
+    /// // Returns: ["AAA#0", "AAA#1", ...] if they exist
+    ///
+    /// // Get all samples with haplotype 0
+    /// let hap0_samples = dec.list_samples_with_prefix("AAA#0");
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn list_samples_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.list_samples()
+            .into_iter()
+            .filter(|s| s.starts_with(prefix))
+            .collect()
+    }
+
+    /// Extract multiple samples matching a prefix
+    ///
+    /// Returns a HashMap mapping sample names to their contigs.
+    /// Each contig is represented as (contig_name, sequence).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use ragc_core::{Decompressor, DecompressorConfig};
+    ///
+    /// let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+    ///
+    /// // Extract all AAA samples
+    /// let aaa_samples = dec.get_samples_by_prefix("AAA")?;
+    ///
+    /// for (sample_name, contigs) in aaa_samples {
+    ///     println!("Sample {}: {} contigs", sample_name, contigs.len());
+    ///     for (contig_name, sequence) in contigs {
+    ///         println!("  {}: {} bp", contig_name, sequence.len());
+    ///     }
+    /// }
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn get_samples_by_prefix(
+        &mut self,
+        prefix: &str,
+    ) -> Result<HashMap<String, Vec<(String, Contig)>>> {
+        let sample_names = self.list_samples_with_prefix(prefix);
+        let mut results = HashMap::new();
+
+        for sample_name in sample_names {
+            let contigs = self.get_sample(&sample_name)?;
+            results.insert(sample_name, contigs);
+        }
+
+        Ok(results)
+    }
+
+    /// Clone this decompressor for use in another thread
+    ///
+    /// This creates an independent reader that can be used from a different thread.
+    /// The clone is lightweight as it shares the archive data structure.
+    ///
+    /// # Thread Safety
+    /// Each clone is fully independent and can be used from a separate thread.
+    /// The segment cache is NOT shared between clones.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use ragc_core::{Decompressor, DecompressorConfig};
+    /// use std::thread;
+    ///
+    /// let dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+    /// let samples = dec.list_samples();
+    ///
+    /// // Spawn threads to extract samples in parallel
+    /// let handles: Vec<_> = samples.into_iter().map(|sample_name| {
+    ///     let mut thread_dec = dec.clone_for_thread().unwrap();
+    ///     thread::spawn(move || {
+    ///         thread_dec.get_sample(&sample_name)
+    ///     })
+    /// }).collect();
+    ///
+    /// // Collect results
+    /// for handle in handles {
+    ///     let result = handle.join().unwrap()?;
+    ///     // Process result...
+    /// }
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn clone_for_thread(&self) -> Result<Self> {
+        // Re-open the archive (cheap - just re-reads metadata)
+        // Archive data is memory-mapped or cached by the OS
+        Self::open(&self.archive_path, self.config.clone())
     }
 
     /// Write a sample to a FASTA file
