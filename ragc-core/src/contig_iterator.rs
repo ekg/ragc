@@ -56,7 +56,9 @@ impl SampleOrderInfo {
         // Read headers from first column of FAI file
         for line in reader.lines() {
             let line = line?;
-            let full_header = line.split('\t').next()
+            let full_header = line
+                .split('\t')
+                .next()
                 .ok_or_else(|| anyhow!("Invalid FAI format"))?
                 .to_string();
 
@@ -399,7 +401,7 @@ impl ContigIterator for BufferedPansnFileIterator {
 /// Uses faigz-rs to read contigs in sample-grouped order even if file is out-of-order
 #[cfg(feature = "indexed-fasta")]
 pub struct IndexedPansnFileIterator {
-    index: FastaIndex,  // Must keep index alive for reader
+    index: FastaIndex, // Must keep index alive for reader
     reader: FastaReader,
     order_info: SampleOrderInfo,
     current_sample_idx: usize,
@@ -434,11 +436,10 @@ impl IndexedPansnFileIterator {
         .with_context(|| format!("Failed to load FASTA index for {}", file_path.display()))?;
 
         // Create the reader once and reuse it for all fetches
-        let reader = FastaReader::new(&index)
-            .with_context(|| "Failed to create FASTA reader")?;
+        let reader = FastaReader::new(&index).with_context(|| "Failed to create FASTA reader")?;
 
         Ok(IndexedPansnFileIterator {
-            index,   // Store index to keep it alive
+            index, // Store index to keep it alive
             reader,
             order_info,
             current_sample_idx: 0,
@@ -477,7 +478,8 @@ impl ContigIterator for IndexedPansnFileIterator {
             self.current_contig_idx += 1;
 
             // Use faigz-rs to fetch the sequence (reusing the reader)
-            let sequence = self.reader
+            let sequence = self
+                .reader
                 .fetch_seq_all(full_header)
                 .with_context(|| format!("Failed to fetch sequence for {full_header}"))?;
 
