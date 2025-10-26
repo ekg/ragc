@@ -271,26 +271,27 @@ fn create_archive(
                 eprintln!();
             }
 
-            // Try to use indexed iterator if .fai exists
+            // Try indexed iterator first (fast random access if .fai exists)
+            // Fall back to buffered in-memory reordering if no index
             #[cfg(feature = "indexed-fasta")]
             {
                 use ragc_core::contig_iterator::IndexedPansnFileIterator;
                 match IndexedPansnFileIterator::new(input_path) {
                     Ok(indexed_iter) => {
                         if verbosity > 0 {
-                            eprintln!("Using indexed FASTA with random access (.fai index found)");
+                            eprintln!("Using indexed random access (.fai index found)");
                             eprintln!();
                         }
                         compressor.add_contigs_with_splitters(Box::new(indexed_iter))?;
                     }
-                    Err(e) => {
-                        // No index or error loading it, use regular iterator
+                    Err(_) => {
+                        // No index, use buffered approach
+                        use ragc_core::contig_iterator::BufferedPansnFileIterator;
                         if verbosity > 0 {
-                            eprintln!("Indexed iterator failed: {}", e);
-                            eprintln!("Falling back to regular iterator");
+                            eprintln!("Using buffered in-memory reordering (no .fai index)");
                             eprintln!();
                         }
-                        let iterator = PansnFileIterator::new(input_path)?;
+                        let iterator = BufferedPansnFileIterator::new(input_path)?;
                         compressor.add_contigs_with_splitters(Box::new(iterator))?;
                     }
                 }
@@ -298,7 +299,12 @@ fn create_archive(
 
             #[cfg(not(feature = "indexed-fasta"))]
             {
-                let iterator = PansnFileIterator::new(input_path)?;
+                use ragc_core::contig_iterator::BufferedPansnFileIterator;
+                if verbosity > 0 {
+                    eprintln!("Using buffered in-memory reordering");
+                    eprintln!();
+                }
+                let iterator = BufferedPansnFileIterator::new(input_path)?;
                 compressor.add_contigs_with_splitters(Box::new(iterator))?;
             }
         } else {

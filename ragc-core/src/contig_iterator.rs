@@ -220,11 +220,116 @@ impl ContigIterator for PansnFileIterator {
     }
 }
 
+/// Iterator that buffers entire file in memory and outputs in sample-grouped order
+/// Much faster than random access for files with non-contiguous sample ordering
+pub struct BufferedPansnFileIterator {
+    // Map from sample name to vector of (contig_name, sequence)
+    sample_contigs: HashMap<String, Vec<(String, Contig)>>,
+    sample_order: Vec<String>,
+    current_sample_idx: usize,
+    current_contig_idx: usize,
+}
+
+impl BufferedPansnFileIterator {
+    /// Create a new buffered iterator that reads entire file into memory
+    pub fn new(file_path: &Path) -> Result<Self> {
+        eprintln!("Reading entire file into memory for reordering...");
+
+        // Open reader
+        let file = File::open(file_path)
+            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
+        let reader: Box<dyn Read> = if file_path.to_string_lossy().ends_with(".gz") {
+            Box::new(BufReader::new(MultiGzDecoder::new(file)))
+        } else {
+            Box::new(BufReader::new(file))
+        };
+        let mut genome_io = GenomeIO::new(reader);
+
+        // Read all contigs and group by sample
+        let mut sample_contigs: HashMap<String, Vec<(String, Contig)>> = HashMap::new();
+        let mut sample_order = Vec::new();
+        let mut seen_samples = std::collections::HashSet::new();
+
+        while let Some((header, contig)) = genome_io.read_contig()? {
+            // Parse sample name from header (sample#hap#chr format)
+            let sample_name = if let Some(parts) = header.split('#').nth(0) {
+                if let Some(hap) = header.split('#').nth(1) {
+                    format!("{}#{}", parts, hap)
+                } else {
+                    header.clone()
+                }
+            } else {
+                header.clone()
+            };
+
+            // Track sample order (first occurrence)
+            if !seen_samples.contains(&sample_name) {
+                sample_order.push(sample_name.clone());
+                seen_samples.insert(sample_name.clone());
+            }
+
+            // Store contig
+            sample_contigs
+                .entry(sample_name)
+                .or_default()
+                .push((header, contig));
+        }
+
+        eprintln!("Loaded {} samples into memory", sample_order.len());
+
+        Ok(BufferedPansnFileIterator {
+            sample_contigs,
+            sample_order,
+            current_sample_idx: 0,
+            current_contig_idx: 0,
+        })
+    }
+}
+
+impl ContigIterator for BufferedPansnFileIterator {
+    fn next_contig(&mut self) -> Result<Option<(String, String, Contig)>> {
+        // Check if we've exhausted all samples
+        if self.current_sample_idx >= self.sample_order.len() {
+            return Ok(None);
+        }
+
+        let sample_name = &self.sample_order[self.current_sample_idx];
+        let contigs = self
+            .sample_contigs
+            .get(sample_name)
+            .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))?;
+
+        // Check if we've exhausted contigs for this sample
+        if self.current_contig_idx >= contigs.len() {
+            // Move to next sample
+            self.current_sample_idx += 1;
+            self.current_contig_idx = 0;
+            return self.next_contig(); // Recursively get first contig of next sample
+        }
+
+        // Get the contig
+        let (contig_name, contig) = &contigs[self.current_contig_idx];
+        self.current_contig_idx += 1;
+
+        Ok(Some((
+            sample_name.clone(),
+            contig_name.clone(),
+            contig.clone(),
+        )))
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.current_sample_idx = 0;
+        self.current_contig_idx = 0;
+        Ok(())
+    }
+}
+
 /// Iterator for indexed PanSN FASTA files with random access
 /// Uses faigz-rs to read contigs in sample-grouped order even if file is out-of-order
 #[cfg(feature = "indexed-fasta")]
 pub struct IndexedPansnFileIterator {
-    index: std::sync::Arc<FastaIndex>,
+    reader: FastaReader,
     order_info: SampleOrderInfo,
     current_sample_idx: usize,
     current_contig_idx: usize,
@@ -254,11 +359,15 @@ impl IndexedPansnFileIterator {
         )
         .with_context(|| format!("Failed to load FASTA index for {}", file_path.display()))?;
 
+        // Create the reader once and reuse it for all fetches
+        let reader = FastaReader::new(&index)
+            .with_context(|| "Failed to create FASTA reader")?;
+
         // Analyze sample ordering
         let order_info = SampleOrderInfo::analyze_file(file_path)?;
 
         Ok(IndexedPansnFileIterator {
-            index: std::sync::Arc::new(index),
+            reader,
             order_info,
             current_sample_idx: 0,
             current_contig_idx: 0,
@@ -293,11 +402,8 @@ impl ContigIterator for IndexedPansnFileIterator {
         let full_header = &contigs[self.current_contig_idx];
         self.current_contig_idx += 1;
 
-        // Use faigz-rs to fetch the sequence
-        let reader =
-            FastaReader::new(&self.index).with_context(|| "Failed to create FASTA reader")?;
-
-        let sequence = reader
+        // Use faigz-rs to fetch the sequence (reusing the reader)
+        let sequence = self.reader
             .fetch_seq_all(full_header)
             .with_context(|| format!("Failed to fetch sequence for {full_header}"))?;
 
