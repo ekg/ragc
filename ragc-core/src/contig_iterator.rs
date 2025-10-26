@@ -399,6 +399,7 @@ impl ContigIterator for BufferedPansnFileIterator {
 /// Uses faigz-rs to read contigs in sample-grouped order even if file is out-of-order
 #[cfg(feature = "indexed-fasta")]
 pub struct IndexedPansnFileIterator {
+    index: FastaIndex,  // Must keep index alive for reader
     reader: FastaReader,
     order_info: SampleOrderInfo,
     current_sample_idx: usize,
@@ -437,6 +438,7 @@ impl IndexedPansnFileIterator {
             .with_context(|| "Failed to create FASTA reader")?;
 
         Ok(IndexedPansnFileIterator {
+            index,   // Store index to keep it alive
             reader,
             order_info,
             current_sample_idx: 0,
