@@ -46,7 +46,7 @@ impl SampleOrderInfo {
         use std::io::BufRead;
 
         let file = File::open(index_path)
-            .with_context(|| format!("Failed to open index: {}", index_path))?;
+            .with_context(|| format!("Failed to open index: {index_path}"))?;
         let reader = BufReader::new(file);
 
         let mut sample_contigs: HashMap<String, Vec<String>> = HashMap::new();
@@ -65,7 +65,7 @@ impl SampleOrderInfo {
             // Parse sample name (sample#hap format)
             let sample_name = if let Some(parts) = full_header.split('#').nth(0) {
                 if let Some(hap) = full_header.split('#').nth(1) {
-                    format!("{}#{}", parts, hap)
+                    format!("{parts}#{hap}")
                 } else {
                     full_header.clone()
                 }
@@ -326,7 +326,7 @@ impl BufferedPansnFileIterator {
             // Parse sample name from header (sample#hap#chr format)
             let sample_name = if let Some(parts) = header.split('#').nth(0) {
                 if let Some(hap) = header.split('#').nth(1) {
-                    format!("{}#{}", parts, hap)
+                    format!("{parts}#{hap}")
                 } else {
                     header.clone()
                 }
@@ -401,6 +401,8 @@ impl ContigIterator for BufferedPansnFileIterator {
 /// Uses faigz-rs to read contigs in sample-grouped order even if file is out-of-order
 #[cfg(feature = "indexed-fasta")]
 pub struct IndexedPansnFileIterator {
+    // Field is intentionally kept to prevent dangling pointer in reader
+    #[allow(dead_code)]
     index: FastaIndex, // Must keep index alive for reader
     reader: FastaReader,
     order_info: SampleOrderInfo,

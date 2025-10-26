@@ -9,7 +9,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ragc_core::{
-    Decompressor, DecompressorConfig, MultiFileIterator, PansnFileIterator, StreamingCompressor,
+    Decompressor, DecompressorConfig, MultiFileIterator, StreamingCompressor,
     StreamingCompressorConfig,
 };
 use std::io::{self, Write};
