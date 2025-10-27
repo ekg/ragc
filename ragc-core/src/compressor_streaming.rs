@@ -719,6 +719,70 @@ impl StreamingCompressor {
         }
 
         // ==================================================================
+        // PHASE 1.5: Fix one-kmer segment keys using candidate search
+        // ==================================================================
+        if self.config.verbosity > 0 {
+            println!("Phase 1.5: Finding candidate groups for one-kmer segments...");
+        }
+
+        // Build terminators map from segments with both k-mers
+        let mut group_terminators: HashMap<u64, Vec<u64>> = HashMap::new();
+        for segment in &all_segments {
+            if segment.key.kmer_front != MISSING_KMER && segment.key.kmer_back != MISSING_KMER {
+                // Track both directions
+                group_terminators
+                    .entry(segment.key.kmer_front)
+                    .or_default()
+                    .push(segment.key.kmer_back);
+                if segment.key.kmer_front != segment.key.kmer_back {
+                    group_terminators
+                        .entry(segment.key.kmer_back)
+                        .or_default()
+                        .push(segment.key.kmer_front);
+                }
+            }
+        }
+
+        // Fix one-kmer segments to use first candidate
+        let mut fixed_count = 0;
+        for segment in &mut all_segments {
+            let has_front = segment.key.kmer_front != MISSING_KMER;
+            let has_back = segment.key.kmer_back != MISSING_KMER;
+
+            if (has_front && !has_back) || (!has_front && has_back) {
+                // One k-mer present - search for candidates
+                let present_kmer = if has_front {
+                    segment.key.kmer_front
+                } else {
+                    segment.key.kmer_back
+                };
+
+                if let Some(candidates) = group_terminators.get(&present_kmer) {
+                    if !candidates.is_empty() {
+                        // Use FIRST candidate to avoid creating new MISSING_KMER groups
+                        let first_cand = candidates[0];
+                        segment.key = if first_cand < present_kmer {
+                            SegmentGroupKey {
+                                kmer_front: first_cand,
+                                kmer_back: present_kmer,
+                            }
+                        } else {
+                            SegmentGroupKey {
+                                kmer_front: present_kmer,
+                                kmer_back: first_cand,
+                            }
+                        };
+                        fixed_count += 1;
+                    }
+                }
+            }
+        }
+
+        if self.config.verbosity > 0 {
+            println!("Phase 1.5 complete: Fixed {fixed_count} one-kmer segments");
+        }
+
+        // ==================================================================
         // PHASE 2: Single-threaded grouping (group segments by key)
         // ==================================================================
         if self.config.verbosity > 0 {
@@ -1187,23 +1251,76 @@ impl StreamingCompressor {
                             let terms_map = group_terms.read().unwrap();
                             if let Some(candidates) = terms_map.get(&present_kmer) {
                                 if !candidates.is_empty() {
-                                    // Found existing groups with this k-mer
-                                    // For now, use the first candidate (TODO: test compression with each)
-                                    let cand_kmer = candidates[0];
-
-                                    // Create normalized key
-                                    let (key, _needs_rc) = if cand_kmer < present_kmer {
-                                        (SegmentGroupKey { kmer_front: cand_kmer, kmer_back: present_kmer }, true)
-                                    } else {
-                                        (SegmentGroupKey { kmer_front: present_kmer, kmer_back: cand_kmer }, false)
-                                    };
-
+                                    // Found existing groups - test compression with each (matching C++ AGC)
                                     if cfg.verbosity > 2 {
-                                        eprintln!("[MATCH] One-kmer segment ({}) matched to existing group ({}, {})",
-                                            present_kmer, key.kmer_front, key.kmer_back);
+                                        eprintln!("[ESTIMATE] Testing {} candidates for kmer {}", candidates.len(), present_kmer);
                                     }
 
-                                    key
+                                    // Use FIRST candidate as initial best (not fallback MISSING_KMER key)
+                                    // This ensures we GROUP with existing segments even if compression isn't better
+                                    // (small boundary segments often don't compress, but still belong in groups)
+                                    let first_cand = candidates[0];
+                                    let mut best_key = if first_cand < present_kmer {
+                                        SegmentGroupKey { kmer_front: first_cand, kmer_back: present_kmer }
+                                    } else {
+                                        SegmentGroupKey { kmer_front: present_kmer, kmer_back: first_cand }
+                                    };
+                                    let mut best_size = seg_info.segment.data.len();
+
+                                    for &cand_kmer in candidates.iter() {
+                                        // Create normalized key for this candidate
+                                        let (test_key, needs_rc) = if cand_kmer < present_kmer {
+                                            (SegmentGroupKey { kmer_front: cand_kmer, kmer_back: present_kmer }, true)
+                                        } else {
+                                            (SegmentGroupKey { kmer_front: present_kmer, kmer_back: cand_kmer }, false)
+                                        };
+
+                                        // Get the group's reference to test compression
+                                        if let Some(group_entry) = writers.get(&test_key) {
+                                            let group_guard = group_entry.lock().unwrap();
+                                            if let Some(ref reference) = group_guard.reference {
+                                                if cfg.verbosity > 2 {
+                                                    eprintln!("[ESTIMATE] Testing candidate ({}, {}) with ref size {}",
+                                                        test_key.kmer_front, test_key.kmer_back, reference.len());
+                                                }
+                                                // Estimate compressed size using LZ encoding
+                                                use crate::lz_diff::LZDiff;
+                                                let mut lz_diff = LZDiff::new(cfg.min_match_len);
+                                                lz_diff.prepare(reference);
+
+                                                let test_segment = if needs_rc {
+                                                    // Reverse complement for testing
+                                                    seg_info.segment.data.iter().rev().map(|&b| match b {
+                                                        0 => 3, 1 => 2, 2 => 1, 3 => 0, _ => b
+                                                    }).collect()
+                                                } else {
+                                                    seg_info.segment.data.clone()
+                                                };
+
+                                                let encoded = lz_diff.encode(&test_segment);
+                                                let estimated_size = encoded.len();
+
+                                                if cfg.verbosity > 2 {
+                                                    eprintln!("[ESTIMATE] Candidate ({}, {}) → estimated={}, best={}, raw={}",
+                                                        test_key.kmer_front, test_key.kmer_back,
+                                                        estimated_size, best_size, seg_info.segment.data.len());
+                                                }
+
+                                                if estimated_size < best_size {
+                                                    best_size = estimated_size;
+                                                    best_key = test_key;
+
+                                                    if cfg.verbosity > 2 {
+                                                        eprintln!("[MATCH] Better candidate: ({}, {}) size={} (was {})",
+                                                            best_key.kmer_front, best_key.kmer_back,
+                                                            estimated_size, seg_info.segment.data.len());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    best_key
                                 } else {
                                     // No candidates - use original key
                                     seg_info.key.clone()
@@ -2467,6 +2584,10 @@ impl StreamingCompressor {
         let next_group_id = Arc::new(AtomicU32::new(self.next_group_id));
         let total_segments_counter = Arc::new(AtomicUsize::new(0));
 
+        // Shared terminators map for one-kmer candidate search (matching C++ AGC)
+        // Maps k-mer → Vec of paired k-mers in existing groups
+        let group_terminators = Arc::new(DashMap::<u64, Vec<u64>>::new());
+
         // Move archive and collection to Arc<Mutex> so writer thread can access them
         let archive = Arc::new(Mutex::new(std::mem::replace(
             &mut self.archive,
@@ -2611,6 +2732,7 @@ impl StreamingCompressor {
                 let groups = groups.clone();
                 let next_group_id = next_group_id.clone();
                 let total_segments_counter = total_segments_counter.clone();
+                let group_terminators = group_terminators.clone();
                 let splitters = splitters.clone();
                 let config = self.config.clone();
 
@@ -2642,7 +2764,7 @@ impl StreamingCompressor {
                             }
 
                             // Prepare segment info
-                            let seg_info = Self::prepare_segment_info(
+                            let mut seg_info = Self::prepare_segment_info(
                                 &config,
                                 &task.sample_name,
                                 &task.contig_name,
@@ -2652,10 +2774,58 @@ impl StreamingCompressor {
                                 segment.back_kmer,
                             )?;
 
+                            // Check if segment has one k-mer - search for candidates (matching C++ AGC)
+                            let has_front = seg_info.key.kmer_front != MISSING_KMER;
+                            let has_back = seg_info.key.kmer_back != MISSING_KMER;
+
+                            if (has_front && !has_back) || (!has_front && has_back) {
+                                // One k-mer present - search for candidate groups
+                                let present_kmer = if has_front {
+                                    seg_info.key.kmer_front
+                                } else {
+                                    seg_info.key.kmer_back
+                                };
+
+                                if let Some(candidates_ref) = group_terminators.get(&present_kmer) {
+                                    if !candidates_ref.is_empty() {
+                                        // Use FIRST candidate to avoid creating new MISSING_KMER groups
+                                        let first_cand = candidates_ref[0];
+                                        seg_info.key = if first_cand < present_kmer {
+                                            SegmentGroupKey {
+                                                kmer_front: first_cand,
+                                                kmer_back: present_kmer,
+                                            }
+                                        } else {
+                                            SegmentGroupKey {
+                                                kmer_front: present_kmer,
+                                                kmer_back: first_cand,
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+
                             // Access shared groups with DashMap (per-shard locking, not global!)
                             let pack_opt = {
                                 let mut group_entry =
                                     groups.entry(seg_info.key.clone()).or_insert_with(|| {
+                                        // Update terminators map WHEN CREATING new group with both k-mers
+                                        // This ensures terminators are available before other threads check
+                                        if seg_info.key.kmer_front != MISSING_KMER
+                                            && seg_info.key.kmer_back != MISSING_KMER
+                                        {
+                                            group_terminators
+                                                .entry(seg_info.key.kmer_front)
+                                                .or_default()
+                                                .push(seg_info.key.kmer_back);
+                                            if seg_info.key.kmer_front != seg_info.key.kmer_back {
+                                                group_terminators
+                                                    .entry(seg_info.key.kmer_back)
+                                                    .or_default()
+                                                    .push(seg_info.key.kmer_front);
+                                            }
+                                        }
+
                                         let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
                                         let stream_id = gid as usize;
                                         let ref_stream_id = if gid >= 16 {

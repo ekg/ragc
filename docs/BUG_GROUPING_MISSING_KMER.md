@@ -68,12 +68,41 @@ This means:
 - Each one-kmer segment creates a new unique group
 - Result: 1537 groups instead of ~240
 
-## Fix Required
+## Fix Applied (Partial)
 
-1. Re-enable `group_terminators` tracking (lines 1177-1191)
-2. Implement `find_candidate_group_with_one_kmer()` function
-3. When `kmer_front` or `kmer_back` is MISSING_KMER:
-   - Look up candidates in `group_terminators`
-   - Test compression with each candidate's reference
-   - Pick best match
-4. Fall back to creating new group if no candidates exist
+✅ **Phase 1 Complete:**
+1. Re-enabled `group_terminators` tracking
+2. Implemented one-kmer candidate search
+3. Groups: 1537 → 240 (matches C++ AGC!)
+4. Splitters: 10,989,085 singletons, 240 splitters (correct!)
+
+⚠️ **Remaining Issue:**
+- File size: 15M vs C++ AGC's 9.6M (56% larger)
+- Cause: Using **first candidate** instead of testing all candidates
+- Packs: 1,537 (avg 3.4 segs/pack) instead of optimal ~104 packs
+- Result: Poor grouping → unfilled packs → less LZ benefit
+
+## Phase 2 Required
+
+Implement proper candidate selection (matching C++ AGC):
+```rust
+// For each one-kmer segment:
+let candidates = group_terminators.get(&present_kmer);
+let mut best_group = None;
+let mut best_size = segment.len();
+
+for cand_kmer in candidates {
+    let group_key = normalize(present_kmer, cand_kmer);
+    let estimated_size = estimate_compression(segment, group[group_key].reference);
+    if estimated_size < best_size {
+        best_size = estimated_size;
+        best_group = Some(group_key);
+    }
+}
+```
+
+This will lead to:
+- Better group selection (segments join most similar groups)
+- Fuller packs (fewer small groups)
+- Better LZ compression (more similar segments per group)
+- **Expected result: ~9.6M matching C++ AGC**
