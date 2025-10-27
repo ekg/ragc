@@ -138,20 +138,18 @@ pub fn determine_splitters_streaming(
             reader.read_contig_with_sample()?
         {
             if !sequence.is_empty() {
-                // Identify first sample#haplotype as reference
+                // Identify first sample#haplotype for logging
                 if reference_sample.is_empty() {
                     reference_sample = sample_name.clone();
                     eprintln!(
-                        "DEBUG: Using {} as reference (first sample#haplotype)",
+                        "DEBUG: Collecting k-mers from ALL samples (first sample: {})",
                         reference_sample
                     );
                 }
 
-                // Only collect k-mers from reference sample#haplotype
-                if sample_name == reference_sample {
-                    let contig_kmers = enumerate_kmers(&sequence, k);
-                    all_kmers.extend(contig_kmers);
-                }
+                // CRITICAL FIX: Collect k-mers from ALL samples (matching C++ AGC)
+                let contig_kmers = enumerate_kmers(&sequence, k);
+                all_kmers.extend(contig_kmers);
             }
         }
     }
@@ -205,11 +203,11 @@ pub fn determine_splitters_streaming(
 
     {
         let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
-        while let Some((_full_header, sample_name, _contig_name, sequence)) =
+        while let Some((_full_header, _sample_name, _contig_name, sequence)) =
             reader.read_contig_with_sample()?
         {
-            // Only process contigs from reference sample#haplotype
-            if !sequence.is_empty() && sample_name == reference_sample {
+            // CRITICAL FIX: Process ALL samples (matching C++ AGC)
+            if !sequence.is_empty() {
                 let used = find_actual_splitters_in_contig(&sequence, &candidates, k, segment_size);
                 splitters.extend(used);
             }

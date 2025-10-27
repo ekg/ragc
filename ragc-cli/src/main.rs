@@ -322,23 +322,25 @@ fn create_archive(
             compressor.add_fasta_files_with_splitters(&[(sample_name, input_path.as_path())])?;
         }
     } else {
-        // Multiple input files: sample names from FASTA headers
+        // Multiple input files: treat each file as a separate sample
+        // Use C++ AGC behavior: find splitters from first file only
         if verbosity > 0 {
-            eprintln!("Processing multiple files (sample names from FASTA headers)");
+            eprintln!("Processing multiple files (each file is a separate sample)");
+            eprintln!("Using first file for splitter determination (matching C++ AGC)");
             eprintln!();
         }
 
-        let mut file_paths = Vec::new();
+        let mut file_paths_with_names = Vec::new();
         for input_path in &inputs {
             if !input_path.exists() {
                 eprintln!("Warning: Input file not found: {input_path:?}");
                 continue;
             }
-            file_paths.push(input_path.clone());
+            let sample_name = extract_sample_name(input_path);
+            file_paths_with_names.push((sample_name, input_path.as_path()));
         }
 
-        let iterator = MultiFileIterator::new(file_paths)?;
-        compressor.add_contigs_with_splitters(Box::new(iterator))?;
+        compressor.add_fasta_files_with_splitters(&file_paths_with_names)?;
     }
 
     // Finalize the archive

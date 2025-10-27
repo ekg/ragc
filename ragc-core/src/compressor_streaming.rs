@@ -570,20 +570,20 @@ impl StreamingCompressor {
                     if reference_sample.is_empty() {
                         reference_sample = sample_name.clone();
                         if self.config.verbosity > 0 {
-                            println!("Using {reference_sample} as reference to find splitters...");
+                            println!("Using ALL samples to find splitters (matching C++ AGC)...");
+                            println!("First sample: {reference_sample}");
                         }
                     }
 
-                    // Only collect contigs from the first sample
-                    if sample_name == reference_sample {
-                        reference_contigs.push(sequence);
-                        contig_count += 1;
-                    }
+                    // CRITICAL FIX: Collect contigs from ALL samples to find splitters
+                    // (matching C++ AGC behavior for multi-file input)
+                    reference_contigs.push(sequence);
+                    contig_count += 1;
                 }
             }
 
             if self.config.verbosity > 0 {
-                println!("Collected {contig_count} reference contigs from {reference_sample}");
+                println!("Collected {contig_count} reference contigs from ALL samples");
             }
         }
 
@@ -675,6 +675,15 @@ impl StreamingCompressor {
 
                         // Prepare segment info (k-mer normalization, RC if needed)
                         // IMPORTANT: Use full_header as contig name to match C++ AGC
+
+                        // DEBUG: Print k-mers from first few segments
+                        if total_segments_count < 10 {
+                            eprintln!(
+                                "DEBUG segment {}: front_kmer={}, back_kmer={}, len={}",
+                                total_segments_count, segment.front_kmer, segment.back_kmer, segment.data.len()
+                            );
+                        }
+
                         let seg_info = Self::prepare_segment_info(
                             &self.config,
                             &sample_name,
@@ -684,6 +693,14 @@ impl StreamingCompressor {
                             segment.front_kmer,
                             segment.back_kmer,
                         )?;
+
+                        // DEBUG: Print key from first few prepared segments
+                        if total_segments_count < 10 {
+                            eprintln!(
+                                "DEBUG prepared {}: key.front={}, key.back={}",
+                                total_segments_count, seg_info.key.kmer_front, seg_info.key.kmer_back
+                            );
+                        }
 
                         all_segments.push(seg_info);
                     }
@@ -975,11 +992,12 @@ impl StreamingCompressor {
                 if reference_sample.is_empty() {
                     reference_sample = sample_name.clone();
                     if self.config.verbosity > 0 {
-                        println!("Using {reference_sample} as reference to find splitters...");
+                        println!("Using first sample ({reference_sample}) as reference to find splitters...");
                     }
                 }
 
-                // Only collect contigs from the first sample
+                // CRITICAL FIX: Only collect contigs from FIRST sample (matching C++ AGC)
+                // C++ AGC uses only the reference (first) file/sample to find splitters
                 if sample_name == reference_sample {
                     reference_contigs.push(sequence);
                     contig_count += 1;
@@ -988,7 +1006,7 @@ impl StreamingCompressor {
         }
 
         if self.config.verbosity > 0 {
-            println!("Collected {contig_count} reference contigs from {reference_sample}");
+            println!("Collected {contig_count} reference contigs from first sample ({reference_sample})");
         }
 
         // Find splitters (also get singleton and duplicate k-mers for adaptive mode)
@@ -1109,7 +1127,7 @@ impl StreamingCompressor {
             let uncompressed_tx = uncompressed_tx.clone();
             let compressed_tx = compressed_tx.clone();
             let writers = group_writers.clone();
-            let _group_terms = group_terminators.clone();
+            let group_terms = group_terminators.clone();
             let registrations = contig_registrations.clone();
             let total_segs = total_segments.clone();
             let total_b = total_bases.clone();
@@ -1151,26 +1169,76 @@ impl StreamingCompressor {
                             segment.back_kmer,
                         )?;
 
+                        // Determine final key (may search for candidates if one k-mer is MISSING)
+                        let final_key = if seg_info.key.kmer_front != MISSING_KMER && seg_info.key.kmer_back != MISSING_KMER {
+                            // Both k-mers present - use the normalized key as-is
+                            seg_info.key.clone()
+                        } else if seg_info.key.kmer_front == MISSING_KMER && seg_info.key.kmer_back == MISSING_KMER {
+                            // No k-mers - use as-is (fallback case)
+                            seg_info.key.clone()
+                        } else {
+                            // One k-mer present - search for candidate groups (matching C++ AGC)
+                            let present_kmer = if seg_info.key.kmer_front != MISSING_KMER {
+                                seg_info.key.kmer_front
+                            } else {
+                                seg_info.key.kmer_back
+                            };
+
+                            let terms_map = group_terms.read().unwrap();
+                            if let Some(candidates) = terms_map.get(&present_kmer) {
+                                if !candidates.is_empty() {
+                                    // Found existing groups with this k-mer
+                                    // For now, use the first candidate (TODO: test compression with each)
+                                    let cand_kmer = candidates[0];
+
+                                    // Create normalized key
+                                    let (key, _needs_rc) = if cand_kmer < present_kmer {
+                                        (SegmentGroupKey { kmer_front: cand_kmer, kmer_back: present_kmer }, true)
+                                    } else {
+                                        (SegmentGroupKey { kmer_front: present_kmer, kmer_back: cand_kmer }, false)
+                                    };
+
+                                    if cfg.verbosity > 2 {
+                                        eprintln!("[MATCH] One-kmer segment ({}) matched to existing group ({}, {})",
+                                            present_kmer, key.kmer_front, key.kmer_back);
+                                    }
+
+                                    key
+                                } else {
+                                    // No candidates - use original key
+                                    seg_info.key.clone()
+                                }
+                            } else {
+                                // No candidates - use original key
+                                seg_info.key.clone()
+                            }
+                        };
+
                         // Get or create group writer
                         let group_writer =
-                            writers.entry(seg_info.key.clone()).or_insert_with(|| {
+                            writers.entry(final_key.clone()).or_insert_with(|| {
                                 let gid = group_id_counter.fetch_add(1, Ordering::SeqCst) as u32;
 
-                                // TEMPORARILY DISABLED: Update terminators to test if this is the bottleneck
-                                // if seg_info.key.kmer_front != MISSING_KMER && seg_info.key.kmer_back != MISSING_KMER {
-                                //     let mut map = group_terms.write().unwrap();
-                                //     map.entry(seg_info.key.kmer_front)
-                                //         .or_default()
-                                //         .push(seg_info.key.kmer_back);
-                                //     map.get_mut(&seg_info.key.kmer_front).unwrap().sort_unstable();
-                                //
-                                //     if seg_info.key.kmer_front != seg_info.key.kmer_back {
-                                //         map.entry(seg_info.key.kmer_back)
-                                //             .or_default()
-                                //             .push(seg_info.key.kmer_front);
-                                //         map.get_mut(&seg_info.key.kmer_back).unwrap().sort_unstable();
-                                //     }
-                                // }
+                                if cfg.verbosity > 2 {
+                                    eprintln!("[GROUP] Creating group {} with key: front={}, back={}",
+                                        gid, final_key.kmer_front, final_key.kmer_back);
+                                }
+
+                                // Update terminators map when BOTH k-mers are present
+                                if final_key.kmer_front != MISSING_KMER && final_key.kmer_back != MISSING_KMER {
+                                    let mut map = group_terms.write().unwrap();
+                                    map.entry(final_key.kmer_front)
+                                        .or_default()
+                                        .push(final_key.kmer_back);
+                                    map.get_mut(&final_key.kmer_front).unwrap().sort_unstable();
+
+                                    if final_key.kmer_front != final_key.kmer_back {
+                                        map.entry(final_key.kmer_back)
+                                            .or_default()
+                                            .push(final_key.kmer_front);
+                                        map.get_mut(&final_key.kmer_back).unwrap().sort_unstable();
+                                    }
+                                }
 
                                 let stream_id = gid;
 
@@ -1434,9 +1502,10 @@ impl StreamingCompressor {
             println!("=== Pass 1: Finding splitter k-mers across all genomes ===");
         }
 
-        // Pass 1: Stream through FIRST genome to find splitters
-        // This is the reference-based approach: use splitters from first genome
-        // to segment all genomes at the same positions
+        // Pass 1: Stream through FIRST FILE ONLY to find splitters
+        // (matching C++ AGC: only reference file used for splitter determination)
+        // IMPORTANT: We read ALL contigs from the first file, finding singletons
+        // within that file's contigs (not across all genomes)
         //
         // MEMORY-EFFICIENT: Streams through file twice instead of loading all contigs
         // For yeast (12MB genome): ~100MB Vec vs ~2.8GB loading all contigs!
@@ -1444,9 +1513,10 @@ impl StreamingCompressor {
             fasta_paths.first()
         {
             if self.config.verbosity > 0 {
-                println!("Using {ref_sample_name} as reference to find splitters (streaming)...");
+                println!("Using first file ({ref_sample_name}) as reference to find splitters (streaming)...");
             }
 
+            // Read ALL contigs from FIRST FILE ONLY (matching C++ AGC behavior)
             crate::splitters::determine_splitters_streaming(
                 ref_fasta_path,
                 self.config.kmer_length as usize,
