@@ -322,7 +322,7 @@ impl BufferedPansnFileIterator {
         let mut sample_order = Vec::new();
         let mut seen_samples = std::collections::HashSet::new();
 
-        while let Some((header, contig)) = genome_io.read_contig()? {
+        while let Some((header, contig)) = genome_io.read_contig_converted()? {
             // Parse sample name from header (sample#hap#chr format)
             let sample_name = if let Some(parts) = header.split('#').nth(0) {
                 if let Some(hap) = header.split('#').nth(1) {
@@ -485,8 +485,16 @@ impl ContigIterator for IndexedPansnFileIterator {
                 .fetch_seq_all(full_header)
                 .with_context(|| format!("Failed to fetch sequence for {full_header}"))?;
 
-            // Convert to Contig
-            let contig = Contig::from(sequence.as_bytes());
+            // Convert ASCII nucleotides to 0-3 encoding
+            use crate::genome_io::CNV_NUM;
+            let mut contig = Contig::with_capacity(sequence.len());
+            for byte in sequence.as_bytes() {
+                if (*byte as usize) < CNV_NUM.len() {
+                    contig.push(CNV_NUM[*byte as usize]);
+                } else {
+                    contig.push(4); // N for invalid characters
+                }
+            }
 
             return Ok(Some((sample_name.clone(), full_header.clone(), contig)));
         }

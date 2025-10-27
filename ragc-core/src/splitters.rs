@@ -35,6 +35,14 @@ pub fn determine_splitters(
     k: usize,
     segment_size: usize,
 ) -> (HashSet<u64>, HashSet<u64>, HashSet<u64>) {
+    // DEBUG: Check if contigs have data
+    let total_bases: usize = contigs.iter().map(|c| c.len()).sum();
+    eprintln!(
+        "DEBUG: determine_splitters() received {} contigs with {} total bases",
+        contigs.len(),
+        total_bases
+    );
+
     // Pass 1: Find candidate k-mers (singletons from reference)
     // Parallelize k-mer extraction across contigs (matching C++ AGC)
     let all_kmers_vec: Vec<Vec<u64>> = contigs
@@ -43,6 +51,7 @@ pub fn determine_splitters(
         .collect();
 
     let mut all_kmers: Vec<u64> = all_kmers_vec.into_iter().flatten().collect();
+    eprintln!("DEBUG: Extracted {} k-mers from reference contigs", all_kmers.len());
 
     // Radix sort (matching C++ AGC's RadixSortMSD)
     all_kmers.radix_sort_unstable();
@@ -118,16 +127,31 @@ pub fn determine_splitters_streaming(
     k: usize,
     segment_size: usize,
 ) -> Result<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> {
-    // Pass 1a: Stream through file to collect ALL k-mers (with duplicates) into Vec
+    // Pass 1a: Stream through file to collect k-mers from FIRST SAMPLE only (with duplicates) into Vec
     eprintln!("DEBUG: Pass 1 - Collecting k-mers from reference (streaming)...");
     let mut all_kmers = Vec::new();
+    let mut reference_sample = String::new();
 
     {
         let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
-        while let Some((_contig_name, sequence)) = reader.read_contig_converted()? {
+        while let Some((_full_header, sample_name, _contig_name, sequence)) =
+            reader.read_contig_with_sample()?
+        {
             if !sequence.is_empty() {
-                let contig_kmers = enumerate_kmers(&sequence, k);
-                all_kmers.extend(contig_kmers);
+                // Identify first sample#haplotype as reference
+                if reference_sample.is_empty() {
+                    reference_sample = sample_name.clone();
+                    eprintln!(
+                        "DEBUG: Using {} as reference (first sample#haplotype)",
+                        reference_sample
+                    );
+                }
+
+                // Only collect k-mers from reference sample#haplotype
+                if sample_name == reference_sample {
+                    let contig_kmers = enumerate_kmers(&sequence, k);
+                    all_kmers.extend(contig_kmers);
+                }
             }
         }
     }
@@ -175,14 +199,17 @@ pub fn determine_splitters_streaming(
         candidates.len()
     );
 
-    // Pass 2: Stream through file again to find actually-used splitters
+    // Pass 2: Stream through file again to find actually-used splitters from reference sample only
     eprintln!("DEBUG: Pass 2 - Finding actually-used splitters (streaming)...");
     let mut splitters = HashSet::new();
 
     {
         let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
-        while let Some((_contig_name, sequence)) = reader.read_contig_converted()? {
-            if !sequence.is_empty() {
+        while let Some((_full_header, sample_name, _contig_name, sequence)) =
+            reader.read_contig_with_sample()?
+        {
+            // Only process contigs from reference sample#haplotype
+            if !sequence.is_empty() && sample_name == reference_sample {
                 let used = find_actual_splitters_in_contig(&sequence, &candidates, k, segment_size);
                 splitters.extend(used);
             }

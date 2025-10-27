@@ -12,7 +12,7 @@ use ragc_common::Contig;
 
 /// Nucleotide conversion table matching C++ cnv_num
 /// Maps ASCII characters to numeric representation
-const CNV_NUM: [u8; 128] = [
+pub(crate) const CNV_NUM: [u8; 128] = [
     // 0-15: Control characters -> ACGT... (matching C++)
     b'A', b'C', b'G', b'T', b'N', b'R', b'Y', b'S', b'W', b'K', b'M', b'B', b'D', b'H', b'V', b'U',
     // 16-63: Unused
