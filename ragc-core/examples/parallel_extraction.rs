@@ -31,8 +31,8 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(num_cpus::get);
 
-    println!("Opening archive: {}", archive_path);
-    println!("Using {} threads\n", num_threads);
+    println!("Opening archive: {archive_path}");
+    println!("Using {num_threads} threads\n");
 
     // Open the main decompressor
     let decompressor = Decompressor::open(archive_path, DecompressorConfig::default())?;
@@ -79,8 +79,8 @@ fn main() -> Result<()> {
     // Display results
     println!("\n--- Results ---");
     println!("Samples processed: {}", samples_arc.len());
-    println!("Total contigs: {}", total_contigs);
-    println!("Total bases: {} bp", total_bases);
+    println!("Total contigs: {total_contigs}");
+    println!("Total bases: {total_bases} bp");
     println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
     println!(
         "Throughput: {:.2} MB/s",
@@ -124,10 +124,7 @@ fn extract_worker(
                 bases_extracted += sample_bases as u64;
             }
             Err(e) => {
-                eprintln!(
-                    "[Thread {}] Error extracting {}: {}",
-                    thread_id, sample_name, e
-                );
+                eprintln!("[Thread {thread_id}] Error extracting {sample_name}: {e}");
             }
         }
     }

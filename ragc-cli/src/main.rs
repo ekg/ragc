@@ -374,11 +374,11 @@ fn getset_command(
     let samples_to_extract = if let Some(prefix_str) = prefix {
         // Extract by prefix
         if verbosity > 0 {
-            eprintln!("Finding samples with prefix: {}", prefix_str);
+            eprintln!("Finding samples with prefix: {prefix_str}");
         }
         let matching_samples = decompressor.list_samples_with_prefix(&prefix_str);
         if matching_samples.is_empty() {
-            anyhow::bail!("No samples found matching prefix '{}'", prefix_str);
+            anyhow::bail!("No samples found matching prefix '{prefix_str}'");
         }
         if verbosity > 0 {
             eprintln!("Found {} matching samples", matching_samples.len());

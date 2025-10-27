@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "data.agc".to_string());
 
-    println!("Opening archive: {}", archive_path);
+    println!("Opening archive: {archive_path}");
 
     let mut decompressor = Decompressor::open(&archive_path, DecompressorConfig::default())?;
 
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
 
     // Extract the first sample (if available)
     if let Some(first_sample) = samples.first() {
-        println!("\nExtracting sample: {}", first_sample);
+        println!("\nExtracting sample: {first_sample}");
 
         let contigs = decompressor.get_sample(first_sample)?;
 
@@ -44,8 +44,8 @@ fn main() -> Result<()> {
         // Display first 100bp of first contig
         if let Some((contig_name, sequence)) = contigs.first() {
             let preview = String::from_utf8_lossy(&sequence[..sequence.len().min(100)]);
-            println!("\nFirst 100bp of {}:", contig_name);
-            println!("{}", preview);
+            println!("\nFirst 100bp of {contig_name}:");
+            println!("{preview}");
         }
     }
 

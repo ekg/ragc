@@ -30,24 +30,24 @@ fn main() -> Result<()> {
     let archive_path = &args[1];
     let prefix = args.get(2).map(String::as_str);
 
-    println!("Opening archive: {}", archive_path);
+    println!("Opening archive: {archive_path}");
 
     let mut decompressor = Decompressor::open(archive_path, DecompressorConfig::default())?;
 
     if let Some(prefix) = prefix {
         // Extract samples matching the prefix
-        println!("\nSearching for samples with prefix: '{}'", prefix);
+        println!("\nSearching for samples with prefix: '{prefix}'");
 
         let matching_samples = decompressor.list_samples_with_prefix(prefix);
 
         if matching_samples.is_empty() {
-            println!("No samples found matching prefix '{}'", prefix);
+            println!("No samples found matching prefix '{prefix}'");
             return Ok(());
         }
 
         println!("Found {} matching samples:", matching_samples.len());
         for sample in &matching_samples {
-            println!("  - {}", sample);
+            println!("  - {sample}");
         }
 
         // Extract all matching samples
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
         if args.len() >= 4 && args[3] == "--output" {
             if let Some(output_path) = args.get(4) {
                 write_fasta(&samples_data, output_path)?;
-                println!("\nWrote output to: {}", output_path);
+                println!("\nWrote output to: {output_path}");
             }
         }
     } else {
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
         let samples = decompressor.list_samples();
         println!("\nFound {} samples:", samples.len());
         for sample in &samples {
-            println!("  {}", sample);
+            println!("  {sample}");
         }
     }
 
@@ -106,9 +106,9 @@ fn write_fasta(
 
     let mut file = std::fs::File::create(output_path)?;
 
-    for (_sample_name, contigs) in samples_data {
+    for contigs in samples_data.values() {
         for (contig_name, sequence) in contigs {
-            writeln!(file, ">{}", contig_name)?;
+            writeln!(file, ">{contig_name}")?;
             file.write_all(sequence)?;
             writeln!(file)?;
         }
