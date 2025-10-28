@@ -660,6 +660,10 @@ impl StreamingCompressor {
                 if !sequence.is_empty() {
                     contig_count += 1;
 
+                    // PRE-REGISTER CONTIG: Ensures contigs are registered in file order
+                    // before parallel Phase 3 processing (fixes data corruption!)
+                    self.collection.register_sample_contig(&sample_name, &full_header)?;
+
                     // Segment at splitters
                     let segments = split_at_splitters_with_size(
                         &sequence,
@@ -761,7 +765,8 @@ impl StreamingCompressor {
                     if !candidates.is_empty() {
                         // Use FIRST candidate to avoid creating new MISSING_KMER groups
                         let first_cand = candidates[0];
-                        segment.key = if first_cand < present_kmer {
+                        let old_key = segment.key.clone();
+                        let new_key = if first_cand < present_kmer {
                             SegmentGroupKey {
                                 kmer_front: first_cand,
                                 kmer_back: present_kmer,
@@ -772,6 +777,8 @@ impl StreamingCompressor {
                                 kmer_back: first_cand,
                             }
                         };
+
+                        segment.key = new_key;
                         fixed_count += 1;
                     }
                 }
@@ -2607,6 +2614,7 @@ impl StreamingCompressor {
                 .map(|(name, path)| (name.clone(), path.to_path_buf()))
                 .collect();
             let config = self.config.clone();
+            let collection_clone = Arc::clone(&collection);
 
             thread::spawn(move || -> Result<(usize, usize)> {
                 let mut total_contigs = 0;
@@ -2627,6 +2635,11 @@ impl StreamingCompressor {
 
                         total_bases += sequence.len();
                         total_contigs += 1;
+
+                        // PRE-REGISTER contig in file order (CRITICAL for correct extraction!)
+                        collection_clone.lock().unwrap()
+                            .register_sample_contig(sample_name, &contig_name)
+                            .context("Failed to register contig")?;
 
                         // Push contig to queue (blocks if queue is full - memory control!)
                         contig_tx
@@ -2785,12 +2798,14 @@ impl StreamingCompressor {
                                 } else {
                                     seg_info.key.kmer_back
                                 };
+                                let kmer_was_in_front = has_front;
 
                                 if let Some(candidates_ref) = group_terminators.get(&present_kmer) {
                                     if !candidates_ref.is_empty() {
                                         // Use FIRST candidate to avoid creating new MISSING_KMER groups
                                         let first_cand = candidates_ref[0];
-                                        seg_info.key = if first_cand < present_kmer {
+                                        let old_key = seg_info.key.clone();
+                                        let new_key = if first_cand < present_kmer {
                                             SegmentGroupKey {
                                                 kmer_front: first_cand,
                                                 kmer_back: present_kmer,
@@ -2801,6 +2816,28 @@ impl StreamingCompressor {
                                                 kmer_back: first_cand,
                                             }
                                         };
+
+                                        // Check if k-mer changed position (front↔back)
+                                        let kmer_now_in_front = new_key.kmer_front == present_kmer;
+                                        let needs_rc_adjustment = kmer_was_in_front != kmer_now_in_front;
+
+                                        // Apply RC if position changed (matching C++ AGC logic)
+                                        if needs_rc_adjustment {
+                                            seg_info.segment.data = seg_info.segment.data
+                                                .iter()
+                                                .rev()
+                                                .map(|&b| match b {
+                                                    0 => 3,
+                                                    1 => 2,
+                                                    2 => 1,
+                                                    3 => 0,
+                                                    _ => b,
+                                                })
+                                                .collect();
+                                            seg_info.segment.is_rev_comp = !seg_info.segment.is_rev_comp;
+                                        }
+
+                                        seg_info.key = new_key;
                                     }
                                 }
                             }
@@ -3835,6 +3872,7 @@ impl StreamingCompressor {
                 }
 
                 // Register reference in collection (in_group_id = 0)
+                // NOTE: Contig MUST already be registered during file read (line 1733)!
                 self.collection.add_segment_placed(
                     &ref_segment.sample_name,
                     &ref_segment.contig_name,
@@ -3953,6 +3991,8 @@ impl StreamingCompressor {
                     eprintln!("REGISTER: group={}, in_group_id={}, pack_id would be {}, contig={}, seg_part={}",
                         group_id, global_in_group_id, (global_in_group_id - 1) / 50, seg_info.contig_name, seg_info.seg_part_no);
                 }
+
+                // NOTE: Contig MUST already be registered during file read (line 1733)!
                 self.collection.add_segment_placed(
                     &seg_info.sample_name,
                     &seg_info.contig_name,
