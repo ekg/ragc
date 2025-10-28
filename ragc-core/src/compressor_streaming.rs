@@ -13,7 +13,7 @@ fn estimate_memory_mb<T>(items: &[T]) -> f64 {
 use crate::{
     contig_iterator::ContigIterator,
     genome_io::GenomeIO,
-    kmer::{Kmer, KmerMode},
+    kmer::{Kmer, KmerMode, reverse_complement},
     lz_diff::LZDiff,
     segment::{split_at_splitters_with_size, MISSING_KMER},
     segment_compression::{compress_reference_segment, compress_segment_configured},
@@ -27,6 +27,7 @@ use ragc_common::{
     AGC_FILE_MINOR, CONTIG_SEPARATOR,
 };
 use rayon::prelude::*;
+use sha2::{Sha256, Digest};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
@@ -429,7 +430,7 @@ impl StreamingCompressor {
             collection,
             segment_groups: HashMap::new(),
             group_metadata: HashMap::new(),
-            next_group_id: 0,
+            next_group_id: 16,  // Reserve 0-15 for raw groups (matching C++ AGC)
             group_terminators: HashMap::new(),
             reference_kmers_singletons: HashSet::new(),
             reference_kmers_duplicates: HashSet::new(),
@@ -2568,6 +2569,120 @@ impl StreamingCompressor {
         Ok(())
     }
 
+    /// Helper function to find optimal split position using LZ cost calculation
+    /// Port of find_middle_splitter logic to work with DashMap (parallel context)
+    /// Returns (middle_kmer, split_position) if splitting is beneficial
+    /// Matches C++ AGC lines 1505-1623 exactly
+    fn calculate_split_position(
+        kmer_front: u64,
+        kmer_back: u64,
+        middle_kmer: u64,
+        segment: &Contig,
+        groups: &DashMap<SegmentGroupKey, (u32, GroupWriter)>,
+        config: &StreamingCompressorConfig,
+    ) -> Option<usize> {
+        // Look up existing groups using normalized keys
+        let (key1, _) = SegmentGroupKey::new_normalized(kmer_front, middle_kmer);
+        let (key2, _) = SegmentGroupKey::new_normalized(middle_kmer, kmer_back);
+
+        // Get reference segments from both groups
+        let ref_seg1 = {
+            let group_entry = groups.get(&key1)?;
+            group_entry.1.reference.as_ref()?.clone()
+        };
+
+        let ref_seg2 = {
+            let group_entry = groups.get(&key2)?;
+            group_entry.1.reference.as_ref()?.clone()
+        };
+
+        // Compute reverse complement of segment (matching C++ exactly)
+        let segment_rc: Vec<u8> = segment
+            .iter()
+            .rev()
+            .map(|&b| match b {
+                0 => 3, // A -> T
+                1 => 2, // C -> G
+                2 => 1, // G -> C
+                3 => 0, // T -> A
+                _ => b, // N stays N
+            })
+            .collect();
+
+        // Prepare LZ encoders with reference segments
+        let mut lz_diff1 = LZDiff::new(config.min_match_len);
+        let mut lz_diff2 = LZDiff::new(config.min_match_len);
+
+        lz_diff1.prepare(&ref_seg1);
+        lz_diff2.prepare(&ref_seg2);
+
+        // Compute cost vector for first part (C++ lines 1541-1551)
+        let mut v_costs1 = if kmer_front < middle_kmer {
+            lz_diff1.get_coding_cost_vector(segment, true)
+        } else {
+            let mut costs = lz_diff1.get_coding_cost_vector(&segment_rc, false);
+            costs.reverse();
+            costs
+        };
+
+        if v_costs1.is_empty() {
+            return None;
+        }
+
+        // Apply forward partial_sum to v_costs1
+        for i in 1..v_costs1.len() {
+            v_costs1[i] += v_costs1[i - 1];
+        }
+
+        // Compute cost vector for second part (C++ lines 1553-1578)
+        let mut v_costs2 = if middle_kmer < kmer_back {
+            lz_diff2.get_coding_cost_vector(segment, false)
+        } else {
+            lz_diff2.get_coding_cost_vector(&segment_rc, true)
+        };
+
+        if v_costs2.is_empty() || v_costs1.len() != v_costs2.len() {
+            return None;
+        }
+
+        // Apply partial_sum based on orientation
+        if middle_kmer < kmer_back {
+            // Reverse partial_sum
+            for i in (0..v_costs2.len() - 1).rev() {
+                v_costs2[i] += v_costs2[i + 1];
+            }
+        } else {
+            // Forward partial_sum, then reverse
+            for i in 1..v_costs2.len() {
+                v_costs2[i] += v_costs2[i - 1];
+            }
+            v_costs2.reverse();
+        }
+
+        // Find position with minimum total cost (C++ lines 1606-1617)
+        let mut best_sum = u32::MAX;
+        let mut best_pos = 0;
+
+        for i in 0..v_costs1.len() {
+            let cs = v_costs1[i] + v_costs2[i];
+            if cs < best_sum {
+                best_sum = cs;
+                best_pos = i;
+            }
+        }
+
+        // Boundary validation (C++ lines 1619-1622)
+        let kmer_length = config.kmer_length as usize;
+        if best_pos < kmer_length + 1 {
+            best_pos = 0;
+        }
+        if best_pos + kmer_length + 1 > v_costs1.len() {
+            best_pos = v_costs1.len();
+        }
+
+        Some(best_pos)
+    }
+
     /// C++ AGC exact architecture: contig-level parallelism with shared groups
     /// Matches C++ AGC's CBoundedPQueue + worker threads precisely
     /// Memory target: ~245 MB (vs C++ AGC's 205 MB)
@@ -2754,6 +2869,11 @@ impl StreamingCompressor {
                     // Currently not using buffer pooling, but this is where it would go
 
                     while let Ok(task) = contig_rx.recv() {
+                        eprintln!(
+                            "[CONTIG_PROCESS] sample={} contig={} size={}",
+                            task.sample_name, task.contig_name, task.sequence.len()
+                        );
+
                         // Split contig into segments (contig-level parallelism!)
                         let segments = split_at_splitters_with_size(
                             &task.sequence,
@@ -2838,6 +2958,187 @@ impl StreamingCompressor {
                                         }
 
                                         seg_info.key = new_key;
+                                    }
+                                }
+                            }
+
+                            // Check if we should attempt segment splitting (C++ AGC lines 1366-1369)
+                            // Conditions: multi-sample mode, both k-mers valid, group doesn't exist yet
+                            let should_try_split = seg_info.key.kmer_front != MISSING_KMER
+                                && seg_info.key.kmer_back != MISSING_KMER
+                                && !groups.contains_key(&seg_info.key);
+
+                            if should_try_split {
+                                // Try to find shared splitters
+                                if let (Some(front_terms), Some(back_terms)) = (
+                                    group_terminators.get(&seg_info.key.kmer_front),
+                                    group_terminators.get(&seg_info.key.kmer_back),
+                                ) {
+                                    // Find shared k-mers (set intersection)
+                                    let shared: Vec<u64> = front_terms
+                                        .iter()
+                                        .filter(|k| back_terms.contains(*k))
+                                        .copied()
+                                        .collect();
+
+                                    if !shared.is_empty() {
+                                        let middle_kmer = shared[0];
+
+                                        // Check if original k-mers need swapping (matching C++ AGC lines 1385-1391: use_rc)
+                                        let use_rc = seg_info.key.kmer_front > seg_info.key.kmer_back;
+
+                                        // Check if BOTH target groups exist (matching C++ AGC lines 1538-1539)
+                                        // C++ AGC: auto segment_id1 = map_segments[minmax(kmer_front.data(), middle)];
+                                        let key1 = SegmentGroupKey::new_normalized(seg_info.key.kmer_front, middle_kmer).0;
+                                        let key2 = SegmentGroupKey::new_normalized(middle_kmer, seg_info.key.kmer_back).0;
+
+                                        let key1_exists = groups.contains_key(&key1);
+                                        let key2_exists = groups.contains_key(&key2);
+
+                                        // BOTH target groups must exist before we can split
+                                        if key1_exists && key2_exists {
+                                            // Calculate optimal split position using LZ cost
+                                            if let Some(split_pos) = Self::calculate_split_position(
+                                            seg_info.key.kmer_front,
+                                            seg_info.key.kmer_back,
+                                            middle_kmer,
+                                            &seg_info.segment.data,
+                                            &groups,
+                                            &config,
+                                        ) {
+                                            // Execute split with overlap (C++ lines 1419-1444)
+                                            let mut left_size = split_pos;
+                                            let mut right_size = seg_info.segment.data.len() - split_pos;
+
+                                            // Swap sizes if k-mers were swapped for normalization (C++ line 1422-1423)
+                                            if use_rc {
+                                                std::mem::swap(&mut left_size, &mut right_size);
+                                            }
+
+                                            if left_size == 0 {
+                                                // Left side empty - update key
+                                                seg_info.key =
+                                                    SegmentGroupKey::new_normalized(middle_kmer, seg_info.key.kmer_back).0;
+                                            } else if right_size == 0 {
+                                                // Right side empty - update key
+                                                seg_info.key =
+                                                    SegmentGroupKey::new_normalized(seg_info.key.kmer_front, middle_kmer).0;
+                                            } else {
+                                                // Both sizes > 0: Split with overlap
+                                                let kmer_len = config.kmer_length as usize;
+                                                let seg2_start_pos = split_pos.saturating_sub(kmer_len / 2);
+
+                                                let seg1_data = seg_info.segment.data[..seg2_start_pos + kmer_len].to_vec();
+                                                let seg2_data = seg_info.segment.data[seg2_start_pos..].to_vec();
+
+                                                // Determine RC orientation (matching C++ AGC lines 1433-1457)
+                                                let store_rc = seg_info.key.kmer_front >= middle_kmer;
+                                                let store2_rc = middle_kmer >= seg_info.key.kmer_back;
+
+                                                // Create RC versions if needed for hashing
+                                                let seg1_for_hash = if store_rc {
+                                                    seg1_data.iter().rev().map(|&b| reverse_complement(b as u64) as u8).collect::<Vec<u8>>()
+                                                } else {
+                                                    seg1_data.clone()
+                                                };
+                                                let seg2_for_hash = if store2_rc {
+                                                    seg2_data.iter().rev().map(|&b| reverse_complement(b as u64) as u8).collect::<Vec<u8>>()
+                                                } else {
+                                                    seg2_data.clone()
+                                                };
+
+                                                // Hash segments for tracing (first 8 hex digits of SHA-256)
+                                                let hash1 = Sha256::digest(&seg1_for_hash);
+                                                let hash2 = Sha256::digest(&seg2_for_hash);
+                                                eprintln!(
+                                                    "[SPLIT_EXEC] kmer1={:016x} mid={:016x} kmer2={:016x} | seg1: len={} hash={:08x} | seg2: len={} hash={:08x} | part_no={}",
+                                                    seg_info.key.kmer_front, middle_kmer, seg_info.key.kmer_back,
+                                                    seg1_data.len(), u32::from_be_bytes(hash1[0..4].try_into().unwrap()),
+                                                    seg2_data.len(), u32::from_be_bytes(hash2[0..4].try_into().unwrap()),
+                                                    seg_info.segment.seg_part_no
+                                                );
+
+                                                // Create two segments from the split
+                                                let seg1 = PreparedSegment {
+                                                    key: SegmentGroupKey::new_normalized(seg_info.key.kmer_front, middle_kmer).0,
+                                                    segment: SegmentInfo {
+                                                        data: seg1_data,
+                                                        sample_name: seg_info.segment.sample_name.clone(),
+                                                        contig_name: seg_info.segment.contig_name.clone(),
+                                                        seg_part_no: seg_info.segment.seg_part_no,
+                                                        is_rev_comp: seg_info.segment.is_rev_comp,
+                                                    },
+                                                };
+
+                                                let seg2 = PreparedSegment {
+                                                    key: SegmentGroupKey::new_normalized(middle_kmer, seg_info.key.kmer_back).0,
+                                                    segment: SegmentInfo {
+                                                        data: seg2_data,
+                                                        sample_name: seg_info.segment.sample_name.clone(),
+                                                        contig_name: seg_info.segment.contig_name.clone(),
+                                                        seg_part_no: seg_info.segment.seg_part_no + 1,  // C++ AGC line 1501
+                                                        is_rev_comp: seg_info.segment.is_rev_comp,
+                                                    },
+                                                };
+
+                                                // Process both segments immediately (no recursion needed in loop)
+                                                // This is safe because we're processing segments from the same contig sequentially
+                                                for split_seg in [seg1, seg2] {
+                                                    let pack_opt = {
+                                                        let mut group_entry =
+                                                            groups.entry(split_seg.key.clone()).or_insert_with(|| {
+                                                                if split_seg.key.kmer_front != MISSING_KMER
+                                                                    && split_seg.key.kmer_back != MISSING_KMER
+                                                                {
+                                                                    group_terminators
+                                                                        .entry(split_seg.key.kmer_front)
+                                                                        .or_default()
+                                                                        .push(split_seg.key.kmer_back);
+                                                                    if split_seg.key.kmer_front != split_seg.key.kmer_back {
+                                                                        group_terminators
+                                                                            .entry(split_seg.key.kmer_back)
+                                                                            .or_default()
+                                                                            .push(split_seg.key.kmer_front);
+                                                                    }
+                                                                }
+                                                                let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                                                                let stream_id = gid as usize;
+                                                                let ref_stream_id = if gid >= 16 {
+                                                                    Some(10000 + gid as usize)
+                                                                } else {
+                                                                    None
+                                                                };
+                                                                (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
+                                                            });
+                                                        group_entry.1.add_segment(split_seg.segment, &config)?
+                                                    };
+
+                                                    if let Some(pack) = pack_opt {
+                                                        let compressed_pack = match pack {
+                                                            PackToWrite::Compressed(cp) => cp,
+                                                            PackToWrite::Uncompressed(uncompressed_pack) => {
+                                                                let compressed_data = compress_segment_configured(
+                                                                    &uncompressed_pack.uncompressed_data,
+                                                                    config.compression_level,
+                                                                )?;
+                                                                CompressedPack {
+                                                                    compressed_data,
+                                                                    group_id: uncompressed_pack.group_id,
+                                                                    stream_id: uncompressed_pack.stream_id,
+                                                                    uncompressed_size: uncompressed_pack.uncompressed_data.len() as u64,
+                                                                    segments: uncompressed_pack.segments,
+                                                                }
+                                                            }
+                                                        };
+                                                        pack_tx.send(compressed_pack)?;
+                                                    }
+                                                }
+
+                                                // Skip processing the original segment since we split it
+                                                continue;
+                                            }
+                                        }
+                                        }  // End: if groups.contains_key(&key1) && groups.contains_key(&key2)
                                     }
                                 }
                             }
