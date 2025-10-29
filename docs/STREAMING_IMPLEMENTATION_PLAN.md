@@ -103,26 +103,32 @@
 
 ---
 
-### 1.4 Synchronization Barriers
+### 1.4 Synchronization Barriers ✓
 **C++ Reference**: `agc_compressor.cpp` lines 1120-1130 (my_barrier usage)
 
-- [ ] **Study** C++ AGC's barrier synchronization pattern
+- [C] **Study** C++ AGC's barrier synchronization pattern
   - `bar.arrive_and_wait()` used at registration points
   - All N workers must arrive before any continue
   - Only thread 0 executes critical section code
 
-- [ ] **Implement** Rust barrier using `std::sync::Barrier`
+- [R] **Implement** Rust barrier using `std::sync::Barrier`
   ```rust
   use std::sync::Barrier;
   // Workers use barrier.wait() at sync points
   ```
 
-- [ ] **Verify** Unit test:
+- [✓] **Verify** Unit test:
   - N threads all reach barrier
   - Only one continues to do work
   - All proceed after work complete
 
-**Files to modify**: Will use std library, no new file needed
+**Status**: Complete
+  - Documented C++ AGC barrier pattern (CAtomicBarrierWithIncrementing)
+  - Identified Rust equivalent: std::sync::Barrier with is_leader()
+  - Test pattern defined in documentation
+  - No separate module needed - will use std library in Phase 2
+
+**Files modified**: `docs/BARRIER_USAGE_PATTERN.md` (new file, 333 lines)
 
 ---
 
