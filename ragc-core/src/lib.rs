@@ -123,6 +123,7 @@ pub mod lz_matcher;
 pub mod segment;
 pub mod segment_compression;
 pub mod splitters;
+pub mod task;
 pub mod tuple_packing;
 pub mod zstd_pool;
 
