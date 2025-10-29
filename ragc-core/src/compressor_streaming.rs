@@ -557,20 +557,21 @@ impl StreamingCompressor {
                     if reference_sample.is_empty() {
                         reference_sample = sample_name.clone();
                         if self.config.verbosity > 0 {
-                            println!("Using ALL samples to find splitters (matching C++ AGC)...");
-                            println!("First sample: {reference_sample}");
+                            println!("Using first sample ({reference_sample}) as reference");
                         }
                     }
 
-                    // CRITICAL FIX: Collect contigs from ALL samples to find splitters
-                    // (matching C++ AGC behavior for multi-file input)
-                    reference_contigs.push(sequence);
-                    contig_count += 1;
+                    // CRITICAL: Only collect contigs from FIRST sample (matching C++ AGC behavior)
+                    // C++ AGC's determine_splitters() only processes the reference file/sample
+                    if sample_name == reference_sample {
+                        reference_contigs.push(sequence);
+                        contig_count += 1;
+                    }
                 }
             }
 
             if self.config.verbosity > 0 {
-                println!("Collected {contig_count} reference contigs from ALL samples");
+                println!("Collected {contig_count} reference contigs from first sample ({reference_sample})");
             }
         }
 
