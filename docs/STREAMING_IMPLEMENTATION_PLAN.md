@@ -17,16 +17,16 @@
 
 ## Phase 1: Core Infrastructure (Priority Queue + Task System)
 
-### 1.1 Task Types and Processing Stages
+### 1.1 Task Types and Processing Stages ✅
 **C++ Reference**: `agc_compressor.h` lines 550-560 (contig_processing_stage_t)
 
-- [ ] **Study** C++ AGC's `contig_processing_stage_t` enum
+- [C] **Study** C++ AGC's `contig_processing_stage_t` enum
   - `all_contigs`: Initial contig processing
   - `registration`: Synchronization point for segment registration
   - `new_splitters`: Synchronization point for adaptive splitter finding
   - `hard_contigs`: Contigs that need adaptive splitters
 
-- [ ] **Implement** Rust equivalent `ContigProcessingStage` enum
+- [R] **Implement** Rust equivalent `ContigProcessingStage` enum
   ```rust
   enum ContigProcessingStage {
       AllContigs,      // Normal contig processing
@@ -36,22 +36,24 @@
   }
   ```
 
-- [ ] **Verify** Unit test or code review for enum variants
+- [✓] **Verify** Unit test or code review for enum variants
+  - 5/5 tests pass
+  - Commit: f72de9c
 
-**Files to modify**: `ragc-core/src/task.rs` (new file)
+**Files modified**: `ragc-core/src/task.rs` (new file)
 
 ---
 
-### 1.2 Task Structure
-**C++ Reference**: `agc_compressor.h` line 623 (task_t typedef)
+### 1.2 Task Structure ✅
+**C++ Reference**: `agc_compressor.h` line 656 (task_t typedef)
 
-- [ ] **Study** C++ AGC's task structure
+- [C] **Study** C++ AGC's task structure
   ```cpp
   using task_t = tuple<contig_processing_stage_t, string, string, contig_t>;
   // (stage, sample_name, contig_name, sequence)
   ```
 
-- [ ] **Implement** Rust `Task` struct
+- [R] **Implement** Rust `Task` struct
   ```rust
   struct Task {
       stage: ContigProcessingStage,
@@ -61,9 +63,11 @@
   }
   ```
 
-- [ ] **Verify** Unit test for task creation and field access
+- [✓] **Verify** Unit test for task creation and field access
+  - Included in 1.1 tests (5/5 pass)
+  - Commit: f72de9c
 
-**Files to modify**: `ragc-core/src/task.rs`
+**Files modified**: `ragc-core/src/task.rs`
 
 ---
 
