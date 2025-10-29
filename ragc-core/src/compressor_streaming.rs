@@ -1200,29 +1200,23 @@ impl StreamingCompressor {
             println!("Starting C++ AGC-style compression (sequential sample processing)...");
         }
 
-        // Track which groups exist and their k-mer connections (persistent across samples)
+        // Track which segment keys we've seen (persistent across samples)
         let mut known_groups = HashSet::<SegmentGroupKey>::new();
-        let mut kmer_connections: HashMap<u64, Vec<u64>> = HashMap::new();
 
         // Segment buffer - collect all segments from all samples
         let mut segment_buffer = Vec::<BufferedSegment>::new();
 
-        // Groups map - create groups inline so references available for splits
-        let groups = Arc::new(DashMap::<SegmentGroupKey, (u32, Arc<Mutex<Vec<u8>>>)>::new());
-        let next_group_id = Arc::new(AtomicU32::new(0));
-
-        // Track contigs, bases, and splits
+        // Track contigs and bases
         let mut total_contigs = 0;
         let mut total_bases = 0;
-        let mut splits_executed = 0;
         let mut current_sample = String::new();
 
         // ================================================================
-        // PHASE 1: STREAM THROUGH ALL CONTIGS WITH INLINE SPLIT CHECKING
+        // PHASE 1: STREAM THROUGH ALL CONTIGS AND BUFFER SEGMENTS
         // ================================================================
 
         if self.config.verbosity > 0 {
-            println!("=== Phase 1: Streaming contigs with inline split checking ===");
+            println!("=== Phase 1: Collecting segments from all contigs ===");
         }
 
         while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
@@ -1255,185 +1249,42 @@ impl StreamingCompressor {
                 self.config.segment_size as usize,
             );
 
-            // Process each segment with inline split checking
+            // Buffer all segments (no inline processing)
             for (seg_idx, segment) in segments.into_iter().enumerate() {
-                    let kmer_front = segment.front_kmer;
-                    let kmer_back = segment.back_kmer;
-                    let segment_data = segment.data;
+                let kmer_front = segment.front_kmer;
+                let kmer_back = segment.back_kmer;
+                let segment_data = segment.data;
 
-                    // Create segment key
-                    let (key, _) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
+                // Create segment key
+                let (key, _) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
 
-                    // INLINE SPLIT CHECKING AND EXECUTION (C++ AGC add_segment)
-                    let group_exists = known_groups.contains(&key);
-
-                    if !group_exists
-                        && kmer_front != u64::MAX && kmer_back != u64::MAX
-                        && kmer_connections.contains_key(&kmer_front)
-                        && kmer_connections.contains_key(&kmer_back)
-                    {
-                        // Find shared k-mers (middle splitters)
-                        if let Some(middle_kmer) = self.find_shared_kmer(
-                            kmer_front,
-                            kmer_back,
-                            &kmer_connections,
-                        ) {
-                            // Check if BOTH target groups exist
-                            let (key1, _) = SegmentGroupKey::new_normalized(kmer_front, middle_kmer);
-                            let (key2, _) = SegmentGroupKey::new_normalized(middle_kmer, kmer_back);
-
-                            if known_groups.contains(&key1) && known_groups.contains(&key2) {
-                                // Get reference sequences from both groups
-                                let ref1 = groups.get(&key1).map(|entry| entry.1.clone());
-                                let ref2 = groups.get(&key2).map(|entry| entry.1.clone());
-
-                                if let (Some(ref1_arc), Some(ref2_arc)) = (ref1, ref2) {
-                                    let ref1_seq = ref1_arc.lock().unwrap();
-                                    let ref2_seq = ref2_arc.lock().unwrap();
-
-                                    // Calculate optimal split position using LZ costs
-                                    use crate::lz_matcher::get_coding_cost_vector;
-
-                                    let costs1 = get_coding_cost_vector(&ref1_seq, &segment_data, true);
-                                    let costs2 = get_coding_cost_vector(&ref2_seq, &segment_data, false);
-
-                                    // Find position that minimizes total cost
-                                    let split_pos = if costs1.len() == segment_data.len() && costs2.len() == segment_data.len() {
-                                        let k = self.config.kmer_length as usize;
-                                        let min_size = k + 1;
-                                        let mut best_pos = segment_data.len() / 2;
-                                        let mut best_cost = u32::MAX;
-
-                                        // Calculate prefix sums once (O(n)) instead of recalculating on every iteration (O(n²))
-                                        let mut prefix1 = vec![0u32; costs1.len() + 1];
-                                        for i in 0..costs1.len() {
-                                            prefix1[i + 1] = prefix1[i] + costs1[i];
-                                        }
-
-                                        let mut prefix2 = vec![0u32; costs2.len() + 1];
-                                        for i in 0..costs2.len() {
-                                            prefix2[i + 1] = prefix2[i] + costs2[i];
-                                        }
-
-                                        let total_cost2 = prefix2[segment_data.len()];
-
-                                        // Now find best position in O(n) instead of O(n²)
-                                        for i in min_size..(segment_data.len() - min_size) {
-                                            let cost1 = prefix1[i];  // sum of costs1[0..i]
-                                            let cost2 = total_cost2 - prefix2[i];  // sum of costs2[i..]
-                                            let cost = cost1 + cost2;
-                                            if cost < best_cost {
-                                                best_cost = cost;
-                                                best_pos = i;
-                                            }
-                                        }
-                                        Some(best_pos)
-                                    } else {
-                                        None
-                                    };
-
-                                    if let Some(pos) = split_pos {
-                                        // Split segment into TWO parts
-                                        let (seg1_data, seg2_data) = segment_data.split_at(pos);
-
-                                        if self.config.verbosity > 1 {
-                                            eprintln!(
-                                                "[SPLIT_EXEC] Sample={} kmer1={:016x} kmer2={:016x} middle={:016x} split_pos={}",
-                                                sample_name, kmer_front, kmer_back, middle_kmer, pos
-                                            );
-                                        }
-
-                                        // Prepare FIRST segment (joins key1 group)
-                                        let seg1_info = Self::prepare_segment_info(
-                                            &self.config,
-                                            &sample_name,
-                                            &contig_name,
-                                            seg_idx,
-                                            seg1_data.to_vec(),
-                                            Some(kmer_front),
-                                            Some(middle_kmer),
-                                        )?;
-
-                                        // Prepare SECOND segment (joins key2 group)
-                                        let seg2_info = Self::prepare_segment_info(
-                                            &self.config,
-                                            &sample_name,
-                                            &contig_name,
-                                            seg_idx,
-                                            seg2_data.to_vec(),
-                                            Some(middle_kmer),
-                                            Some(kmer_back),
-                                        )?;
-
-                                        // Buffer BOTH segments as KNOWN (joining existing groups)
-                                        segment_buffer.push(BufferedSegment {
-                                            key: seg1_info.key,
-                                            segment: seg1_info.segment,
-                                            is_new: false,
-                                        });
-
-                                        segment_buffer.push(BufferedSegment {
-                                            key: seg2_info.key,
-                                            segment: seg2_info.segment,
-                                            is_new: false,
-                                        });
-
-                                        splits_executed += 1;
-
-                                        // Skip buffering original segment
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Classify as NEW or KNOWN
-                    let is_new = !group_exists;
-                    if is_new {
-                        // Create group inline with this segment as reference
-                        let group_id = next_group_id.fetch_add(1, Ordering::SeqCst);
-                        let ref_sequence = Arc::new(Mutex::new(segment_data.clone()));
-                        groups.insert(key.clone(), (group_id, ref_sequence));
-                        known_groups.insert(key.clone());
-
-                        // Update kmer_connections
-                        if kmer_front != u64::MAX && kmer_back != u64::MAX {
-                            kmer_connections.entry(kmer_front)
-                                .or_insert_with(Vec::new)
-                                .push(kmer_back);
-                            if kmer_front != kmer_back {
-                                kmer_connections.entry(kmer_back)
-                                    .or_insert_with(Vec::new)
-                                    .push(kmer_front);
-                            }
-                        }
-                    }
-
-                    // Prepare and buffer segment
-                    let seg_info = Self::prepare_segment_info(
-                        &self.config,
-                        &sample_name,
-                        &contig_name,
-                        seg_idx,
-                        segment_data,
-                        Some(kmer_front),
-                        Some(kmer_back),
-                    )?;
-
-                    segment_buffer.push(BufferedSegment {
-                        key: seg_info.key,
-                        segment: seg_info.segment,
-                        is_new,
-                    });
+                // Classify as NEW or KNOWN based on whether we've seen this key before
+                let is_new = !known_groups.contains(&key);
+                if is_new {
+                    known_groups.insert(key.clone());
                 }
+
+                // Prepare and buffer segment
+                let seg_info = Self::prepare_segment_info(
+                    &self.config,
+                    &sample_name,
+                    &contig_name,
+                    seg_idx,
+                    segment_data,
+                    Some(kmer_front),
+                    Some(kmer_back),
+                )?;
+
+                segment_buffer.push(BufferedSegment {
+                    key: seg_info.key,
+                    segment: seg_info.segment,
+                    is_new,
+                });
             }
+        }
 
         if self.config.verbosity > 0 {
-            println!("All contigs segmented: {} segments collected", segment_buffer.len());
-            if splits_executed > 0 {
-                println!("Splits executed during Phase 1: {}", splits_executed);
-            }
+            println!("Phase 1 complete: {} segments collected", segment_buffer.len());
         }
 
         // ================================================================
