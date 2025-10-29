@@ -178,13 +178,20 @@ fn handle_registration_stage(
     // TODO: store_segments(worker_id, shared);
 
     // Barrier 3: Wait for storage complete
-    let wait_result = barrier.wait();
+    barrier.wait();
 
-    // Leader thread: cleanup and flush
-    if wait_result.is_leader() {
-        // TODO: buffered_seg_part.clear();
+    // Thread 0 or 1: cleanup and flush (C++ AGC pattern: BOTH threads do work!)
+    // See agc_compressor.cpp:1136-1180
+    if worker_id == 0 {
+        // TODO: buffered_seg_part.clear(max(1, num_workers - 1));
         // TODO: update processed_samples
+        // TODO: store_contig_batch if needed
         // TODO: flush archive buffers
+        // TODO: if adaptive_compression: switch back to main queue
+    } else if worker_id == 1 {
+        // TODO: update processed_samples (same as thread 0!)
+        // TODO: store_contig_batch if needed (same as thread 0!)
+        // TODO: flush archive buffers (same as thread 0!)
     }
 
     // Barrier 4: All ready to continue

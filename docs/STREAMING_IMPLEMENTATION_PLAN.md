@@ -183,20 +183,20 @@
 
 ---
 
-### 2.2 Registration Stage Handler
+### 2.2 Registration Stage Handler ✓
 **C++ Reference**: `agc_compressor.cpp` lines 1115-1180 (registration stage)
 
-- [ ] **Study** C++ AGC's registration logic
+- [C] **Study** C++ AGC's registration logic
   - Barrier: all workers arrive
   - Thread 0: calls `register_segments()`
   - Thread 0: processes fallback minimizers
   - Barrier: wait for registration complete
   - All threads: call `store_segments()`
   - Barrier: wait for storage complete
-  - Thread 0 or 1: update progress, flush buffers
+  - Thread 0 **AND** 1: update progress, flush buffers (BOTH threads!)
   - Barrier: all ready to continue
 
-- [ ] **Implement** Rust registration handler
+- [R] **Implement** Rust registration handler
   ```rust
   ContigProcessingStage::Registration => {
       barrier.wait();
@@ -210,7 +210,10 @@
       store_segments(worker_id, &shared_state);
       barrier.wait();
 
+      // BOTH thread 0 and 1 do cleanup (matching C++ AGC exactly)
       if worker_id == 0 {
+          flush_and_update_progress(&shared_state);
+      } else if worker_id == 1 {
           flush_and_update_progress(&shared_state);
       }
 
@@ -218,9 +221,16 @@
   }
   ```
 
-- [ ] **Verify** Unit test with multiple workers hitting registration
+- [✓] **Verify** Unit test with multiple workers hitting registration
 
-**Files to modify**: `ragc-core/src/worker.rs`, `ragc-core/src/registration.rs` (new)
+**Status**: Complete
+  - Correct 4-barrier synchronization pattern
+  - Leader-only sections for register_segments() and fallback minimizers
+  - All-threads section for store_segments()
+  - BOTH thread 0 and 1 do cleanup (matches C++ AGC behavior)
+  - Detailed segment processing implementation in Phase 3
+
+**Files modified**: `ragc-core/src/worker.rs` (handle_registration_stage updated)
 
 ---
 
