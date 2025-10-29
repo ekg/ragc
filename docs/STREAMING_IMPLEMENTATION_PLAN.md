@@ -71,17 +71,18 @@
 
 ---
 
-### 1.3 Priority Queue System
-**C++ Reference**: `agc_compressor.cpp` lines 2131-2133 (CBoundedPQueue)
+### 1.3 Priority Queue System ✅
+**C++ Reference**: `queue.h` lines 153-346 (CBoundedPQueue)
 
-- [ ] **Study** C++ AGC's `CBoundedPQueue<task_t>` behavior
+- [C] **Study** C++ AGC's `CBoundedPQueue<task_t>` behavior
   - Items have (value, priority, cost)
-  - PopLarge() returns highest priority items first
+  - PopLarge() returns highest priority items first (reverse iterator)
   - Multiple workers can pop concurrently
   - MarkCompleted() signals end of queue
   - Size limited by memory capacity (2GB or 192MB/thread)
+  - EmplaceManyNoCost() for sync barriers
 
-- [ ] **Implement** Rust `BoundedPriorityQueue<T>` using crossbeam
+- [R] **Implement** Rust `BoundedPriorityQueue<T>`
   ```rust
   struct BoundedPriorityQueue<T> {
       // Internal: BinaryHeap + Mutex + Condvar
@@ -89,13 +90,16 @@
   }
   ```
 
-- [ ] **Verify** Unit tests:
-  - Multiple producers, multiple consumers
-  - Priority ordering (highest priority first)
-  - Capacity limiting
-  - Graceful completion signaling
+- [✓] **Verify** Unit tests:
+  - Multiple producers, multiple consumers ✓
+  - Priority ordering (highest priority first) ✓
+  - Capacity limiting ✓
+  - Graceful completion signaling ✓
+  - EmplaceManyNoCost for sync barriers ✓
+  - 5/5 tests pass
+  - Commit: f07169e
 
-**Files to modify**: `ragc-core/src/priority_queue.rs` (new file)
+**Files modified**: `ragc-core/src/priority_queue.rs` (new file, 434 lines)
 
 ---
 
