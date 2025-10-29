@@ -75,6 +75,7 @@ impl SharedCompressorState {
 /// * `shared` - Shared state accessible to all workers
 pub fn worker_thread(
     worker_id: usize,
+    num_workers: usize,
     queue: Arc<BoundedPriorityQueue<Task>>,
     barrier: Arc<Barrier>,
     shared: Arc<SharedCompressorState>,
@@ -107,7 +108,7 @@ pub fn worker_thread(
 
                     ContigProcessingStage::NewSplitters => {
                         // Handle adaptive splitter finding (agc_compressor.cpp:1187-1237)
-                        handle_new_splitters_stage(worker_id, &barrier, &shared);
+                        handle_new_splitters_stage(worker_id, num_workers, &barrier, &shared);
                         continue; // Return to top of loop
                     }
 
@@ -204,21 +205,43 @@ fn handle_registration_stage(
 /// See BARRIER_USAGE_PATTERN.md for detailed documentation.
 fn handle_new_splitters_stage(
     worker_id: usize,
+    num_workers: usize,
     barrier: &Arc<Barrier>,
     shared: &Arc<SharedCompressorState>,
 ) {
     // Barrier 1: All workers arrive
-    let wait_result = barrier.wait();
+    barrier.wait();
 
-    // Leader thread: insert new splitters and re-enqueue hard contigs
-    if wait_result.is_leader() {
-        // TODO: insert_adaptive_splitters(shared);
-        // TODO: re_enqueue_hard_contigs(shared, queue_aux);
-        // TODO: switch_to_aux_queue(shared);
+    // bloom_insert logic: Insert new splitters into bloom filter and hash set
+    // In C++ AGC, this is a lambda defined inline (lines 1191-1209)
+    let bloom_insert = || {
+        // TODO: Insert splitters from vv_splitters into hs_splitters and bloom_splitters
+        // TODO: Clear vv_splitters
+        // TODO: If bloom_splitters.filling_factor() > 0.3: resize and rebuild
+    };
+
+    // Thread 0: Re-enqueue hard contigs and switch queues
+    if worker_id == 0 {
+        // Single-threaded: thread 0 does bloom_insert
+        if num_workers == 1 {
+            bloom_insert();
+        }
+
+        // Re-enqueue hard contigs for reprocessing with new splitters
+        // TODO: for (sample, contig, seq) in raw_contigs:
+        //     aux_queue.emplace(Task::new_contig(sample, contig, seq, HardContigs), priority=1, cost=seq.len())
+        // TODO: raw_contigs.clear()
+
+        // Enqueue registration sync tokens for next round
+        // TODO: aux_queue.emplace_many_no_cost(Task::new_sync(Registration), priority=0, n_items=num_workers)
+
+        // Switch working queue to aux queue
+        // TODO: working_queue = aux_queue
     }
-
-    // Note: In C++ AGC, both thread 0 and thread 1 do work here
-    // TODO: Handle the bloom_insert pattern correctly
+    // Thread 1: Handle bloom_insert for multi-threaded case
+    else if worker_id == 1 {
+        bloom_insert();
+    }
 
     // Barrier 2: All ready to process hard contigs
     barrier.wait();
@@ -281,7 +304,7 @@ mod tests {
                 let s = shared.clone();
 
                 thread::spawn(move || {
-                    worker_thread(worker_id, q, b, s);
+                    worker_thread(worker_id, 2, q, b, s);
                 })
             })
             .collect();
@@ -319,7 +342,7 @@ mod tests {
         let s = shared.clone();
 
         let handle = thread::spawn(move || {
-            worker_thread(0, q, b, s);
+            worker_thread(0, 1, q, b, s);
         });
 
         handle.join().unwrap();

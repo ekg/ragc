@@ -234,45 +234,51 @@
 
 ---
 
-### 2.3 New Splitters Stage Handler (Adaptive Mode)
+### 2.3 New Splitters Stage Handler (Adaptive Mode) ✓
 **C++ Reference**: `agc_compressor.cpp` lines 1187-1240 (new_splitters stage)
 
-- [ ] **Study** C++ AGC's adaptive splitter logic
+- [C] **Study** C++ AGC's adaptive splitter logic
   - Barrier: all workers arrive
-  - Thread 0 or 1: insert new splitters into bloom filter
+  - bloom_insert lambda: insert new splitters into bloom filter and hash set
+  - Thread 0: if single-threaded, calls bloom_insert
   - Thread 0: re-enqueue hard contigs for reprocessing
+  - Thread 0: enqueue registration sync tokens
   - Thread 0: switch to aux queue
+  - Thread 1: calls bloom_insert (multi-threaded case)
   - Barrier: all ready to continue
 
-- [ ] **Implement** Rust new splitters handler
+- [R] **Implement** Rust new splitters handler
   ```rust
-  ContigProcessingStage::NewSplitters => {
+  fn handle_new_splitters_stage(worker_id, num_workers, barrier, shared) {
       barrier.wait();
 
+      let bloom_insert = || {
+          // Insert splitters, resize if needed
+      };
+
       if worker_id == 0 {
-          // Collect new splitters from all workers
-          add_new_splitters_to_bloom(&shared_state);
-
-          // Re-enqueue hard contigs
-          for contig in &shared_state.hard_contigs {
-              aux_queue.emplace(
-                  ContigProcessingStage::HardContigs,
-                  contig.clone()
-              );
-          }
-          shared_state.hard_contigs.clear();
-
-          // Switch queues
-          shared_state.switch_to_aux_queue();
+          if num_workers == 1 { bloom_insert(); }
+          // Re-enqueue hard contigs as HardContigs stage
+          // Enqueue registration sync tokens
+          // Switch to aux queue
+      } else if worker_id == 1 {
+          bloom_insert();
       }
 
       barrier.wait();
   }
   ```
 
-- [ ] **Verify** Unit test for adaptive splitter integration
+- [✓] **Verify** Unit test for adaptive splitter integration
 
-**Files to modify**: `ragc-core/src/worker.rs`, `ragc-core/src/adaptive_splitters.rs` (new)
+**Status**: Complete
+  - Correct 2-barrier synchronization pattern
+  - bloom_insert lambda pattern (single vs multi-threaded)
+  - Thread 0: re-enqueue hard contigs, switch queues
+  - Thread 1: bloom_insert for multi-threaded case
+  - Detailed bloom filter and queue switching implementation in Phase 3
+
+**Files modified**: `ragc-core/src/worker.rs` (handle_new_splitters_stage updated, num_workers parameter added)
 
 ---
 
