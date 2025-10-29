@@ -1482,7 +1482,6 @@ impl StreamingCompressor {
             // Check if both k-mers valid for potential split
             if buffered_seg.key.kmer_front != MISSING_KMER
                 && buffered_seg.key.kmer_back != MISSING_KMER
-                && !groups.contains_key(&buffered_seg.key)
             {
                 stats_valid_kmers += 1;
 
