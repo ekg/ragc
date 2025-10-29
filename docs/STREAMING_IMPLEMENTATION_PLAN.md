@@ -383,66 +383,60 @@
 
 ---
 
-### 3.2 Inline Segmentation During Compression
-**C++ Reference**: `agc_compressor.cpp` lines 1340-1500 (compress_contig)
+### 3.2 Inline Segmentation During Compression ✓ (Study Complete)
+**C++ Reference**: `agc_compressor.cpp` lines 2000-2054 (compress_contig), 1275-1507 (add_segment)
 
-- [ ] **Study** C++ AGC's inline segmentation
-  - Segments created during `compress_contig()`
-  - Each segment checked: NEW or KNOWN?
-  - NEW segments checked for split eligibility
-  - Segments added to `buffered_seg_part`
-  - NOT written immediately - buffered until registration
+- [C] **Study** C++ AGC's inline segmentation and split detection
+  - compress_contig: scan contig for splitters, call add_segment for each
+  - add_segment: determine key (k1, k2) based on terminal k-mers
+  - Four cases: no terminals, both, front-only, back-only
+  - Fallback minimizers for segments without clear terminals
+  - NEW segments checked for split eligibility (lines 1366-1467)
+  - Split conditions: both k1 and k2 in map_segments_terminators
+  - find_cand_segment_with_missing_middle_splitter: find shared k_middle
+  - Split with overlap: kmer_length/2 overlap between parts
+  - Segments buffered (not written immediately) until registration barrier
 
 - [ ] **Implement** Rust inline segmentation
-  ```rust
-  fn compress_contig(
-      task: &Task,
-      zstd_ctx: &mut ZstdContext,
-      shared: &SharedState,
-      worker_id: usize,
-      barrier: &Barrier,
-  ) -> bool {
-      // Segment at splitters
-      let segments = segment_contig(&task.sequence, &shared.splitters);
+  - **Note**: Deferred - very complex logic requiring:
+    - KmerScanner for finding splitters
+    - Canonical k-mer determination with fallback minimizers
+    - Split detection with shared terminator intersection
+    - Middle splitter position finding with ZSTD decompression
+  - Will implement after simpler components are working
 
-      for (idx, segment) in segments.iter().enumerate() {
-          let key = (segment.front_kmer, segment.back_kmer);
+- [✓] **Verify** Comprehensive documentation in INLINE_SEGMENTATION_PATTERN.md
 
-          // Check if group exists
-          let group_id = shared.segment_map.get(&key);
+**Status**: Study complete (647 lines of documentation)
+  - Documented compress_contig main loop
+  - Documented add_segment with all 4 terminal k-mer cases
+  - Documented split detection conditions and execution
+  - Documented find_cand_segment_with_missing_middle_splitter
+  - Provided Rust implementation strategy outline
 
-          if let Some(gid) = group_id {
-              // KNOWN segment
-              buffer_known_segment(worker_id, gid, segment);
-          } else {
-              // NEW segment - check for split
-              if should_split(&key, &shared) {
-                  // Split and add to existing groups
-              } else {
-                  // Buffer as new group
-                  buffer_new_segment(worker_id, &key, segment);
-              }
-          }
-      }
-
-      true
-  }
-  ```
-
-- [ ] **Verify** Unit test for segmentation flow
-
-**Files to modify**: `ragc-core/src/compression.rs`
+**Files created**:
+  - `docs/INLINE_SEGMENTATION_PATTERN.md` (647 lines)
 
 ---
 
-### 3.3 Split Detection and Execution (Inline)
-**C++ Reference**: `agc_compressor.cpp` lines 1381-1501 (split logic in compress_contig)
+### 3.3 Split Detection and Execution ✓ (Documented in 3.2)
+**C++ Reference**: `agc_compressor.cpp` lines 1366-1467 (split in add_segment), 1510-1597 (find middle splitter)
 
-- [ ] **Study** C++ AGC's split checking
-  ```cpp
-  // Check if NEW segment (K1, K2) can split
-  auto it1 = map_segments_terminators.find(x1);
-  auto it2 = map_segments_terminators.find(x2);
+**Note**: Split detection is tightly integrated with inline segmentation (Phase 3.2).
+All split logic is documented in INLINE_SEGMENTATION_PATTERN.md.
+
+- [C] **Study** C++ AGC's split checking (completed as part of 3.2)
+  - Split eligibility: pk not in map_segments, both k1 and k2 in map_segments_terminators
+  - find_cand_segment_with_missing_middle_splitter: intersection of terminator lists
+  - Try each shared k_middle: check if groups (k1, k_mid) and (k_mid, k2) exist
+  - find_middle_splitter: locate k_middle position in segment
+  - Split outcomes: no split (entire to one group), split (two overlapping segments)
+
+- [ ] **Implement** Rust split detection (deferred with 3.2)
+
+- [✓] **Verify** Documented in INLINE_SEGMENTATION_PATTERN.md
+
+**Status**: Study complete (integrated with Phase 3.2 documentation)
 
   if (it1 != map_segments_terminators.end()) {
       for (auto x : it1->second) {
