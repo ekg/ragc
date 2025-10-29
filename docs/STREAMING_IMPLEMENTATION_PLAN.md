@@ -486,53 +486,38 @@ All split logic is documented in INLINE_SEGMENTATION_PATTERN.md.
 
 ---
 
-### 3.4 Segment Registration Phase
-**C++ Reference**: `agc_compressor.cpp` lines 1527-1620 (register_segments)
+### 3.4 Segment Registration Phase ✓ (Study Complete)
+**C++ Reference**:
+- `agc_compressor.cpp` lines 954-971 (register_segments)
+- `agc_compressor.cpp` lines 974-1050 (store_segments)
+- `agc_compressor.h` lines 384-415 (CBufferedSegPart::process_new)
 
-- [ ] **Study** C++ AGC's `register_segments()`
-  - Processes ALL buffered NEW segments
-  - Assigns group IDs sequentially
-  - Creates group metadata
-  - Adds terminators to map_segments_terminators
-  - Moves segments from NEW buffer to group storage
+- [C] **Study** C++ AGC's `register_segments()` and `store_segments()`
+  - **register_segments()**: Sort KNOWN, assign group IDs to NEW, register archive streams
+  - **process_new()**: Map (kmer1, kmer2) → group_id, move NEW to KNOWN
+  - **store_segments()**: Parallel atomic iteration, create CSegment objects, **actual semantic registration** (update map_segments + terminators), write segments
+  - **Critical insight**: Despite the name, actual registration (map_segments/terminators) happens in store_segments, NOT register_segments
+  - **Terminator tracking**: map_segments_terminators accumulates k1↔k2 pairs for split detection
+  - **Priority handling**: Lower group_id wins when (k1,k2) already exists (earlier samples are reference)
+  - **4-barrier synchronization**: arrive → register → arrive → store (all workers) → arrive → cleanup (thread 0 & 1) → arrive
 
 - [ ] **Implement** Rust segment registration
-  ```rust
-  fn register_segments(shared: &mut SharedState) {
-      let buffered = shared.take_buffered_new_segments();
+  - **Note**: Deferred - requires full CSegment implementation, archive stream registration, collection metadata tracking
+  - Will implement after Phase 4 (main compression flow) structure is in place
+  - Comprehensive Rust implementation strategy in SEGMENT_REGISTRATION_PATTERN.md
 
-      for (key, segments) in buffered {
-          // Assign new group ID
-          let group_id = shared.next_group_id;
-          shared.next_group_id += 1;
+- [✓] **Verify** Comprehensive documentation in SEGMENT_REGISTRATION_PATTERN.md
 
-          // Register in map
-          shared.segment_map.insert(key, group_id);
+**Status**: Study complete (comprehensive 700+ line documentation)
+  - Documented register_segments() flow (7 steps)
+  - Documented process_new() flow (7 steps)
+  - Documented store_segments() flow (10 steps)
+  - Documented 4-barrier synchronization pattern
+  - Provided complete Rust implementation strategy
+  - Identified C++ AGC quirks to match exactly
 
-          // Add terminators
-          if key.0 != MISSING_KMER && key.1 != MISSING_KMER {
-              shared.terminators
-                  .entry(key.0)
-                  .or_default()
-                  .push(key.1);
-
-              if key.0 != key.1 {
-                  shared.terminators
-                      .entry(key.1)
-                      .or_default()
-                      .push(key.0);
-              }
-          }
-
-          // Move segments to group storage
-          shared.groups.insert(group_id, segments);
-      }
-  }
-  ```
-
-- [ ] **Verify** Unit test for registration logic
-
-**Files to modify**: `ragc-core/src/registration.rs`
+**Files created**:
+  - `docs/SEGMENT_REGISTRATION_PATTERN.md` (comprehensive C++ AGC documentation with Rust strategy)
 
 ---
 
