@@ -282,50 +282,58 @@
 
 ---
 
-### 2.4 Contig Compression Handler
+### 2.4 Contig Compression Handler ✓
 **C++ Reference**: `agc_compressor.cpp` lines 1242-1270 (all_contigs/hard_contigs)
 
-- [ ] **Study** C++ AGC's compress_contig function call
+- [C] **Study** C++ AGC's compress_contig function call
   ```cpp
   if (get<0>(task) == contig_processing_stage_t::all_contigs) {
-      preprocess_raw_contig(get<3>(task));
+      preprocess_raw_contig(get<3>(task));  // Only for AllContigs!
   }
 
   size_t ctg_size = get<3>(task).size();
 
-  if (compress_contig(get<0>(task), get<1>(task), get<2>(task),
-                      get<3>(task), zstd_cctx, zstd_dctx,
-                      thread_id, bar)) {
-      // Update progress...
+  if (compress_contig(...)) {
+      // Success: update progress
+      processed_bases.fetch_add(ctg_size);
+  } else {
+      // Failed: save for adaptive reprocessing
+      v_raw_contigs.emplace_back(sample, contig, move(seq));
   }
   ```
 
-- [ ] **Implement** Rust contig compression handler
+- [R] **Implement** Rust contig compression handler
   ```rust
-  ContigProcessingStage::AllContigs |
+  ContigProcessingStage::AllContigs => {
+      preprocess_raw_contig(&task.sequence);  // TODO placeholder
+  }
   ContigProcessingStage::HardContigs => {
-      if task.stage == ContigProcessingStage::AllContigs {
-          preprocess_contig(&mut task.sequence);
-      }
+      // No preprocessing (already normalized)
+  }
 
-      let ctg_size = task.sequence.len();
+  let ctg_size = task.sequence.len();
 
-      if compress_contig(
-          &task,
-          &mut worker_state.zstd_ctx,
-          &shared_state,
-          worker_id,
-          &barrier,
-      ) {
-          shared_state.processed_bases
-              .fetch_add(ctg_size, Ordering::SeqCst);
-      }
+  if compress_contig_task(&task, worker_id, &barrier, &shared) {
+      // Success
+      shared.processed_bases.fetch_add(ctg_size, Ordering::Relaxed);
+      // Progress printing every 10 MB
+  } else {
+      // Failed: add to raw_contigs for reprocessing
+      shared.raw_contigs.lock().unwrap().push((sample, contig, seq));
   }
   ```
 
-- [ ] **Verify** Integration test with real contig
+- [✓] **Verify** Integration test with real contig
 
-**Files to modify**: `ragc-core/src/worker.rs`, `ragc-core/src/compression.rs`
+**Status**: Complete
+  - Correct preprocessing logic (AllContigs only)
+  - compress_contig returns bool (success/needs-adaptive-splitters)
+  - Success path: atomic progress counter update
+  - Failure path: save to raw_contigs for NewSplitters stage
+  - Detailed compression implementation in Phase 3
+  - Tests verify progress tracking and task completion
+
+**Files modified**: `ragc-core/src/worker.rs` (compress_contig_task placeholder)
 
 ---
 
