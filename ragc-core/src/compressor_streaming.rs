@@ -225,6 +225,11 @@ impl GroupWriter {
         }
     }
 
+    /// Get reference segment data if available (for split cost calculation)
+    fn get_reference(&self) -> Option<&Contig> {
+        self.reference.as_ref()
+    }
+
     /// Add a segment to this group's buffer
     /// Returns Some(CompressedPack) if buffer is full and pack should be written
     /// Returns Some(pack) if this is the first segment of an LZ group or if buffer is full
@@ -2998,6 +3003,7 @@ impl StreamingCompressor {
                                         // BOTH target groups must exist before we can split
                                         if key1_exists && key2_exists {
                                             // Calculate optimal split position using LZ cost
+                                            // Only split if we can calculate optimal position (both groups have references)
                                             if let Some(split_pos) = Self::calculate_split_position(
                                             seg_info.key.kmer_front,
                                             seg_info.key.kmer_back,
