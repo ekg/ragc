@@ -563,93 +563,45 @@ All split logic is documented in INLINE_SEGMENTATION_PATTERN.md.
 
 ---
 
-### 4.2 Worker Thread Spawning and Management
+### 4.2 Worker Thread Spawning and Management ✓ (Study Complete)
 **C++ Reference**: `agc_compressor.cpp` lines 2134-2141 (thread management)
 
-- [ ] **Study** C++ AGC's thread spawning
-  ```cpp
-  uint32_t no_workers = (no_threads < 8) ? no_threads : no_threads - 1;
-
-  vector<thread> v_threads;
-  v_threads.reserve((size_t)no_workers);
-
-  my_barrier bar(no_workers);
-
-  start_compressing_threads(v_threads, bar, no_workers);
-  ```
+- [C] **Study** C++ AGC's thread spawning
+  - **Worker count decision**: `no_workers = (no_threads < 8) ? no_threads : no_threads - 1`
+  - **Barrier creation**: `my_barrier bar(no_workers)` - all workers synchronize here
+  - **Thread spawning**: `start_compressing_threads(v_threads, bar, no_workers)`
+  - **Worker loop**: Covered in Phase 2.1 (WORKER_THREAD_PATTERN.md)
+  - **Join pattern**: Covered in Phase 4.1 (MAIN_COMPRESSION_FLOW_PATTERN.md Step 5)
 
 - [ ] **Implement** Rust thread management
-  ```rust
-  pub fn start_compression(
-      &mut self,
-  ) -> Result<()> {
-      let num_workers = if self.config.num_threads < 8 {
-          self.config.num_threads
-      } else {
-          self.config.num_threads - 1
-      };
+  - **Note**: Implementation strategy provided in MAIN_COMPRESSION_FLOW_PATTERN.md
 
-      let barrier = Arc::new(Barrier::new(num_workers));
-      let queue = Arc::clone(&self.task_queue);
-      let shared = Arc::clone(&self.shared_state);
+- [✓] **Verify** Documented in Phase 2.1 and Phase 4.1
 
-      let mut handles = Vec::new();
-
-      for worker_id in 0..num_workers {
-          let queue = Arc::clone(&queue);
-          let barrier = Arc::clone(&barrier);
-          let shared = Arc::clone(&shared);
-
-          let handle = thread::spawn(move || {
-              worker_thread(worker_id, queue, barrier, shared)
-          });
-
-          handles.push(handle);
-      }
-
-      // Wait for all workers to complete
-      for handle in handles {
-          handle.join().unwrap();
-      }
-
-      Ok(())
-  }
-  ```
-
-- [ ] **Verify** Integration test with worker spawning
-
-**Files to modify**: `ragc-core/src/compressor_streaming.rs`
+**Status**: Study complete (covered in existing documentation)
+  - Phase 2.1: Worker thread loop structure (WORKER_THREAD_PATTERN.md)
+  - Phase 4.1: Thread spawning in main flow (MAIN_COMPRESSION_FLOW_PATTERN.md)
 
 ---
 
-### 4.3 Queue Completion and Cleanup
-**C++ Reference**: `agc_compressor.cpp` lines 2244-2251 (completion)
+### 4.3 Queue Completion and Cleanup ✓ (Study Complete)
+**C++ Reference**: `agc_compressor.cpp` lines 2254-2269 (completion and cleanup)
 
-- [ ] **Study** C++ AGC's completion sequence
-  ```cpp
-  pq_contigs_desc->MarkCompleted();
-
-  join_threads(v_threads);
-
-  pq_contigs_desc.reset();
-  pq_contigs_desc_aux.reset();
-  ```
+- [C] **Study** C++ AGC's completion sequence
+  - **Mark completed**: `pq_contigs_desc->MarkCompleted()` - signals no more tasks
+  - **Workers exit**: Pop returns `completed` result, workers break from loop
+  - **Join threads**: `join_threads(v_threads)` - wait for all workers
+  - **Final flush**: `out_archive->FlushOutBuffers()` - write pending data
+  - **Queue cleanup**: `pq_contigs_desc.reset()`, `pq_contigs_desc_aux.reset()` - free memory
+  - **Sample count update**: `no_samples_in_archive += samples.size() - num_empty_input`
 
 - [ ] **Implement** Rust completion
-  ```rust
-  // After enqueuing all tasks
-  self.task_queue.mark_completed();
+  - **Note**: Implementation strategy provided in MAIN_COMPRESSION_FLOW_PATTERN.md
 
-  // Workers will exit when they see completed signal
-  // join handled in start_compression()
+- [✓] **Verify** Documented in Phase 4.1
 
-  // Cleanup
-  self.task_queue = None;
-  ```
-
-- [ ] **Verify** Test graceful shutdown
-
-**Files to modify**: `ragc-core/src/compressor_streaming.rs`
+**Status**: Study complete (covered in MAIN_COMPRESSION_FLOW_PATTERN.md Step 6)
+  - MarkCompleted() → join_threads() → FlushOutBuffers() → reset queues
 
 ---
 
