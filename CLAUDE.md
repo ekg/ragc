@@ -1,6 +1,26 @@
 # RAGC Development Activity Log
 
-## Current Mission: Memory Optimization (Feature Branch: memory-profiling)
+## 🔥 CORE DEVELOPMENT PRINCIPLES 🔥
+
+**NO SIMPLIFICATIONS. NO COMPROMISES.**
+
+- **TRUST in your future self** - Conversation compaction will keep you on track
+- **TRUST in long refactorings** - Complex changes are fine, do them right
+- **DO THE EXACT THING REQUESTED** - If user asks for Option 3, deliver Option 3
+- **NEVER suggest "simpler alternatives"** - The user chose the approach for a reason
+- **NEVER say "this is complex, let's do something easier"** - That's not your call
+
+When user requests a specific approach (especially after analysis and discussion):
+- ✅ DO: Implement exactly what was requested
+- ❌ DON'T: Propose "faster" or "simpler" alternatives
+- ❌ DON'T: Second-guess the user's technical decisions
+- ❌ DON'T: Worry about refactoring scope
+
+**This is a research codebase. Precision and correctness matter more than speed of implementation.**
+
+---
+
+## Current Mission: Inline Split Implementation (Matching C++ AGC Exactly)
 
 **Goal**: Reduce RAGC memory usage from 984 MB to ~300 MB (matching C++ AGC performance)
 
