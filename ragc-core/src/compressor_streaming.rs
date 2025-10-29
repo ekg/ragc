@@ -1681,7 +1681,6 @@ impl StreamingCompressor {
         fasta_paths: &[(String, &Path)],
         splitters: &HashSet<u64>,
     ) -> Result<()> {
-        eprintln!("[DEBUG] Entered add_fasta_files_cpp_agc_style with {} samples", fasta_paths.len());
         if self.config.verbosity > 0 {
             println!("Starting C++ AGC-style compression (sequential sample processing)...");
         }
@@ -1707,16 +1706,13 @@ impl StreamingCompressor {
         // ================================================================
 
         for (sample_name, fasta_path) in fasta_paths {
-            eprintln!("[DEBUG] Starting sample: {}", sample_name);
             if self.config.verbosity > 0 {
                 println!("Processing sample: {} from {:?}", sample_name, fasta_path);
             }
 
             // Read contigs from this sample
-            eprintln!("[DEBUG] Opening file: {:?}", fasta_path);
             let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
                 .context(format!("Failed to open {}", sample_name))?;
-            eprintln!("[DEBUG] File opened successfully");
 
             while let Some((contig_name, sequence)) = reader.read_contig_converted()? {
                 if sequence.is_empty() {
