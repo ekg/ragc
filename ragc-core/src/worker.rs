@@ -1,0 +1,323 @@
+// Worker thread implementation for streaming compression pipeline
+// Matches C++ AGC's start_compressing_threads (agc_compressor.cpp:1097-1270)
+
+use crate::priority_queue::{BoundedPriorityQueue, PopResult};
+use crate::task::{ContigProcessingStage, Task};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+
+/// Shared state accessible to all worker threads
+///
+/// This matches C++ AGC's shared variables captured by lambda (agc_compressor.cpp:1099):
+/// - Atomic counters (processed_bases, processed_samples)
+/// - Mutexes for shared collections (v_raw_contigs, vv_fallback_minimizers, etc.)
+/// - Archive writer, collection descriptor, etc.
+pub struct SharedCompressorState {
+    /// Total bases processed (for progress tracking)
+    pub processed_bases: AtomicUsize,
+
+    /// Number of samples processed (for progress tracking)
+    pub processed_samples: AtomicUsize,
+
+    /// Contigs that failed to compress well (need adaptive splitters)
+    /// Matches C++ AGC's v_raw_contigs (protected by mtx_raw_contigs)
+    pub raw_contigs: Mutex<Vec<(String, String, Vec<u8>)>>,
+
+    /// Verbosity level (0 = quiet, 1 = normal, 2 = verbose)
+    pub verbosity: usize,
+
+    // TODO: Add more shared state as needed:
+    // - buffered_seg_part: BufferedSegments
+    // - vv_fallback_minimizers: Mutex<Vec<Vec<Vec<u64>>>>
+    // - vv_splitters: Mutex<Vec<Vec<u64>>>
+    // - hs_splitters: Mutex<HashSet<u64>>
+    // - bloom_splitters: Mutex<BloomFilter>
+    // - out_archive: Mutex<ArchiveWriter>
+    // - collection_desc: Mutex<Collection>
+}
+
+impl SharedCompressorState {
+    /// Create new shared state
+    pub fn new(verbosity: usize) -> Self {
+        SharedCompressorState {
+            processed_bases: AtomicUsize::new(0),
+            processed_samples: AtomicUsize::new(0),
+            raw_contigs: Mutex::new(Vec::new()),
+            verbosity,
+        }
+    }
+}
+
+/// Worker thread main loop
+///
+/// This matches C++ AGC's worker lambda (agc_compressor.cpp:1099-1270):
+/// ```cpp
+/// v_threads.emplace_back([&, i, n_t]() {
+///     auto zstd_cctx = ZSTD_createCCtx();
+///     auto zstd_dctx = ZSTD_createDCtx();
+///     uint32_t thread_id = i;
+///
+///     while(true) {
+///         task_t task;
+///         auto q_res = pq_contigs_desc_working->PopLarge(task);
+///         // ... process task ...
+///     }
+///
+///     ZSTD_freeCCtx(zstd_cctx);
+///     ZSTD_freeDCtx(zstd_dctx);
+/// });
+/// ```
+///
+/// # Arguments
+/// * `worker_id` - Thread ID (0 to num_workers-1)
+/// * `queue` - Priority queue for pulling tasks
+/// * `barrier` - Synchronization barrier for registration/new_splitters stages
+/// * `shared` - Shared state accessible to all workers
+pub fn worker_thread(
+    worker_id: usize,
+    queue: Arc<BoundedPriorityQueue<Task>>,
+    barrier: Arc<Barrier>,
+    shared: Arc<SharedCompressorState>,
+) {
+    // TODO: Create per-thread ZSTD contexts
+    // let mut zstd_encoder = ...;
+    // let mut zstd_decoder = ...;
+
+    loop {
+        // Pop task from priority queue (agc_compressor.cpp:1108)
+        let (result, task_opt) = queue.pop_large();
+
+        match result {
+            // Queue empty but producers still active - retry
+            PopResult::Empty => continue,
+
+            // Queue empty and no producers - exit worker loop
+            PopResult::Completed => break,
+
+            // Successfully got a task - process it
+            PopResult::Normal => {
+                let task = task_opt.expect("PopResult::Normal should have task");
+
+                match task.stage {
+                    ContigProcessingStage::Registration => {
+                        // Handle registration synchronization (agc_compressor.cpp:1114-1185)
+                        handle_registration_stage(worker_id, &barrier, &shared);
+                        continue; // Return to top of loop
+                    }
+
+                    ContigProcessingStage::NewSplitters => {
+                        // Handle adaptive splitter finding (agc_compressor.cpp:1187-1237)
+                        handle_new_splitters_stage(worker_id, &barrier, &shared);
+                        continue; // Return to top of loop
+                    }
+
+                    ContigProcessingStage::AllContigs => {
+                        // Preprocess contig before compression (agc_compressor.cpp:1241)
+                        // TODO: preprocess_raw_contig(&task.sequence);
+                    }
+
+                    ContigProcessingStage::HardContigs => {
+                        // Hard contigs don't need preprocessing (already normalized)
+                    }
+                }
+
+                // Compress contig (AllContigs and HardContigs both use this path)
+                let ctg_size = task.sequence.len();
+
+                if compress_contig_task(&task, worker_id, &barrier, &shared) {
+                    // Success: update progress counter (agc_compressor.cpp:1248-1255)
+                    let old_pb = shared
+                        .processed_bases
+                        .fetch_add(ctg_size, Ordering::Relaxed);
+                    let new_pb = old_pb + ctg_size;
+
+                    // Print progress every 10 MB
+                    if shared.verbosity > 0 && old_pb / 10_000_000 != new_pb / 10_000_000 {
+                        eprintln!("Compressed: {} Mb\r", new_pb / 1_000_000);
+                    }
+                } else {
+                    // Failed to compress well: save for reprocessing (agc_compressor.cpp:1258-1261)
+                    let mut raw_contigs = shared.raw_contigs.lock().unwrap();
+                    raw_contigs.push((
+                        task.sample_name.clone(),
+                        task.contig_name.clone(),
+                        task.sequence.clone(),
+                    ));
+                }
+
+                // Task memory automatically freed (Rust Drop)
+            }
+        }
+    }
+
+    // ZSTD contexts automatically freed (Rust Drop)
+}
+
+/// Handle registration stage synchronization
+///
+/// Matches C++ AGC's registration logic (agc_compressor.cpp:1114-1185)
+/// See BARRIER_USAGE_PATTERN.md for detailed documentation.
+fn handle_registration_stage(
+    worker_id: usize,
+    barrier: &Arc<Barrier>,
+    shared: &Arc<SharedCompressorState>,
+) {
+    // Barrier 1: All workers arrive
+    let wait_result = barrier.wait();
+
+    // Leader thread: register segments and process fallbacks
+    if wait_result.is_leader() {
+        // TODO: register_segments(shared);
+        // TODO: process_fallback_minimizers(shared);
+    }
+
+    // Barrier 2: Wait for registration complete
+    barrier.wait();
+
+    // All threads: store their segments
+    // TODO: store_segments(worker_id, shared);
+
+    // Barrier 3: Wait for storage complete
+    let wait_result = barrier.wait();
+
+    // Leader thread: cleanup and flush
+    if wait_result.is_leader() {
+        // TODO: buffered_seg_part.clear();
+        // TODO: update processed_samples
+        // TODO: flush archive buffers
+    }
+
+    // Barrier 4: All ready to continue
+    barrier.wait();
+}
+
+/// Handle new splitters stage synchronization
+///
+/// Matches C++ AGC's new_splitters logic (agc_compressor.cpp:1187-1237)
+/// See BARRIER_USAGE_PATTERN.md for detailed documentation.
+fn handle_new_splitters_stage(
+    worker_id: usize,
+    barrier: &Arc<Barrier>,
+    shared: &Arc<SharedCompressorState>,
+) {
+    // Barrier 1: All workers arrive
+    let wait_result = barrier.wait();
+
+    // Leader thread: insert new splitters and re-enqueue hard contigs
+    if wait_result.is_leader() {
+        // TODO: insert_adaptive_splitters(shared);
+        // TODO: re_enqueue_hard_contigs(shared, queue_aux);
+        // TODO: switch_to_aux_queue(shared);
+    }
+
+    // Note: In C++ AGC, both thread 0 and thread 1 do work here
+    // TODO: Handle the bloom_insert pattern correctly
+
+    // Barrier 2: All ready to process hard contigs
+    barrier.wait();
+}
+
+/// Compress a contig task
+///
+/// Matches C++ AGC's compress_contig (agc_compressor.cpp:833-1093)
+///
+/// Returns:
+/// - true: Contig compressed successfully
+/// - false: Contig didn't compress well (needs adaptive splitters)
+fn compress_contig_task(
+    task: &Task,
+    worker_id: usize,
+    barrier: &Arc<Barrier>,
+    shared: &Arc<SharedCompressorState>,
+) -> bool {
+    // TODO: Implement actual compression logic
+    // This will involve:
+    // 1. Split contig at splitters
+    // 2. LZ-encode each segment
+    // 3. Check segment sizes (if adaptive mode)
+    // 4. ZSTD compress segments
+    // 5. Add to buffered_seg_part
+    //
+    // For now, return true (success) as placeholder
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shared_state_creation() {
+        let state = SharedCompressorState::new(1);
+        assert_eq!(state.verbosity, 1);
+        assert_eq!(state.processed_bases.load(Ordering::Relaxed), 0);
+        assert_eq!(state.processed_samples.load(Ordering::Relaxed), 0);
+        assert_eq!(state.raw_contigs.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_worker_thread_completion() {
+        use std::thread;
+
+        let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
+        let barrier = Arc::new(Barrier::new(2));
+        let shared = Arc::new(SharedCompressorState::new(0));
+
+        // Mark queue as completed (no tasks)
+        queue.mark_completed();
+
+        // Spawn two workers
+        let handles: Vec<_> = (0..2)
+            .map(|worker_id| {
+                let q = queue.clone();
+                let b = barrier.clone();
+                let s = shared.clone();
+
+                thread::spawn(move || {
+                    worker_thread(worker_id, q, b, s);
+                })
+            })
+            .collect();
+
+        // Workers should exit immediately
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_worker_thread_with_task() {
+        use std::thread;
+
+        let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
+        let barrier = Arc::new(Barrier::new(1));
+        let shared = Arc::new(SharedCompressorState::new(0));
+
+        // Enqueue a simple task
+        queue.emplace(
+            Task::new_contig(
+                "sample1".to_string(),
+                "chr1".to_string(),
+                vec![0, 1, 2, 3, 0, 1, 2, 3], // 8 bases
+                ContigProcessingStage::AllContigs,
+            ),
+            100,
+            8,
+        );
+        queue.mark_completed();
+
+        // Spawn single worker
+        let q = queue.clone();
+        let b = barrier.clone();
+        let s = shared.clone();
+
+        let handle = thread::spawn(move || {
+            worker_thread(0, q, b, s);
+        });
+
+        handle.join().unwrap();
+
+        // Verify task was processed (compress_contig_task returns true)
+        assert_eq!(shared.processed_bases.load(Ordering::Relaxed), 8);
+    }
+}

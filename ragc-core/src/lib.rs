@@ -126,6 +126,7 @@ pub mod segment_compression;
 pub mod splitters;
 pub mod task;
 pub mod tuple_packing;
+pub mod worker;
 pub mod zstd_pool;
 
 // Re-export commonly used types

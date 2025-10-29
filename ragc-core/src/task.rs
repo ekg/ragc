@@ -54,7 +54,7 @@ pub enum ContigProcessingStage {
 /// For synchronization tasks (Registration, NewSplitters):
 /// - `sample_name`, `contig_name`, and `sequence` are empty
 /// - Workers detect sync tasks and enter barrier synchronization
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
     pub stage: ContigProcessingStage,
     pub sample_name: String,
