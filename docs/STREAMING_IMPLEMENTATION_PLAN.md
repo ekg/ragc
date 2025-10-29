@@ -339,46 +339,47 @@
 
 ## Phase 3: Segment Processing (Inline During Compression)
 
-### 3.1 Buffered Segment Storage
-**C++ Reference**: `agc_compressor.h` lines 630-640 (CBufferedSegmentsPart)
+### 3.1 Buffered Segment Storage ✓
+**C++ Reference**: `agc_compressor.h` lines 27-536 (CBufferedSegPart)
 
-- [ ] **Study** C++ AGC's `buffered_seg_part` structure
-  ```cpp
-  struct seg_part_t {
-      contig_processing_stage_t stage;
-      string sample_name;
-      string contig_name;
-      uint32_t seg_part_no;
-      bool is_rev_comp;
-      uint32_t group_id;
-      vector<uint8_t> data;
-  };
+- [C] **Study** C++ AGC's `CBufferedSegPart` structure
+  - `vector<list_seg_part_t> vl_seg_part` - KNOWN segments indexed by group_id
+  - `set<kk_seg_part_t> s_seg_part` - NEW segments (not yet assigned group_id)
+  - `sort_known()` - Parallel sort by (sample, contig, part_no)
+  - `process_new()` - Assign group IDs to NEW segments, resize, move to KNOWN
+  - `distribute_segments()` - Round-robin distribution
+  - `restart_read_vec()` / `get_vec_id()` / `get_part()` - Atomic reading pattern
 
-  class CBufferedSegmentsPart {
-      map<pair<uint64_t, uint64_t>, vector<seg_part_t>> map_buffered;
-  };
-  ```
-
-- [ ] **Implement** Rust `BufferedSegments` structure
+- [R] **Implement** Rust `BufferedSegments` structure
   ```rust
-  struct SegmentPart {
-      stage: ContigProcessingStage,
-      sample_name: String,
-      contig_name: String,
-      seg_part_no: u32,
-      is_rev_comp: bool,
-      group_id: u32,
-      data: Vec<u8>,
+  struct SegmentPartList {
+      parts: Mutex<Vec<SegmentPart>>,
+      virt_begin: Mutex<usize>,  // Virtual begin for pop
   }
 
-  struct BufferedSegments {
-      map: HashMap<(u64, u64), Vec<SegmentPart>>,
+  pub struct BufferedSegments {
+      vl_seg_part: Vec<SegmentPartList>,     // KNOWN segments
+      s_seg_part: Mutex<BTreeSet<SegmentPart>>,  // NEW segments
+      a_v_part_id: AtomicI32,  // Atomic counter for reading
+      resize_mtx: Mutex<()>,
   }
   ```
 
-- [ ] **Verify** Unit test for buffering and retrieval
+- [✓] **Verify** Unit test for buffering and retrieval
 
-**Files to modify**: Update `ragc-core/src/segment_buffer.rs`
+**Status**: Complete
+  - Complete rewrite of segment_buffer.rs (574 lines)
+  - SegmentPart ordering matches C++ AGC (sample, contig, part_no)
+  - SegmentPartList with virt_begin for efficient pop without removal
+  - BufferedSegments with KNOWN/NEW separation
+  - All methods match C++ AGC exactly
+  - 6/6 tests pass (ordering, add_known, add_new + process, get_vec_id, get_part, sort)
+  - Comprehensive documentation in BUFFERED_SEGMENTS_PATTERN.md (509 lines)
+
+**Files modified**:
+  - `ragc-core/src/segment_buffer.rs` (completely rewritten, 574 lines)
+  - `ragc-core/src/lib.rs` (added pub mod segment_buffer)
+  - `docs/BUFFERED_SEGMENTS_PATTERN.md` (new, comprehensive C++ AGC documentation)
 
 ---
 
