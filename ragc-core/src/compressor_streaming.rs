@@ -88,6 +88,14 @@ struct SegmentInfo {
     is_rev_comp: bool,
 }
 
+/// A buffered segment awaiting two-phase processing (analogous to C++ seg_part_t)
+#[derive(Debug, Clone)]
+struct BufferedSegment {
+    key: SegmentGroupKey,
+    segment: SegmentInfo,
+    is_new: bool,  // true = creates new group (NEW), false = joins existing (KNOWN)
+}
+
 /// An uncompressed pack ready for compression (sent from workers to compression pool)
 #[derive(Debug)]
 struct UncompressedPack {
