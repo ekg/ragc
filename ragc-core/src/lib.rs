@@ -120,6 +120,7 @@ pub mod kmer;
 pub mod kmer_extract;
 pub mod lz_diff;
 pub mod lz_matcher;
+pub mod priority_queue;
 pub mod segment;
 pub mod segment_compression;
 pub mod splitters;
