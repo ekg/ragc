@@ -30,7 +30,7 @@ use rayon::prelude::*;
 use sha2::{Sha256, Digest};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex, RwLock,
@@ -502,19 +502,29 @@ impl StreamingCompressor {
         let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
             .context("Failed to open FASTA for detection")?;
 
-        // Read first few headers to check format
-        for _ in 0..5 {
-            if let Some((header, _, _, _)) = reader.read_contig_with_sample()? {
+        // Read first few headers and collect unique sample names
+        let mut sample_names = std::collections::HashSet::new();
+        let mut has_multi_part_headers = false;
+
+        for _ in 0..10 {  // Check more headers to be sure
+            if let Some((header, sample_name, _, _)) = reader.read_contig_with_sample()? {
                 let parts: Vec<&str> = header.split('#').collect();
                 if parts.len() >= 3 {
-                    return Ok(true); // Multi-sample format detected
+                    has_multi_part_headers = true;
+                    sample_names.insert(sample_name);
+
+                    // If we found 2+ unique samples, it's definitely multi-sample
+                    if sample_names.len() >= 2 {
+                        return Ok(true);
+                    }
                 }
             } else {
                 break;
             }
         }
 
-        Ok(false) // No multi-sample format detected
+        // Only multi-sample if we found the right header format AND multiple samples
+        Ok(has_multi_part_headers && sample_names.len() >= 2)
     }
 
     /// Add a multi-sample FASTA file with splitter-based segmentation
@@ -1017,35 +1027,34 @@ impl StreamingCompressor {
     /// Uses the two-pass algorithm with parallel streaming:
     /// Pass 1: Collect reference contigs → find splitter k-mers
     /// Pass 2: Stream through all contigs → segment → parallel compress
+    /// Process contigs using a ContigIterator (for multi-sample FASTAs)
+    ///
+    /// This is the entry point for single-file multi-sample FASTAs (e.g., yeast235.fa.bgz)
+    /// It finds splitters from the first sample, then processes all samples using
+    /// the unified inline split logic.
     pub fn add_contigs_with_splitters(
         &mut self,
         mut iterator: Box<dyn ContigIterator>,
     ) -> Result<()> {
         if self.config.verbosity > 0 {
-            println!("=== Processing contigs with unified iterator ===");
-            println!();
+            println!("=== Pass 1: Finding splitter k-mers from first sample ===");
         }
 
         // Pass 1: Collect reference contigs for splitter finding
-        if self.config.verbosity > 0 {
-            println!("=== Pass 1: Finding splitter k-mers from reference ===");
-        }
-
         let mut reference_contigs = Vec::new();
         let mut reference_sample = String::new();
-
         let mut contig_count = 0;
+
         while let Some((sample_name, _contig_name, sequence)) = iterator.next_contig()? {
             if !sequence.is_empty() {
                 if reference_sample.is_empty() {
                     reference_sample = sample_name.clone();
                     if self.config.verbosity > 0 {
-                        println!("Using first sample ({reference_sample}) as reference to find splitters...");
+                        println!("Using first sample ({reference_sample}) as reference");
                     }
                 }
 
-                // CRITICAL FIX: Only collect contigs from FIRST sample (matching C++ AGC)
-                // C++ AGC uses only the reference (first) file/sample to find splitters
+                // Only collect contigs from FIRST sample (matching C++ AGC)
                 if sample_name == reference_sample {
                     reference_contigs.push(sequence);
                     contig_count += 1;
@@ -1054,7 +1063,7 @@ impl StreamingCompressor {
         }
 
         if self.config.verbosity > 0 {
-            println!("Collected {contig_count} reference contigs from first sample ({reference_sample})");
+            println!("Collected {contig_count} reference contigs");
         }
 
         // Find splitters (also get singleton and duplicate k-mers for adaptive mode)
@@ -1069,17 +1078,12 @@ impl StreamingCompressor {
             self.reference_kmers_singletons = singletons;
             self.reference_kmers_duplicates = duplicates;
             self.current_splitters = splitters.clone();
-
-            if self.config.verbosity > 0 {
-                println!("Adaptive mode: Stored {} singleton k-mers and {} duplicate k-mers from reference",
-                    self.reference_kmers_singletons.len(), self.reference_kmers_duplicates.len());
-            }
         }
 
         if self.config.verbosity > 0 {
-            println!("Found {} actually-used splitter k-mers", splitters.len());
+            println!("Found {} splitter k-mers", splitters.len());
             println!();
-            println!("=== Pass 2: Segmenting and compressing all samples ===");
+            println!("=== Pass 2: Processing all samples with unified logic ===");
         }
 
         drop(reference_contigs); // Free memory
@@ -1087,503 +1091,8 @@ impl StreamingCompressor {
         // Reset iterator for second pass
         iterator.reset()?;
 
-        // Pass 2: Collect all contigs in memory (simple approach for now)
-        // TODO: Optimize to streaming later if memory becomes an issue
-        if self.config.verbosity > 0 {
-            println!("=== Pass 2: Collecting all contigs ===");
-        }
-
-        let mut all_contigs = Vec::new();
-        while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
-            if !sequence.is_empty() {
-                all_contigs.push((sample_name, contig_name, sequence));
-            }
-        }
-
-        if self.config.verbosity > 0 {
-            println!(
-                "Collected {} contigs, starting parallel processing...",
-                all_contigs.len()
-            );
-        }
-
-        // Now use parallel pipeline
-        use crossbeam::channel::{bounded, Receiver, Sender};
-
-        type ContigTask = (String, String, Contig);
-
-        // Reduced buffer sizes from 100 → 10 to lower memory pressure
-        // Each buffered item contains Vec<u8> with segment data (~10KB+)
-        // 100 slots × 3 channels = significant memory overhead
-        let (contig_tx, contig_rx): (Sender<ContigTask>, Receiver<ContigTask>) = bounded(10);
-
-        // THREE-STAGE PIPELINE for parallel compression
-        let (uncompressed_tx, uncompressed_rx): (
-            Sender<UncompressedPack>,
-            Receiver<UncompressedPack>,
-        ) = bounded(10);
-
-        let (compressed_tx, compressed_rx): (Sender<CompressedPack>, Receiver<CompressedPack>) =
-            bounded(10);
-
-        let verbosity = self.config.verbosity;
-
-        // Producer thread: feeds contigs from memory to channel
-        let producer_handle = std::thread::spawn(move || -> Result<usize> {
-            let contig_count = all_contigs.len();
-            for (sample_name, contig_name, sequence) in all_contigs {
-                contig_tx
-                    .send((sample_name, contig_name, sequence))
-                    .context("Failed to send contig to workers")?;
-            }
-
-            // Close channel to signal workers we're done
-            drop(contig_tx);
-
-            if verbosity > 0 {
-                println!("Producer: finished sending {contig_count} contigs");
-            }
-
-            Ok(contig_count)
-        });
-
-        // Shared state for middle splitter optimization
-        // Matches C++ AGC: single RwLock protecting entire map (seg_map_mtx)
-        let group_terminators = Arc::new(RwLock::new(std::mem::take(&mut self.group_terminators)));
-
-        // Per-group buffers for segment writing
-        let group_writers =
-            Arc::new(DashMap::<SegmentGroupKey, std::sync::Mutex<GroupWriter>>::new());
-
-        // Group ID counter (atomic, shared across workers)
-        let next_group_id = Arc::new(AtomicUsize::new(self.next_group_id as usize));
-
-        // Collect contig registrations for sequential processing
-        let contig_registrations = Arc::new(DashMap::new());
-
-        let total_segments = Arc::new(AtomicUsize::new(self.total_segments));
-        let total_bases = Arc::new(AtomicUsize::new(self.total_bases_processed));
-        let config = Arc::new(self.config.clone());
-        let splitters_arc = Arc::new(splitters);
-
-        let contig_registrations_ref = contig_registrations.clone();
-
-        // Worker threads: consume from channel and process
-        let mut worker_handles = Vec::new();
-        for _worker_id in 0..self.config.num_threads {
-            let rx = contig_rx.clone();
-            let uncompressed_tx = uncompressed_tx.clone();
-            let compressed_tx = compressed_tx.clone();
-            let writers = group_writers.clone();
-            let group_terms = group_terminators.clone();
-            let registrations = contig_registrations.clone();
-            let total_segs = total_segments.clone();
-            let total_b = total_bases.clone();
-            let cfg = config.clone();
-            let splitters = splitters_arc.clone();
-            let group_id_counter = next_group_id.clone();
-
-            let worker_handle = std::thread::spawn(move || -> Result<usize> {
-                let mut worker_contigs = 0;
-
-                // Consume from channel until closed
-                while let Ok((sample_name, contig_name, sequence)) = rx.recv() {
-                    worker_contigs += 1;
-
-                    // Record registration for later
-                    registrations.insert((sample_name.clone(), contig_name.clone()), ());
-
-                    // Segment at splitters
-                    let segments = split_at_splitters_with_size(
-                        &sequence,
-                        &splitters,
-                        cfg.kmer_length as usize,
-                        cfg.segment_size as usize,
-                    );
-
-                    // Process each segment: buffer in per-group writers
-                    for (seg_idx, segment) in segments.into_iter().enumerate() {
-                        total_b.fetch_add(segment.data.len(), Ordering::Relaxed);
-                        total_segs.fetch_add(1, Ordering::Relaxed);
-
-                        // Prepare segment info
-                        let seg_info = Self::prepare_segment_info(
-                            &cfg,
-                            &sample_name,
-                            &contig_name,
-                            seg_idx,
-                            segment.data,
-                            Some(segment.front_kmer),
-                            Some(segment.back_kmer),
-                        )?;
-
-                        // Determine final key (may search for candidates if one k-mer is MISSING)
-                        let final_key = if seg_info.key.kmer_front != MISSING_KMER && seg_info.key.kmer_back != MISSING_KMER {
-                            // Both k-mers present - use the normalized key as-is
-                            seg_info.key.clone()
-                        } else if seg_info.key.kmer_front == MISSING_KMER && seg_info.key.kmer_back == MISSING_KMER {
-                            // No k-mers - use as-is (fallback case)
-                            seg_info.key.clone()
-                        } else {
-                            // One k-mer present - search for candidate groups (matching C++ AGC)
-                            let present_kmer = if seg_info.key.kmer_front != MISSING_KMER {
-                                seg_info.key.kmer_front
-                            } else {
-                                seg_info.key.kmer_back
-                            };
-
-                            let terms_map = group_terms.read().unwrap();
-                            if let Some(candidates) = terms_map.get(&present_kmer) {
-                                if !candidates.is_empty() {
-                                    // Found existing groups - test compression with each (matching C++ AGC)
-                                    if cfg.verbosity > 2 {
-                                        eprintln!("[ESTIMATE] Testing {} candidates for kmer {}", candidates.len(), present_kmer);
-                                    }
-
-                                    // Use FIRST candidate as initial best (not fallback MISSING_KMER key)
-                                    // This ensures we GROUP with existing segments even if compression isn't better
-                                    // (small boundary segments often don't compress, but still belong in groups)
-                                    let first_cand = candidates[0];
-                                    let mut best_key = if first_cand < present_kmer {
-                                        SegmentGroupKey { kmer_front: first_cand, kmer_back: present_kmer }
-                                    } else {
-                                        SegmentGroupKey { kmer_front: present_kmer, kmer_back: first_cand }
-                                    };
-                                    let mut best_size = seg_info.segment.data.len();
-
-                                    for &cand_kmer in candidates.iter() {
-                                        // Create normalized key for this candidate
-                                        let (test_key, needs_rc) = if cand_kmer < present_kmer {
-                                            (SegmentGroupKey { kmer_front: cand_kmer, kmer_back: present_kmer }, true)
-                                        } else {
-                                            (SegmentGroupKey { kmer_front: present_kmer, kmer_back: cand_kmer }, false)
-                                        };
-
-                                        // Get the group's reference to test compression
-                                        if let Some(group_entry) = writers.get(&test_key) {
-                                            let group_guard = group_entry.lock().unwrap();
-                                            if let Some(ref reference) = group_guard.reference {
-                                                if cfg.verbosity > 2 {
-                                                    eprintln!("[ESTIMATE] Testing candidate ({}, {}) with ref size {}",
-                                                        test_key.kmer_front, test_key.kmer_back, reference.len());
-                                                }
-                                                // Estimate compressed size using LZ encoding
-                                                use crate::lz_diff::LZDiff;
-                                                let mut lz_diff = LZDiff::new(cfg.min_match_len);
-                                                lz_diff.prepare(reference);
-
-                                                let test_segment = if needs_rc {
-                                                    // Reverse complement for testing
-                                                    seg_info.segment.data.iter().rev().map(|&b| match b {
-                                                        0 => 3, 1 => 2, 2 => 1, 3 => 0, _ => b
-                                                    }).collect()
-                                                } else {
-                                                    seg_info.segment.data.clone()
-                                                };
-
-                                                let encoded = lz_diff.encode(&test_segment);
-                                                let estimated_size = encoded.len();
-
-                                                if cfg.verbosity > 2 {
-                                                    eprintln!("[ESTIMATE] Candidate ({}, {}) → estimated={}, best={}, raw={}",
-                                                        test_key.kmer_front, test_key.kmer_back,
-                                                        estimated_size, best_size, seg_info.segment.data.len());
-                                                }
-
-                                                if estimated_size < best_size {
-                                                    best_size = estimated_size;
-                                                    best_key = test_key;
-
-                                                    if cfg.verbosity > 2 {
-                                                        eprintln!("[MATCH] Better candidate: ({}, {}) size={} (was {})",
-                                                            best_key.kmer_front, best_key.kmer_back,
-                                                            estimated_size, seg_info.segment.data.len());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    best_key
-                                } else {
-                                    // No candidates - use original key
-                                    seg_info.key.clone()
-                                }
-                            } else {
-                                // No candidates - use original key
-                                seg_info.key.clone()
-                            }
-                        };
-
-                        // Get or create group writer
-                        let group_writer =
-                            writers.entry(final_key.clone()).or_insert_with(|| {
-                                let gid = group_id_counter.fetch_add(1, Ordering::SeqCst) as u32;
-
-                                if cfg.verbosity > 2 {
-                                    eprintln!("[GROUP] Creating group {} with key: front={}, back={}",
-                                        gid, final_key.kmer_front, final_key.kmer_back);
-                                }
-
-                                // Update terminators map when BOTH k-mers are present
-                                if final_key.kmer_front != MISSING_KMER && final_key.kmer_back != MISSING_KMER {
-                                    let mut map = group_terms.write().unwrap();
-                                    map.entry(final_key.kmer_front)
-                                        .or_default()
-                                        .push(final_key.kmer_back);
-                                    map.get_mut(&final_key.kmer_front).unwrap().sort_unstable();
-
-                                    if final_key.kmer_front != final_key.kmer_back {
-                                        map.entry(final_key.kmer_back)
-                                            .or_default()
-                                            .push(final_key.kmer_front);
-                                        map.get_mut(&final_key.kmer_back).unwrap().sort_unstable();
-                                    }
-                                }
-
-                                let stream_id = gid;
-
-                                const NO_RAW_GROUPS: u32 = 16;
-                                let ref_stream_id = if gid >= NO_RAW_GROUPS {
-                                    Some(10000 + gid as usize)
-                                } else {
-                                    None
-                                };
-
-                                std::sync::Mutex::new(GroupWriter::new(
-                                    gid,
-                                    stream_id as usize,
-                                    ref_stream_id,
-                                ))
-                            });
-
-                        // Add segment to group buffer
-                        let mut writer_guard = group_writer.lock().unwrap();
-                        if let Some(pack) = writer_guard.add_segment(seg_info.segment, &cfg)? {
-                            drop(writer_guard); // Release lock before sending
-
-                            match pack {
-                                PackToWrite::Compressed(compressed_pack) => {
-                                    // Reference pack - already compressed, send to writer
-                                    compressed_tx.send(compressed_pack).context(
-                                        "Failed to send compressed reference pack to writer",
-                                    )?;
-                                }
-                                PackToWrite::Uncompressed(uncompressed_pack) => {
-                                    // Buffer is full - send to compression pool
-                                    uncompressed_tx.send(uncompressed_pack).context(
-                                        "Failed to send uncompressed pack to compression pool",
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Ok(worker_contigs)
-            });
-
-            worker_handles.push(worker_handle);
-        }
-
-        // Compression thread pool: receives uncompressed packs and compresses in parallel
-        let compression_level = config.compression_level;
-        let num_compressors = self.config.num_threads;
-        for _compressor_id in 0..num_compressors {
-            let uncompressed_rx = uncompressed_rx.clone();
-            let compressed_tx = compressed_tx.clone();
-
-            std::thread::spawn(move || {
-                while let Ok(uncompressed_pack) = uncompressed_rx.recv() {
-                    // Compress the pack
-                    let compressed = compress_segment_configured(
-                        &uncompressed_pack.uncompressed_data,
-                        compression_level,
-                    );
-
-                    if let Ok(compressed_data) = compressed {
-                        // Decide whether to use compressed or raw data
-                        let (final_data, uncompressed_size) = if compressed_data.len() + 1
-                            < uncompressed_pack.uncompressed_data.len()
-                        {
-                            let mut data_with_marker = compressed_data;
-                            data_with_marker.push(0); // Marker byte
-                            (
-                                data_with_marker,
-                                uncompressed_pack.uncompressed_data.len() as u64,
-                            )
-                        } else {
-                            (uncompressed_pack.uncompressed_data, 0)
-                        };
-
-                        // Send compressed pack to writer
-                        let compressed_pack = CompressedPack {
-                            group_id: uncompressed_pack.group_id,
-                            stream_id: uncompressed_pack.stream_id,
-                            compressed_data: final_data,
-                            uncompressed_size,
-                            segments: uncompressed_pack.segments,
-                        };
-
-                        let _ = compressed_tx.send(compressed_pack);
-                    }
-                }
-            });
-        }
-
-        // Spawn a thread to signal when workers finish and flush remaining packs
-        let writers_for_flush = group_writers.clone();
-        let cfg_for_flush = config.clone();
-        let (workers_done_tx, workers_done_rx) = bounded(1);
-        std::thread::spawn(move || {
-            let _ = producer_handle.join();
-            for handle in worker_handles {
-                let _ = handle.join();
-            }
-
-            // Workers done - flush all remaining buffers
-            for entry in writers_for_flush.iter() {
-                let mut writer = entry.value().lock().unwrap();
-                if let Ok(Some(uncompressed_pack)) = writer.prepare_pack(&cfg_for_flush) {
-                    let _ = uncompressed_tx.send(uncompressed_pack);
-                }
-            }
-
-            drop(uncompressed_tx); // Close uncompressed channel
-            let _ = workers_done_tx.send(());
-        });
-
-        // Drop original compressed_tx so compression pool has the only remaining senders
-        drop(compressed_tx);
-
-        // Register streams in archive
-        let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
-        let mut stream_id_map = HashMap::new();
-
-        // Write packs as they arrive from compression pool
-        let mut packs_written = 0;
-        let mut segments_written = 0;
-
-        loop {
-            match compressed_rx.try_recv() {
-                Ok(pack) => {
-                    // Register stream if first time seeing it
-                    let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
-                        id
-                    } else {
-                        let stream_name = if pack.stream_id >= 10000 {
-                            // Reference stream
-                            let group_id = (pack.stream_id - 10000) as u32;
-                            stream_ref_name(archive_version, group_id)
-                        } else {
-                            // Delta stream
-                            stream_delta_name(archive_version, pack.group_id)
-                        };
-                        let actual_id = self.archive.register_stream(&stream_name);
-                        stream_id_map.insert(pack.stream_id, actual_id);
-                        actual_id
-                    };
-
-                    // Register segments in collection
-                    for seg_meta in &pack.segments {
-                        self.collection
-                            .register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
-
-                        self.collection.add_segment_placed(
-                            &seg_meta.sample_name,
-                            &seg_meta.contig_name,
-                            seg_meta.seg_part_no,
-                            pack.group_id,
-                            seg_meta.in_group_id,
-                            seg_meta.is_rev_comp,
-                            seg_meta.data_len,
-                        )?;
-                    }
-
-                    // Write pack to archive
-                    self.archive.add_part(
-                        actual_stream_id,
-                        &pack.compressed_data,
-                        pack.uncompressed_size,
-                    )?;
-                    packs_written += 1;
-                    segments_written += pack.segments.len();
-                }
-                Err(crossbeam::channel::TryRecvError::Empty) => {
-                    // No pack available yet - check if workers are done
-                    if workers_done_rx.try_recv().is_ok() {
-                        // Workers done and channel empty - drain remaining
-                        while let Ok(pack) = compressed_rx.recv() {
-                            let actual_stream_id =
-                                if let Some(&id) = stream_id_map.get(&pack.stream_id) {
-                                    id
-                                } else {
-                                    let stream_name = if pack.stream_id >= 10000 {
-                                        let group_id = (pack.stream_id - 10000) as u32;
-                                        stream_ref_name(archive_version, group_id)
-                                    } else {
-                                        stream_delta_name(archive_version, pack.group_id)
-                                    };
-                                    let actual_id = self.archive.register_stream(&stream_name);
-                                    stream_id_map.insert(pack.stream_id, actual_id);
-                                    actual_id
-                                };
-
-                            for seg_meta in &pack.segments {
-                                self.collection.register_sample_contig(
-                                    &seg_meta.sample_name,
-                                    &seg_meta.contig_name,
-                                )?;
-                                self.collection.add_segment_placed(
-                                    &seg_meta.sample_name,
-                                    &seg_meta.contig_name,
-                                    seg_meta.seg_part_no,
-                                    pack.group_id,
-                                    seg_meta.in_group_id,
-                                    seg_meta.is_rev_comp,
-                                    seg_meta.data_len,
-                                )?;
-                            }
-
-                            self.archive.add_part(
-                                actual_stream_id,
-                                &pack.compressed_data,
-                                pack.uncompressed_size,
-                            )?;
-                            packs_written += 1;
-                            segments_written += pack.segments.len();
-                        }
-                        break;
-                    }
-                    // Workers not done yet - sleep briefly and retry
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(crossbeam::channel::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        if self.config.verbosity > 0 {
-            println!(
-                "Streaming complete: wrote {packs_written} packs ({segments_written} segments)"
-            );
-        }
-
-        // Move shared state back from RwLock to HashMap
-        {
-            let rwlock = Arc::try_unwrap(group_terminators)
-                .map_err(|_| anyhow::anyhow!("Failed to unwrap group_terminators Arc"))?;
-            self.group_terminators = rwlock.into_inner().unwrap();
-        }
-        self.total_segments = Arc::try_unwrap(total_segments)
-            .map_err(|_| anyhow::anyhow!("Failed to unwrap total_segments Arc"))?
-            .into_inner();
-        self.total_bases_processed = Arc::try_unwrap(total_bases)
-            .map_err(|_| anyhow::anyhow!("Failed to unwrap total_bases Arc"))?
-            .into_inner();
-
-        if self.config.verbosity > 0 {
-            println!("Processed {} contigs total", contig_registrations_ref.len());
-        }
+        // Use the unified implementation
+        self.add_segments_with_inline_splits(iterator, &splitters)?;
 
         Ok(())
     }
@@ -1646,7 +1155,11 @@ impl StreamingCompressor {
         }
 
         // Pass 2: Use C++ AGC exact architecture (two-phase processing)
-        self.add_fasta_files_cpp_agc_style(fasta_paths, &splitters)?;
+        // Create MultiFileIterator from file paths
+        let file_path_bufs: Vec<PathBuf> = fasta_paths.iter().map(|(_, path)| path.to_path_buf()).collect();
+        let iterator = Box::new(crate::contig_iterator::MultiFileIterator::new(file_path_bufs)?);
+
+        self.add_segments_with_inline_splits(iterator, &splitters)?;
 
         Ok(())
     }
@@ -1676,9 +1189,11 @@ impl StreamingCompressor {
     /// C++ AGC exact architecture: SEQUENTIAL SAMPLE PROCESSING with inline split checking
     /// Process samples ONE AT A TIME (like C++ AGC) so kmer_connections builds naturally
     /// For each segment: check if we can split into existing groups BEFORE creating new group
-    fn add_fasta_files_cpp_agc_style(
+    ///
+    /// UNIFIED IMPLEMENTATION: Works with any ContigIterator (MultiFileIterator, BufferedPansnFileIterator, etc.)
+    fn add_segments_with_inline_splits(
         &mut self,
-        fasta_paths: &[(String, &Path)],
+        mut iterator: Box<dyn ContigIterator>,
         splitters: &HashSet<u64>,
     ) -> Result<()> {
         if self.config.verbosity > 0 {
@@ -1700,41 +1215,48 @@ impl StreamingCompressor {
         let mut total_contigs = 0;
         let mut total_bases = 0;
         let mut splits_executed = 0;
+        let mut current_sample = String::new();
 
         // ================================================================
-        // PROCESS EACH SAMPLE COMPLETELY (ONE AT A TIME)
+        // PHASE 1: STREAM THROUGH ALL CONTIGS WITH INLINE SPLIT CHECKING
         // ================================================================
 
-        for (sample_name, fasta_path) in fasta_paths {
-            if self.config.verbosity > 0 {
-                println!("Processing sample: {} from {:?}", sample_name, fasta_path);
+        if self.config.verbosity > 0 {
+            println!("=== Phase 1: Streaming contigs with inline split checking ===");
+        }
+
+        while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
+            if sequence.is_empty() {
+                continue;
             }
 
-            // Read contigs from this sample
-            let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)
-                .context(format!("Failed to open {}", sample_name))?;
-
-            while let Some((contig_name, sequence)) = reader.read_contig_converted()? {
-                if sequence.is_empty() {
-                    continue;
+            // Log when we move to a new sample
+            if current_sample != sample_name {
+                if self.config.verbosity > 0 && !current_sample.is_empty() {
+                    println!("Finished processing sample: {}", current_sample);
                 }
+                current_sample = sample_name.clone();
+                if self.config.verbosity > 0 {
+                    println!("Processing sample: {}", sample_name);
+                }
+            }
 
-                total_contigs += 1;
-                total_bases += sequence.len();
+            total_contigs += 1;
+            total_bases += sequence.len();
 
-                // Pre-register contig (for correct extraction order)
-                self.collection.register_sample_contig(sample_name, &contig_name)?;
+            // Pre-register contig (for correct extraction order)
+            self.collection.register_sample_contig(&sample_name, &contig_name)?;
 
-                // Segment contig at splitters
-                let segments = split_at_splitters_with_size(
-                    &sequence,
-                    splitters,
-                    self.config.kmer_length as usize,
-                    self.config.segment_size as usize,
-                );
+            // Segment contig at splitters
+            let segments = split_at_splitters_with_size(
+                &sequence,
+                splitters,
+                self.config.kmer_length as usize,
+                self.config.segment_size as usize,
+            );
 
-                // Process each segment with inline split checking
-                for (seg_idx, segment) in segments.into_iter().enumerate() {
+            // Process each segment with inline split checking
+            for (seg_idx, segment) in segments.into_iter().enumerate() {
                     let kmer_front = segment.front_kmer;
                     let kmer_back = segment.back_kmer;
                     let segment_data = segment.data;
@@ -1824,7 +1346,7 @@ impl StreamingCompressor {
                                         // Prepare FIRST segment (joins key1 group)
                                         let seg1_info = Self::prepare_segment_info(
                                             &self.config,
-                                            sample_name,
+                                            &sample_name,
                                             &contig_name,
                                             seg_idx,
                                             seg1_data.to_vec(),
@@ -1835,7 +1357,7 @@ impl StreamingCompressor {
                                         // Prepare SECOND segment (joins key2 group)
                                         let seg2_info = Self::prepare_segment_info(
                                             &self.config,
-                                            sample_name,
+                                            &sample_name,
                                             &contig_name,
                                             seg_idx,
                                             seg2_data.to_vec(),
@@ -1891,7 +1413,7 @@ impl StreamingCompressor {
                     // Prepare and buffer segment
                     let seg_info = Self::prepare_segment_info(
                         &self.config,
-                        sample_name,
+                        &sample_name,
                         &contig_name,
                         seg_idx,
                         segment_data,
@@ -1906,10 +1428,9 @@ impl StreamingCompressor {
                     });
                 }
             }
-        }
 
         if self.config.verbosity > 0 {
-            println!("All samples segmented: {} segments collected", segment_buffer.len());
+            println!("All contigs segmented: {} segments collected", segment_buffer.len());
             if splits_executed > 0 {
                 println!("Splits executed during Phase 1: {}", splits_executed);
             }
