@@ -523,88 +523,43 @@ All split logic is documented in INLINE_SEGMENTATION_PATTERN.md.
 
 ## Phase 4: Main Compression Flow Integration
 
-### 4.1 Sample-by-Sample Processing Loop
-**C++ Reference**: `agc_compressor.cpp` lines 2163-2242 (AddSampleFiles)
+### 4.1 Sample-by-Sample Processing Loop ✓ (Study Complete)
+**C++ Reference**:
+- `agc_compressor.cpp` lines 2121-2270 (AddSampleFiles - full function)
+- `agc_compressor.cpp` lines 2163-2242 (main processing loop)
 
-- [ ] **Study** C++ AGC's main loop
-  ```cpp
-  for (auto sf : _v_sample_file_name) {  // Each sample
-      while (gio.ReadContigRaw(id, contig)) {  // Each contig
-          collection_desc->register_sample_contig(sf.first, id);
+- [C] **Study** C++ AGC's main compression orchestration
+  - **Queue setup**: main queue (bounded: max(2GB, threads*192MB)), aux queue (unlimited)
+  - **Worker count**: threads < 8 ? threads : threads - 1 (reserve 1 for main thread if 8+)
+  - **Thread spawning**: barrier(no_workers), start_compressing_threads()
+  - **Main loop**: For each sample → read contigs → register → enqueue → send sync tokens
+  - **Priority ordering**: sample_priority starts at MAX, decrements after each sample
+  - **Task cost**: contig.size() for queue capacity management (backpressure)
+  - **Sync tokens**: EmplaceManyNoCost(..., no_workers) - MUST send exactly N tokens for N workers
+  - **Adaptive vs normal**: new_splitters sync (adaptive) vs registration sync (normal)
+  - **Concatenated mode**: Sync every pack_cardinality contigs (e.g., 128) instead of per-sample
+  - **Completion**: MarkCompleted() → join_threads() → FlushOutBuffers() → reset queues
+  - **Queue switching** (adaptive): Switch to aux queue in new_splitters handler for hard contig reprocessing
 
-          pq_contigs_desc->Emplace(
-              make_tuple(all_contigs, sf.first, id, move(contig)),
-              sample_priority, cost);
-      }
+- [ ] **Implement** Rust main compression orchestration
+  - **Note**: Deferred - requires full worker thread implementation, CSegment, archive I/O
+  - Will implement after all Phase 1-3 components are working
+  - Comprehensive Rust implementation strategy in MAIN_COMPRESSION_FLOW_PATTERN.md
 
-      // Synchronization after sample
-      pq_contigs_desc->EmplaceManyNoCost(
-          make_tuple(registration, "", "", contig_t()),
-          sample_priority, no_workers);
+- [✓] **Verify** Comprehensive documentation in MAIN_COMPRESSION_FLOW_PATTERN.md
 
-      --sample_priority;
-  }
-  ```
+**Status**: Study complete (comprehensive 900+ line documentation)
+  - Documented AddSampleFiles() flow (6 major steps)
+  - Documented queue initialization and capacity calculation
+  - Documented worker thread count decision (< 8 vs >= 8)
+  - Documented priority ordering and task cost
+  - Documented synchronization token pattern (normal vs concatenated modes)
+  - Documented adaptive mode queue switching
+  - Provided complete Rust implementation strategy
+  - Identified critical correctness requirements
 
-- [ ] **Implement** Rust main loop
-  ```rust
-  pub fn add_samples_streaming(
-      &mut self,
-      sample_files: &[(String, PathBuf)],
-  ) -> Result<()> {
-      let mut sample_priority = usize::MAX;
-
-      for (sample_name, path) in sample_files {
-          let mut reader = GenomeIO::open(path)?;
-
-          while let Some((contig_name, sequence)) = reader.read_contig()? {
-              // Pre-register contig
-              self.collection.register_sample_contig(
-                  sample_name,
-                  &contig_name,
-              )?;
-
-              // Enqueue task
-              self.task_queue.emplace(
-                  Task {
-                      stage: ContigProcessingStage::AllContigs,
-                      sample_name: sample_name.clone(),
-                      contig_name,
-                      sequence,
-                  },
-                  sample_priority,
-                  cost,
-              );
-          }
-
-          // Synchronization barrier after sample
-          let sync_stage = if self.config.adaptive_mode {
-              ContigProcessingStage::NewSplitters
-          } else {
-              ContigProcessingStage::Registration
-          };
-
-          self.task_queue.emplace_many(
-              Task {
-                  stage: sync_stage,
-                  sample_name: String::new(),
-                  contig_name: String::new(),
-                  sequence: Vec::new(),
-              },
-              sample_priority,
-              self.num_workers,
-          );
-
-          sample_priority -= 1;
-      }
-
-      Ok(())
-  }
-  ```
-
-- [ ] **Verify** Integration test with multiple samples
-
-**Files to modify**: `ragc-core/src/compressor_streaming.rs`
+**Files created**:
+  - `docs/MAIN_COMPRESSION_FLOW_PATTERN.md` (comprehensive C++ AGC documentation with Rust strategy)
 
 ---
 
