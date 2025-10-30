@@ -1476,7 +1476,9 @@ impl StreamingCompressor {
                                     let kmer_len = self.config.kmer_length as usize;
                                     let seg2_start_pos = split_pos.saturating_sub(kmer_len / 2);
 
-                                    let seg1_data = segment_data[..seg2_start_pos + kmer_len].to_vec();
+                                    // Ensure seg1_end doesn't exceed segment bounds
+                                    let seg1_end = std::cmp::min(seg2_start_pos + kmer_len, segment_data.len());
+                                    let seg1_data = segment_data[..seg1_end].to_vec();
                                     let seg2_data = segment_data[seg2_start_pos..].to_vec();
 
                                     // Create first split segment (seg_part_no)
@@ -2333,7 +2335,9 @@ impl StreamingCompressor {
                     // C++ lines 1426-1428:
                     // segment2 = [seg2_start_pos, end)
                     // segment1 = [0, seg2_start_pos + kmer_length)
-                    let seg1 = final_segment[..seg2_start_pos + kmer_len].to_vec();
+                    // Ensure seg1_end doesn't exceed segment bounds
+                    let seg1_end = std::cmp::min(seg2_start_pos + kmer_len, final_segment.len());
+                    let seg1 = final_segment[..seg1_end].to_vec();
                     let seg2 = final_segment[seg2_start_pos..].to_vec();
 
                     if self.config.verbosity > 1 {
