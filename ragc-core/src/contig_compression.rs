@@ -1,0 +1,330 @@
+//! Contig compression with inline segmentation
+//!
+//! This module implements C++ AGC's compress_contig and add_segment logic
+//! for inline segmentation during compression.
+//!
+//! See docs/INLINE_SEGMENTATION_PATTERN.md for detailed C++ AGC analysis.
+
+use crate::kmer::{Kmer, KmerMode};
+use crate::segment_buffer::BufferedSegments;
+use std::sync::{Arc, Mutex};
+
+/// Contig type (vector of nucleotides in numeric encoding)
+pub type Contig = Vec<u8>;
+
+/// Missing k-mer marker (both k1 and k2 = ~0 means no terminal splitters)
+pub const MISSING_KMER: u64 = !0u64;
+
+/// Segment part for inline buffering
+#[derive(Debug, Clone)]
+pub struct SegmentPart {
+    pub kmer1: u64,
+    pub kmer2: u64,
+    pub sample_name: String,
+    pub contig_name: String,
+    pub seg_data: Vec<u8>,
+    pub is_rev_comp: bool,
+    pub seg_part_no: u32,
+}
+
+/// Shared state for compression (passed from worker threads)
+pub struct CompressionContext {
+    pub splitters: Arc<Mutex<std::collections::HashSet<u64>>>,
+    pub bloom_splitters: Arc<Mutex<()>>, // TODO: Actual bloom filter
+    pub buffered_segments: Arc<Mutex<BufferedSegments>>,
+    pub kmer_length: usize,
+    pub adaptive_mode: bool,
+}
+
+/// Compress a contig with inline segmentation
+///
+/// Matches C++ AGC's compress_contig (agc_compressor.cpp:2000-2054)
+///
+/// # Arguments
+/// * `sample_name` - Sample identifier
+/// * `contig_name` - Contig identifier
+/// * `contig` - Nucleotide sequence (numeric encoding: A=0, C=1, G=2, T=3)
+/// * `ctx` - Compression context with splitters and buffering
+///
+/// # Returns
+/// * `true` - Contig segmented successfully
+/// * `false` - Contig failed to segment (adaptive mode: needs new splitters)
+///
+/// # Algorithm
+/// 1. Scan contig with k-mer sliding window
+/// 2. Check each k-mer against splitters (bloom filter + hash set)
+/// 3. When splitter found: extract segment, call add_segment()
+/// 4. If no splitters found and adaptive mode: return false
+/// 5. Handle final segment (after last splitter to end)
+pub fn compress_contig(
+    sample_name: &str,
+    contig_name: &str,
+    contig: &Contig,
+    ctx: &CompressionContext,
+) -> bool {
+    let kmer_length = ctx.kmer_length as u32;
+
+    // Create k-mer scanner for canonical k-mers
+    let mut kmer = Kmer::new(kmer_length, KmerMode::Canonical);
+
+    // Track segment boundaries
+    let mut split_pos: usize = 0; // Start of current segment
+    let mut split_kmer = Kmer::new(kmer_length, KmerMode::Canonical); // K-mer at split position
+    let mut seg_part_no: u32 = 0;
+
+    // Scan contig for splitters
+    for (pos, &base) in contig.iter().enumerate() {
+        kmer.insert(base as u64);
+
+        if !kmer.is_full() {
+            continue;
+        }
+
+        // Get canonical k-mer value
+        let kmer_val = kmer.data_canonical();
+
+        // Check if this k-mer is a splitter
+        // C++ AGC: bloom_splitters.check(d) && hs_splitters.check(d)
+        if is_splitter(kmer_val, ctx) {
+            // Found splitter - extract segment from split_pos to current position
+            let seg_start = split_pos;
+            let seg_end = pos + 1; // Inclusive of current position
+            let segment = contig[seg_start..seg_end].to_vec();
+
+            // Add segment with terminal k-mers (split_kmer, current kmer)
+            add_segment(
+                sample_name,
+                contig_name,
+                seg_part_no,
+                segment,
+                &split_kmer,
+                &kmer,
+                ctx,
+            );
+
+            // Update for next segment
+            seg_part_no += 1;
+            split_pos = pos + 1 - kmer_length as usize; // Start of next segment overlaps by kmer_length
+            split_kmer = kmer.clone();
+        }
+    }
+
+    // Check if contig failed to segment (adaptive mode)
+    if ctx.adaptive_mode && seg_part_no == 0 {
+        // No splitters found - this is a "hard" contig
+        // split_kmer is still empty (never set), which C++ AGC checks as:
+        // if (adaptive_compression && split_kmer == CKmer(...))
+        return false; // Signal failure - needs new splitters
+    }
+
+    // Add final segment (from last splitter to end of contig)
+    if split_pos < contig.len() {
+        let segment = contig[split_pos..].to_vec();
+
+        add_segment(
+            sample_name,
+            contig_name,
+            seg_part_no,
+            segment,
+            &split_kmer,
+            &Kmer::new(kmer_length, KmerMode::Canonical), // Empty k-mer for end
+            ctx,
+        );
+    }
+
+    true // Success
+}
+
+/// Add segment to buffered storage with terminal k-mer detection
+///
+/// Matches C++ AGC's add_segment (agc_compressor.cpp:1275-1507)
+///
+/// # Terminal K-mer Cases
+/// 1. **No terminators** (k1 = k2 = ~0): Whole-contig segment
+/// 2. **Both terminators** (k1, k2 both valid): Normal segment
+/// 3. **Front-only** (k1 valid, k2 = ~0): First segment
+/// 4. **Back-only** (k1 = ~0, k2 valid): Last segment
+///
+/// # Split Detection
+/// If segment is NEW and both k1 and k2 are in map_segments_terminators:
+/// - Try to find shared middle splitter k_mid
+/// - Split segment into two overlapping parts
+///
+/// See INLINE_SEGMENTATION_PATTERN.md Section 2 for detailed algorithm.
+fn add_segment(
+    sample_name: &str,
+    contig_name: &str,
+    seg_part_no: u32,
+    segment: Vec<u8>,
+    kmer_front: &Kmer,
+    kmer_back: &Kmer,
+    ctx: &CompressionContext,
+) {
+    // Determine terminal k-mers (k1, k2) based on which are full
+    let k1 = if kmer_front.is_full() {
+        kmer_front.data_canonical()
+    } else {
+        MISSING_KMER
+    };
+
+    let k2 = if kmer_back.is_full() {
+        kmer_back.data_canonical()
+    } else {
+        MISSING_KMER
+    };
+
+    // TODO: Implement split detection
+    // if !concatenated_genomes && segment is NEW:
+    //     if k1 != ~0 && k2 != ~0:
+    //         if k1 in map_segments_terminators && k2 in map_segments_terminators:
+    //             split_match = find_cand_segment_with_missing_middle_splitter(...)
+    //             if split_match found:
+    //                 // Split into 2 segments with overlap
+    //                 let split_pos = ...
+    //                 let seg1 = segment[0..split_pos+kmer_length]
+    //                 let seg2 = segment[split_pos-kmer_length/2..]
+    //                 // Add both segments
+    //                 return
+
+    // TODO: ZSTD compress segment
+    // For now, just store uncompressed
+    let compressed_seg = segment.clone();
+
+    // Create segment part
+    let part = SegmentPart {
+        kmer1: k1,
+        kmer2: k2,
+        sample_name: sample_name.to_string(),
+        contig_name: contig_name.to_string(),
+        seg_data: compressed_seg,
+        is_rev_comp: false, // TODO: Determine from k-mer comparison
+        seg_part_no,
+    };
+
+    // Add to buffered segments
+    // If this (k1, k2) pair is known (in map_segments), add as KNOWN
+    // Otherwise, add as NEW (will be assigned group_id during registration)
+
+    // TODO: Check if (k1, k2) exists in map_segments
+    // For now, always add as NEW
+    let mut buffered = ctx.buffered_segments.lock().unwrap();
+    buffered.add_new(
+        k1,
+        k2,
+        sample_name.to_string(),
+        contig_name.to_string(),
+        part.seg_data,
+        part.is_rev_comp,
+        seg_part_no,
+    );
+}
+
+/// Check if k-mer is a splitter
+///
+/// Matches C++ AGC's two-stage check:
+/// 1. Bloom filter (fast, probabilistic)
+/// 2. Hash set (exact)
+fn is_splitter(kmer: u64, ctx: &CompressionContext) -> bool {
+    // TODO: Implement bloom filter check
+    // For now, just check hash set
+    let splitters = ctx.splitters.lock().unwrap();
+    splitters.contains(&kmer)
+}
+
+/// Find candidate segment with missing middle splitter (for split detection)
+///
+/// Matches C++ AGC's find_cand_segment_with_missing_middle_splitter
+/// (agc_compressor.cpp:1510-1597)
+///
+/// # Algorithm
+/// 1. Find intersection of terminators for k1 and k2
+/// 2. For each shared k_mid in intersection:
+///    - Check if (k1, k_mid) and (k_mid, k2) both exist in map_segments
+///    - If yes, return k_mid and group IDs
+/// 3. If no shared middle splitter found, return None
+///
+/// TODO: Implement this based on INLINE_SEGMENTATION_PATTERN.md Section 3
+#[allow(dead_code)]
+fn find_cand_segment_with_missing_middle_splitter(
+    _kmer_front: &Kmer,
+    _kmer_back: &Kmer,
+    _ctx: &CompressionContext,
+) -> Option<(u64, u32, u32)> {
+    // Returns: (middle_kmer, group_id1, group_id2)
+    // TODO: Implement
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_missing_kmer_constant() {
+        assert_eq!(MISSING_KMER, !0u64);
+    }
+
+    #[test]
+    fn test_segment_part_creation() {
+        let part = SegmentPart {
+            kmer1: 12345,
+            kmer2: 67890,
+            sample_name: "sample1".to_string(),
+            contig_name: "chr1".to_string(),
+            seg_data: vec![0, 1, 2, 3],
+            is_rev_comp: false,
+            seg_part_no: 0,
+        };
+
+        assert_eq!(part.kmer1, 12345);
+        assert_eq!(part.kmer2, 67890);
+        assert_eq!(part.sample_name, "sample1");
+        assert_eq!(part.seg_part_no, 0);
+    }
+
+    #[test]
+    fn test_compress_contig_no_splitters() {
+        use std::collections::HashSet;
+
+        let ctx = CompressionContext {
+            splitters: Arc::new(Mutex::new(HashSet::new())),
+            bloom_splitters: Arc::new(Mutex::new(())),
+            buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
+            kmer_length: 21,
+            adaptive_mode: false,
+        };
+
+        // Simple contig with no splitters
+        let contig = vec![0, 1, 2, 3, 0, 1, 2, 3]; // ACGTACGT
+
+        let result = compress_contig("sample1", "chr1", &contig, &ctx);
+
+        // Should succeed (one whole-contig segment)
+        assert!(result);
+
+        // Should have 1 NEW segment
+        let buffered = ctx.buffered_segments.lock().unwrap();
+        assert_eq!(buffered.get_num_new(), 1);
+    }
+
+    #[test]
+    fn test_compress_contig_adaptive_failure() {
+        use std::collections::HashSet;
+
+        let ctx = CompressionContext {
+            splitters: Arc::new(Mutex::new(HashSet::new())),
+            bloom_splitters: Arc::new(Mutex::new(())),
+            buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
+            kmer_length: 21,
+            adaptive_mode: true, // Adaptive mode enabled
+        };
+
+        // Short contig with no splitters
+        let contig = vec![0, 1, 2, 3, 0, 1, 2, 3];
+
+        let result = compress_contig("sample1", "chr1", &contig, &ctx);
+
+        // Should FAIL in adaptive mode (no splitters found)
+        assert!(!result);
+    }
+}

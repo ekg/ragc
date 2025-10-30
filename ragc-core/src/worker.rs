@@ -1,8 +1,11 @@
 // Worker thread implementation for streaming compression pipeline
 // Matches C++ AGC's start_compressing_threads (agc_compressor.cpp:1097-1270)
 
+use crate::contig_compression::{compress_contig, CompressionContext};
 use crate::priority_queue::{BoundedPriorityQueue, PopResult};
+use crate::segment_buffer::BufferedSegments;
 use crate::task::{ContigProcessingStage, Task};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -26,24 +29,47 @@ pub struct SharedCompressorState {
     /// Verbosity level (0 = quiet, 1 = normal, 2 = verbose)
     pub verbosity: usize,
 
+    /// Buffered segments (KNOWN + NEW)
+    /// Matches C++ AGC's CBufferedSegPart buffered_seg_part
+    pub buffered_segments: Arc<Mutex<BufferedSegments>>,
+
+    /// Splitter k-mers (exact set)
+    /// Matches C++ AGC's hs_splitters
+    pub splitters: Arc<Mutex<HashSet<u64>>>,
+
+    /// Bloom filter for splitters (fast probabilistic check)
+    /// Matches C++ AGC's bloom_splitters
+    /// TODO: Replace () with actual bloom filter implementation
+    pub bloom_splitters: Arc<Mutex<()>>,
+
+    /// K-mer length for segmentation
+    pub kmer_length: usize,
+
+    /// Adaptive compression mode (find new splitters for hard contigs)
+    pub adaptive_mode: bool,
+
     // TODO: Add more shared state as needed:
-    // - buffered_seg_part: BufferedSegments
     // - vv_fallback_minimizers: Mutex<Vec<Vec<Vec<u64>>>>
     // - vv_splitters: Mutex<Vec<Vec<u64>>>
-    // - hs_splitters: Mutex<HashSet<u64>>
-    // - bloom_splitters: Mutex<BloomFilter>
     // - out_archive: Mutex<ArchiveWriter>
     // - collection_desc: Mutex<Collection>
+    // - map_segments: Mutex<HashMap<(u64, u64), u32>>
+    // - map_segments_terminators: Mutex<HashMap<u64, Vec<u64>>>
 }
 
 impl SharedCompressorState {
     /// Create new shared state
-    pub fn new(verbosity: usize) -> Self {
+    pub fn new(verbosity: usize, kmer_length: usize, adaptive_mode: bool) -> Self {
         SharedCompressorState {
             processed_bases: AtomicUsize::new(0),
             processed_samples: AtomicUsize::new(0),
             raw_contigs: Mutex::new(Vec::new()),
             verbosity,
+            buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
+            splitters: Arc::new(Mutex::new(HashSet::new())),
+            bloom_splitters: Arc::new(Mutex::new(())),
+            kmer_length,
+            adaptive_mode,
         }
     }
 }
@@ -249,27 +275,28 @@ fn handle_new_splitters_stage(
 
 /// Compress a contig task
 ///
-/// Matches C++ AGC's compress_contig (agc_compressor.cpp:833-1093)
+/// Matches C++ AGC's compress_contig (agc_compressor.cpp:2000-2054)
 ///
 /// Returns:
 /// - true: Contig compressed successfully
 /// - false: Contig didn't compress well (needs adaptive splitters)
 fn compress_contig_task(
     task: &Task,
-    worker_id: usize,
-    barrier: &Arc<Barrier>,
+    _worker_id: usize,
+    _barrier: &Arc<Barrier>,
     shared: &Arc<SharedCompressorState>,
 ) -> bool {
-    // TODO: Implement actual compression logic
-    // This will involve:
-    // 1. Split contig at splitters
-    // 2. LZ-encode each segment
-    // 3. Check segment sizes (if adaptive mode)
-    // 4. ZSTD compress segments
-    // 5. Add to buffered_seg_part
-    //
-    // For now, return true (success) as placeholder
-    true
+    // Create compression context from shared state
+    let ctx = CompressionContext {
+        splitters: Arc::clone(&shared.splitters),
+        bloom_splitters: Arc::clone(&shared.bloom_splitters),
+        buffered_segments: Arc::clone(&shared.buffered_segments),
+        kmer_length: shared.kmer_length,
+        adaptive_mode: shared.adaptive_mode,
+    };
+
+    // Call the actual compression function
+    compress_contig(&task.sample_name, &task.contig_name, &task.sequence, &ctx)
 }
 
 #[cfg(test)]
@@ -278,8 +305,10 @@ mod tests {
 
     #[test]
     fn test_shared_state_creation() {
-        let state = SharedCompressorState::new(1);
+        let state = SharedCompressorState::new(1, 21, false);
         assert_eq!(state.verbosity, 1);
+        assert_eq!(state.kmer_length, 21);
+        assert_eq!(state.adaptive_mode, false);
         assert_eq!(state.processed_bases.load(Ordering::Relaxed), 0);
         assert_eq!(state.processed_samples.load(Ordering::Relaxed), 0);
         assert_eq!(state.raw_contigs.lock().unwrap().len(), 0);
@@ -291,7 +320,7 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(2));
-        let shared = Arc::new(SharedCompressorState::new(0));
+        let shared = Arc::new(SharedCompressorState::new(0, 21, false));
 
         // Mark queue as completed (no tasks)
         queue.mark_completed();
@@ -321,7 +350,7 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(1));
-        let shared = Arc::new(SharedCompressorState::new(0));
+        let shared = Arc::new(SharedCompressorState::new(0, 21, false));
 
         // Enqueue a simple task
         queue.emplace(

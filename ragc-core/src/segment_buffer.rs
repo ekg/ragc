@@ -298,6 +298,14 @@ impl BufferedSegments {
         no_new
     }
 
+    /// Get the number of NEW segments (not yet assigned group_id)
+    ///
+    /// **For testing** - count segments in s_seg_part
+    pub fn get_num_new(&self) -> usize {
+        let s_seg_part = self.s_seg_part.lock().unwrap();
+        s_seg_part.len()
+    }
+
     /// Distribute segments from src_id to range [dest_from, dest_to)
     ///
     /// Matches C++ AGC's CBufferedSegPart::distribute_segments (agc_compressor.h:417-435)
