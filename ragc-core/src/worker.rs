@@ -501,6 +501,165 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
     // }
 }
 
+// ============================================================================
+// Phase 4: Main Compression Flow
+// ============================================================================
+
+/// Compress sample files using streaming pipeline with priority queue and worker threads
+///
+/// Matches C++ AGC's AddSampleFiles() (agc_compressor.cpp:2121-2270)
+///
+/// # Arguments
+/// * `sample_files` - Vector of (sample_name, file_path) pairs
+/// * `splitters` - Set of splitter k-mers
+/// * `kmer_length` - K-mer length for segmentation
+/// * `num_threads` - Number of threads to use
+/// * `adaptive_mode` - Enable adaptive splitter finding
+/// * `concatenated_genomes` - Treat all contigs as one sample
+/// * `verbosity` - Verbosity level (0=quiet, 1=normal, 2=verbose)
+///
+/// # Returns
+/// Ok(()) on success, Err on failure
+pub fn compress_samples_streaming(
+    sample_files: Vec<(String, String)>,
+    splitters: HashSet<u64>,
+    kmer_length: usize,
+    num_threads: usize,
+    adaptive_mode: bool,
+    concatenated_genomes: bool,
+    verbosity: usize,
+) -> Result<(), String> {
+    use crate::genome_io::GenomeIO;
+
+    if sample_files.is_empty() {
+        return Ok(());
+    }
+
+    // Step 1: Queue initialization (agc_compressor.cpp:2128-2132)
+    let queue_capacity = std::cmp::max(2_u64 << 30, num_threads as u64 * (192_u64 << 20));
+    let queue = Arc::new(BoundedPriorityQueue::new(1, queue_capacity as usize));
+
+    // TODO: Auxiliary queue for adaptive mode
+    // let aux_queue = Arc::new(BoundedPriorityQueue::new(1, usize::MAX));
+
+    // Step 2: Worker thread count (agc_compressor.cpp:2134)
+    let no_workers = if num_threads < 8 { num_threads } else { num_threads - 1 };
+
+    // Step 3: Shared state initialization
+    let shared = Arc::new(SharedCompressorState {
+        processed_bases: AtomicUsize::new(0),
+        processed_samples: AtomicUsize::new(0),
+        raw_contigs: Mutex::new(Vec::new()),
+        verbosity,
+        buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
+        splitters: Arc::new(Mutex::new(splitters)),
+        bloom_splitters: Arc::new(Mutex::new(())),
+        kmer_length,
+        adaptive_mode,
+        map_segments: Arc::new(Mutex::new(HashMap::new())),
+        map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
+        concatenated_genomes,
+        no_segments: Arc::new(Mutex::new(0)),
+        no_raw_groups: 0,
+    });
+
+    // Step 4: Thread spawning (agc_compressor.cpp:2136-2141)
+    let barrier = Arc::new(Barrier::new(no_workers));
+    let mut worker_handles = Vec::with_capacity(no_workers);
+
+    for worker_id in 0..no_workers {
+        let q = queue.clone();
+        let b = barrier.clone();
+        let s = shared.clone();
+
+        let handle = std::thread::spawn(move || {
+            worker_thread(worker_id, no_workers, q, b, s);
+        });
+
+        worker_handles.push(handle);
+    }
+
+    // Step 5: Main processing loop (agc_compressor.cpp:2163-2242)
+    let mut sample_priority = usize::MAX;
+    let mut _cnt_contigs_in_sample = 0;
+    const PACK_CARDINALITY: usize = 50;  // TODO: Get from config
+
+    for (sample_name, file_path) in sample_files {
+        if verbosity > 0 {
+            eprintln!("Processing sample: {} from {}", sample_name, file_path);
+        }
+
+        // Open FASTA file
+        let mut gio = match GenomeIO::open(&file_path) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Cannot open file {}: {}", file_path, e);
+                continue;
+            }
+        };
+
+        let mut any_contigs_added = false;
+
+        // Read contigs from file
+        while let Ok(Some((contig_name, sequence))) = gio.read_contig_raw() {
+            if concatenated_genomes {
+                // TODO: Register with empty sample name
+                // TODO: Implement concatenated mode logic
+                eprintln!("Concatenated genomes mode not yet implemented");
+            } else {
+                // Normal mode: one sample per file
+                // TODO: Register sample/contig with collection
+
+                let cost = sequence.len();
+                queue.emplace(
+                    Task::new_contig(
+                        sample_name.clone(),
+                        contig_name.clone(),
+                        sequence,
+                        ContigProcessingStage::AllContigs,
+                    ),
+                    sample_priority,
+                    cost,
+                );
+
+                any_contigs_added = true;
+            }
+        }
+
+        // Step 6: Send synchronization tokens after each sample (agc_compressor.cpp:2148-2155)
+        if !concatenated_genomes && any_contigs_added {
+            let sync_stage = if adaptive_mode {
+                ContigProcessingStage::NewSplitters
+            } else {
+                ContigProcessingStage::Registration
+            };
+
+            // Send exactly no_workers sync tokens (0 cost)
+            queue.emplace_many_no_cost(
+                Task::new_sync(sync_stage),
+                sample_priority,
+                no_workers,
+            );
+
+            sample_priority -= 1;
+        }
+    }
+
+    // Step 7: Signal completion and wait for workers (agc_compressor.cpp:2254-2256)
+    queue.mark_completed();
+
+    for handle in worker_handles {
+        handle.join().map_err(|_| "Worker thread panicked")?;
+    }
+
+    if verbosity > 0 {
+        let total_bases = shared.processed_bases.load(Ordering::Relaxed);
+        eprintln!("Compression complete: {} bases processed", total_bases);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
