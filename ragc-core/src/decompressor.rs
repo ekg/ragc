@@ -480,7 +480,12 @@ impl Decompressor {
             let delta_stream_id = self
                 .archive
                 .get_stream_id(&delta_stream_name)
-                .ok_or_else(|| anyhow!("Delta stream not found: {delta_stream_name}"))?;
+                .ok_or_else(|| {
+                    eprintln!("ERROR: Delta stream not found: {}", delta_stream_name);
+                    eprintln!("  Requested by segment: group_id={}, in_group_id={}, raw_length={}",
+                        desc.group_id, desc.in_group_id, desc.raw_length);
+                    anyhow!("Delta stream not found: {delta_stream_name}")
+                })?;
 
             // Check how many parts this stream has
             let num_parts = self.archive.get_num_parts(delta_stream_id);

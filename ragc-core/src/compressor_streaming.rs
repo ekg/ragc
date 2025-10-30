@@ -842,7 +842,7 @@ impl StreamingCompressor {
 
                     const NO_RAW_GROUPS: u32 = 16;
                     let ref_stream_id = if gid >= NO_RAW_GROUPS {
-                        Some(10000 + gid as usize) // Ref streams at offset 10000
+                        Some(100000 + gid as usize) // Ref streams at offset 100000
                     } else {
                         None
                     };
@@ -954,9 +954,9 @@ impl StreamingCompressor {
             let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
                 id
             } else {
-                let stream_name = if pack.stream_id >= 10000 {
+                let stream_name = if pack.stream_id >= 100000 {
                     // Reference stream
-                    let group_id = (pack.stream_id - 10000) as u32;
+                    let group_id = (pack.stream_id - 100000) as u32;
                     stream_ref_name(archive_version, group_id)
                 } else {
                     // Delta stream
@@ -1205,90 +1205,21 @@ impl StreamingCompressor {
         }
 
         // Track which segment keys we've seen (persistent across samples)
-        let mut known_groups = HashSet::<SegmentGroupKey>::new();
-
-        // Segment buffer - collect all segments from all samples
-        let mut segment_buffer = Vec::<BufferedSegment>::new();
+        let mut known_groups = HashMap::<SegmentGroupKey, u32>::new();
 
         // Track contigs and bases
         let mut total_contigs = 0;
         let mut total_bases = 0;
+        let mut total_segments = 0;
         let mut current_sample = String::new();
 
-        // ================================================================
-        // PHASE 1: STREAM THROUGH ALL CONTIGS AND BUFFER SEGMENTS
-        // ================================================================
+        // Group storage and management
+        let mut groups = HashMap::<SegmentGroupKey, (u32, GroupWriter)>::new();
+        let mut group_terminators = HashMap::<u64, Vec<u64>>::new();
+        let next_group_id = Arc::new(AtomicU32::new(self.next_group_id));
 
         if self.config.verbosity > 0 {
-            println!("=== Phase 1: Collecting segments from all contigs ===");
-        }
-
-        while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
-            if sequence.is_empty() {
-                continue;
-            }
-
-            // Log when we move to a new sample
-            if current_sample != sample_name {
-                if self.config.verbosity > 0 && !current_sample.is_empty() {
-                    println!("Finished processing sample: {}", current_sample);
-                }
-                current_sample = sample_name.clone();
-                if self.config.verbosity > 0 {
-                    println!("Processing sample: {}", sample_name);
-                }
-            }
-
-            total_contigs += 1;
-            total_bases += sequence.len();
-
-            // Pre-register contig (for correct extraction order)
-            self.collection.register_sample_contig(&sample_name, &contig_name)?;
-
-            // Segment contig at splitters
-            let segments = split_at_splitters_with_size(
-                &sequence,
-                splitters,
-                self.config.kmer_length as usize,
-                self.config.segment_size as usize,
-            );
-
-            // Buffer all segments (no inline processing)
-            for (seg_idx, segment) in segments.into_iter().enumerate() {
-                let kmer_front = segment.front_kmer;
-                let kmer_back = segment.back_kmer;
-                let segment_data = segment.data;
-
-                // Create segment key
-                let (key, _) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
-
-                // Classify as NEW or KNOWN based on whether we've seen this key before
-                let is_new = !known_groups.contains(&key);
-                if is_new {
-                    known_groups.insert(key.clone());
-                }
-
-                // Prepare and buffer segment
-                let seg_info = Self::prepare_segment_info(
-                    &self.config,
-                    &sample_name,
-                    &contig_name,
-                    seg_idx,
-                    segment_data,
-                    Some(kmer_front),
-                    Some(kmer_back),
-                )?;
-
-                segment_buffer.push(BufferedSegment {
-                    key: seg_info.key,
-                    segment: seg_info.segment,
-                    is_new,
-                });
-            }
-        }
-
-        if self.config.verbosity > 0 {
-            println!("Phase 1 complete: {} segments collected", segment_buffer.len());
+            println!("=== Sequential Processing: Process segments one-at-a-time ===");
         }
 
         // ================================================================
@@ -1313,27 +1244,70 @@ impl StreamingCompressor {
                 let mut stream_id_map: HashMap<usize, usize> = HashMap::new();
                 let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
                 let mut packs_written = 0;
+                let mut segments_registered = 0;
+                let mut seen_segments: HashMap<(String, String, usize), (u32, u32)> = HashMap::new();
 
                 while let Ok(pack) = pack_rx.recv() {
                     let mut archive_lock = archive.lock().unwrap();
                     let mut collection_lock = collection.lock().unwrap();
 
+                    if config.verbosity > 2 && (pack.group_id == 11813 || pack.group_id < 100) {
+                        println!("  Writer received pack: group_id={}, stream_id={}, {} segments",
+                            pack.group_id, pack.stream_id, pack.segments.len());
+                    }
+
                     // Register stream on-demand
                     let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
+                        if config.verbosity > 2 && (pack.group_id == 11813 || pack.group_id < 100) {
+                            println!("    Stream already registered: stream_id={} -> archive_id={}", pack.stream_id, id);
+                        }
                         id
                     } else {
-                        let stream_name = if pack.stream_id >= 10000 {
-                            stream_ref_name(archive_version, (pack.stream_id - 10000) as u32)
+                        let stream_name = if pack.stream_id >= 100000 {
+                            stream_ref_name(archive_version, (pack.stream_id - 100000) as u32)
                         } else {
                             stream_delta_name(archive_version, pack.group_id)
                         };
+                        if config.verbosity > 1 {
+                            println!("  Registering stream: {} for group_id={}", stream_name, pack.group_id);
+                        }
                         let id = archive_lock.register_stream(&stream_name);
+
+                        // Check for collision before inserting
+                        if let Some(&existing_id) = stream_id_map.get(&pack.stream_id) {
+                            eprintln!("ERROR: stream_id collision detected!");
+                            eprintln!("  stream_id={} already maps to archive_id={}", pack.stream_id, existing_id);
+                            eprintln!("  Trying to register stream '{}' for group_id={} as archive_id={}",
+                                stream_name, pack.group_id, id);
+                            eprintln!("  This means two different groups are using the same stream_id!");
+                        }
+
                         stream_id_map.insert(pack.stream_id, id);
+
+                        if config.verbosity > 2 {
+                            println!("    Mapped: stream_id={} -> archive_id={} ({})", pack.stream_id, id, stream_name);
+                        }
                         id
                     };
 
-                    // Register segments in collection
+                    // Register segments in collection (seg_part_no already correct from sequential processing!)
                     for seg_meta in &pack.segments {
+                        // Check for duplicate seg_part_no
+                        let key = (seg_meta.sample_name.clone(), seg_meta.contig_name.clone(), seg_meta.seg_part_no);
+                        if let Some((prev_group_id, prev_in_group_id)) = seen_segments.get(&key) {
+                            println!("WARNING: Duplicate segment detected!");
+                            println!("  Sample: {}, Contig: {}, seg_part_no: {}", seg_meta.sample_name, seg_meta.contig_name, seg_meta.seg_part_no);
+                            println!("  Previous: group_id={}, in_group_id={}", prev_group_id, prev_in_group_id);
+                            println!("  Current:  group_id={}, in_group_id={}", pack.group_id, seg_meta.in_group_id);
+                        }
+
+                        if pack.group_id > 50000 {
+                            println!("WARNING: Registering segment with huge group_id={}! Sample={}, Contig={}, seg_part_no={}",
+                                pack.group_id, seg_meta.sample_name, seg_meta.contig_name, seg_meta.seg_part_no);
+                        }
+
+                        seen_segments.insert(key, (pack.group_id, seg_meta.in_group_id));
+
                         collection_lock.register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
                         collection_lock.add_segment_placed(
                             &seg_meta.sample_name,
@@ -1344,6 +1318,7 @@ impl StreamingCompressor {
                             seg_meta.is_rev_comp,
                             seg_meta.data_len,
                         )?;
+                        segments_registered += 1;
                     }
 
                     // Write pack
@@ -1352,426 +1327,200 @@ impl StreamingCompressor {
                 }
 
                 if config.verbosity > 0 {
-                    println!("Writer thread complete: wrote {} packs", packs_written);
+                    println!("Writer thread complete: wrote {} packs, registered {} segments", packs_written, segments_registered);
                 }
                 Ok(packs_written)
             })
         };
 
         // ================================================================
-        // PHASE 2: SORT AND SEPARATE NEW/KNOWN SEGMENTS
+        // SEQUENTIAL PROCESSING: Process each contig segment-by-segment
         // ================================================================
-        let mut all_segments = segment_buffer;
-        let total_segments = all_segments.len();
+        // This matches C++ AGC: assign seg_part_no DURING processing, accounting for splits immediately
+        // NO pre-assigned part numbers = NO duplicate conflicts!
 
-        if self.config.verbosity > 0 {
-            println!("Phase 2: Sorting {} segments...", total_segments);
-        }
-
-        // Sort by sample_name, contig_name, seg_part_no (C++ AGC line 957: sort_known)
-        all_segments.sort_by(|a, b| {
-            a.segment.sample_name.cmp(&b.segment.sample_name)
-                .then(a.segment.contig_name.cmp(&b.segment.contig_name))
-                .then(a.segment.seg_part_no.cmp(&b.segment.seg_part_no))
-        });
-
-        // Separate NEW and KNOWN segments
-        let (new_segments, known_segments): (Vec<_>, Vec<_>) =
-            all_segments.into_iter().partition(|s| s.is_new);
-
-        if self.config.verbosity > 0 {
-            println!("  NEW segments (create groups): {}", new_segments.len());
-            println!("  KNOWN segments (join groups): {}", known_segments.len());
-        }
-
-        // ================================================================
-        // PHASE 3: PROCESS NEW SEGMENTS (creates groups with references)
-        // ================================================================
-        // This matches C++ AGC line 959: buffered_seg_part.process_new()
-        if self.config.verbosity > 0 {
-            println!("Phase 3: Processing NEW segments (creating groups)...");
-        }
-
-        // Recreate shared state for Phase 3/4
-        let groups = DashMap::<SegmentGroupKey, (u32, GroupWriter)>::new();
-        let next_group_id = AtomicU32::new(self.next_group_id);
-        let group_terminators = DashMap::<u64, Vec<u64>>::new();
-
-        let mut stats_new_split_attempts = 0;
-        let mut stats_new_splits_executed = 0;
-
-        for mut buffered_seg in new_segments {
-            let key = buffered_seg.key.clone();
-
-            // C++ AGC SPLIT LOGIC: Check if NEW segment (group doesn't exist) can be split
-            // This matches C++ AGC lines 1381-1501 where splits are checked on segments
-            // where `p == map_segments.end()` (group doesn't exist yet)
-            let mut split_executed = false;
-
-            if !groups.contains_key(&key)
-                && key.kmer_front != MISSING_KMER
-                && key.kmer_back != MISSING_KMER
-                && !self.config.concatenated_genomes  // Disable split detection in concatenated mode
-            {
-                // Check if both k-mers are terminators (have existing groups)
-                if let (Some(front_terms), Some(back_terms)) = (
-                    group_terminators.get(&key.kmer_front),
-                    group_terminators.get(&key.kmer_back),
-                ) {
-                    // Find shared middle k-mers
-                    let shared: Vec<u64> = front_terms
-                        .iter()
-                        .filter(|k| back_terms.contains(*k))
-                        .copied()
-                        .collect();
-
-                    if !shared.is_empty() {
-                        stats_new_split_attempts += 1;
-                        let middle_kmer = shared[0];
-
-                        // Check if BOTH target groups exist
-                        let key1 = SegmentGroupKey::new_normalized(key.kmer_front, middle_kmer).0;
-                        let key2 = SegmentGroupKey::new_normalized(middle_kmer, key.kmer_back).0;
-
-                        if groups.contains_key(&key1) && groups.contains_key(&key2) {
-                            // Calculate optimal split position
-                            if let Some(split_pos) = Self::calculate_split_position(
-                                key.kmer_front,
-                                key.kmer_back,
-                                middle_kmer,
-                                &buffered_seg.segment.data,
-                                &groups,
-                                &self.config,
-                            ) {
-                                // Execute split - add to existing groups instead of creating new one
-                                let kmer_len = self.config.kmer_length as usize;
-                                let use_rc = key.kmer_front > key.kmer_back;
-                                let mut left_size = split_pos;
-                                let mut right_size = buffered_seg.segment.data.len() - split_pos;
-
-                                if use_rc {
-                                    std::mem::swap(&mut left_size, &mut right_size);
-                                }
-
-                                if left_size > 0 && right_size > 0 {
-                                    // Both sides non-empty: create two segments
-                                    let seg2_start_pos = split_pos.saturating_sub(kmer_len / 2);
-                                    let seg1_data = buffered_seg.segment.data[..seg2_start_pos + kmer_len].to_vec();
-                                    let seg2_data = buffered_seg.segment.data[seg2_start_pos..].to_vec();
-
-                                    // Clone metadata once
-                                    let sample_name = buffered_seg.segment.sample_name.clone();
-                                    let contig_name = buffered_seg.segment.contig_name.clone();
-                                    let seg_part_no = buffered_seg.segment.seg_part_no;
-                                    let is_rev_comp = buffered_seg.segment.is_rev_comp;
-
-                                    // Add first segment to group (key.kmer_front, middle_kmer)
-                                    if let Some(mut group1) = groups.get_mut(&key1) {
-                                        let seg1_info = SegmentInfo {
-                                            data: seg1_data,
-                                            sample_name: sample_name.clone(),
-                                            contig_name: contig_name.clone(),
-                                            seg_part_no,
-                                            is_rev_comp,
-                                        };
-                                        if let Some(pack) = group1.1.add_segment(seg1_info, &self.config)? {
-                                            let compressed_pack = match pack {
-                                                PackToWrite::Compressed(cp) => cp,
-                                                PackToWrite::Uncompressed(uncompressed_pack) => {
-                                                    let compressed_data = compress_segment_configured(
-                                                        &uncompressed_pack.uncompressed_data,
-                                                        self.config.compression_level,
-                                                    )?;
-                                                    let (final_data, uncompressed_size) =
-                                                        if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
-                                                            let mut data_with_marker = compressed_data;
-                                                            data_with_marker.push(0);
-                                                            (data_with_marker, uncompressed_pack.uncompressed_data.len() as u64)
-                                                        } else {
-                                                            (uncompressed_pack.uncompressed_data, 0)
-                                                        };
-                                                    CompressedPack {
-                                                        group_id: uncompressed_pack.group_id,
-                                                        stream_id: uncompressed_pack.stream_id,
-                                                        compressed_data: final_data,
-                                                        uncompressed_size,
-                                                        segments: uncompressed_pack.segments,
-                                                    }
-                                                }
-                                            };
-                                            pack_tx.send(compressed_pack)?;
-                                        }
-                                    }
-
-                                    // Add second segment to group (middle_kmer, key.kmer_back)
-                                    if let Some(mut group2) = groups.get_mut(&key2) {
-                                        let seg2_info = SegmentInfo {
-                                            data: seg2_data,
-                                            sample_name,
-                                            contig_name,
-                                            seg_part_no: seg_part_no + 1,
-                                            is_rev_comp,
-                                        };
-                                        if let Some(pack) = group2.1.add_segment(seg2_info, &self.config)? {
-                                            let compressed_pack = match pack {
-                                                PackToWrite::Compressed(cp) => cp,
-                                                PackToWrite::Uncompressed(uncompressed_pack) => {
-                                                    let compressed_data = compress_segment_configured(
-                                                        &uncompressed_pack.uncompressed_data,
-                                                        self.config.compression_level,
-                                                    )?;
-                                                    let (final_data, uncompressed_size) =
-                                                        if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
-                                                            let mut data_with_marker = compressed_data;
-                                                            data_with_marker.push(0);
-                                                            (data_with_marker, uncompressed_pack.uncompressed_data.len() as u64)
-                                                        } else {
-                                                            (uncompressed_pack.uncompressed_data, 0)
-                                                        };
-                                                    CompressedPack {
-                                                        group_id: uncompressed_pack.group_id,
-                                                        stream_id: uncompressed_pack.stream_id,
-                                                        compressed_data: final_data,
-                                                        uncompressed_size,
-                                                        segments: uncompressed_pack.segments,
-                                                    }
-                                                }
-                                            };
-                                            pack_tx.send(compressed_pack)?;
-                                        }
-                                    }
-
-                                    stats_new_splits_executed += 1;
-                                    split_executed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If split succeeded, skip creating new group
-            if split_executed {
+        while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
+            if sequence.is_empty() {
                 continue;
             }
 
-            // Normal path: Get or create group
-            let mut group_entry = groups.entry(key.clone()).or_insert_with(|| {
-                // Update terminators when creating group
-                if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                    group_terminators
-                        .entry(key.kmer_front)
-                        .or_default()
-                        .push(key.kmer_back);
-                    if key.kmer_front != key.kmer_back {
-                        group_terminators
-                            .entry(key.kmer_back)
-                            .or_default()
-                            .push(key.kmer_front);
-                    }
+            // Log sample changes
+            if current_sample != sample_name {
+                if !current_sample.is_empty() && self.config.verbosity > 0 {
+                    println!("Finished processing sample: {}", current_sample);
                 }
+                current_sample = sample_name.clone();
+                if self.config.verbosity > 0 {
+                    println!("Processing sample: {}", sample_name);
+                }
+            }
 
-                let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
-                let stream_id = gid as usize;
-                let ref_stream_id = if gid >= 16 {
-                    Some(10000 + gid as usize)
-                } else {
-                    None
-                };
-                (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
-            });
+            total_contigs += 1;
+            total_bases += sequence.len();
 
-            // Add segment (this sets the reference for the group!)
-            if let Some(pack) = group_entry.1.add_segment(buffered_seg.segment, &self.config)? {
-                // Send pack to writer
-                let compressed_pack = match pack {
-                    PackToWrite::Compressed(cp) => cp,
-                    PackToWrite::Uncompressed(uncompressed_pack) => {
-                        let compressed_data = compress_segment_configured(
-                            &uncompressed_pack.uncompressed_data,
-                            self.config.compression_level,
-                        )?;
+            // Segment contig at splitters
+            let segments = split_at_splitters_with_size(
+                &sequence,
+                splitters,
+                self.config.kmer_length as usize,
+                self.config.segment_size as usize,
+            );
 
-                        let (final_data, uncompressed_size) =
-                            if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
-                                let mut data_with_marker = compressed_data;
-                                data_with_marker.push(0);
-                                (data_with_marker, uncompressed_pack.uncompressed_data.len() as u64)
-                            } else {
-                                (uncompressed_pack.uncompressed_data, 0)
-                            };
+            // Process each segment IMMEDIATELY (sequential!)
+            let mut seg_part_no = 0;
 
-                        CompressedPack {
-                            group_id: uncompressed_pack.group_id,
-                            stream_id: uncompressed_pack.stream_id,
-                            compressed_data: final_data,
-                            uncompressed_size,
-                            segments: uncompressed_pack.segments,
+            for segment in segments {
+                let kmer_front = segment.front_kmer;
+                let kmer_back = segment.back_kmer;
+                let segment_data = segment.data;
+
+                // Create normalized key
+                let (key, _) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
+
+                // Classify: NEW or KNOWN?
+                let group_id_opt = known_groups.get(&key).copied();
+                let is_new = group_id_opt.is_none();
+
+                if is_new {
+                    // NEW SEGMENT: Create group
+                    let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                    known_groups.insert(key.clone(), gid);
+
+                    if total_segments % 1000 == 0 || gid < 100 || gid > 50000 {
+                        println!("DEBUG: Created group_id={} at segment {} (total unique groups={})", gid, total_segments, known_groups.len());
+                    }
+
+                    // Add terminators
+                    if kmer_front != MISSING_KMER && kmer_back != MISSING_KMER {
+                        group_terminators.entry(kmer_front).or_default().push(kmer_back);
+                        if kmer_front != kmer_back {
+                            group_terminators.entry(kmer_back).or_default().push(kmer_front);
                         }
                     }
-                };
-                pack_tx.send(compressed_pack)?;
-            }
-        }
 
-        if self.config.verbosity > 0 {
-            println!("Phase 3 complete: {} groups created", groups.len());
-            println!("  group_terminators has {} k-mers", group_terminators.len());
-            let total_connections: usize = group_terminators.iter().map(|e| e.value().len()).sum();
-            println!("  Total terminator connections: {}", total_connections);
-            println!("  NEW segment split attempts: {}", stats_new_split_attempts);
-            println!("  NEW segment splits executed: {}", stats_new_splits_executed);
-        }
+                    // Prepare segment
+                    let seg_info = Self::prepare_segment_info(
+                        &self.config,
+                        &sample_name,
+                        &contig_name,
+                        seg_part_no,
+                        segment_data,
+                        Some(kmer_front),
+                        Some(kmer_back),
+                    )?;
 
-        // ================================================================
-        // PHASE 4: PROCESS KNOWN SEGMENTS (optimal splits work!)
-        // ================================================================
-        // This matches C++ AGC line 969: buffered_seg_part.distribute_segments()
-        if self.config.verbosity > 0 {
-            println!("Phase 4: Processing KNOWN segments (optimal splits enabled)...");
-        }
+                    // Create group and add segment
+                    let stream_id = gid as usize;
+                    let ref_stream_id = if gid >= 16 { Some(100000 + gid as usize) } else { None };
+                    let mut group_writer = GroupWriter::new(gid, stream_id, ref_stream_id);
 
-        let mut stats_known_processed = 0;
-        let mut stats_valid_kmers = 0;
-        let mut stats_group_not_exists = 0;
-        let mut stats_no_terminators = 0;
-        let mut stats_no_shared = 0;
-        let mut stats_both_groups_exist = 0;
-        let mut stats_split_calculated = 0;
-        let mut stats_split_executed = 0;
-
-        for mut buffered_seg in known_segments {
-            stats_known_processed += 1;
-
-            // Check if both k-mers valid for potential split
-            if buffered_seg.key.kmer_front != MISSING_KMER
-                && buffered_seg.key.kmer_back != MISSING_KMER
-            {
-                stats_valid_kmers += 1;
-
-                // Try to find shared splitters (C++ AGC lines 1369-1403)
-                if let (Some(front_terms), Some(back_terms)) = (
-                    group_terminators.get(&buffered_seg.key.kmer_front),
-                    group_terminators.get(&buffered_seg.key.kmer_back),
-                ) {
-                    // Find shared k-mers (set intersection)
-                    let shared: Vec<u64> = front_terms
-                        .iter()
-                        .filter(|k| back_terms.contains(*k))
-                        .copied()
-                        .collect();
-
-                    if !shared.is_empty() {
-                        let middle_kmer = shared[0];
-
-                        // Check if BOTH target groups exist (they should, we're in Phase 4!)
-                        let key1 = SegmentGroupKey::new_normalized(buffered_seg.key.kmer_front, middle_kmer).0;
-                        let key2 = SegmentGroupKey::new_normalized(middle_kmer, buffered_seg.key.kmer_back).0;
-
-                        let key1_exists = groups.contains_key(&key1);
-                        let key2_exists = groups.contains_key(&key2);
-
-                        if key1_exists && key2_exists {
-                            stats_both_groups_exist += 1;
-                            // Calculate optimal split position using LZ cost
-                            if let Some(split_pos) = Self::calculate_split_position(
-                                buffered_seg.key.kmer_front,
-                                buffered_seg.key.kmer_back,
-                                middle_kmer,
-                                &buffered_seg.segment.data,
-                                &groups,
-                                &self.config,
-                            ) {
-                                stats_split_calculated += 1;
-                                // Execute split (C++ AGC lines 1419-1501)
-                                let use_rc = buffered_seg.key.kmer_front > buffered_seg.key.kmer_back;
-                                let mut left_size = split_pos;
-                                let mut right_size = buffered_seg.segment.data.len() - split_pos;
-
-                                if use_rc {
-                                    std::mem::swap(&mut left_size, &mut right_size);
-                                }
-
-                                if left_size == 0 {
-                                    // Left side empty - update key
-                                    buffered_seg.key = SegmentGroupKey::new_normalized(middle_kmer, buffered_seg.key.kmer_back).0;
-                                } else if right_size == 0 {
-                                    // Right side empty - update key
-                                    buffered_seg.key = SegmentGroupKey::new_normalized(buffered_seg.key.kmer_front, middle_kmer).0;
+                    if let Some(pack) = group_writer.add_segment(seg_info.segment, &self.config)? {
+                        let compressed_pack = match pack {
+                            PackToWrite::Compressed(cp) => cp,
+                            PackToWrite::Uncompressed(up) => {
+                                let compressed_data = compress_segment_configured(&up.uncompressed_data, self.config.compression_level)?;
+                                let (final_data, uncompressed_size) = if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                                    let mut data_with_marker = compressed_data;
+                                    data_with_marker.push(0);
+                                    (data_with_marker, up.uncompressed_data.len() as u64)
                                 } else {
-                                    // Both sizes > 0: Split with overlap
+                                    (up.uncompressed_data, 0)
+                                };
+                                CompressedPack {
+                                    group_id: up.group_id,
+                                    stream_id: up.stream_id,
+                                    compressed_data: final_data,
+                                    uncompressed_size,
+                                    segments: up.segments,
+                                }
+                            }
+                        };
+                        pack_tx.send(compressed_pack)?;
+                    }
+
+                    groups.insert(key, (gid, group_writer));
+
+                    seg_part_no += 1;  // Increment by 1 for normal segment
+                    total_segments += 1;
+
+                } else {
+                    // KNOWN SEGMENT: Try to split
+                    let _group_id = group_id_opt.unwrap();
+
+                    // Check if we can split
+                    let can_split = kmer_front != MISSING_KMER
+                                 && kmer_back != MISSING_KMER
+                                 && segment_data.len() >= 2 * self.config.segment_size as usize
+                                 && !self.config.concatenated_genomes;
+
+                    let mut did_split = false;
+
+                    if can_split {
+                        // Try to find shared k-mer
+                        if let Some(middle_kmer) = self.find_shared_kmer(kmer_front, kmer_back, &group_terminators) {
+                            // Check if both target groups exist
+                            let key1 = SegmentGroupKey::new_normalized(kmer_front, middle_kmer).0;
+                            let key2 = SegmentGroupKey::new_normalized(middle_kmer, kmer_back).0;
+
+                            if groups.contains_key(&key1) && groups.contains_key(&key2) {
+                                // Calculate split position
+                                if let Some(split_pos) = Self::calculate_split_position(
+                                    kmer_front,
+                                    kmer_back,
+                                    middle_kmer,
+                                    &segment_data,
+                                    &groups,
+                                    &self.config,
+                                ) {
+                                    // SPLIT THE SEGMENT!
                                     let kmer_len = self.config.kmer_length as usize;
                                     let seg2_start_pos = split_pos.saturating_sub(kmer_len / 2);
 
-                                    let seg1_data = buffered_seg.segment.data[..seg2_start_pos + kmer_len].to_vec();
-                                    let seg2_data = buffered_seg.segment.data[seg2_start_pos..].to_vec();
+                                    let seg1_data = segment_data[..seg2_start_pos + kmer_len].to_vec();
+                                    let seg2_data = segment_data[seg2_start_pos..].to_vec();
 
-                                    // Determine RC orientation
-                                    let store_rc = buffered_seg.key.kmer_front >= middle_kmer;
-                                    let store2_rc = middle_kmer >= buffered_seg.key.kmer_back;
+                                    // Create first split segment (seg_part_no)
+                                    let seg1_info = Self::prepare_segment_info(
+                                        &self.config,
+                                        &sample_name,
+                                        &contig_name,
+                                        seg_part_no,
+                                        seg1_data,
+                                        Some(kmer_front),
+                                        Some(middle_kmer),
+                                    )?;
 
-                                    // Hash segments for tracing
-                                    let seg1_for_hash = if store_rc {
-                                        seg1_data.iter().rev().map(|&b| reverse_complement(b as u64) as u8).collect::<Vec<u8>>()
-                                    } else {
-                                        seg1_data.clone()
-                                    };
-                                    let seg2_for_hash = if store2_rc {
-                                        seg2_data.iter().rev().map(|&b| reverse_complement(b as u64) as u8).collect::<Vec<u8>>()
-                                    } else {
-                                        seg2_data.clone()
-                                    };
+                                    // Create second split segment (seg_part_no + 1)
+                                    let seg2_info = Self::prepare_segment_info(
+                                        &self.config,
+                                        &sample_name,
+                                        &contig_name,
+                                        seg_part_no + 1,
+                                        seg2_data,
+                                        Some(middle_kmer),
+                                        Some(kmer_back),
+                                    )?;
 
-                                    let hash1 = Sha256::digest(&seg1_for_hash);
-                                    let hash2 = Sha256::digest(&seg2_for_hash);
-                                    if self.config.verbosity > 1 {
-                                        eprintln!(
-                                            "[SPLIT_EXEC] kmer1={:016x} mid={:016x} kmer2={:016x} | seg1: len={} hash={:08x} | seg2: len={} hash={:08x}",
-                                            buffered_seg.key.kmer_front, middle_kmer, buffered_seg.key.kmer_back,
-                                            seg1_data.len(), u32::from_be_bytes(hash1[0..4].try_into().unwrap()),
-                                            seg2_data.len(), u32::from_be_bytes(hash2[0..4].try_into().unwrap())
-                                        );
-                                    }
+                                    // Add both segments to their respective groups
+                                    for (seg_key, seg_info_prepared) in [(seg1_info.key.clone(), seg1_info), (seg2_info.key.clone(), seg2_info)] {
+                                        let mut group_entry = groups.entry(seg_key.clone()).or_insert_with(|| {
+                                            let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                                            known_groups.insert(seg_key.clone(), gid);
 
-                                    // Create two segments
-                                    let seg1 = PreparedSegment {
-                                        key: SegmentGroupKey::new_normalized(buffered_seg.key.kmer_front, middle_kmer).0,
-                                        segment: SegmentInfo {
-                                            data: seg1_data,
-                                            sample_name: buffered_seg.segment.sample_name.clone(),
-                                            contig_name: buffered_seg.segment.contig_name.clone(),
-                                            seg_part_no: buffered_seg.segment.seg_part_no,
-                                            is_rev_comp: buffered_seg.segment.is_rev_comp,
-                                        },
-                                    };
-
-                                    let seg2 = PreparedSegment {
-                                        key: SegmentGroupKey::new_normalized(middle_kmer, buffered_seg.key.kmer_back).0,
-                                        segment: SegmentInfo {
-                                            data: seg2_data,
-                                            sample_name: buffered_seg.segment.sample_name.clone(),
-                                            contig_name: buffered_seg.segment.contig_name.clone(),
-                                            seg_part_no: buffered_seg.segment.seg_part_no + 1,
-                                            is_rev_comp: buffered_seg.segment.is_rev_comp,
-                                        },
-                                    };
-
-                                    // Process both split segments
-                                    for split_seg in [seg1, seg2] {
-                                        let mut group_entry = groups.entry(split_seg.key.clone()).or_insert_with(|| {
-                                            if split_seg.key.kmer_front != MISSING_KMER && split_seg.key.kmer_back != MISSING_KMER {
-                                                group_terminators.entry(split_seg.key.kmer_front).or_default().push(split_seg.key.kmer_back);
-                                                if split_seg.key.kmer_front != split_seg.key.kmer_back {
-                                                    group_terminators.entry(split_seg.key.kmer_back).or_default().push(split_seg.key.kmer_front);
+                                            // Add terminators
+                                            if seg_key.kmer_front != MISSING_KMER && seg_key.kmer_back != MISSING_KMER {
+                                                group_terminators.entry(seg_key.kmer_front).or_default().push(seg_key.kmer_back);
+                                                if seg_key.kmer_front != seg_key.kmer_back {
+                                                    group_terminators.entry(seg_key.kmer_back).or_default().push(seg_key.kmer_front);
                                                 }
                                             }
-                                            let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+
                                             let stream_id = gid as usize;
-                                            let ref_stream_id = if gid >= 16 { Some(10000 + gid as usize) } else { None };
+                                            let ref_stream_id = if gid >= 16 { Some(100000 + gid as usize) } else { None };
                                             (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
                                         });
 
-                                        if let Some(pack) = group_entry.1.add_segment(split_seg.segment, &self.config)? {
+                                        if let Some(pack) = group_entry.1.add_segment(seg_info_prepared.segment, &self.config)? {
                                             let compressed_pack = match pack {
                                                 PackToWrite::Compressed(cp) => cp,
                                                 PackToWrite::Uncompressed(up) => {
@@ -1796,97 +1545,87 @@ impl StreamingCompressor {
                                         }
                                     }
 
-                                    stats_split_executed += 1;
-                                    continue; // Skip normal processing
+                                    seg_part_no += 2;  // Increment by 2 for split
+                                    total_segments += 2;
+                                    did_split = true;
                                 }
                             }
-                        } else {
-                            // One or both target groups don't exist
                         }
-                    } else {
-                        // No shared k-mers found
-                        stats_no_shared += 1;
                     }
-                } else {
-                    // No terminators found
-                    stats_no_terminators += 1;
-                }
-            } else {
-                // Group already exists or invalid k-mers
-                stats_group_not_exists += 1;
-            }
 
-            // Normal processing (no split or split failed)
-            let mut group_entry = groups.entry(buffered_seg.key.clone()).or_insert_with(|| {
-                if buffered_seg.key.kmer_front != MISSING_KMER && buffered_seg.key.kmer_back != MISSING_KMER {
-                    group_terminators
-                        .entry(buffered_seg.key.kmer_front)
-                        .or_default()
-                        .push(buffered_seg.key.kmer_back);
-                    if buffered_seg.key.kmer_front != buffered_seg.key.kmer_back {
-                        group_terminators
-                            .entry(buffered_seg.key.kmer_back)
-                            .or_default()
-                            .push(buffered_seg.key.kmer_front);
-                    }
-                }
-
-                let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
-                let stream_id = gid as usize;
-                let ref_stream_id = if gid >= 16 { Some(10000 + gid as usize) } else { None };
-                (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
-            });
-
-            if let Some(pack) = group_entry.1.add_segment(buffered_seg.segment, &self.config)? {
-                let compressed_pack = match pack {
-                    PackToWrite::Compressed(cp) => cp,
-                    PackToWrite::Uncompressed(uncompressed_pack) => {
-                        let compressed_data = compress_segment_configured(
-                            &uncompressed_pack.uncompressed_data,
-                            self.config.compression_level,
+                    if !did_split {
+                        // No split - add as normal KNOWN segment
+                        let seg_info = Self::prepare_segment_info(
+                            &self.config,
+                            &sample_name,
+                            &contig_name,
+                            seg_part_no,
+                            segment_data,
+                            Some(kmer_front),
+                            Some(kmer_back),
                         )?;
 
-                        let (final_data, uncompressed_size) =
-                            if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
-                                let mut data_with_marker = compressed_data;
-                                data_with_marker.push(0);
-                                (data_with_marker, uncompressed_pack.uncompressed_data.len() as u64)
-                            } else {
-                                (uncompressed_pack.uncompressed_data, 0)
+                        let mut group_entry = groups.entry(key.clone()).or_insert_with(|| {
+                            let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                            known_groups.insert(key.clone(), gid);
+
+                            // Add terminators
+                            if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                                group_terminators.entry(key.kmer_front).or_default().push(key.kmer_back);
+                                if key.kmer_front != key.kmer_back {
+                                    group_terminators.entry(key.kmer_back).or_default().push(key.kmer_front);
+                                }
+                            }
+
+                            let stream_id = gid as usize;
+                            let ref_stream_id = if gid >= 16 { Some(100000 + gid as usize) } else { None };
+                            (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
+                        });
+
+                        if let Some(pack) = group_entry.1.add_segment(seg_info.segment, &self.config)? {
+                            let compressed_pack = match pack {
+                                PackToWrite::Compressed(cp) => cp,
+                                PackToWrite::Uncompressed(up) => {
+                                    let compressed_data = compress_segment_configured(&up.uncompressed_data, self.config.compression_level)?;
+                                    let (final_data, uncompressed_size) = if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                                        let mut data_with_marker = compressed_data;
+                                        data_with_marker.push(0);
+                                        (data_with_marker, up.uncompressed_data.len() as u64)
+                                    } else {
+                                        (up.uncompressed_data, 0)
+                                    };
+                                    CompressedPack {
+                                        group_id: up.group_id,
+                                        stream_id: up.stream_id,
+                                        compressed_data: final_data,
+                                        uncompressed_size,
+                                        segments: up.segments,
+                                    }
+                                }
                             };
-
-                        CompressedPack {
-                            group_id: uncompressed_pack.group_id,
-                            stream_id: uncompressed_pack.stream_id,
-                            compressed_data: final_data,
-                            uncompressed_size,
-                            segments: uncompressed_pack.segments,
+                            pack_tx.send(compressed_pack)?;
                         }
-                    }
-                };
-                pack_tx.send(compressed_pack)?;
-            }
-        }
 
-        if self.config.verbosity > 0 {
-            println!("Phase 4 complete: All KNOWN segments processed");
-            println!("[SPLIT_STATS] RAGC:");
-            println!("  Known segments processed: {}", stats_known_processed);
-            println!("  Valid k-mers (eligible for split): {}", stats_valid_kmers);
-            println!("  Group already exists: {}", stats_group_not_exists);
-            println!("  No terminators found: {}", stats_no_terminators);
-            println!("  No shared k-mers: {}", stats_no_shared);
-            println!("  Both target groups exist: {}", stats_both_groups_exist);
-            println!("  Split position calculated: {}", stats_split_calculated);
-            println!("  Splits executed: {}", stats_split_executed);
+                        seg_part_no += 1;  // Increment by 1
+                        total_segments += 1;
+                    }
+                }
+            }
         }
 
         // ================================================================
         // FLUSH REMAINING GROUPS
         // ================================================================
-        let mut flush_packs_count = 0;
-        for (_key, (_gid, mut group_writer)) in groups.into_iter() {
+        if self.config.verbosity > 0 {
+            println!("Flushing {} remaining groups...", groups.len());
+        }
+
+        for (_, (gid, mut group_writer)) in groups {
             if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
+                if self.config.verbosity > 1 && (gid == 11813 || gid < 100) {
+                    println!("  Flushing delta pack for group_id={}, {} segments buffered",
+                        gid, uncompressed_pack.segments.len());
+                }
                 let compressed_data = compress_segment_configured(
                     &uncompressed_pack.uncompressed_data,
                     self.config.compression_level,
@@ -1910,12 +1649,7 @@ impl StreamingCompressor {
                 };
 
                 pack_tx.send(compressed_pack)?;
-                flush_packs_count += 1;
             }
-        }
-
-        if self.config.verbosity > 0 {
-            println!("Flushed {} final packs", flush_packs_count);
         }
 
         // ================================================================
@@ -1933,6 +1667,9 @@ impl StreamingCompressor {
 
         // Update next_group_id for future calls
         self.next_group_id = next_group_id.load(Ordering::SeqCst);
+
+        // Update total_segments for finalize() (critical for collection metadata)
+        self.total_segments = total_segments;
 
         // Restore archive and collection
         self.archive = Arc::try_unwrap(archive)
@@ -1952,14 +1689,14 @@ impl StreamingCompressor {
         }
 
         Ok(())
-    }
 
+    }
     fn calculate_split_position(
         kmer_front: u64,
         kmer_back: u64,
         middle_kmer: u64,
         segment: &Contig,
-        groups: &DashMap<SegmentGroupKey, (u32, GroupWriter)>,
+        groups: &HashMap<SegmentGroupKey, (u32, GroupWriter)>,
         config: &StreamingCompressorConfig,
     ) -> Option<usize> {
         // Look up existing groups using normalized keys
@@ -3282,13 +3019,25 @@ impl StreamingCompressor {
         self.store_segment_splitters_stream()?;
 
         // Store collection metadata
+        if self.config.verbosity > 0 {
+            println!("DEBUG: Storing collection metadata...");
+            println!("  Number of samples: {}", self.collection.get_no_samples());
+        }
+
         self.collection
             .store_batch_sample_names(&mut self.archive)?;
 
         let num_samples = self.collection.get_no_samples();
         if num_samples > 0 {
+            if self.config.verbosity > 0 {
+                println!("  Storing contig batch for {} samples", num_samples);
+            }
             self.collection
                 .store_contig_batch(&mut self.archive, 0, num_samples)?;
+        } else {
+            if self.config.verbosity > 0 {
+                println!("  WARNING: No samples to store!");
+            }
         }
 
         // Store file_type_info stream (must be last)
