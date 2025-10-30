@@ -4,7 +4,9 @@
 use crate::contig_compression::{compress_contig, CompressionContext};
 use crate::priority_queue::{BoundedPriorityQueue, PopResult};
 use crate::segment_buffer::BufferedSegments;
+use crate::segment_compression::compress_reference_segment;
 use crate::task::{ContigProcessingStage, Task};
+use crate::zstd_pool::compress_segment_pooled;
 use ragc_common::{Archive, Contig};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,12 +63,15 @@ impl SegmentGroup {
         archive: &mut Archive,
     ) -> anyhow::Result<u32> {
         if self.reference.is_none() {
-            // First segment - store as reference
-            self.reference = Some(seg_data.to_vec());
+            // First segment - store as reference with adaptive compression
+            let seg_vec = seg_data.to_vec();
+            self.reference = Some(seg_vec.clone());
 
-            // Write reference to archive (uncompressed)
-            // TODO: Add ZSTD compression
-            archive.add_part(self.ref_stream_id, seg_data, 0)?;
+            // Compress reference segment (chooses between plain ZSTD or tuple packing)
+            let (compressed, marker) = compress_reference_segment(&seg_vec)?;
+
+            // Write compressed reference to archive with marker byte as metadata
+            archive.add_part(self.ref_stream_id, &compressed, marker as u64)?;
             self.ref_written = true;
 
             let in_group_id = self.in_group_counter;
@@ -74,9 +79,12 @@ impl SegmentGroup {
             Ok(in_group_id) // in_group_id = 0 for reference
         } else {
             // Subsequent segment - delta encode against reference
-            // TODO: Implement LZ encoding
-            // For now, write uncompressed
-            archive.add_part(self.stream_id, seg_data, 0)?;
+            // TODO: Implement LZ encoding - for now just compress with ZSTD
+            let seg_vec = seg_data.to_vec();
+            let compressed = compress_segment_pooled(&seg_vec, 17)?;
+
+            // Write compressed delta to archive (marker 0 = plain ZSTD)
+            archive.add_part(self.stream_id, &compressed, 0)?;
 
             let in_group_id = self.in_group_counter;
             self.in_group_counter += 1;
