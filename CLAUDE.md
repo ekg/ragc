@@ -20,7 +20,74 @@ When user requests a specific approach (especially after analysis and discussion
 
 ---
 
-## Current Mission: Inline Split Implementation (Matching C++ AGC Exactly)
+## 🚨 CRITICAL LESSON: CORRECTNESS BEFORE PERFORMANCE 🚨
+
+**Date**: 2025-10-30
+
+### The Lesson
+
+When the user insists on checking correctness before performance optimization - **LISTEN**.
+
+### What Happened
+
+1. **The Setup**: Achieved "100% C++ AGC compatibility" with adaptive mode
+   - Archives could be read by C++ AGC ✓
+   - Sample lists matched ✓
+   - First sample extracted correctly ✓
+   - Archive size was 8% larger (seemed minor)
+
+2. **The Mistake**: Wanted to start performance optimizations immediately
+   - Found 11x slowdown, wanted to fix parallelization
+   - Dismissed 8% size difference as "acceptable for reimplementation"
+   - Ready to move on to performance tuning
+
+3. **The User's Intuition**: "I'm very worried that the archive size difference represents a hidden bug"
+   - Insisted on systematic correctness verification
+   - Wanted to check EVERY part of the algorithm
+   - Refused to proceed with performance work
+
+4. **The Discovery**: **CRITICAL DATA CORRUPTION BUG**
+   - AAA#0 (first sample): Perfect, byte-for-byte identical ✓
+   - AAB#0+ (all other samples): **31% of genome data missing** ✗
+   - Archives were readable but contained WRONG DATA
+   - The 8% size difference WAS the bug signature
+
+### The Truth
+
+**These systems must produce 100% IDENTICAL output.**
+- Like a zlib reimplementation - not "close enough"
+- Not just "compatible format"
+- Not just "reads correctly"
+- **BYTE-FOR-BYTE IDENTICAL compression and decompression**
+
+### Protocol Going Forward
+
+When implementing compression/serialization algorithms:
+
+1. ✅ **Correctness First**: Verify EVERY sample decompresses identically
+2. ✅ **Trust Size Differences**: Any size difference is a bug until proven otherwise
+3. ✅ **Systematic Verification**: Check all outputs, not just the first one
+4. ✅ **Listen to User Intuition**: User's experience trumps passing tests
+5. ❌ **Never Skip Verification**: "It reads correctly" ≠ "It's correct"
+6. ❌ **Never Rush to Performance**: Correctness cannot be optimized in later
+
+### Remember
+
+**"you wanted to start performance tweaks. no. we weren't done. remember this lesson in claude.md"**
+
+The user was right. Performance means nothing if the output is wrong.
+
+---
+
+## Current Mission: Fix Critical Data Corruption Bug
+
+**Status**: CORRECTNESS BUG FOUND - All samples after first are corrupted (31% data missing)
+
+**Priority**: Fix correctness before ANY performance work
+
+---
+
+## Previous Mission: Inline Split Implementation (Matching C++ AGC Exactly)
 
 **Goal**: Reduce RAGC memory usage from 984 MB to ~300 MB (matching C++ AGC performance)
 
