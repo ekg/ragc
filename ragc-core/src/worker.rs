@@ -5,7 +5,7 @@ use crate::contig_compression::{compress_contig, CompressionContext};
 use crate::priority_queue::{BoundedPriorityQueue, PopResult};
 use crate::segment_buffer::BufferedSegments;
 use crate::task::{ContigProcessingStage, Task};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -48,18 +48,35 @@ pub struct SharedCompressorState {
     /// Adaptive compression mode (find new splitters for hard contigs)
     pub adaptive_mode: bool,
 
+    /// Map: (kmer1, kmer2) → group_id
+    /// Matches C++ AGC's map_segments
+    /// Lower group_id wins when same (k1, k2) pair (earlier samples are reference)
+    pub map_segments: Arc<Mutex<HashMap<(u64, u64), u32>>>,
+
+    /// Map: kmer → Vec<kmer> (sorted terminators)
+    /// Matches C++ AGC's map_segments_terminators
+    /// Used for split detection: find shared terminators between k1 and k2
+    pub map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+
+    /// Concatenated genomes mode (treat all contigs as one sample)
+    pub concatenated_genomes: bool,
+
     // TODO: Add more shared state as needed:
     // - vv_fallback_minimizers: Mutex<Vec<Vec<Vec<u64>>>>
     // - vv_splitters: Mutex<Vec<Vec<u64>>>
     // - out_archive: Mutex<ArchiveWriter>
     // - collection_desc: Mutex<Collection>
-    // - map_segments: Mutex<HashMap<(u64, u64), u32>>
-    // - map_segments_terminators: Mutex<HashMap<u64, Vec<u64>>>
+    // - v_segments: Mutex<Vec<Option<Arc<Segment>>>>
 }
 
 impl SharedCompressorState {
     /// Create new shared state
-    pub fn new(verbosity: usize, kmer_length: usize, adaptive_mode: bool) -> Self {
+    pub fn new(
+        verbosity: usize,
+        kmer_length: usize,
+        adaptive_mode: bool,
+        concatenated_genomes: bool,
+    ) -> Self {
         SharedCompressorState {
             processed_bases: AtomicUsize::new(0),
             processed_samples: AtomicUsize::new(0),
@@ -70,6 +87,9 @@ impl SharedCompressorState {
             bloom_splitters: Arc::new(Mutex::new(())),
             kmer_length,
             adaptive_mode,
+            map_segments: Arc::new(Mutex::new(HashMap::new())),
+            map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
+            concatenated_genomes,
         }
     }
 }
@@ -293,6 +313,9 @@ fn compress_contig_task(
         buffered_segments: Arc::clone(&shared.buffered_segments),
         kmer_length: shared.kmer_length,
         adaptive_mode: shared.adaptive_mode,
+        map_segments: Arc::clone(&shared.map_segments),
+        map_segments_terminators: Arc::clone(&shared.map_segments_terminators),
+        concatenated_genomes: shared.concatenated_genomes,
     };
 
     // Call the actual compression function
@@ -305,10 +328,11 @@ mod tests {
 
     #[test]
     fn test_shared_state_creation() {
-        let state = SharedCompressorState::new(1, 21, false);
+        let state = SharedCompressorState::new(1, 21, false, false);
         assert_eq!(state.verbosity, 1);
         assert_eq!(state.kmer_length, 21);
         assert_eq!(state.adaptive_mode, false);
+        assert_eq!(state.concatenated_genomes, false);
         assert_eq!(state.processed_bases.load(Ordering::Relaxed), 0);
         assert_eq!(state.processed_samples.load(Ordering::Relaxed), 0);
         assert_eq!(state.raw_contigs.lock().unwrap().len(), 0);
@@ -320,7 +344,7 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(2));
-        let shared = Arc::new(SharedCompressorState::new(0, 21, false));
+        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false));
 
         // Mark queue as completed (no tasks)
         queue.mark_completed();
@@ -350,7 +374,7 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(1));
-        let shared = Arc::new(SharedCompressorState::new(0, 21, false));
+        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false));
 
         // Enqueue a simple task
         queue.emplace(

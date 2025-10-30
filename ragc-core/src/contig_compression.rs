@@ -34,6 +34,9 @@ pub struct CompressionContext {
     pub buffered_segments: Arc<Mutex<BufferedSegments>>,
     pub kmer_length: usize,
     pub adaptive_mode: bool,
+    pub map_segments: Arc<Mutex<std::collections::HashMap<(u64, u64), u32>>>,
+    pub map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>,
+    pub concatenated_genomes: bool,
 }
 
 /// Compress a contig with inline segmentation
@@ -155,7 +158,7 @@ fn add_segment(
     sample_name: &str,
     contig_name: &str,
     seg_part_no: u32,
-    segment: Vec<u8>,
+    mut segment: Vec<u8>,
     kmer_front: &Kmer,
     kmer_back: &Kmer,
     ctx: &CompressionContext,
@@ -173,50 +176,129 @@ fn add_segment(
         MISSING_KMER
     };
 
-    // TODO: Implement split detection
-    // if !concatenated_genomes && segment is NEW:
-    //     if k1 != ~0 && k2 != ~0:
-    //         if k1 in map_segments_terminators && k2 in map_segments_terminators:
-    //             split_match = find_cand_segment_with_missing_middle_splitter(...)
-    //             if split_match found:
-    //                 // Split into 2 segments with overlap
-    //                 let split_pos = ...
-    //                 let seg1 = segment[0..split_pos+kmer_length]
-    //                 let seg2 = segment[split_pos-kmer_length/2..]
-    //                 // Add both segments
-    //                 return
+    // Normalize key to canonical order (C++ AGC uses minmax)
+    let pk = if k1 <= k2 { (k1, k2) } else { (k2, k1) };
 
-    // TODO: ZSTD compress segment
+    // Check if this segment key is already registered
+    let map_segments = ctx.map_segments.lock().unwrap();
+    let group_id = map_segments.get(&pk).copied();
+    drop(map_segments);
+
+    // Try split detection if NEW segment
+    let mut segment2: Option<Vec<u8>> = None;
+    let mut pk2: Option<(u64, u64)> = None;
+
+    if group_id.is_none() && !ctx.concatenated_genomes {
+        // NEW segment - check for split eligibility
+        if k1 != MISSING_KMER && k2 != MISSING_KMER {
+            // Both terminators exist - check if they're in terminators map
+            let terminators = ctx.map_segments_terminators.lock().unwrap();
+            let k1_in_map = terminators.contains_key(&k1);
+            let k2_in_map = terminators.contains_key(&k2);
+            drop(terminators);
+
+            if k1_in_map && k2_in_map {
+                // Try to find shared middle splitter
+                if let Some((k_middle, left_size, right_size)) =
+                    find_cand_segment_with_missing_middle_splitter(kmer_front, kmer_back, ctx)
+                {
+                    // Determine split outcome
+                    if left_size == 0 || right_size == 0 {
+                        // No actual split - entire segment goes to one group
+                        // (This shouldn't happen but C++ AGC handles it)
+                    } else {
+                        // Split into 2 segments with overlap
+                        let kmer_length = ctx.kmer_length;
+                        let seg2_start_pos = left_size - kmer_length / 2;
+
+                        // segment2: [seg2_start_pos, end)
+                        segment2 = Some(segment[seg2_start_pos..].to_vec());
+
+                        // segment: [0, seg2_start_pos + kmer_length)
+                        segment.resize(seg2_start_pos + kmer_length, 0);
+
+                        // Segment 1 key: (k1, k_middle)
+                        pk2 = Some(if k_middle <= k2 {
+                            (k_middle, k2)
+                        } else {
+                            (k2, k_middle)
+                        });
+
+                        // Note: pk remains (k1, k_middle) or (k_middle, k1) depending on order
+                    }
+                }
+            }
+        }
+    }
+
+    // TODO: ZSTD compress segments
     // For now, just store uncompressed
     let compressed_seg = segment.clone();
 
-    // Create segment part
-    let part = SegmentPart {
-        kmer1: k1,
-        kmer2: k2,
-        sample_name: sample_name.to_string(),
-        contig_name: contig_name.to_string(),
-        seg_data: compressed_seg,
-        is_rev_comp: false, // TODO: Determine from k-mer comparison
-        seg_part_no,
-    };
+    // Add first segment (or whole segment if no split)
+    if group_id.is_some() {
+        // KNOWN segment
+        let mut buffered = ctx.buffered_segments.lock().unwrap();
+        buffered.add_known(
+            group_id.unwrap(),
+            MISSING_KMER,
+            MISSING_KMER,
+            sample_name.to_string(),
+            contig_name.to_string(),
+            compressed_seg,
+            false, // TODO: Determine is_rev_comp from k-mer comparison
+            seg_part_no,
+        );
+    } else {
+        // NEW segment
+        let mut buffered = ctx.buffered_segments.lock().unwrap();
+        buffered.add_new(
+            pk.0,
+            pk.1,
+            sample_name.to_string(),
+            contig_name.to_string(),
+            compressed_seg,
+            false, // TODO: Determine is_rev_comp
+            seg_part_no,
+        );
+    }
 
-    // Add to buffered segments
-    // If this (k1, k2) pair is known (in map_segments), add as KNOWN
-    // Otherwise, add as NEW (will be assigned group_id during registration)
+    // Add second segment if split occurred
+    if let (Some(seg2), Some(pk2_key)) = (segment2, pk2) {
+        // TODO: ZSTD compress segment2
+        let compressed_seg2 = seg2.clone();
 
-    // TODO: Check if (k1, k2) exists in map_segments
-    // For now, always add as NEW
-    let mut buffered = ctx.buffered_segments.lock().unwrap();
-    buffered.add_new(
-        k1,
-        k2,
-        sample_name.to_string(),
-        contig_name.to_string(),
-        part.seg_data,
-        part.is_rev_comp,
-        seg_part_no,
-    );
+        // Check if second segment key is known
+        let map_segments = ctx.map_segments.lock().unwrap();
+        let group_id2 = map_segments.get(&pk2_key).copied();
+        drop(map_segments);
+
+        let mut buffered = ctx.buffered_segments.lock().unwrap();
+        if let Some(gid2) = group_id2 {
+            // KNOWN segment
+            buffered.add_known(
+                gid2,
+                MISSING_KMER,
+                MISSING_KMER,
+                sample_name.to_string(),
+                contig_name.to_string(),
+                compressed_seg2,
+                false, // TODO: is_rev_comp
+                seg_part_no + 1,
+            );
+        } else {
+            // NEW segment
+            buffered.add_new(
+                pk2_key.0,
+                pk2_key.1,
+                sample_name.to_string(),
+                contig_name.to_string(),
+                compressed_seg2,
+                false, // TODO: is_rev_comp
+                seg_part_no + 1,
+            );
+        }
+    }
 }
 
 /// Check if k-mer is a splitter
@@ -240,24 +322,95 @@ fn is_splitter(kmer: u64, ctx: &CompressionContext) -> bool {
 /// 1. Find intersection of terminators for k1 and k2
 /// 2. For each shared k_mid in intersection:
 ///    - Check if (k1, k_mid) and (k_mid, k2) both exist in map_segments
-///    - If yes, return k_mid and group IDs
-/// 3. If no shared middle splitter found, return None
+///    - Find k_mid position in segment (via find_middle_splitter)
+/// 3. Return first valid split: (middle_kmer, left_size, right_size)
 ///
-/// TODO: Implement this based on INLINE_SEGMENTATION_PATTERN.md Section 3
-#[allow(dead_code)]
+/// # Returns
+/// - Some((k_middle, left_size, right_size)) if split found
+/// - None if no valid split
 fn find_cand_segment_with_missing_middle_splitter(
-    _kmer_front: &Kmer,
-    _kmer_back: &Kmer,
-    _ctx: &CompressionContext,
-) -> Option<(u64, u32, u32)> {
-    // Returns: (middle_kmer, group_id1, group_id2)
-    // TODO: Implement
+    kmer_front: &Kmer,
+    kmer_back: &Kmer,
+    ctx: &CompressionContext,
+) -> Option<(u64, usize, usize)> {
+    let k1 = kmer_front.data_canonical();
+    let k2 = kmer_back.data_canonical();
+
+    // Get terminator lists for k1 and k2
+    let terminators = ctx.map_segments_terminators.lock().unwrap();
+    let k1_terminators = terminators.get(&k1)?;
+    let k2_terminators = terminators.get(&k2)?;
+
+    // Find shared terminators (intersection)
+    // Both lists are sorted, so we can use two-pointer technique
+    let mut shared_splitters = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < k1_terminators.len() && j < k2_terminators.len() {
+        if k1_terminators[i] == k2_terminators[j] {
+            shared_splitters.push(k1_terminators[i]);
+            i += 1;
+            j += 1;
+        } else if k1_terminators[i] < k2_terminators[j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    if shared_splitters.is_empty() {
+        return None;
+    }
+
+    drop(terminators);
+
+    // Try each shared splitter
+    let map_segments = ctx.map_segments.lock().unwrap();
+
+    for &k_middle in &shared_splitters {
+        // Create keys (k1, k_middle) and (k_middle, k2) in canonical order
+        let pk_left = if k1 <= k_middle {
+            (k1, k_middle)
+        } else {
+            (k_middle, k1)
+        };
+
+        let pk_right = if k_middle <= k2 {
+            (k_middle, k2)
+        } else {
+            (k2, k_middle)
+        };
+
+        // Check if both groups exist
+        if map_segments.contains_key(&pk_left) && map_segments.contains_key(&pk_right) {
+            drop(map_segments);
+
+            // TODO: Find actual position of k_middle in segment using find_middle_splitter
+            // This requires:
+            // - Decompressing both segments from v_segments[pk_left] and v_segments[pk_right]
+            // - Finding the position where k_middle occurs
+            // - Computing optimal split position via cost analysis
+            //
+            // For now, return a simplified result with approximate position
+            // This is a placeholder - real implementation needed for correctness
+
+            // Placeholder: assume k_middle is in the middle
+            // TODO: Implement find_middle_splitter properly
+            let left_size = ctx.kmer_length; // Placeholder
+            let right_size = ctx.kmer_length; // Placeholder
+
+            return Some((k_middle, left_size, right_size));
+        }
+    }
+
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_missing_kmer_constant() {
@@ -292,6 +445,9 @@ mod tests {
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
             kmer_length: 21,
             adaptive_mode: false,
+            map_segments: Arc::new(Mutex::new(HashMap::new())),
+            map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
+            concatenated_genomes: false,
         };
 
         // Simple contig with no splitters
@@ -317,6 +473,9 @@ mod tests {
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
             kmer_length: 21,
             adaptive_mode: true, // Adaptive mode enabled
+            map_segments: Arc::new(Mutex::new(HashMap::new())),
+            map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
+            concatenated_genomes: false,
         };
 
         // Short contig with no splitters
