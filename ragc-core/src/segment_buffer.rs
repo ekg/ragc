@@ -5,6 +5,10 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Block size for atomic work distribution
+/// Matches C++ AGC's PART_ID_STEP (agc_compressor.h)
+pub const PART_ID_STEP: i32 = 128;
+
 /// Segment part data
 ///
 /// Matches C++ AGC's seg_part_t (agc_compressor.h:29-120) and kk_seg_part_t (lines 124-165)

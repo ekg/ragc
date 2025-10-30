@@ -61,6 +61,14 @@ pub struct SharedCompressorState {
     /// Concatenated genomes mode (treat all contigs as one sample)
     pub concatenated_genomes: bool,
 
+    /// Total number of segment groups (assigned group IDs)
+    /// Matches C++ AGC's no_segments
+    pub no_segments: Arc<Mutex<u32>>,
+
+    /// Number of raw groups (groups without LZ encoding)
+    /// Matches C++ AGC's no_raw_groups
+    pub no_raw_groups: u32,
+
     // TODO: Add more shared state as needed:
     // - vv_fallback_minimizers: Mutex<Vec<Vec<Vec<u64>>>>
     // - vv_splitters: Mutex<Vec<Vec<u64>>>
@@ -76,13 +84,14 @@ impl SharedCompressorState {
         kmer_length: usize,
         adaptive_mode: bool,
         concatenated_genomes: bool,
+        no_raw_groups: u32,
     ) -> Self {
         SharedCompressorState {
             processed_bases: AtomicUsize::new(0),
             processed_samples: AtomicUsize::new(0),
             raw_contigs: Mutex::new(Vec::new()),
             verbosity,
-            buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
+            buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(no_raw_groups as usize))),
             splitters: Arc::new(Mutex::new(HashSet::new())),
             bloom_splitters: Arc::new(Mutex::new(())),
             kmer_length,
@@ -90,6 +99,8 @@ impl SharedCompressorState {
             map_segments: Arc::new(Mutex::new(HashMap::new())),
             map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
             concatenated_genomes,
+            no_segments: Arc::new(Mutex::new(0)),
+            no_raw_groups,
         }
     }
 }
@@ -214,7 +225,7 @@ fn handle_registration_stage(
 
     // Leader thread: register segments and process fallbacks
     if wait_result.is_leader() {
-        // TODO: register_segments(shared);
+        register_segments(shared);
         // TODO: process_fallback_minimizers(shared);
     }
 
@@ -222,7 +233,7 @@ fn handle_registration_stage(
     barrier.wait();
 
     // All threads: store their segments
-    // TODO: store_segments(worker_id, shared);
+    store_segments(worker_id, shared);
 
     // Barrier 3: Wait for storage complete
     barrier.wait();
@@ -322,20 +333,190 @@ fn compress_contig_task(
     compress_contig(&task.sample_name, &task.contig_name, &task.sequence, &ctx)
 }
 
+/// Register segments - assign group IDs to NEW segments
+///
+/// Matches C++ AGC's register_segments (agc_compressor.cpp:954-971)
+///
+/// Called by leader thread only (thread 0) during registration barrier.
+///
+/// # Steps
+/// 1. Sort KNOWN segments by (sample, contig, part_no)
+/// 2. Process NEW segments - assign group IDs
+/// 3. Register archive streams (placeholder for now)
+/// 4. Distribute raw group segments (if applicable)
+/// 5. Restart read pointer for parallel storage
+fn register_segments(shared: &Arc<SharedCompressorState>) {
+    let mut buffered = shared.buffered_segments.lock().unwrap();
+
+    // Step 1: Sort KNOWN segments in parallel
+    // TODO: Implement parallel sort with rayon
+    // For now: sequential sort is already done in BufferedSegments
+    buffered.sort_known(1); // Single-threaded for now
+
+    // Step 2: Process NEW segments - assign group IDs
+    let no_new = buffered.process_new();
+
+    drop(buffered);
+
+    if no_new > 0 {
+        // Step 3: Register archive streams for new groups
+        // TODO: Call out_archive->RegisterStreams() for each new group
+        // For now, just update the segment counter
+
+        let mut no_segments = shared.no_segments.lock().unwrap();
+        let current_no_segments = *no_segments;
+
+        // Register streams: for i in 0..no_new:
+        //   out_archive.register_streams(
+        //     format!("seg-{}", current_no_segments + i),
+        //     format!("seg-{}", current_no_segments + i)
+        //   )
+
+        *no_segments += no_new;
+        drop(no_segments);
+
+        // Step 4: Resize v_segments vector
+        // TODO: Resize v_segments to accommodate new groups
+        // let no_segments_value = *shared.no_segments.lock().unwrap();
+        // shared.v_segments.lock().unwrap().resize(no_segments_value, None);
+    }
+
+    // Step 5: Distribute raw group segments (if applicable)
+    if shared.no_raw_groups > 0 {
+        let buffered = shared.buffered_segments.lock().unwrap();
+        buffered.distribute_segments(0, 0, shared.no_raw_groups);
+    }
+
+    // Step 6: Restart read pointer for parallel storage
+    let buffered = shared.buffered_segments.lock().unwrap();
+    buffered.restart_read_vec();
+}
+
+/// Store segments - write all buffered segments to archive
+///
+/// Matches C++ AGC's store_segments (agc_compressor.cpp:974-1050)
+///
+/// Called by ALL worker threads in parallel during registration barrier.
+///
+/// # Algorithm
+/// 1. Atomic get_vec_id() to claim a block of groups
+/// 2. For each group in block:
+///    - get_part() to pop segments
+///    - Create CSegment object on first use (lazy initialization)
+///    - Update map_segments and map_segments_terminators (CRITICAL!)
+///    - Write segment to archive
+/// 3. Batch collection metadata updates (every 32 segments)
+fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
+    // const MAX_BUFF_SIZE: usize = 32;
+    // TODO: Implement buffered placement tracking
+    // let mut buffered_placements: Vec<SegmentPlacement> = Vec::with_capacity(MAX_BUFF_SIZE);
+
+    let buffered = shared.buffered_segments.lock().unwrap();
+
+    loop {
+        // Step 1: Atomic block allocation
+        let block_group_id = buffered.get_vec_id();
+
+        if block_group_id < 0 {
+            break; // No more blocks
+        }
+
+        // Step 2: Process groups in block (backwards iteration)
+        for group_id in
+            (block_group_id - crate::segment_buffer::PART_ID_STEP + 1..=block_group_id).rev()
+        {
+            if buffered.is_empty_part(group_id) {
+                continue;
+            }
+
+            // Step 3: Process all segments in this group
+            while let Some((kmer1, kmer2, _sample_name, _contig_name, _seg_data, _is_rev_comp, _seg_part_no)) = buffered.get_part(group_id) {
+                // Step 4: Create CSegment on first use (lazy initialization)
+                // TODO: Create v_segments[group_id] if None
+                // let mut v_segments = shared.v_segments.lock().unwrap();
+                // if v_segments[group_id].is_none() {
+                //     v_segments[group_id] = Some(Arc::new(Mutex::new(Segment::new(...))));
+                // }
+
+                // Step 5: Update map_segments (CRITICAL REGISTRATION!)
+                let key = (kmer1, kmer2);
+                let mut map_segments = shared.map_segments.lock().unwrap();
+                map_segments
+                    .entry(key)
+                    .and_modify(|existing| {
+                        // Keep lower group_id (earlier samples are reference)
+                        if (group_id as u32) < *existing {
+                            *existing = group_id as u32;
+                        }
+                    })
+                    .or_insert(group_id as u32);
+                drop(map_segments);
+
+                // Step 6: Update map_segments_terminators (CRITICAL!)
+                if kmer1 != crate::contig_compression::MISSING_KMER
+                    && kmer2 != crate::contig_compression::MISSING_KMER
+                {
+                    let mut terminators = shared.map_segments_terminators.lock().unwrap();
+
+                    // Add k2 to k1's terminator list
+                    let list1 = terminators.entry(kmer1).or_insert_with(Vec::new);
+                    if !list1.contains(&kmer2) {
+                        list1.push(kmer2);
+                        list1.sort_unstable();
+                    }
+
+                    // Add k1 to k2's terminator list (if different)
+                    if kmer1 != kmer2 {
+                        let list2 = terminators.entry(kmer2).or_insert_with(Vec::new);
+                        if !list2.contains(&kmer1) {
+                            list2.push(kmer1);
+                            list2.sort_unstable();
+                        }
+                    }
+
+                    drop(terminators);
+                }
+
+                // Step 7: Write segment to archive
+                // TODO: segment.add() or segment.add_raw()
+                // let in_group_id = if group_id < shared.no_raw_groups as i32 {
+                //     segment.add_raw(&part.seg_data)
+                // } else {
+                //     segment.add(&part.seg_data)
+                // };
+
+                // Step 8: Buffer collection metadata
+                // TODO: buffered_placements.push(SegmentPlacement { ... });
+                // if buffered_placements.len() == MAX_BUFF_SIZE {
+                //     collection.add_segments_placed(&buffered_placements);
+                //     buffered_placements.clear();
+                // }
+            }
+        }
+    }
+
+    // Step 9: Final flush
+    // if !buffered_placements.is_empty() {
+    //     collection.add_segments_placed(&buffered_placements);
+    // }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_shared_state_creation() {
-        let state = SharedCompressorState::new(1, 21, false, false);
+        let state = SharedCompressorState::new(1, 21, false, false, 0);
         assert_eq!(state.verbosity, 1);
         assert_eq!(state.kmer_length, 21);
         assert_eq!(state.adaptive_mode, false);
         assert_eq!(state.concatenated_genomes, false);
+        assert_eq!(state.no_raw_groups, 0);
         assert_eq!(state.processed_bases.load(Ordering::Relaxed), 0);
         assert_eq!(state.processed_samples.load(Ordering::Relaxed), 0);
         assert_eq!(state.raw_contigs.lock().unwrap().len(), 0);
+        assert_eq!(*state.no_segments.lock().unwrap(), 0);
     }
 
     #[test]
@@ -344,7 +525,7 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(2));
-        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false));
+        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false, 0));
 
         // Mark queue as completed (no tasks)
         queue.mark_completed();
@@ -374,7 +555,7 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(1));
-        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false));
+        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false, 0));
 
         // Enqueue a simple task
         queue.emplace(
