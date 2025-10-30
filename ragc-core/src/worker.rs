@@ -654,7 +654,159 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
 // Phase 4: Main Compression Flow
 // ============================================================================
 
+/// Create an AGC archive from FASTA files - complete end-to-end pipeline
+///
+/// This is the top-level API for creating AGC archives using the streaming pipeline.
+///
+/// # Arguments
+/// * `output_path` - Path to write the AGC archive
+/// * `sample_files` - Vector of (sample_name, file_path) pairs
+/// * `splitters` - Set of splitter k-mers (from determine_splitters)
+/// * `kmer_length` - K-mer length for segmentation
+/// * `segment_size` - Segment size parameter for collection
+/// * `num_threads` - Number of threads to use
+/// * `adaptive_mode` - Enable adaptive splitter finding
+/// * `concatenated_genomes` - Treat all contigs as one sample
+/// * `verbosity` - Verbosity level (0=quiet, 1=normal, 2=verbose)
+///
+/// # Returns
+/// Ok(()) on success, Err on failure
+pub fn create_agc_archive(
+    output_path: &str,
+    sample_files: Vec<(String, String)>,
+    splitters: HashSet<u64>,
+    kmer_length: usize,
+    segment_size: u32,
+    num_threads: usize,
+    adaptive_mode: bool,
+    concatenated_genomes: bool,
+    verbosity: usize,
+) -> anyhow::Result<()> {
+    use ragc_common::CollectionV3;
+
+    if sample_files.is_empty() {
+        return Ok(());
+    }
+
+    let num_samples = sample_files.len();
+
+    // Create archive for writing
+    let mut archive = Archive::new_writer();
+    archive.open(output_path)?;
+
+    // Write file_type_info stream (C++ AGC compatibility)
+    {
+        let mut data = Vec::new();
+        let append_str = |data: &mut Vec<u8>, s: &str| {
+            data.extend_from_slice(s.as_bytes());
+            data.push(0);
+        };
+
+        append_str(&mut data, "producer");
+        append_str(&mut data, "ragc");
+
+        append_str(&mut data, "producer_version_major");
+        append_str(&mut data, &ragc_common::AGC_FILE_MAJOR.to_string());
+
+        append_str(&mut data, "producer_version_minor");
+        append_str(&mut data, &ragc_common::AGC_FILE_MINOR.to_string());
+
+        append_str(&mut data, "producer_version_build");
+        append_str(&mut data, "0");
+
+        append_str(&mut data, "file_version_major");
+        append_str(&mut data, &ragc_common::AGC_FILE_MAJOR.to_string());
+
+        append_str(&mut data, "file_version_minor");
+        append_str(&mut data, &ragc_common::AGC_FILE_MINOR.to_string());
+
+        append_str(&mut data, "comment");
+        append_str(&mut data, &format!("RAGC v.{}.{}", ragc_common::AGC_FILE_MAJOR, ragc_common::AGC_FILE_MINOR));
+
+        let stream_id = archive.register_stream("file_type_info");
+        archive.add_part(stream_id, &data, 7)?; // 7 key-value pairs
+
+        if verbosity > 0 {
+            eprintln!("Wrote file_type_info: version {}.{}", ragc_common::AGC_FILE_MAJOR, ragc_common::AGC_FILE_MINOR);
+        }
+    }
+
+    // Write params stream (kmer_length, min_match_len, pack_cardinality, segment_size)
+    {
+        let params_stream_id = archive.register_stream("params");
+        let mut params_data = Vec::new();
+
+        // Standard params format (16 bytes for C++ AGC compatibility)
+        params_data.extend_from_slice(&(kmer_length as u32).to_le_bytes());
+        params_data.extend_from_slice(&20u32.to_le_bytes()); // min_match_len (default)
+        params_data.extend_from_slice(&50u32.to_le_bytes()); // pack_cardinality (default)
+        params_data.extend_from_slice(&segment_size.to_le_bytes());
+
+        archive.add_part(params_stream_id, &params_data, 0)?;
+
+        if verbosity > 0 {
+            eprintln!("Wrote params: k={}, segment_size={}", kmer_length, segment_size);
+        }
+    }
+
+    // Create collection for metadata
+    let mut collection = CollectionV3::new();
+    collection.set_config(segment_size, kmer_length as u32, None);
+
+    // Register collection streams in archive
+    collection.prepare_for_compression(&mut archive)?;
+
+    // Wrap in Arc<Mutex<>> for shared access during compression
+    let archive = Arc::new(Mutex::new(archive));
+    let collection = Arc::new(Mutex::new(collection));
+
+    // Run compression pipeline
+    compress_samples_streaming_with_archive(
+        sample_files,
+        splitters,
+        kmer_length,
+        num_threads,
+        adaptive_mode,
+        concatenated_genomes,
+        verbosity,
+        Some(archive.clone()),
+        Some(collection.clone()),
+    ).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Serialize collection metadata to archive
+    {
+        let mut archive_guard = archive.lock().unwrap();
+        let mut collection_guard = collection.lock().unwrap();
+
+        if verbosity > 0 {
+            eprintln!("Serializing collection metadata for {} samples...", num_samples);
+        }
+
+        // Write sample names
+        collection_guard.store_batch_sample_names(&mut archive_guard)?;
+
+        // Write contig names and segment details
+        collection_guard.store_contig_batch(&mut archive_guard, 0, num_samples)?;
+
+        if verbosity > 0 {
+            eprintln!("Collection metadata serialized successfully");
+        }
+    }
+
+    // Close archive (writes footer)
+    let mut archive = archive.lock().unwrap();
+    archive.close()?;
+
+    if verbosity > 0 {
+        eprintln!("AGC archive created: {}", output_path);
+    }
+
+    Ok(())
+}
+
 /// Compress sample files using streaming pipeline with priority queue and worker threads
+///
+/// Internal function - use create_agc_archive() for complete end-to-end pipeline
 ///
 /// Matches C++ AGC's AddSampleFiles() (agc_compressor.cpp:2121-2270)
 ///
@@ -666,10 +818,12 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
 /// * `adaptive_mode` - Enable adaptive splitter finding
 /// * `concatenated_genomes` - Treat all contigs as one sample
 /// * `verbosity` - Verbosity level (0=quiet, 1=normal, 2=verbose)
+/// * `archive` - Optional archive for writing compressed segments
+/// * `collection` - Optional collection for metadata tracking
 ///
 /// # Returns
 /// Ok(()) on success, Err on failure
-pub fn compress_samples_streaming(
+fn compress_samples_streaming_with_archive(
     sample_files: Vec<(String, String)>,
     splitters: HashSet<u64>,
     kmer_length: usize,
@@ -677,6 +831,8 @@ pub fn compress_samples_streaming(
     adaptive_mode: bool,
     concatenated_genomes: bool,
     verbosity: usize,
+    archive: Option<Arc<Mutex<Archive>>>,
+    collection: Option<Arc<Mutex<ragc_common::CollectionV3>>>,
 ) -> Result<(), String> {
     use crate::genome_io::GenomeIO;
 
@@ -710,9 +866,9 @@ pub fn compress_samples_streaming(
         concatenated_genomes,
         no_segments: Arc::new(Mutex::new(0)),
         no_raw_groups: 0,
-        archive: None, // TODO: Set when archive is created
+        archive,
         v_segments: Arc::new(Mutex::new(Vec::new())),
-        collection: None, // TODO: Set when collection is created
+        collection,
     });
 
     // Step 4: Thread spawning (agc_compressor.cpp:2136-2141)
@@ -760,7 +916,11 @@ pub fn compress_samples_streaming(
                 eprintln!("Concatenated genomes mode not yet implemented");
             } else {
                 // Normal mode: one sample per file
-                // TODO: Register sample/contig with collection
+                // Register sample/contig with collection
+                if let Some(collection_mutex) = &shared.collection {
+                    let mut collection = collection_mutex.lock().unwrap();
+                    let _ = collection.register_sample_contig(&sample_name, &contig_name);
+                }
 
                 let cost = sequence.len();
                 queue.emplace(

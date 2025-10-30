@@ -151,3 +151,4 @@ pub use segment_compression::{
 pub use splitters::{
     determine_splitters, determine_splitters_streaming, find_candidate_kmers_multi, is_splitter,
 };
+pub use worker::create_agc_archive;
