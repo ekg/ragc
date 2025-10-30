@@ -541,7 +541,7 @@ fn handle_new_splitters_stage(
 /// - false: Contig didn't compress well (needs adaptive splitters)
 fn compress_contig_task(
     task: &Task,
-    _worker_id: usize,
+    worker_id: usize,
     _barrier: &Arc<Barrier>,
     shared: &Arc<SharedCompressorState>,
 ) -> bool {
@@ -558,7 +558,40 @@ fn compress_contig_task(
     };
 
     // Call the actual compression function
-    compress_contig(&task.sample_name, &task.contig_name, &task.sequence, &ctx)
+    let success = compress_contig(&task.sample_name, &task.contig_name, &task.sequence, &ctx);
+
+    // Adaptive mode: Handle hard contigs (C++ AGC agc_compressor.cpp:2033-2039)
+    if shared.adaptive_mode
+        && !success
+        && task.stage == ContigProcessingStage::AllContigs
+        && task.sequence.len() >= 1000
+    {
+        // This is a hard contig - no splitters found, and it's large enough to matter
+        if shared.verbosity > 1 {
+            eprintln!(
+                "Hard contig detected: {}/{} ({} bp)",
+                task.sample_name,
+                task.contig_name,
+                task.sequence.len()
+            );
+        }
+
+        // Find new splitters from this contig
+        find_new_splitters(&task.sequence, worker_id, shared);
+
+        // Store contig for reprocessing after NewSplitters barrier
+        let mut raw_contigs = shared.raw_contigs.lock().unwrap();
+        raw_contigs.push((
+            task.sample_name.clone(),
+            task.contig_name.clone(),
+            task.sequence.clone(),
+        ));
+
+        // Return false to indicate contig wasn't processed yet
+        return false;
+    }
+
+    success
 }
 
 /// Register segments - assign group IDs to NEW segments
