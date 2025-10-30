@@ -371,6 +371,93 @@ fn handle_registration_stage(
     barrier.wait();
 }
 
+/// Find new splitters for a hard contig
+///
+/// Matches C++ AGC's find_new_splitters (agc_compressor.cpp:2046-2077)
+///
+/// Algorithm:
+/// 1. Extract all k-mers from contig and find singletons
+/// 2. Exclude k-mers present in reference genome (singletons)
+/// 3. Exclude k-mers present in reference genome (duplicates)
+/// 4. Add remaining k-mers to thread-local splitter vector
+///
+/// # Arguments
+/// * `contig` - The contig sequence that needs new splitters
+/// * `thread_id` - Worker thread ID for vv_splitters indexing
+/// * `shared` - Shared compressor state with reference k-mers
+fn find_new_splitters(
+    contig: &ragc_common::Contig,
+    thread_id: usize,
+    shared: &Arc<SharedCompressorState>,
+) {
+    use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
+
+    // Step 1: Extract k-mers from contig and find singletons
+    let mut v_contig_kmers = enumerate_kmers(contig, shared.kmer_length);
+    v_contig_kmers.sort_unstable();
+    remove_non_singletons(&mut v_contig_kmers, 0);
+
+    if shared.verbosity > 1 {
+        eprintln!(
+            "find_new_splitters: contig has {} singleton k-mers",
+            v_contig_kmers.len()
+        );
+    }
+
+    // Step 2: Exclude k-mers in reference genome (singletons)
+    // C++ AGC uses v_candidate_kmers_offset to skip some candidates
+    // For now, we use the full v_candidate_kmers (offset=0)
+    let mut v_tmp = Vec::with_capacity(v_contig_kmers.len());
+    set_difference(&v_contig_kmers, &shared.v_candidate_kmers, &mut v_tmp);
+
+    if shared.verbosity > 1 {
+        eprintln!(
+            "find_new_splitters: {} k-mers after excluding reference singletons",
+            v_tmp.len()
+        );
+    }
+
+    // Step 3: Exclude k-mers in reference genome (duplicates)
+    v_contig_kmers.clear();
+    set_difference(&v_tmp, &shared.v_duplicated_kmers, &mut v_contig_kmers);
+
+    if shared.verbosity > 1 {
+        eprintln!(
+            "find_new_splitters: {} NEW splitters found",
+            v_contig_kmers.len()
+        );
+    }
+
+    // Step 4: Add to thread-local splitter vector
+    let mut vv_splitters = shared.vv_splitters.lock().unwrap();
+    vv_splitters[thread_id].extend(v_contig_kmers);
+}
+
+/// Compute set difference: result = a \ b (elements in a but not in b)
+///
+/// Both input vectors must be sorted. Matches std::set_difference behavior.
+fn set_difference(a: &[u64], b: &[u64], result: &mut Vec<u64>) {
+    result.clear();
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < a.len() && j < b.len() {
+        if a[i] < b[j] {
+            result.push(a[i]);
+            i += 1;
+        } else if a[i] > b[j] {
+            j += 1;
+        } else {
+            // a[i] == b[j], skip
+            i += 1;
+            j += 1;
+        }
+    }
+
+    // Add remaining elements from a
+    result.extend_from_slice(&a[i..]);
+}
+
 /// Handle new splitters stage synchronization
 ///
 /// Matches C++ AGC's new_splitters logic (agc_compressor.cpp:1187-1237)
