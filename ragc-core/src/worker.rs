@@ -473,36 +473,62 @@ fn handle_new_splitters_stage(
 
     // bloom_insert logic: Insert new splitters into bloom filter and hash set
     // In C++ AGC, this is a lambda defined inline (lines 1191-1209)
-    let bloom_insert = || {
-        // TODO: Insert splitters from vv_splitters into hs_splitters and bloom_splitters
-        // TODO: Clear vv_splitters
-        // TODO: If bloom_splitters.filling_factor() > 0.3: resize and rebuild
-    };
+    //
+    // Multi-threaded execution: All threads merge in parallel
+    // Single-threaded: Only thread 0 does the merge
+    if num_workers > 1 || worker_id == 0 {
+        let mut splitters = shared.splitters.lock().unwrap();
+        let mut vv_splitters = shared.vv_splitters.lock().unwrap();
 
-    // Thread 0: Re-enqueue hard contigs and switch queues
-    if worker_id == 0 {
-        // Single-threaded: thread 0 does bloom_insert
-        if num_workers == 1 {
-            bloom_insert();
+        let mut total_new = 0;
+        for thread_splitters in vv_splitters.iter_mut() {
+            total_new += thread_splitters.len();
+            for &kmer in thread_splitters.iter() {
+                splitters.insert(kmer);
+                // TODO: bloom_splitters.insert(kmer);
+            }
+            thread_splitters.clear();
         }
 
-        // Re-enqueue hard contigs for reprocessing with new splitters
-        // TODO: for (sample, contig, seq) in raw_contigs:
-        //     aux_queue.emplace(Task::new_contig(sample, contig, seq, HardContigs), priority=1, cost=seq.len())
-        // TODO: raw_contigs.clear()
+        if shared.verbosity > 0 && total_new > 0 {
+            eprintln!("Adaptive mode: Added {} new splitters", total_new);
+            eprintln!("Total splitters: {}", splitters.len());
+        }
 
-        // Enqueue registration sync tokens for next round
-        // TODO: aux_queue.emplace_many_no_cost(Task::new_sync(Registration), priority=0, n_items=num_workers)
+        // TODO: Check bloom filter filling factor and resize if > 0.3
+        // if bloom_filling_factor > 0.3 {
+        //     resize bloom filter
+        //     rebuild from hs_splitters
+        // }
+    }
+
+    // Thread 0: Re-enqueue hard contigs and switch queues
+    // NOTE: We don't have aux_queue yet, so hard contigs won't be reprocessed
+    // This is a TODO for full adaptive mode support
+    if worker_id == 0 {
+        let raw_contigs = shared.raw_contigs.lock().unwrap();
+
+        if shared.verbosity > 0 && !raw_contigs.is_empty() {
+            eprintln!(
+                "Adaptive mode: {} hard contigs detected (reprocessing not yet implemented)",
+                raw_contigs.len()
+            );
+        }
+
+        // TODO: Re-enqueue hard contigs for reprocessing with new splitters
+        // for (sample, contig, seq) in raw_contigs.iter():
+        //     aux_queue.emplace(Task::new_contig(sample, contig, seq, HardContigs), priority=1, cost=seq.len())
+        // raw_contigs.clear()
+
+        // TODO: Enqueue registration sync tokens for next round
+        // aux_queue.emplace_many_no_cost(Task::new_sync(Registration), priority=0, n_items=num_workers)
 
         // Switch working queue to aux queue
         // TODO: working_queue = aux_queue
     }
-    // Thread 1: Handle bloom_insert for multi-threaded case
-    else if worker_id == 1 {
-        bloom_insert();
-    }
 
-    // Barrier 2: All ready to process hard contigs
+    // Barrier 2: Ready to continue with new splitters
+    // All workers synchronized after splitter merge
     barrier.wait();
 }
 
