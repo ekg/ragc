@@ -1390,11 +1390,11 @@ impl StreamingCompressor {
                         println!("DEBUG: Created group_id={} at segment {} (total unique groups={})", gid, total_segments, known_groups.len());
                     }
 
-                    // Add terminators
-                    if kmer_front != MISSING_KMER && kmer_back != MISSING_KMER {
-                        group_terminators.entry(kmer_front).or_default().push(kmer_back);
-                        if kmer_front != kmer_back {
-                            group_terminators.entry(kmer_back).or_default().push(kmer_front);
+                    // Add terminators (use NORMALIZED key values to match C++ AGC!)
+                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                        group_terminators.entry(key.kmer_front).or_default().push(key.kmer_back);
+                        if key.kmer_front != key.kmer_back {
+                            group_terminators.entry(key.kmer_back).or_default().push(key.kmer_front);
                         }
                     }
 
