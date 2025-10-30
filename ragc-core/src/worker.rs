@@ -10,6 +10,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
+/// Segment placement info for collection metadata
+///
+/// Matches C++ AGC's segment placement tracking (agc_compressor.cpp:974-1050)
+#[derive(Debug, Clone)]
+struct SegmentPlacement {
+    sample_name: String,
+    contig_name: String,
+    place: usize,           // Segment index within contig (seg_part_no)
+    group_id: u32,
+    in_group_id: u32,
+    is_rev_comp: bool,
+    raw_length: u32,        // Uncompressed segment length
+}
+
 /// Segment group manager matching C++ AGC's CSegment
 ///
 /// Manages a group of segments with the same (kmer1, kmer2) pair:
@@ -22,6 +36,7 @@ struct SegmentGroup {
     ref_stream_id: usize,    // Reference stream for first segment
     reference: Option<Contig>, // First segment (reference for LZ encoding)
     ref_written: bool,       // Whether reference has been written
+    in_group_counter: u32,   // Counter for in_group_id assignment
 }
 
 impl SegmentGroup {
@@ -32,6 +47,7 @@ impl SegmentGroup {
             ref_stream_id,
             reference: None,
             ref_written: false,
+            in_group_counter: 0,
         }
     }
 
@@ -53,15 +69,18 @@ impl SegmentGroup {
             archive.add_part(self.ref_stream_id, seg_data, 0)?;
             self.ref_written = true;
 
-            Ok(0) // in_group_id = 0 for reference
+            let in_group_id = self.in_group_counter;
+            self.in_group_counter += 1;
+            Ok(in_group_id) // in_group_id = 0 for reference
         } else {
             // Subsequent segment - delta encode against reference
             // TODO: Implement LZ encoding
             // For now, write uncompressed
             archive.add_part(self.stream_id, seg_data, 0)?;
 
-            // TODO: Track actual in_group_id
-            Ok(1)
+            let in_group_id = self.in_group_counter;
+            self.in_group_counter += 1;
+            Ok(in_group_id)
         }
     }
 }
@@ -135,10 +154,13 @@ pub struct SharedCompressorState {
     /// Lazily created when first segment arrives for that group
     pub v_segments: Arc<Mutex<Vec<Option<SegmentGroup>>>>,
 
+    /// Collection metadata for samples/contigs/segments
+    /// Matches C++ AGC's collection_desc
+    pub collection: Option<Arc<Mutex<ragc_common::CollectionV3>>>,
+
     // TODO: Add more shared state as needed:
     // - vv_fallback_minimizers: Mutex<Vec<Vec<Vec<u64>>>>
     // - vv_splitters: Mutex<Vec<Vec<u64>>>
-    // - collection_desc: Mutex<Collection>
 }
 
 impl SharedCompressorState {
@@ -167,6 +189,7 @@ impl SharedCompressorState {
             no_raw_groups,
             archive: None, // Set later when archive is created
             v_segments: Arc::new(Mutex::new(Vec::new())),
+            collection: None, // Set later when collection is created
         }
     }
 }
@@ -477,9 +500,8 @@ fn register_segments(shared: &Arc<SharedCompressorState>) {
 ///    - Write segment to archive
 /// 3. Batch collection metadata updates (every 32 segments)
 fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
-    // const MAX_BUFF_SIZE: usize = 32;
-    // TODO: Implement buffered placement tracking
-    // let mut buffered_placements: Vec<SegmentPlacement> = Vec::with_capacity(MAX_BUFF_SIZE);
+    const MAX_BUFF_SIZE: usize = 32;
+    let mut buffered_placements: Vec<SegmentPlacement> = Vec::with_capacity(MAX_BUFF_SIZE);
 
     let buffered = shared.buffered_segments.lock().unwrap();
 
@@ -500,7 +522,7 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
             }
 
             // Step 3: Process all segments in this group
-            while let Some((kmer1, kmer2, _sample_name, _contig_name, seg_data, _is_rev_comp, _seg_part_no)) = buffered.get_part(group_id) {
+            while let Some((kmer1, kmer2, sample_name, contig_name, seg_data, is_rev_comp, seg_part_no)) = buffered.get_part(group_id) {
                 // Step 4: Create SegmentGroup on first use (lazy initialization)
                 let mut v_segments = shared.v_segments.lock().unwrap();
                 if group_id >= 0 && (group_id as usize) < v_segments.len() && v_segments[group_id as usize].is_none() {
@@ -515,18 +537,49 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
                     }
                 }
 
-                // Get segment group
+                // Step 5: Write segment to archive and get in_group_id
+                let mut in_group_id = 0;
                 if group_id >= 0 && (group_id as usize) < v_segments.len() {
                     if let Some(segment_group) = &mut v_segments[group_id as usize] {
-                        // Step 5: Write segment to archive
                         if let Some(archive_mutex) = &shared.archive {
                             let mut archive = archive_mutex.lock().unwrap();
-                            let _in_group_id = segment_group.add_segment(&seg_data, &mut archive);
-                            // TODO: Track in_group_id for collection metadata
+                            if let Ok(id) = segment_group.add_segment(&seg_data, &mut archive) {
+                                in_group_id = id;
+                            }
                         }
                     }
                 }
                 drop(v_segments);
+
+                // Step 6: Buffer collection metadata
+                buffered_placements.push(SegmentPlacement {
+                    sample_name,
+                    contig_name,
+                    place: seg_part_no as usize,
+                    group_id: group_id as u32,
+                    in_group_id,
+                    is_rev_comp,
+                    raw_length: seg_data.len() as u32,
+                });
+
+                // Flush batch if full
+                if buffered_placements.len() >= MAX_BUFF_SIZE {
+                    if let Some(collection_mutex) = &shared.collection {
+                        let mut collection = collection_mutex.lock().unwrap();
+                        for placement in &buffered_placements {
+                            let _ = collection.add_segment_placed(
+                                &placement.sample_name,
+                                &placement.contig_name,
+                                placement.place,
+                                placement.group_id,
+                                placement.in_group_id,
+                                placement.is_rev_comp,
+                                placement.raw_length,
+                            );
+                        }
+                    }
+                    buffered_placements.clear();
+                }
 
                 // Step 6: Update map_segments (CRITICAL REGISTRATION!)
                 let key = (kmer1, kmer2);
@@ -566,21 +619,27 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
 
                     drop(terminators);
                 }
-
-                // Step 8: Buffer collection metadata
-                // TODO: buffered_placements.push(SegmentPlacement { ... });
-                // if buffered_placements.len() == MAX_BUFF_SIZE {
-                //     collection.add_segments_placed(&buffered_placements);
-                //     buffered_placements.clear();
-                // }
             }
         }
     }
 
-    // Step 9: Final flush
-    // TODO: if !buffered_placements.is_empty() {
-    //     collection.add_segments_placed(&buffered_placements);
-    // }
+    // Step 9: Final flush of remaining placements
+    if !buffered_placements.is_empty() {
+        if let Some(collection_mutex) = &shared.collection {
+            let mut collection = collection_mutex.lock().unwrap();
+            for placement in &buffered_placements {
+                let _ = collection.add_segment_placed(
+                    &placement.sample_name,
+                    &placement.contig_name,
+                    placement.place,
+                    placement.group_id,
+                    placement.in_group_id,
+                    placement.is_rev_comp,
+                    placement.raw_length,
+                );
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -645,6 +704,7 @@ pub fn compress_samples_streaming(
         no_raw_groups: 0,
         archive: None, // TODO: Set when archive is created
         v_segments: Arc::new(Mutex::new(Vec::new())),
+        collection: None, // TODO: Set when collection is created
     });
 
     // Step 4: Thread spawning (agc_compressor.cpp:2136-2141)
