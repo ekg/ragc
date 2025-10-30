@@ -180,6 +180,14 @@ pub struct SharedCompressorState {
     /// Matches C++ AGC's collection_desc
     pub collection: Option<Arc<Mutex<ragc_common::CollectionV3>>>,
 
+    /// Auxiliary queue for adaptive mode (re-enqueue hard contigs)
+    /// Matches C++ AGC's pq_contigs_desc_aux
+    pub aux_queue: Arc<BoundedPriorityQueue<Task>>,
+
+    /// Working queue pointer (switches between main and aux)
+    /// Matches C++ AGC's pq_contigs_desc_working
+    pub working_queue: Mutex<Arc<BoundedPriorityQueue<Task>>>,
+
     // TODO: Add more shared state as needed:
     // - vv_fallback_minimizers: Mutex<Vec<Vec<Vec<u64>>>>
     // - vv_splitters: Mutex<Vec<Vec<u64>>>
@@ -193,10 +201,14 @@ impl SharedCompressorState {
         adaptive_mode: bool,
         concatenated_genomes: bool,
         no_raw_groups: u32,
+        main_queue: Arc<BoundedPriorityQueue<Task>>,
     ) -> Self {
         // Create bloom filter sized for expected splitters
         // C++ AGC uses ~10K splitters, allocate 8 bits/item = 80K bits = 10KB
         let bloom_filter = crate::bloom_filter::BloomFilter::new(80 * 1024);
+
+        // Create auxiliary queue for adaptive mode (unlimited capacity)
+        let aux_queue = Arc::new(BoundedPriorityQueue::new(1, usize::MAX));
 
         SharedCompressorState {
             processed_bases: AtomicUsize::new(0),
@@ -219,6 +231,8 @@ impl SharedCompressorState {
             archive: None, // Set later when archive is created
             v_segments: Arc::new(Mutex::new(Vec::new())),
             collection: None, // Set later when collection is created
+            aux_queue,
+            working_queue: Mutex::new(main_queue), // Start with main queue
         }
     }
 }
@@ -251,7 +265,7 @@ impl SharedCompressorState {
 pub fn worker_thread(
     worker_id: usize,
     num_workers: usize,
-    queue: Arc<BoundedPriorityQueue<Task>>,
+    _queue: Arc<BoundedPriorityQueue<Task>>, // Legacy parameter, use shared.working_queue instead
     barrier: Arc<Barrier>,
     shared: Arc<SharedCompressorState>,
 ) {
@@ -260,7 +274,12 @@ pub fn worker_thread(
     // let mut zstd_decoder = ...;
 
     loop {
-        // Pop task from priority queue (agc_compressor.cpp:1108)
+        // Pop task from working queue (can switch between main and aux)
+        // Matches C++ AGC's pq_contigs_desc_working (agc_compressor.cpp:1108)
+        let queue = {
+            let working_queue_guard = shared.working_queue.lock().unwrap();
+            Arc::clone(&*working_queue_guard)
+        };
         let (result, task_opt) = queue.pop_large();
 
         match result {
@@ -522,28 +541,41 @@ fn handle_new_splitters_stage(
     }
 
     // Thread 0: Re-enqueue hard contigs and switch queues
-    // NOTE: We don't have aux_queue yet, so hard contigs won't be reprocessed
-    // This is a TODO for full adaptive mode support
+    // Matches C++ AGC lines 1216-1236
     if worker_id == 0 {
-        let raw_contigs = shared.raw_contigs.lock().unwrap();
+        let mut raw_contigs = shared.raw_contigs.lock().unwrap();
 
         if shared.verbosity > 0 && !raw_contigs.is_empty() {
-            eprintln!(
-                "Adaptive mode: {} hard contigs detected (reprocessing not yet implemented)",
-                raw_contigs.len()
+            eprintln!("Adaptive mode: Re-enqueueing {} hard contigs for reprocessing", raw_contigs.len());
+        }
+
+        // Re-enqueue hard contigs into aux_queue with HardContigs stage
+        // Priority = 1 (higher than normal contigs), cost = sequence length
+        for (sample_name, contig_name, sequence) in raw_contigs.drain(..) {
+            let cost = sequence.len();
+            shared.aux_queue.emplace(
+                Task::new_contig(sample_name, contig_name, sequence, ContigProcessingStage::HardContigs),
+                1, // priority
+                cost,
             );
         }
 
-        // TODO: Re-enqueue hard contigs for reprocessing with new splitters
-        // for (sample, contig, seq) in raw_contigs.iter():
-        //     aux_queue.emplace(Task::new_contig(sample, contig, seq, HardContigs), priority=1, cost=seq.len())
-        // raw_contigs.clear()
-
-        // TODO: Enqueue registration sync tokens for next round
-        // aux_queue.emplace_many_no_cost(Task::new_sync(Registration), priority=0, n_items=num_workers)
+        // Enqueue registration sync tokens for next round
+        // Priority = 0 (lowest), cost = 0
+        shared.aux_queue.emplace_many_no_cost(
+            Task::new_sync(ContigProcessingStage::Registration),
+            0, // priority
+            num_workers,
+        );
 
         // Switch working queue to aux queue
-        // TODO: working_queue = aux_queue
+        // Matches C++ AGC: pq_contigs_desc_working = pq_contigs_desc_aux
+        let mut working_queue = shared.working_queue.lock().unwrap();
+        *working_queue = Arc::clone(&shared.aux_queue);
+
+        if shared.verbosity > 1 {
+            eprintln!("Switched to auxiliary queue for hard contig reprocessing");
+        }
     }
 
     // Barrier 2: Ready to continue with new splitters
@@ -1033,9 +1065,6 @@ fn compress_samples_streaming_with_archive(
     let queue_capacity = std::cmp::max(2_u64 << 30, num_threads as u64 * (192_u64 << 20));
     let queue = Arc::new(BoundedPriorityQueue::new(1, queue_capacity as usize));
 
-    // TODO: Auxiliary queue for adaptive mode
-    // let aux_queue = Arc::new(BoundedPriorityQueue::new(1, usize::MAX));
-
     // Step 2: Worker thread count (agc_compressor.cpp:2134)
     let no_workers = if num_threads < 8 { num_threads } else { num_threads - 1 };
 
@@ -1054,6 +1083,9 @@ fn compress_samples_streaming_with_archive(
     for &kmer in &splitters {
         bloom_filter.insert(kmer);
     }
+
+    // Create auxiliary queue for adaptive mode
+    let aux_queue = Arc::new(BoundedPriorityQueue::new(1, usize::MAX));
 
     let shared = Arc::new(SharedCompressorState {
         processed_bases: AtomicUsize::new(0),
@@ -1076,6 +1108,8 @@ fn compress_samples_streaming_with_archive(
         archive,
         v_segments: Arc::new(Mutex::new(Vec::new())),
         collection,
+        aux_queue,
+        working_queue: Mutex::new(Arc::clone(&queue)), // Start with main queue
     });
 
     // Step 4: Thread spawning (agc_compressor.cpp:2136-2141)
