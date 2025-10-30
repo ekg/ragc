@@ -123,8 +123,7 @@ pub struct SharedCompressorState {
 
     /// Bloom filter for splitters (fast probabilistic check)
     /// Matches C++ AGC's bloom_splitters
-    /// TODO: Replace () with actual bloom filter implementation
-    pub bloom_splitters: Arc<Mutex<()>>,
+    pub bloom_splitters: Arc<Mutex<crate::bloom_filter::BloomFilter>>,
 
     /// Per-thread vectors for accumulating new splitters (adaptive mode)
     /// Matches C++ AGC's vv_splitters (agc_compressor.h:721)
@@ -195,6 +194,10 @@ impl SharedCompressorState {
         concatenated_genomes: bool,
         no_raw_groups: u32,
     ) -> Self {
+        // Create bloom filter sized for expected splitters
+        // C++ AGC uses ~10K splitters, allocate 8 bits/item = 80K bits = 10KB
+        let bloom_filter = crate::bloom_filter::BloomFilter::new(80 * 1024);
+
         SharedCompressorState {
             processed_bases: AtomicUsize::new(0),
             processed_samples: AtomicUsize::new(0),
@@ -202,7 +205,7 @@ impl SharedCompressorState {
             verbosity,
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(no_raw_groups as usize))),
             splitters: Arc::new(Mutex::new(HashSet::new())),
-            bloom_splitters: Arc::new(Mutex::new(())),
+            bloom_splitters: Arc::new(Mutex::new(bloom_filter)),
             vv_splitters: Mutex::new(Vec::new()),
             v_candidate_kmers: Vec::new(),
             v_duplicated_kmers: Vec::new(),
@@ -478,6 +481,7 @@ fn handle_new_splitters_stage(
     // Single-threaded: Only thread 0 does the merge
     if num_workers > 1 || worker_id == 0 {
         let mut splitters = shared.splitters.lock().unwrap();
+        let mut bloom = shared.bloom_splitters.lock().unwrap();
         let mut vv_splitters = shared.vv_splitters.lock().unwrap();
 
         let mut total_new = 0;
@@ -485,7 +489,7 @@ fn handle_new_splitters_stage(
             total_new += thread_splitters.len();
             for &kmer in thread_splitters.iter() {
                 splitters.insert(kmer);
-                // TODO: bloom_splitters.insert(kmer);
+                bloom.insert(kmer);
             }
             thread_splitters.clear();
         }
@@ -495,11 +499,26 @@ fn handle_new_splitters_stage(
             eprintln!("Total splitters: {}", splitters.len());
         }
 
-        // TODO: Check bloom filter filling factor and resize if > 0.3
-        // if bloom_filling_factor > 0.3 {
-        //     resize bloom filter
-        //     rebuild from hs_splitters
-        // }
+        // Check bloom filter filling factor and resize if > 0.3 (matches C++ AGC)
+        let filling_factor = bloom.filling_factor();
+        if filling_factor > 0.3 {
+            if shared.verbosity > 1 {
+                eprintln!("Bloom filter filling factor {:.2}, resizing...", filling_factor);
+            }
+
+            // Resize to accommodate current + expected growth
+            let new_size_bits = (splitters.len() as f64 / 0.25) as usize * 8; // 25% target fill
+            bloom.resize(new_size_bits);
+
+            // Re-insert all splitters
+            for &kmer in splitters.iter() {
+                bloom.insert(kmer);
+            }
+
+            if shared.verbosity > 1 {
+                eprintln!("Bloom filter resized to {} bits", new_size_bits);
+            }
+        }
     }
 
     // Thread 0: Re-enqueue hard contigs and switch queues
@@ -1028,6 +1047,14 @@ fn compress_samples_streaming_with_archive(
     v_duplicated_kmers.sort_unstable();
 
     // Step 3: Shared state initialization
+    // Initialize bloom filter and populate with base splitters
+    let mut bloom_filter = crate::bloom_filter::BloomFilter::new(
+        splitters.len() * 8  // 8 bits per splitter
+    );
+    for &kmer in &splitters {
+        bloom_filter.insert(kmer);
+    }
+
     let shared = Arc::new(SharedCompressorState {
         processed_bases: AtomicUsize::new(0),
         processed_samples: AtomicUsize::new(0),
@@ -1035,7 +1062,7 @@ fn compress_samples_streaming_with_archive(
         verbosity,
         buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
         splitters: Arc::new(Mutex::new(splitters)),
-        bloom_splitters: Arc::new(Mutex::new(())),
+        bloom_splitters: Arc::new(Mutex::new(bloom_filter)),
         vv_splitters: Mutex::new(vec![Vec::new(); no_workers]),
         v_candidate_kmers,
         v_duplicated_kmers,

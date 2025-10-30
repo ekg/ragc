@@ -30,7 +30,7 @@ pub struct SegmentPart {
 /// Shared state for compression (passed from worker threads)
 pub struct CompressionContext {
     pub splitters: Arc<Mutex<std::collections::HashSet<u64>>>,
-    pub bloom_splitters: Arc<Mutex<()>>, // TODO: Actual bloom filter
+    pub bloom_splitters: Arc<Mutex<crate::bloom_filter::BloomFilter>>,
     pub buffered_segments: Arc<Mutex<BufferedSegments>>,
     pub kmer_length: usize,
     pub adaptive_mode: bool,
@@ -307,8 +307,14 @@ fn add_segment(
 /// 1. Bloom filter (fast, probabilistic)
 /// 2. Hash set (exact)
 fn is_splitter(kmer: u64, ctx: &CompressionContext) -> bool {
-    // TODO: Implement bloom filter check
-    // For now, just check hash set
+    // Fast check: bloom filter (may have false positives)
+    let bloom = ctx.bloom_splitters.lock().unwrap();
+    if !bloom.check(kmer) {
+        return false; // Definitely not a splitter
+    }
+    drop(bloom); // Release lock before next check
+
+    // Exact check: hash set (no false positives)
     let splitters = ctx.splitters.lock().unwrap();
     splitters.contains(&kmer)
 }
@@ -441,7 +447,7 @@ mod tests {
 
         let ctx = CompressionContext {
             splitters: Arc::new(Mutex::new(HashSet::new())),
-            bloom_splitters: Arc::new(Mutex::new(())),
+            bloom_splitters: Arc::new(Mutex::new(crate::bloom_filter::BloomFilter::new(1024))),
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
             kmer_length: 21,
             adaptive_mode: false,
@@ -469,7 +475,7 @@ mod tests {
 
         let ctx = CompressionContext {
             splitters: Arc::new(Mutex::new(HashSet::new())),
-            bloom_splitters: Arc::new(Mutex::new(())),
+            bloom_splitters: Arc::new(Mutex::new(crate::bloom_filter::BloomFilter::new(1024))),
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
             kmer_length: 21,
             adaptive_mode: true, // Adaptive mode enabled

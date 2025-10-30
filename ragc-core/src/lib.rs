@@ -111,6 +111,7 @@
 //! - Format version 3.0 support
 //! - SHA256-verified roundtrip testing
 
+pub mod bloom_filter;
 pub mod compressor;
 pub mod compressor_streaming;
 pub mod contig_compression;
