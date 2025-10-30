@@ -5,9 +5,66 @@ use crate::contig_compression::{compress_contig, CompressionContext};
 use crate::priority_queue::{BoundedPriorityQueue, PopResult};
 use crate::segment_buffer::BufferedSegments;
 use crate::task::{ContigProcessingStage, Task};
+use ragc_common::{Archive, Contig};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
+
+/// Segment group manager matching C++ AGC's CSegment
+///
+/// Manages a group of segments with the same (kmer1, kmer2) pair:
+/// - Stores reference segment (first in group)
+/// - Buffers subsequent delta segments
+/// - Writes to archive streams
+struct SegmentGroup {
+    group_id: u32,
+    stream_id: usize,        // Delta stream for packed segments
+    ref_stream_id: usize,    // Reference stream for first segment
+    reference: Option<Contig>, // First segment (reference for LZ encoding)
+    ref_written: bool,       // Whether reference has been written
+}
+
+impl SegmentGroup {
+    fn new(group_id: u32, stream_id: usize, ref_stream_id: usize) -> Self {
+        SegmentGroup {
+            group_id,
+            stream_id,
+            ref_stream_id,
+            reference: None,
+            ref_written: false,
+        }
+    }
+
+    /// Add a segment to this group
+    ///
+    /// The first segment becomes the reference, subsequent segments are delta-encoded.
+    /// Returns in_group_id (0 for reference, 1+ for delta segments)
+    fn add_segment(
+        &mut self,
+        seg_data: &[u8],
+        archive: &mut Archive,
+    ) -> anyhow::Result<u32> {
+        if self.reference.is_none() {
+            // First segment - store as reference
+            self.reference = Some(seg_data.to_vec());
+
+            // Write reference to archive (uncompressed)
+            // TODO: Add ZSTD compression
+            archive.add_part(self.ref_stream_id, seg_data, 0)?;
+            self.ref_written = true;
+
+            Ok(0) // in_group_id = 0 for reference
+        } else {
+            // Subsequent segment - delta encode against reference
+            // TODO: Implement LZ encoding
+            // For now, write uncompressed
+            archive.add_part(self.stream_id, seg_data, 0)?;
+
+            // TODO: Track actual in_group_id
+            Ok(1)
+        }
+    }
+}
 
 /// Shared state accessible to all worker threads
 ///
@@ -69,12 +126,19 @@ pub struct SharedCompressorState {
     /// Matches C++ AGC's no_raw_groups
     pub no_raw_groups: u32,
 
+    /// Archive writer for segment output
+    /// Matches C++ AGC's out_archive
+    pub archive: Option<Arc<Mutex<Archive>>>,
+
+    /// Segment groups indexed by group_id
+    /// Matches C++ AGC's v_segments (vector<CSegment*>)
+    /// Lazily created when first segment arrives for that group
+    pub v_segments: Arc<Mutex<Vec<Option<SegmentGroup>>>>,
+
     // TODO: Add more shared state as needed:
     // - vv_fallback_minimizers: Mutex<Vec<Vec<Vec<u64>>>>
     // - vv_splitters: Mutex<Vec<Vec<u64>>>
-    // - out_archive: Mutex<ArchiveWriter>
     // - collection_desc: Mutex<Collection>
-    // - v_segments: Mutex<Vec<Option<Arc<Segment>>>>
 }
 
 impl SharedCompressorState {
@@ -101,6 +165,8 @@ impl SharedCompressorState {
             concatenated_genomes,
             no_segments: Arc::new(Mutex::new(0)),
             no_raw_groups,
+            archive: None, // Set later when archive is created
+            v_segments: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -360,25 +426,29 @@ fn register_segments(shared: &Arc<SharedCompressorState>) {
 
     if no_new > 0 {
         // Step 3: Register archive streams for new groups
-        // TODO: Call out_archive->RegisterStreams() for each new group
-        // For now, just update the segment counter
-
         let mut no_segments = shared.no_segments.lock().unwrap();
         let current_no_segments = *no_segments;
 
-        // Register streams: for i in 0..no_new:
-        //   out_archive.register_streams(
-        //     format!("seg-{}", current_no_segments + i),
-        //     format!("seg-{}", current_no_segments + i)
-        //   )
+        if let Some(archive_mutex) = &shared.archive {
+            let mut archive = archive_mutex.lock().unwrap();
+
+            // Register streams for each new group
+            // Each group gets two streams: "seg-N" (delta) and "seg_dN" (reference)
+            for i in 0..no_new {
+                let seg_num = current_no_segments + i;
+                // Use AGC v3 format (version 3000)
+                archive.register_stream(&ragc_common::stream_delta_name(3000, seg_num));
+                archive.register_stream(&ragc_common::stream_ref_name(3000, seg_num));
+            }
+        }
 
         *no_segments += no_new;
         drop(no_segments);
 
-        // Step 4: Resize v_segments vector
-        // TODO: Resize v_segments to accommodate new groups
-        // let no_segments_value = *shared.no_segments.lock().unwrap();
-        // shared.v_segments.lock().unwrap().resize(no_segments_value, None);
+        // Step 4: Resize v_segments vector to accommodate new groups
+        let no_segments_value = *shared.no_segments.lock().unwrap();
+        let mut v_segments = shared.v_segments.lock().unwrap();
+        v_segments.resize_with(no_segments_value as usize, || None);
     }
 
     // Step 5: Distribute raw group segments (if applicable)
@@ -430,15 +500,35 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
             }
 
             // Step 3: Process all segments in this group
-            while let Some((kmer1, kmer2, _sample_name, _contig_name, _seg_data, _is_rev_comp, _seg_part_no)) = buffered.get_part(group_id) {
-                // Step 4: Create CSegment on first use (lazy initialization)
-                // TODO: Create v_segments[group_id] if None
-                // let mut v_segments = shared.v_segments.lock().unwrap();
-                // if v_segments[group_id].is_none() {
-                //     v_segments[group_id] = Some(Arc::new(Mutex::new(Segment::new(...))));
-                // }
+            while let Some((kmer1, kmer2, _sample_name, _contig_name, seg_data, _is_rev_comp, _seg_part_no)) = buffered.get_part(group_id) {
+                // Step 4: Create SegmentGroup on first use (lazy initialization)
+                let mut v_segments = shared.v_segments.lock().unwrap();
+                if group_id >= 0 && (group_id as usize) < v_segments.len() && v_segments[group_id as usize].is_none() {
+                    // Get stream IDs for this group
+                    if let Some(archive_mutex) = &shared.archive {
+                        let archive = archive_mutex.lock().unwrap();
+                        let stream_id = archive.get_stream_id(&ragc_common::stream_delta_name(3000, group_id as u32)).unwrap_or(0);
+                        let ref_stream_id = archive.get_stream_id(&ragc_common::stream_ref_name(3000, group_id as u32)).unwrap_or(0);
+                        drop(archive);
 
-                // Step 5: Update map_segments (CRITICAL REGISTRATION!)
+                        v_segments[group_id as usize] = Some(SegmentGroup::new(group_id as u32, stream_id, ref_stream_id));
+                    }
+                }
+
+                // Get segment group
+                if group_id >= 0 && (group_id as usize) < v_segments.len() {
+                    if let Some(segment_group) = &mut v_segments[group_id as usize] {
+                        // Step 5: Write segment to archive
+                        if let Some(archive_mutex) = &shared.archive {
+                            let mut archive = archive_mutex.lock().unwrap();
+                            let _in_group_id = segment_group.add_segment(&seg_data, &mut archive);
+                            // TODO: Track in_group_id for collection metadata
+                        }
+                    }
+                }
+                drop(v_segments);
+
+                // Step 6: Update map_segments (CRITICAL REGISTRATION!)
                 let key = (kmer1, kmer2);
                 let mut map_segments = shared.map_segments.lock().unwrap();
                 map_segments
@@ -452,7 +542,7 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
                     .or_insert(group_id as u32);
                 drop(map_segments);
 
-                // Step 6: Update map_segments_terminators (CRITICAL!)
+                // Step 7: Update map_segments_terminators (CRITICAL!)
                 if kmer1 != crate::contig_compression::MISSING_KMER
                     && kmer2 != crate::contig_compression::MISSING_KMER
                 {
@@ -477,14 +567,6 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
                     drop(terminators);
                 }
 
-                // Step 7: Write segment to archive
-                // TODO: segment.add() or segment.add_raw()
-                // let in_group_id = if group_id < shared.no_raw_groups as i32 {
-                //     segment.add_raw(&part.seg_data)
-                // } else {
-                //     segment.add(&part.seg_data)
-                // };
-
                 // Step 8: Buffer collection metadata
                 // TODO: buffered_placements.push(SegmentPlacement { ... });
                 // if buffered_placements.len() == MAX_BUFF_SIZE {
@@ -496,7 +578,7 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
     }
 
     // Step 9: Final flush
-    // if !buffered_placements.is_empty() {
+    // TODO: if !buffered_placements.is_empty() {
     //     collection.add_segments_placed(&buffered_placements);
     // }
 }
@@ -561,6 +643,8 @@ pub fn compress_samples_streaming(
         concatenated_genomes,
         no_segments: Arc::new(Mutex::new(0)),
         no_raw_groups: 0,
+        archive: None, // TODO: Set when archive is created
+        v_segments: Arc::new(Mutex::new(Vec::new())),
     });
 
     // Step 4: Thread spawning (agc_compressor.cpp:2136-2141)
