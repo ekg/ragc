@@ -83,10 +83,12 @@ pub fn split_at_splitters_with_size(
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
     let mut segment_start = 0;
     let mut front_kmer = MISSING_KMER;
+    let mut front_kmer_is_dir = false;
 
     // Track recent k-mers for end-of-contig handling
     // C++ AGC doesn't limit this - it accumulates all k-mers since last split
-    let mut recent_kmers: Vec<(usize, u64)> = Vec::new(); // (position, kmer_value)
+    // Store (position, kmer_value, is_dir_oriented) to match C++ AGC's orientation logic
+    let mut recent_kmers: Vec<(usize, u64, bool)> = Vec::new();
 
     for (pos, &base) in contig.iter().enumerate() {
         if base > 3 {
@@ -98,7 +100,8 @@ pub fn split_at_splitters_with_size(
 
             if kmer.is_full() {
                 let kmer_value = kmer.data();
-                recent_kmers.push((pos, kmer_value));
+                let is_dir = kmer.is_dir_oriented();
+                recent_kmers.push((pos, kmer_value, is_dir));
 
                 // CRITICAL FIX: C++ AGC splits at EVERY splitter occurrence!
                 // The distance check (current_len >= min_segment_size) only happens
@@ -110,7 +113,21 @@ pub fn split_at_splitters_with_size(
                     let segment_data = contig[segment_start..segment_end].to_vec();
 
                     if !segment_data.is_empty() {
-                        segments.push(Segment::new(segment_data, front_kmer, kmer_value));
+                        // Apply C++ AGC's orientation logic for segments with one MISSING k-mer
+                        let (seg_front, seg_back) = if front_kmer == MISSING_KMER {
+                            // First segment of contig - only back k-mer present
+                            // C++ AGC swaps the k-mer (swap_dir_rc) before checking orientation (lines 1341-1365)
+                            // So we invert the orientation check: if dir → (MISSING, kmer), else → (kmer, MISSING)
+                            if is_dir {
+                                (MISSING_KMER, kmer_value)
+                            } else {
+                                (kmer_value, MISSING_KMER)
+                            }
+                        } else {
+                            // Normal case: both k-mers present
+                            (front_kmer, kmer_value)
+                        };
+                        segments.push(Segment::new(segment_data, seg_front, seg_back));
                     }
 
                     // Reset for next segment
@@ -119,6 +136,7 @@ pub fn split_at_splitters_with_size(
                     // Next segment should start at pos-k+1 to create k-base overlap
                     segment_start = (pos + 1).saturating_sub(k);
                     front_kmer = kmer_value;
+                    front_kmer_is_dir = is_dir;
                     recent_kmers.clear();
                     kmer.reset();
                 }
@@ -129,7 +147,7 @@ pub fn split_at_splitters_with_size(
     // At end of contig, look backward through recent k-mers to find rightmost splitter
     // CRITICAL: Only split if the remaining data after the splitter will be >= k bytes
     // This ensures C++ AGC can skip k overlap bytes without hitting corruption
-    for (pos, kmer_value) in recent_kmers.iter().rev() {
+    for (pos, kmer_value, is_dir) in recent_kmers.iter().rev() {
         if splitters.contains(kmer_value) {
             let segment_end = pos + 1;
             let remaining_after = contig.len() - segment_end;
@@ -145,6 +163,7 @@ pub fn split_at_splitters_with_size(
                         // Create k-base overlap for next segment
                         segment_start = (pos + 1).saturating_sub(k);
                         front_kmer = *kmer_value;
+                        front_kmer_is_dir = *is_dir;
                     }
                 }
                 break;
@@ -172,7 +191,19 @@ pub fn split_at_splitters_with_size(
     if segment_start < contig.len() {
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
-            segments.push(Segment::new(segment_data, front_kmer, MISSING_KMER));
+            // Match C++ AGC's orientation logic for segments with one MISSING k-mer
+            // (agc_compressor.cpp lines 1649-1657)
+            let (final_front, final_back) = if front_kmer == MISSING_KMER {
+                // No front k-mer at all
+                (MISSING_KMER, MISSING_KMER)
+            } else if front_kmer_is_dir {
+                // K-mer is dir-oriented: keep as (kmer, MISSING)
+                (front_kmer, MISSING_KMER)
+            } else {
+                // K-mer is NOT dir-oriented: swap to (MISSING, kmer)
+                (MISSING_KMER, front_kmer)
+            };
+            segments.push(Segment::new(segment_data, final_front, final_back));
         }
     }
 
