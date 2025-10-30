@@ -60,6 +60,11 @@ enum Commands {
         #[arg(short = 'a', long)]
         adaptive: bool,
 
+        /// Concatenated genomes mode: treat all input as one continuous sample
+        /// Disables split detection. Useful for pangenomes viewed as concatenated sequences.
+        #[arg(long)]
+        concatenated: bool,
+
         /// Number of threads for parallel compression (default: auto-detect)
         /// Set to 1 for single-threaded compression
         #[arg(short = 't', long)]
@@ -163,6 +168,7 @@ fn main() -> Result<()> {
             compression_level,
             verbosity,
             adaptive,
+            concatenated,
             threads,
         } => create_archive(
             output,
@@ -173,6 +179,7 @@ fn main() -> Result<()> {
             compression_level,
             verbosity,
             adaptive,
+            concatenated,
             threads,
         )?,
 
@@ -211,6 +218,7 @@ fn create_archive(
     compression_level: i32,
     verbosity: u32,
     adaptive: bool,
+    concatenated: bool,
     threads: Option<usize>,
 ) -> Result<()> {
     // Determine thread count (use provided or auto-detect)
@@ -235,6 +243,9 @@ fn create_archive(
         if adaptive {
             eprintln!("  adaptive mode: enabled (pangenome-aware splitters)");
         }
+        if concatenated {
+            eprintln!("  concatenated mode: enabled (all contigs as one sample)");
+        }
         eprintln!();
     }
 
@@ -246,6 +257,7 @@ fn create_archive(
         compression_level,
         verbosity,
         adaptive_mode: adaptive,
+        concatenated_genomes: concatenated,
         num_threads,
         ..StreamingCompressorConfig::default()
     };

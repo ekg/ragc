@@ -53,6 +53,8 @@ pub struct StreamingCompressorConfig {
     pub num_threads: usize,
     /// Adaptive mode: find new splitters for samples that can't be segmented well (matches C++ AGC -a flag)
     pub adaptive_mode: bool,
+    /// Concatenated genomes mode: treat all contigs as one continuous sample (disables split detection)
+    pub concatenated_genomes: bool,
 }
 
 impl Default for StreamingCompressorConfig {
@@ -74,6 +76,7 @@ impl Default for StreamingCompressorConfig {
             periodic_flush_interval: 0, // Not needed with immediate flushing
             num_threads,
             adaptive_mode: false, // Default matches C++ AGC (adaptive mode off)
+            concatenated_genomes: false, // Default: normal mode (split detection enabled)
         }
     }
 }
@@ -1408,6 +1411,7 @@ impl StreamingCompressor {
             if !groups.contains_key(&key)
                 && key.kmer_front != MISSING_KMER
                 && key.kmer_back != MISSING_KMER
+                && !self.config.concatenated_genomes  // Disable split detection in concatenated mode
             {
                 // Check if both k-mers are terminators (have existing groups)
                 if let (Some(front_terms), Some(back_terms)) = (

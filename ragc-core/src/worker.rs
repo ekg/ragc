@@ -1091,9 +1091,29 @@ fn compress_samples_streaming_with_archive(
         // Read contigs from file
         while let Ok(Some((contig_name, sequence))) = gio.read_contig_raw() {
             if concatenated_genomes {
-                // TODO: Register with empty sample name
-                // TODO: Implement concatenated mode logic
-                eprintln!("Concatenated genomes mode not yet implemented");
+                // Concatenated mode: treat all contigs as one sample (empty name)
+                // Matches C++ AGC behavior: all genomes concatenated into single sample
+                let concat_sample_name = String::from("");
+
+                // Register contig with empty sample name
+                if let Some(collection_mutex) = &shared.collection {
+                    let mut collection = collection_mutex.lock().unwrap();
+                    let _ = collection.register_sample_contig(&concat_sample_name, &contig_name);
+                }
+
+                let cost = sequence.len();
+                queue.emplace(
+                    Task::new_contig(
+                        concat_sample_name,
+                        contig_name.clone(),
+                        sequence,
+                        ContigProcessingStage::AllContigs,
+                    ),
+                    sample_priority,
+                    cost,
+                );
+
+                any_contigs_added = true;
             } else {
                 // Normal mode: one sample per file
                 // Register sample/contig with collection
