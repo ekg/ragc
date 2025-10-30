@@ -1390,6 +1390,11 @@ impl StreamingCompressor {
                         println!("DEBUG: Created group_id={} at segment {} (total unique groups={})", gid, total_segments, known_groups.len());
                     }
 
+                    // Optional debug logging for compatibility testing
+                    if std::env::var("RAGC_DEBUG_KMER_PAIRS").is_ok() {
+                        eprintln!("GROUP_KMER: group_id={} front={} back={}", gid, key.kmer_front, key.kmer_back);
+                    }
+
                     // Add terminators (use NORMALIZED key values to match C++ AGC!)
                     if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
                         group_terminators.entry(key.kmer_front).or_default().push(key.kmer_back);
