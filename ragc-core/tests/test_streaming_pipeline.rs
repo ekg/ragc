@@ -53,13 +53,15 @@ fn test_yeast3_streaming_compression() {
     println!("Step 1: Determining splitters from reference sample...");
 
     let reference_path = Path::new(&sample_files[0].1);
-    let (splitters, _, _) = determine_splitters_streaming(
+    let (splitters, candidates, duplicates) = determine_splitters_streaming(
         reference_path,
         kmer_length,
         segment_size as usize,
     ).expect("Failed to determine splitters");
 
     println!("  Found {} splitters", splitters.len());
+    println!("  Found {} candidate k-mers", candidates.len());
+    println!("  Found {} duplicated k-mers", duplicates.len());
 
     // Step 2: Compress all samples
     println!("Step 2: Compressing {} samples...", sample_files.len());
@@ -68,6 +70,8 @@ fn test_yeast3_streaming_compression() {
         output_path,
         sample_files.clone(),
         splitters,
+        candidates,
+        duplicates,
         kmer_length,
         segment_size,
         num_threads,
@@ -75,6 +79,7 @@ fn test_yeast3_streaming_compression() {
         concatenated_genomes,
         verbosity,
     );
+
 
     assert!(result.is_ok(), "Compression failed: {:?}", result.err());
     println!("  ✓ Compression successful");

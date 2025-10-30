@@ -126,6 +126,21 @@ pub struct SharedCompressorState {
     /// TODO: Replace () with actual bloom filter implementation
     pub bloom_splitters: Arc<Mutex<()>>,
 
+    /// Per-thread vectors for accumulating new splitters (adaptive mode)
+    /// Matches C++ AGC's vv_splitters (agc_compressor.h:721)
+    /// Each worker thread accumulates splitters, then merges at barrier
+    pub vv_splitters: Mutex<Vec<Vec<u64>>>,
+
+    /// Reference genome singleton k-mers (for adaptive mode exclusion)
+    /// Matches C++ AGC's v_candidate_kmers (agc_compressor.h:708)
+    /// Sorted for efficient set_difference operations
+    pub v_candidate_kmers: Vec<u64>,
+
+    /// Reference genome duplicated k-mers (for adaptive mode exclusion)
+    /// Matches C++ AGC's v_duplicated_kmers (agc_compressor.h:710)
+    /// Sorted for efficient set_difference operations
+    pub v_duplicated_kmers: Vec<u64>,
+
     /// K-mer length for segmentation
     pub kmer_length: usize,
 
@@ -188,6 +203,9 @@ impl SharedCompressorState {
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(no_raw_groups as usize))),
             splitters: Arc::new(Mutex::new(HashSet::new())),
             bloom_splitters: Arc::new(Mutex::new(())),
+            vv_splitters: Mutex::new(Vec::new()),
+            v_candidate_kmers: Vec::new(),
+            v_duplicated_kmers: Vec::new(),
             kmer_length,
             adaptive_mode,
             map_segments: Arc::new(Mutex::new(HashMap::new())),
@@ -675,6 +693,8 @@ pub fn create_agc_archive(
     output_path: &str,
     sample_files: Vec<(String, String)>,
     splitters: HashSet<u64>,
+    candidate_kmers: HashSet<u64>,
+    duplicated_kmers: HashSet<u64>,
     kmer_length: usize,
     segment_size: u32,
     num_threads: usize,
@@ -764,6 +784,8 @@ pub fn create_agc_archive(
     compress_samples_streaming_with_archive(
         sample_files,
         splitters,
+        candidate_kmers,
+        duplicated_kmers,
         kmer_length,
         num_threads,
         adaptive_mode,
@@ -826,6 +848,8 @@ pub fn create_agc_archive(
 fn compress_samples_streaming_with_archive(
     sample_files: Vec<(String, String)>,
     splitters: HashSet<u64>,
+    candidate_kmers: HashSet<u64>,
+    duplicated_kmers: HashSet<u64>,
     kmer_length: usize,
     num_threads: usize,
     adaptive_mode: bool,
@@ -850,6 +874,13 @@ fn compress_samples_streaming_with_archive(
     // Step 2: Worker thread count (agc_compressor.cpp:2134)
     let no_workers = if num_threads < 8 { num_threads } else { num_threads - 1 };
 
+    // Convert reference k-mers to sorted vectors (for set_difference in adaptive mode)
+    let mut v_candidate_kmers: Vec<u64> = candidate_kmers.into_iter().collect();
+    v_candidate_kmers.sort_unstable();
+
+    let mut v_duplicated_kmers: Vec<u64> = duplicated_kmers.into_iter().collect();
+    v_duplicated_kmers.sort_unstable();
+
     // Step 3: Shared state initialization
     let shared = Arc::new(SharedCompressorState {
         processed_bases: AtomicUsize::new(0),
@@ -859,6 +890,9 @@ fn compress_samples_streaming_with_archive(
         buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
         splitters: Arc::new(Mutex::new(splitters)),
         bloom_splitters: Arc::new(Mutex::new(())),
+        vv_splitters: Mutex::new(vec![Vec::new(); no_workers]),
+        v_candidate_kmers,
+        v_duplicated_kmers,
         kmer_length,
         adaptive_mode,
         map_segments: Arc::new(Mutex::new(HashMap::new())),
