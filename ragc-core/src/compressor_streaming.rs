@@ -15,6 +15,7 @@ use crate::{
     genome_io::GenomeIO,
     kmer::{reverse_complement, Kmer, KmerMode},
     lz_diff::LZDiff,
+    priority_queue::{BoundedPriorityQueue, PopResult},
     segment::{split_at_splitters_with_size, MISSING_KMER},
     segment_compression::{compress_reference_segment, compress_segment_configured},
     splitters::determine_splitters,

@@ -83,7 +83,29 @@ Iterator → Queue ──┼─> Worker 2 (local ZSTD ctx) ─┼─> Writer Thr
 ---
 
 ### Phase 2: Worker Thread Architecture
-**Status**: 🔄 In Progress
+**Status**: 🔄 In Progress (Study Complete, Ready to Implement)
+
+**Study**: ✅ COMPLETE
+
+**ROOT CAUSE IDENTIFIED**:
+Current RAGC has TWO code paths, BOTH with single-threaded segmentation:
+
+1. **add_multi_sample_fasta_with_splitters** (line 538):
+   - Phase 1: Single-threaded segmentation → `all_segments` Vec
+   - Phase 2: Single-threaded grouping → `groups` HashMap
+   - Phase 3: Rayon par_iter (parallel group processing)
+   - **Problem**: Only Phase 3 is parallel, segmentation is sequential!
+
+2. **add_fasta_files_with_splitters** (line 1120) → **add_segments_with_inline_splits** (line 1212):
+   - 100% sequential processing in one big loop
+   - No parallelism at all!
+   - **Problem**: Completely sequential!
+
+**Why CPU is 102% not 231%**:
+- Segmentation is CPU-intensive (splitting, k-mer extraction)
+- All segmentation runs on ONE thread
+- Rayon par_iter only processes groups (quick compression)
+- Most work done before parallelism kicks in
 
 **Study**: ✅ COMPLETE
 - [x] Analyzed C++ AGC worker loop (agc_compressor.cpp:1108-1275)
@@ -126,9 +148,26 @@ while (true) {
 - Need: Workers process contigs (segment → group → compress)
 - Skip: Barriers (RAGC processes incrementally, not in batches)
 
-**Implementation**:
-- [ ] Create `ContigTask` type (matches C++ `task_t`)
-- [ ] Create `SegmentWorker` struct
+**Solution**:
+Replace single-threaded segmentation with C++ AGC-style workers:
+```
+Main Thread                    Worker Threads (N)
+─────────────                  ─────────────────
+Iterator → Queue ──┐          ┌→ Worker 1: pull → segment → send
+  (stream)         ├─────────►├→ Worker 2: pull → segment → send
+  [priority]       │          ├→ Worker 3: pull → segment → send
+                   └──────────┘→ Worker N: pull → segment → send
+                                        ↓
+                                   Writer Thread
+```
+
+**Implementation Plan**:
+- [x] ContigTask type already exists (line 147)
+- [x] BoundedPriorityQueue imported
+- [ ] Create worker function: `process_contigs_worker()`
+- [ ] Spawn N worker threads
+- [ ] Main thread streams contigs into queue
+- [ ] Workers pull, segment, send to writer
   - Thread-local ZSTD contexts
   - Access to shared state (groups, terminators)
 - [ ] Implement worker loop:
