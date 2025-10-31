@@ -3,7 +3,7 @@
 
 use crate::{
     genome_io::GenomeWriter, kmer::reverse_complement, lz_diff::LZDiff,
-    segment_compression::decompress_segment,
+    segment_compression::{decompress_segment, decompress_segment_with_marker},
 };
 use anyhow::{anyhow, Context, Result};
 use ragc_common::{
@@ -414,8 +414,8 @@ impl Decompressor {
                     if ref_data.is_empty() {
                         anyhow::bail!("Empty compressed reference data");
                     }
-                    let _marker = ref_data.pop().unwrap();
-                    decompress_segment(&ref_data)?
+                    let marker = ref_data.pop().unwrap();
+                    decompress_segment_with_marker(&ref_data, marker)?
                 };
 
                 // Check if data is in 2-bit packed format (C++ AGC compatibility)
@@ -505,8 +505,8 @@ impl Decompressor {
                 if delta_data.is_empty() {
                     anyhow::bail!("Empty compressed delta data");
                 }
-                let _marker = delta_data.pop().unwrap();
-                decompress_segment(&delta_data)?
+                let marker = delta_data.pop().unwrap();
+                decompress_segment_with_marker(&delta_data, marker)?
             };
 
             // Unpack the specific LZ-encoded segment
@@ -561,8 +561,8 @@ impl Decompressor {
                 if data.is_empty() {
                     anyhow::bail!("Empty compressed data");
                 }
-                let _marker = data.pop().unwrap();
-                decompress_segment(&data)?
+                let marker = data.pop().unwrap();
+                decompress_segment_with_marker(&data, marker)?
             };
 
             // Unpack the raw segment
