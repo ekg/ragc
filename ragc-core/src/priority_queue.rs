@@ -105,6 +105,9 @@ struct QueueState<T> {
 ///         (PopResult::Completed, None) => {
 ///             break;  // All done
 ///         }
+///         _ => {
+///             // Handle other cases
+///         }
 ///     }
 /// }
 /// ```
