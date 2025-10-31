@@ -64,6 +64,7 @@ fn main() -> Result<()> {
             compression_level: 11,
             verbosity: 2, // Verbose output
             group_flush_threshold: 0,
+            concatenated_genomes: false,
             periodic_flush_interval: 0,
             num_threads: 1, // Single thread for determinism
             adaptive_mode: false,

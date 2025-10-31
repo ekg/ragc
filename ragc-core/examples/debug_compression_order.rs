@@ -33,6 +33,7 @@ fn main() -> Result<()> {
         compression_level: 11,
         verbosity: 0,
         group_flush_threshold: 0,
+        concatenated_genomes: false,
         periodic_flush_interval: 0,
         num_threads: 1, // Use single thread to ensure determinism
         adaptive_mode: false,
