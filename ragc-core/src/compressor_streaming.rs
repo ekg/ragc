@@ -1378,12 +1378,132 @@ impl StreamingCompressor {
                 // Create normalized key
                 let (key, _) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
 
-                // Classify: NEW or KNOWN?
-                let group_id_opt = known_groups.get(&key).copied();
-                let is_new = group_id_opt.is_none();
+                // **KEY FIX**: Try to SPLIT FIRST (before checking if new/known)
+                // C++ AGC checks for splits on ALL segments, not just known ones
+                let can_split = kmer_front != MISSING_KMER
+                             && kmer_back != MISSING_KMER
+                             && !self.config.concatenated_genomes;
 
-                if is_new {
-                    // NEW SEGMENT: Create group
+                let mut did_split = false;
+
+                if can_split {
+                    // Try to find shared k-mer
+                    if let Some(middle_kmer) = self.find_shared_kmer(kmer_front, kmer_back, &group_terminators) {
+                        // Check if both target groups exist
+                        let key1 = SegmentGroupKey::new_normalized(kmer_front, middle_kmer).0;
+                        let key2 = SegmentGroupKey::new_normalized(middle_kmer, kmer_back).0;
+
+                        if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+                            eprintln!("SPLIT_ATTEMPT: front={} back={} middle={} key1_exists={} key2_exists={}",
+                                kmer_front, kmer_back, middle_kmer,
+                                groups.contains_key(&key1), groups.contains_key(&key2));
+                        }
+
+                        if groups.contains_key(&key1) && groups.contains_key(&key2) {
+                            // Calculate split position
+                            if let Some(split_pos) = Self::calculate_split_position(
+                                kmer_front,
+                                kmer_back,
+                                middle_kmer,
+                                &segment_data,
+                                &groups,
+                                &self.config,
+                            ) {
+                                // SPLIT THE SEGMENT!
+                                let kmer_len = self.config.kmer_length as usize;
+                                let seg2_start_pos = split_pos.saturating_sub(kmer_len / 2);
+
+                                // Ensure seg1_end doesn't exceed segment bounds
+                                let seg1_end = std::cmp::min(seg2_start_pos + kmer_len, segment_data.len());
+                                let seg1_data = segment_data[..seg1_end].to_vec();
+                                let seg2_data = segment_data[seg2_start_pos..].to_vec();
+
+                                // Create first split segment (seg_part_no)
+                                let seg1_info = Self::prepare_segment_info(
+                                    &self.config,
+                                    &sample_name,
+                                    &contig_name,
+                                    seg_part_no,
+                                    seg1_data,
+                                    Some(kmer_front),
+                                    Some(middle_kmer),
+                                )?;
+
+                                // Create second split segment (seg_part_no + 1)
+                                let seg2_info = Self::prepare_segment_info(
+                                    &self.config,
+                                    &sample_name,
+                                    &contig_name,
+                                    seg_part_no + 1,
+                                    seg2_data,
+                                    Some(middle_kmer),
+                                    Some(kmer_back),
+                                )?;
+
+                                // Add both segments to their respective groups
+                                for (seg_key, seg_info_prepared) in [(seg1_info.key.clone(), seg1_info), (seg2_info.key.clone(), seg2_info)] {
+                                    let group_entry = groups.entry(seg_key.clone()).or_insert_with(|| {
+                                        let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                                        known_groups.insert(seg_key.clone(), gid);
+
+                                        // Add terminators
+                                        if seg_key.kmer_front != MISSING_KMER && seg_key.kmer_back != MISSING_KMER {
+                                            group_terminators.entry(seg_key.kmer_front).or_default().push(seg_key.kmer_back);
+                                            if seg_key.kmer_front != seg_key.kmer_back {
+                                                group_terminators.entry(seg_key.kmer_back).or_default().push(seg_key.kmer_front);
+                                            }
+                                        }
+
+                                        let stream_id = gid as usize;
+                                        let ref_stream_id = if gid >= 16 { Some(100000 + gid as usize) } else { None };
+                                        (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
+                                    });
+
+                                    if let Some(pack) = group_entry.1.add_segment(seg_info_prepared.segment, &self.config)? {
+                                        let compressed_pack = match pack {
+                                            PackToWrite::Compressed(cp) => cp,
+                                            PackToWrite::Uncompressed(up) => {
+                                                let compressed_data = compress_segment_configured(&up.uncompressed_data, self.config.compression_level)?;
+                                                let (final_data, uncompressed_size) = if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                                                    let mut data_with_marker = compressed_data;
+                                                    data_with_marker.push(0);
+                                                    (data_with_marker, up.uncompressed_data.len() as u64)
+                                                } else {
+                                                    (up.uncompressed_data, 0)
+                                                };
+                                                CompressedPack {
+                                                    group_id: up.group_id,
+                                                    stream_id: up.stream_id,
+                                                    compressed_data: final_data,
+                                                    uncompressed_size,
+                                                    segments: up.segments,
+                                                }
+                                            }
+                                        };
+                                        pack_tx.send(compressed_pack)?;
+                                    }
+                                }
+
+                                seg_part_no += 2;  // Increment by 2 for split
+                                total_segments += 2;
+                                did_split = true;
+                            }
+                        }
+                    }
+                }
+
+                // Only process as normal segment if we didn't split
+                if !did_split {
+                    // Classify: NEW or KNOWN?
+                    let group_id_opt = known_groups.get(&key).copied();
+                    let is_new = group_id_opt.is_none();
+
+                    if is_new {
+                    // NEW SEGMENT: Create group (but should we split first?)
+                    if std::env::var("RAGC_DEBUG_SPLIT").is_ok() && kmer_front != MISSING_KMER && kmer_back != MISSING_KMER {
+                        eprintln!("NEW_SEGMENT: front={} back={} size={}", kmer_front, kmer_back, segment_data.len());
+                    }
+
                     let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
                     known_groups.insert(key.clone(), gid);
 
@@ -1449,120 +1569,8 @@ impl StreamingCompressor {
                     seg_part_no += 1;  // Increment by 1 for normal segment
                     total_segments += 1;
 
-                } else {
-                    // KNOWN SEGMENT: Try to split
-                    let _group_id = group_id_opt.unwrap();
-
-                    // Check if we can split
-                    let can_split = kmer_front != MISSING_KMER
-                                 && kmer_back != MISSING_KMER
-                                 && segment_data.len() >= 2 * self.config.segment_size as usize
-                                 && !self.config.concatenated_genomes;
-
-                    let mut did_split = false;
-
-                    if can_split {
-                        // Try to find shared k-mer
-                        if let Some(middle_kmer) = self.find_shared_kmer(kmer_front, kmer_back, &group_terminators) {
-                            // Check if both target groups exist
-                            let key1 = SegmentGroupKey::new_normalized(kmer_front, middle_kmer).0;
-                            let key2 = SegmentGroupKey::new_normalized(middle_kmer, kmer_back).0;
-
-                            if groups.contains_key(&key1) && groups.contains_key(&key2) {
-                                // Calculate split position
-                                if let Some(split_pos) = Self::calculate_split_position(
-                                    kmer_front,
-                                    kmer_back,
-                                    middle_kmer,
-                                    &segment_data,
-                                    &groups,
-                                    &self.config,
-                                ) {
-                                    // SPLIT THE SEGMENT!
-                                    let kmer_len = self.config.kmer_length as usize;
-                                    let seg2_start_pos = split_pos.saturating_sub(kmer_len / 2);
-
-                                    // Ensure seg1_end doesn't exceed segment bounds
-                                    let seg1_end = std::cmp::min(seg2_start_pos + kmer_len, segment_data.len());
-                                    let seg1_data = segment_data[..seg1_end].to_vec();
-                                    let seg2_data = segment_data[seg2_start_pos..].to_vec();
-
-                                    // Create first split segment (seg_part_no)
-                                    let seg1_info = Self::prepare_segment_info(
-                                        &self.config,
-                                        &sample_name,
-                                        &contig_name,
-                                        seg_part_no,
-                                        seg1_data,
-                                        Some(kmer_front),
-                                        Some(middle_kmer),
-                                    )?;
-
-                                    // Create second split segment (seg_part_no + 1)
-                                    let seg2_info = Self::prepare_segment_info(
-                                        &self.config,
-                                        &sample_name,
-                                        &contig_name,
-                                        seg_part_no + 1,
-                                        seg2_data,
-                                        Some(middle_kmer),
-                                        Some(kmer_back),
-                                    )?;
-
-                                    // Add both segments to their respective groups
-                                    for (seg_key, seg_info_prepared) in [(seg1_info.key.clone(), seg1_info), (seg2_info.key.clone(), seg2_info)] {
-                                        let mut group_entry = groups.entry(seg_key.clone()).or_insert_with(|| {
-                                            let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
-                                            known_groups.insert(seg_key.clone(), gid);
-
-                                            // Add terminators
-                                            if seg_key.kmer_front != MISSING_KMER && seg_key.kmer_back != MISSING_KMER {
-                                                group_terminators.entry(seg_key.kmer_front).or_default().push(seg_key.kmer_back);
-                                                if seg_key.kmer_front != seg_key.kmer_back {
-                                                    group_terminators.entry(seg_key.kmer_back).or_default().push(seg_key.kmer_front);
-                                                }
-                                            }
-
-                                            let stream_id = gid as usize;
-                                            let ref_stream_id = if gid >= 16 { Some(100000 + gid as usize) } else { None };
-                                            (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
-                                        });
-
-                                        if let Some(pack) = group_entry.1.add_segment(seg_info_prepared.segment, &self.config)? {
-                                            let compressed_pack = match pack {
-                                                PackToWrite::Compressed(cp) => cp,
-                                                PackToWrite::Uncompressed(up) => {
-                                                    let compressed_data = compress_segment_configured(&up.uncompressed_data, self.config.compression_level)?;
-                                                    let (final_data, uncompressed_size) = if compressed_data.len() + 1 < up.uncompressed_data.len() {
-                                                        let mut data_with_marker = compressed_data;
-                                                        data_with_marker.push(0);
-                                                        (data_with_marker, up.uncompressed_data.len() as u64)
-                                                    } else {
-                                                        (up.uncompressed_data, 0)
-                                                    };
-                                                    CompressedPack {
-                                                        group_id: up.group_id,
-                                                        stream_id: up.stream_id,
-                                                        compressed_data: final_data,
-                                                        uncompressed_size,
-                                                        segments: up.segments,
-                                                    }
-                                                }
-                                            };
-                                            pack_tx.send(compressed_pack)?;
-                                        }
-                                    }
-
-                                    seg_part_no += 2;  // Increment by 2 for split
-                                    total_segments += 2;
-                                    did_split = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if !did_split {
-                        // No split - add as normal KNOWN segment
+                    } else {
+                        // KNOWN SEGMENT: Add to existing group (split was already attempted above)
                         let seg_info = Self::prepare_segment_info(
                             &self.config,
                             &sample_name,
@@ -1573,7 +1581,7 @@ impl StreamingCompressor {
                             Some(kmer_back),
                         )?;
 
-                        let mut group_entry = groups.entry(key.clone()).or_insert_with(|| {
+                        let group_entry = groups.entry(key.clone()).or_insert_with(|| {
                             let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
                             known_groups.insert(key.clone(), gid);
 
