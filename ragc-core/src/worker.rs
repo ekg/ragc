@@ -1239,7 +1239,8 @@ mod tests {
 
     #[test]
     fn test_shared_state_creation() {
-        let state = SharedCompressorState::new(1, 21, false, false, 0);
+        let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
+        let state = SharedCompressorState::new(1, 21, false, false, 0, queue);
         assert_eq!(state.verbosity, 1);
         assert_eq!(state.kmer_length, 21);
         assert_eq!(state.adaptive_mode, false);
@@ -1257,7 +1258,7 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(2));
-        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false, 0));
+        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false, 0, queue.clone()));
 
         // Mark queue as completed (no tasks)
         queue.mark_completed();
@@ -1287,7 +1288,7 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(1));
-        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false, 0));
+        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false, 0, queue.clone()));
 
         // Enqueue a simple task
         queue.emplace(
