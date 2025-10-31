@@ -2,7 +2,9 @@
 // Extracts genomes from AGC archives
 
 use crate::{
-    genome_io::GenomeWriter, kmer::reverse_complement, lz_diff::LZDiff,
+    genome_io::GenomeWriter,
+    kmer::reverse_complement,
+    lz_diff::LZDiff,
     segment_compression::{decompress_segment, decompress_segment_with_marker},
 };
 use anyhow::{anyhow, Context, Result};
@@ -477,15 +479,17 @@ impl Decompressor {
             }
 
             let delta_stream_name = stream_delta_name(archive_version, desc.group_id);
-            let delta_stream_id = self
-                .archive
-                .get_stream_id(&delta_stream_name)
-                .ok_or_else(|| {
-                    eprintln!("ERROR: Delta stream not found: {}", delta_stream_name);
-                    eprintln!("  Requested by segment: group_id={}, in_group_id={}, raw_length={}",
-                        desc.group_id, desc.in_group_id, desc.raw_length);
-                    anyhow!("Delta stream not found: {delta_stream_name}")
-                })?;
+            let delta_stream_id =
+                self.archive
+                    .get_stream_id(&delta_stream_name)
+                    .ok_or_else(|| {
+                        eprintln!("ERROR: Delta stream not found: {}", delta_stream_name);
+                        eprintln!(
+                            "  Requested by segment: group_id={}, in_group_id={}, raw_length={}",
+                            desc.group_id, desc.in_group_id, desc.raw_length
+                        );
+                        anyhow!("Delta stream not found: {delta_stream_name}")
+                    })?;
 
             // Check how many parts this stream has
             let num_parts = self.archive.get_num_parts(delta_stream_id);

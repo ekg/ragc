@@ -2,7 +2,6 @@
 ///
 /// Ports C++ AGC's GetCodingCostVector logic from lz_diff.cpp
 /// Used to find the split position that minimizes total compression cost
-
 use ahash::AHashMap;
 
 const MIN_MATCH_LEN: usize = 15;
@@ -15,11 +14,7 @@ const MIN_NRUN_LEN: usize = 5;
 ///
 /// Returns a vector where v_costs[i] = cost to encode position i
 /// If prefix_costs=true, cost at start of match; if false, cost at end of match
-pub fn get_coding_cost_vector(
-    reference: &[u8],
-    text: &[u8],
-    prefix_costs: bool,
-) -> Vec<u32> {
+pub fn get_coding_cost_vector(reference: &[u8], text: &[u8], prefix_costs: bool) -> Vec<u32> {
     if reference.is_empty() || text.is_empty() {
         return vec![1; text.len()];
     }

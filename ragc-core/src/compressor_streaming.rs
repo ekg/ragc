@@ -13,7 +13,7 @@ fn estimate_memory_mb<T>(items: &[T]) -> f64 {
 use crate::{
     contig_iterator::ContigIterator,
     genome_io::GenomeIO,
-    kmer::{Kmer, KmerMode, reverse_complement},
+    kmer::{reverse_complement, Kmer, KmerMode},
     lz_diff::LZDiff,
     segment::{split_at_splitters_with_size, MISSING_KMER},
     segment_compression::{compress_reference_segment, compress_segment_configured},
@@ -27,7 +27,7 @@ use ragc_common::{
     AGC_FILE_MINOR, CONTIG_SEPARATOR,
 };
 use rayon::prelude::*;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -96,7 +96,7 @@ struct SegmentInfo {
 struct BufferedSegment {
     key: SegmentGroupKey,
     segment: SegmentInfo,
-    is_new: bool,  // true = creates new group (NEW), false = joins existing (KNOWN)
+    is_new: bool, // true = creates new group (NEW), false = joins existing (KNOWN)
 }
 
 /// An uncompressed pack ready for compression (sent from workers to compression pool)
@@ -447,7 +447,7 @@ impl StreamingCompressor {
             collection,
             segment_groups: HashMap::new(),
             group_metadata: HashMap::new(),
-            next_group_id: 16,  // Reserve 0-15 for raw groups (matching C++ AGC)
+            next_group_id: 16, // Reserve 0-15 for raw groups (matching C++ AGC)
             group_terminators: HashMap::new(),
             reference_kmers_singletons: HashSet::new(),
             reference_kmers_duplicates: HashSet::new(),
@@ -510,7 +510,8 @@ impl StreamingCompressor {
         let mut sample_names = std::collections::HashSet::new();
         let mut has_multi_part_headers = false;
 
-        for _ in 0..10 {  // Check more headers to be sure
+        for _ in 0..10 {
+            // Check more headers to be sure
             if let Some((header, sample_name, _, _)) = reader.read_contig_with_sample()? {
                 let parts: Vec<&str> = header.split('#').collect();
                 if parts.len() >= 3 {
@@ -654,7 +655,8 @@ impl StreamingCompressor {
 
                     // PRE-REGISTER CONTIG: Ensures contigs are registered in file order
                     // before parallel Phase 3 processing (fixes data corruption!)
-                    self.collection.register_sample_contig(&sample_name, &full_header)?;
+                    self.collection
+                        .register_sample_contig(&sample_name, &full_header)?;
 
                     // Segment at splitters
                     let segments = split_at_splitters_with_size(
@@ -676,7 +678,10 @@ impl StreamingCompressor {
                         if total_segments_count < 10 {
                             eprintln!(
                                 "DEBUG segment {}: front_kmer={}, back_kmer={}, len={}",
-                                total_segments_count, segment.front_kmer, segment.back_kmer, segment.data.len()
+                                total_segments_count,
+                                segment.front_kmer,
+                                segment.back_kmer,
+                                segment.data.len()
                             );
                         }
 
@@ -694,7 +699,9 @@ impl StreamingCompressor {
                         if total_segments_count < 10 {
                             eprintln!(
                                 "DEBUG prepared {}: key.front={}, key.back={}",
-                                total_segments_count, seg_info.key.kmer_front, seg_info.key.kmer_back
+                                total_segments_count,
+                                seg_info.key.kmer_front,
+                                seg_info.key.kmer_back
                             );
                         }
 
@@ -1161,8 +1168,13 @@ impl StreamingCompressor {
 
         // Pass 2: Use C++ AGC exact architecture (two-phase processing)
         // Create MultiFileIterator from file paths
-        let file_path_bufs: Vec<PathBuf> = fasta_paths.iter().map(|(_, path)| path.to_path_buf()).collect();
-        let iterator = Box::new(crate::contig_iterator::MultiFileIterator::new(file_path_bufs)?);
+        let file_path_bufs: Vec<PathBuf> = fasta_paths
+            .iter()
+            .map(|(_, path)| path.to_path_buf())
+            .collect();
+        let iterator = Box::new(crate::contig_iterator::MultiFileIterator::new(
+            file_path_bufs,
+        )?);
 
         self.add_segments_with_inline_splits(iterator, &splitters)?;
 
@@ -1246,21 +1258,29 @@ impl StreamingCompressor {
                 let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
                 let mut packs_written = 0;
                 let mut segments_registered = 0;
-                let mut seen_segments: HashMap<(String, String, usize), (u32, u32)> = HashMap::new();
+                let mut seen_segments: HashMap<(String, String, usize), (u32, u32)> =
+                    HashMap::new();
 
                 while let Ok(pack) = pack_rx.recv() {
                     let mut archive_lock = archive.lock().unwrap();
                     let mut collection_lock = collection.lock().unwrap();
 
                     if config.verbosity > 2 && (pack.group_id == 11813 || pack.group_id < 100) {
-                        println!("  Writer received pack: group_id={}, stream_id={}, {} segments",
-                            pack.group_id, pack.stream_id, pack.segments.len());
+                        println!(
+                            "  Writer received pack: group_id={}, stream_id={}, {} segments",
+                            pack.group_id,
+                            pack.stream_id,
+                            pack.segments.len()
+                        );
                     }
 
                     // Register stream on-demand
                     let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
                         if config.verbosity > 2 && (pack.group_id == 11813 || pack.group_id < 100) {
-                            println!("    Stream already registered: stream_id={} -> archive_id={}", pack.stream_id, id);
+                            println!(
+                                "    Stream already registered: stream_id={} -> archive_id={}",
+                                pack.stream_id, id
+                            );
                         }
                         id
                     } else {
@@ -1270,23 +1290,36 @@ impl StreamingCompressor {
                             stream_delta_name(archive_version, pack.group_id)
                         };
                         if config.verbosity > 1 {
-                            println!("  Registering stream: {} for group_id={}", stream_name, pack.group_id);
+                            println!(
+                                "  Registering stream: {} for group_id={}",
+                                stream_name, pack.group_id
+                            );
                         }
                         let id = archive_lock.register_stream(&stream_name);
 
                         // Check for collision before inserting
                         if let Some(&existing_id) = stream_id_map.get(&pack.stream_id) {
                             eprintln!("ERROR: stream_id collision detected!");
-                            eprintln!("  stream_id={} already maps to archive_id={}", pack.stream_id, existing_id);
-                            eprintln!("  Trying to register stream '{}' for group_id={} as archive_id={}",
-                                stream_name, pack.group_id, id);
-                            eprintln!("  This means two different groups are using the same stream_id!");
+                            eprintln!(
+                                "  stream_id={} already maps to archive_id={}",
+                                pack.stream_id, existing_id
+                            );
+                            eprintln!(
+                                "  Trying to register stream '{}' for group_id={} as archive_id={}",
+                                stream_name, pack.group_id, id
+                            );
+                            eprintln!(
+                                "  This means two different groups are using the same stream_id!"
+                            );
                         }
 
                         stream_id_map.insert(pack.stream_id, id);
 
                         if config.verbosity > 2 {
-                            println!("    Mapped: stream_id={} -> archive_id={} ({})", pack.stream_id, id, stream_name);
+                            println!(
+                                "    Mapped: stream_id={} -> archive_id={} ({})",
+                                pack.stream_id, id, stream_name
+                            );
                         }
                         id
                     };
@@ -1294,12 +1327,25 @@ impl StreamingCompressor {
                     // Register segments in collection (seg_part_no already correct from sequential processing!)
                     for seg_meta in &pack.segments {
                         // Check for duplicate seg_part_no
-                        let key = (seg_meta.sample_name.clone(), seg_meta.contig_name.clone(), seg_meta.seg_part_no);
+                        let key = (
+                            seg_meta.sample_name.clone(),
+                            seg_meta.contig_name.clone(),
+                            seg_meta.seg_part_no,
+                        );
                         if let Some((prev_group_id, prev_in_group_id)) = seen_segments.get(&key) {
                             println!("WARNING: Duplicate segment detected!");
-                            println!("  Sample: {}, Contig: {}, seg_part_no: {}", seg_meta.sample_name, seg_meta.contig_name, seg_meta.seg_part_no);
-                            println!("  Previous: group_id={}, in_group_id={}", prev_group_id, prev_in_group_id);
-                            println!("  Current:  group_id={}, in_group_id={}", pack.group_id, seg_meta.in_group_id);
+                            println!(
+                                "  Sample: {}, Contig: {}, seg_part_no: {}",
+                                seg_meta.sample_name, seg_meta.contig_name, seg_meta.seg_part_no
+                            );
+                            println!(
+                                "  Previous: group_id={}, in_group_id={}",
+                                prev_group_id, prev_in_group_id
+                            );
+                            println!(
+                                "  Current:  group_id={}, in_group_id={}",
+                                pack.group_id, seg_meta.in_group_id
+                            );
                         }
 
                         if pack.group_id > 50000 {
@@ -1309,7 +1355,8 @@ impl StreamingCompressor {
 
                         seen_segments.insert(key, (pack.group_id, seg_meta.in_group_id));
 
-                        collection_lock.register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
+                        collection_lock
+                            .register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
                         collection_lock.add_segment_placed(
                             &seg_meta.sample_name,
                             &seg_meta.contig_name,
@@ -1323,12 +1370,19 @@ impl StreamingCompressor {
                     }
 
                     // Write pack
-                    archive_lock.add_part(actual_stream_id, &pack.compressed_data, pack.uncompressed_size)?;
+                    archive_lock.add_part(
+                        actual_stream_id,
+                        &pack.compressed_data,
+                        pack.uncompressed_size,
+                    )?;
                     packs_written += 1;
                 }
 
                 if config.verbosity > 0 {
-                    println!("Writer thread complete: wrote {} packs, registered {} segments", packs_written, segments_registered);
+                    println!(
+                        "Writer thread complete: wrote {} packs, registered {} segments",
+                        packs_written, segments_registered
+                    );
                 }
                 Ok(packs_written)
             })
@@ -1381,14 +1435,16 @@ impl StreamingCompressor {
                 // **KEY FIX**: Try to SPLIT FIRST (before checking if new/known)
                 // C++ AGC checks for splits on ALL segments, not just known ones
                 let can_split = kmer_front != MISSING_KMER
-                             && kmer_back != MISSING_KMER
-                             && !self.config.concatenated_genomes;
+                    && kmer_back != MISSING_KMER
+                    && !self.config.concatenated_genomes;
 
                 let mut did_split = false;
 
                 if can_split {
                     // Try to find shared k-mer
-                    if let Some(middle_kmer) = self.find_shared_kmer(kmer_front, kmer_back, &group_terminators) {
+                    if let Some(middle_kmer) =
+                        self.find_shared_kmer(kmer_front, kmer_back, &group_terminators)
+                    {
                         // Check if both target groups exist
                         let key1 = SegmentGroupKey::new_normalized(kmer_front, middle_kmer).0;
                         let key2 = SegmentGroupKey::new_normalized(middle_kmer, kmer_back).0;
@@ -1414,7 +1470,8 @@ impl StreamingCompressor {
                                 let seg2_start_pos = split_pos.saturating_sub(kmer_len / 2);
 
                                 // Ensure seg1_end doesn't exceed segment bounds
-                                let seg1_end = std::cmp::min(seg2_start_pos + kmer_len, segment_data.len());
+                                let seg1_end =
+                                    std::cmp::min(seg2_start_pos + kmer_len, segment_data.len());
                                 let seg1_data = segment_data[..seg1_end].to_vec();
                                 let seg2_data = segment_data[seg2_start_pos..].to_vec();
 
@@ -1441,36 +1498,64 @@ impl StreamingCompressor {
                                 )?;
 
                                 // Add both segments to their respective groups
-                                for (seg_key, seg_info_prepared) in [(seg1_info.key.clone(), seg1_info), (seg2_info.key.clone(), seg2_info)] {
-                                    let group_entry = groups.entry(seg_key.clone()).or_insert_with(|| {
-                                        let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
-                                        known_groups.insert(seg_key.clone(), gid);
+                                for (seg_key, seg_info_prepared) in [
+                                    (seg1_info.key.clone(), seg1_info),
+                                    (seg2_info.key.clone(), seg2_info),
+                                ] {
+                                    let group_entry =
+                                        groups.entry(seg_key.clone()).or_insert_with(|| {
+                                            let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                                            known_groups.insert(seg_key.clone(), gid);
 
-                                        // Add terminators
-                                        if seg_key.kmer_front != MISSING_KMER && seg_key.kmer_back != MISSING_KMER {
-                                            group_terminators.entry(seg_key.kmer_front).or_default().push(seg_key.kmer_back);
-                                            if seg_key.kmer_front != seg_key.kmer_back {
-                                                group_terminators.entry(seg_key.kmer_back).or_default().push(seg_key.kmer_front);
+                                            // Add terminators
+                                            if seg_key.kmer_front != MISSING_KMER
+                                                && seg_key.kmer_back != MISSING_KMER
+                                            {
+                                                group_terminators
+                                                    .entry(seg_key.kmer_front)
+                                                    .or_default()
+                                                    .push(seg_key.kmer_back);
+                                                if seg_key.kmer_front != seg_key.kmer_back {
+                                                    group_terminators
+                                                        .entry(seg_key.kmer_back)
+                                                        .or_default()
+                                                        .push(seg_key.kmer_front);
+                                                }
                                             }
-                                        }
 
-                                        let stream_id = gid as usize;
-                                        let ref_stream_id = if gid >= 16 { Some(100000 + gid as usize) } else { None };
-                                        (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
-                                    });
+                                            let stream_id = gid as usize;
+                                            let ref_stream_id = if gid >= 16 {
+                                                Some(100000 + gid as usize)
+                                            } else {
+                                                None
+                                            };
+                                            (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
+                                        });
 
-                                    if let Some(pack) = group_entry.1.add_segment(seg_info_prepared.segment, &self.config)? {
+                                    if let Some(pack) = group_entry
+                                        .1
+                                        .add_segment(seg_info_prepared.segment, &self.config)?
+                                    {
                                         let compressed_pack = match pack {
                                             PackToWrite::Compressed(cp) => cp,
                                             PackToWrite::Uncompressed(up) => {
-                                                let compressed_data = compress_segment_configured(&up.uncompressed_data, self.config.compression_level)?;
-                                                let (final_data, uncompressed_size) = if compressed_data.len() + 1 < up.uncompressed_data.len() {
-                                                    let mut data_with_marker = compressed_data;
-                                                    data_with_marker.push(0);
-                                                    (data_with_marker, up.uncompressed_data.len() as u64)
-                                                } else {
-                                                    (up.uncompressed_data, 0)
-                                                };
+                                                let compressed_data = compress_segment_configured(
+                                                    &up.uncompressed_data,
+                                                    self.config.compression_level,
+                                                )?;
+                                                let (final_data, uncompressed_size) =
+                                                    if compressed_data.len() + 1
+                                                        < up.uncompressed_data.len()
+                                                    {
+                                                        let mut data_with_marker = compressed_data;
+                                                        data_with_marker.push(0);
+                                                        (
+                                                            data_with_marker,
+                                                            up.uncompressed_data.len() as u64,
+                                                        )
+                                                    } else {
+                                                        (up.uncompressed_data, 0)
+                                                    };
                                                 CompressedPack {
                                                     group_id: up.group_id,
                                                     stream_id: up.stream_id,
@@ -1484,7 +1569,7 @@ impl StreamingCompressor {
                                     }
                                 }
 
-                                seg_part_no += 2;  // Increment by 2 for split
+                                seg_part_no += 2; // Increment by 2 for split
                                 total_segments += 2;
                                 did_split = true;
                             }
@@ -1499,76 +1584,107 @@ impl StreamingCompressor {
                     let is_new = group_id_opt.is_none();
 
                     if is_new {
-                    // NEW SEGMENT: Create group (but should we split first?)
-                    if std::env::var("RAGC_DEBUG_SPLIT").is_ok() && kmer_front != MISSING_KMER && kmer_back != MISSING_KMER {
-                        eprintln!("NEW_SEGMENT: front={} back={} size={}", kmer_front, kmer_back, segment_data.len());
-                    }
-
-                    let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
-                    known_groups.insert(key.clone(), gid);
-
-                    if total_segments % 1000 == 0 || gid < 100 || gid > 50000 {
-                        println!("DEBUG: Created group_id={} at segment {} (total unique groups={})", gid, total_segments, known_groups.len());
-                    }
-
-                    // Optional debug logging for compatibility testing
-                    if std::env::var("RAGC_DEBUG_KMER_PAIRS").is_ok() {
-                        eprintln!("GROUP_KMER: group_id={} front={} back={}", gid, key.kmer_front, key.kmer_back);
-                    }
-
-                    // Add terminators (use NORMALIZED key values to match C++ AGC!)
-                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                        group_terminators.entry(key.kmer_front).or_default().push(key.kmer_back);
-                        if key.kmer_front != key.kmer_back {
-                            group_terminators.entry(key.kmer_back).or_default().push(key.kmer_front);
+                        // NEW SEGMENT: Create group (but should we split first?)
+                        if std::env::var("RAGC_DEBUG_SPLIT").is_ok()
+                            && kmer_front != MISSING_KMER
+                            && kmer_back != MISSING_KMER
+                        {
+                            eprintln!(
+                                "NEW_SEGMENT: front={} back={} size={}",
+                                kmer_front,
+                                kmer_back,
+                                segment_data.len()
+                            );
                         }
-                    }
 
-                    // Prepare segment
-                    let seg_info = Self::prepare_segment_info(
-                        &self.config,
-                        &sample_name,
-                        &contig_name,
-                        seg_part_no,
-                        segment_data,
-                        Some(kmer_front),
-                        Some(kmer_back),
-                    )?;
+                        let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                        known_groups.insert(key.clone(), gid);
 
-                    // Create group and add segment
-                    let stream_id = gid as usize;
-                    let ref_stream_id = if gid >= 16 { Some(100000 + gid as usize) } else { None };
-                    let mut group_writer = GroupWriter::new(gid, stream_id, ref_stream_id);
+                        if total_segments % 1000 == 0 || gid < 100 || gid > 50000 {
+                            println!(
+                                "DEBUG: Created group_id={} at segment {} (total unique groups={})",
+                                gid,
+                                total_segments,
+                                known_groups.len()
+                            );
+                        }
 
-                    if let Some(pack) = group_writer.add_segment(seg_info.segment, &self.config)? {
-                        let compressed_pack = match pack {
-                            PackToWrite::Compressed(cp) => cp,
-                            PackToWrite::Uncompressed(up) => {
-                                let compressed_data = compress_segment_configured(&up.uncompressed_data, self.config.compression_level)?;
-                                let (final_data, uncompressed_size) = if compressed_data.len() + 1 < up.uncompressed_data.len() {
-                                    let mut data_with_marker = compressed_data;
-                                    data_with_marker.push(0);
-                                    (data_with_marker, up.uncompressed_data.len() as u64)
-                                } else {
-                                    (up.uncompressed_data, 0)
-                                };
-                                CompressedPack {
-                                    group_id: up.group_id,
-                                    stream_id: up.stream_id,
-                                    compressed_data: final_data,
-                                    uncompressed_size,
-                                    segments: up.segments,
-                                }
+                        // Optional debug logging for compatibility testing
+                        if std::env::var("RAGC_DEBUG_KMER_PAIRS").is_ok() {
+                            eprintln!(
+                                "GROUP_KMER: group_id={} front={} back={}",
+                                gid, key.kmer_front, key.kmer_back
+                            );
+                        }
+
+                        // Add terminators (use NORMALIZED key values to match C++ AGC!)
+                        if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                            group_terminators
+                                .entry(key.kmer_front)
+                                .or_default()
+                                .push(key.kmer_back);
+                            if key.kmer_front != key.kmer_back {
+                                group_terminators
+                                    .entry(key.kmer_back)
+                                    .or_default()
+                                    .push(key.kmer_front);
                             }
+                        }
+
+                        // Prepare segment
+                        let seg_info = Self::prepare_segment_info(
+                            &self.config,
+                            &sample_name,
+                            &contig_name,
+                            seg_part_no,
+                            segment_data,
+                            Some(kmer_front),
+                            Some(kmer_back),
+                        )?;
+
+                        // Create group and add segment
+                        let stream_id = gid as usize;
+                        let ref_stream_id = if gid >= 16 {
+                            Some(100000 + gid as usize)
+                        } else {
+                            None
                         };
-                        pack_tx.send(compressed_pack)?;
-                    }
+                        let mut group_writer = GroupWriter::new(gid, stream_id, ref_stream_id);
 
-                    groups.insert(key, (gid, group_writer));
+                        if let Some(pack) =
+                            group_writer.add_segment(seg_info.segment, &self.config)?
+                        {
+                            let compressed_pack = match pack {
+                                PackToWrite::Compressed(cp) => cp,
+                                PackToWrite::Uncompressed(up) => {
+                                    let compressed_data = compress_segment_configured(
+                                        &up.uncompressed_data,
+                                        self.config.compression_level,
+                                    )?;
+                                    let (final_data, uncompressed_size) =
+                                        if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                                            let mut data_with_marker = compressed_data;
+                                            data_with_marker.push(0);
+                                            (data_with_marker, up.uncompressed_data.len() as u64)
+                                        } else {
+                                            (up.uncompressed_data, 0)
+                                        };
+                                    CompressedPack {
+                                        group_id: up.group_id,
+                                        stream_id: up.stream_id,
+                                        compressed_data: final_data,
+                                        uncompressed_size,
+                                        segments: up.segments,
+                                    }
+                                }
+                            };
+                            pack_tx.send(compressed_pack)?;
+                        }
 
-                    seg_part_no += 1;  // Increment by 1 for normal segment
-                    total_segments += 1;
+                        groups.insert(key, (gid, group_writer));
 
+                        seg_part_no += 1; // Increment by 1 for normal segment
+                        total_segments += 1;
                     } else {
                         // KNOWN SEGMENT: Add to existing group (split was already attempted above)
                         let seg_info = Self::prepare_segment_info(
@@ -1587,29 +1703,45 @@ impl StreamingCompressor {
 
                             // Add terminators
                             if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                                group_terminators.entry(key.kmer_front).or_default().push(key.kmer_back);
+                                group_terminators
+                                    .entry(key.kmer_front)
+                                    .or_default()
+                                    .push(key.kmer_back);
                                 if key.kmer_front != key.kmer_back {
-                                    group_terminators.entry(key.kmer_back).or_default().push(key.kmer_front);
+                                    group_terminators
+                                        .entry(key.kmer_back)
+                                        .or_default()
+                                        .push(key.kmer_front);
                                 }
                             }
 
                             let stream_id = gid as usize;
-                            let ref_stream_id = if gid >= 16 { Some(100000 + gid as usize) } else { None };
+                            let ref_stream_id = if gid >= 16 {
+                                Some(100000 + gid as usize)
+                            } else {
+                                None
+                            };
                             (gid, GroupWriter::new(gid, stream_id, ref_stream_id))
                         });
 
-                        if let Some(pack) = group_entry.1.add_segment(seg_info.segment, &self.config)? {
+                        if let Some(pack) =
+                            group_entry.1.add_segment(seg_info.segment, &self.config)?
+                        {
                             let compressed_pack = match pack {
                                 PackToWrite::Compressed(cp) => cp,
                                 PackToWrite::Uncompressed(up) => {
-                                    let compressed_data = compress_segment_configured(&up.uncompressed_data, self.config.compression_level)?;
-                                    let (final_data, uncompressed_size) = if compressed_data.len() + 1 < up.uncompressed_data.len() {
-                                        let mut data_with_marker = compressed_data;
-                                        data_with_marker.push(0);
-                                        (data_with_marker, up.uncompressed_data.len() as u64)
-                                    } else {
-                                        (up.uncompressed_data, 0)
-                                    };
+                                    let compressed_data = compress_segment_configured(
+                                        &up.uncompressed_data,
+                                        self.config.compression_level,
+                                    )?;
+                                    let (final_data, uncompressed_size) =
+                                        if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                                            let mut data_with_marker = compressed_data;
+                                            data_with_marker.push(0);
+                                            (data_with_marker, up.uncompressed_data.len() as u64)
+                                        } else {
+                                            (up.uncompressed_data, 0)
+                                        };
                                     CompressedPack {
                                         group_id: up.group_id,
                                         stream_id: up.stream_id,
@@ -1622,7 +1754,7 @@ impl StreamingCompressor {
                             pack_tx.send(compressed_pack)?;
                         }
 
-                        seg_part_no += 1;  // Increment by 1
+                        seg_part_no += 1; // Increment by 1
                         total_segments += 1;
                     }
                 }
@@ -1639,8 +1771,11 @@ impl StreamingCompressor {
         for (_, (gid, mut group_writer)) in groups {
             if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
                 if self.config.verbosity > 1 && (gid == 11813 || gid < 100) {
-                    println!("  Flushing delta pack for group_id={}, {} segments buffered",
-                        gid, uncompressed_pack.segments.len());
+                    println!(
+                        "  Flushing delta pack for group_id={}, {} segments buffered",
+                        gid,
+                        uncompressed_pack.segments.len()
+                    );
                 }
                 let compressed_data = compress_segment_configured(
                     &uncompressed_pack.uncompressed_data,
@@ -1651,7 +1786,10 @@ impl StreamingCompressor {
                     if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
                         let mut data_with_marker = compressed_data;
                         data_with_marker.push(0);
-                        (data_with_marker, uncompressed_pack.uncompressed_data.len() as u64)
+                        (
+                            data_with_marker,
+                            uncompressed_pack.uncompressed_data.len() as u64,
+                        )
                     } else {
                         (uncompressed_pack.uncompressed_data, 0)
                     };
@@ -1705,7 +1843,6 @@ impl StreamingCompressor {
         }
 
         Ok(())
-
     }
     fn calculate_split_position(
         kmer_front: u64,
@@ -2472,7 +2609,6 @@ impl StreamingCompressor {
 
         Ok(())
     }
-
 
     /// Flush a single group to the archive
     fn flush_group(&mut self, key: &SegmentGroupKey) -> Result<()> {

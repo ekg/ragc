@@ -19,11 +19,11 @@ use std::sync::{Arc, Barrier, Mutex};
 struct SegmentPlacement {
     sample_name: String,
     contig_name: String,
-    place: usize,           // Segment index within contig (seg_part_no)
+    place: usize, // Segment index within contig (seg_part_no)
     group_id: u32,
     in_group_id: u32,
     is_rev_comp: bool,
-    raw_length: u32,        // Uncompressed segment length
+    raw_length: u32, // Uncompressed segment length
 }
 
 /// Segment group manager matching C++ AGC's CSegment
@@ -34,11 +34,11 @@ struct SegmentPlacement {
 /// - Writes to archive streams
 struct SegmentGroup {
     group_id: u32,
-    stream_id: usize,        // Delta stream for packed segments
-    ref_stream_id: usize,    // Reference stream for first segment
+    stream_id: usize,          // Delta stream for packed segments
+    ref_stream_id: usize,      // Reference stream for first segment
     reference: Option<Contig>, // First segment (reference for LZ encoding)
-    ref_written: bool,       // Whether reference has been written
-    in_group_counter: u32,   // Counter for in_group_id assignment
+    ref_written: bool,         // Whether reference has been written
+    in_group_counter: u32,     // Counter for in_group_id assignment
 }
 
 impl SegmentGroup {
@@ -57,11 +57,7 @@ impl SegmentGroup {
     ///
     /// The first segment becomes the reference, subsequent segments are delta-encoded.
     /// Returns in_group_id (0 for reference, 1+ for delta segments)
-    fn add_segment(
-        &mut self,
-        seg_data: &[u8],
-        archive: &mut Archive,
-    ) -> anyhow::Result<u32> {
+    fn add_segment(&mut self, seg_data: &[u8], archive: &mut Archive) -> anyhow::Result<u32> {
         if self.reference.is_none() {
             // First segment - store as reference with adaptive compression
             let seg_vec = seg_data.to_vec();
@@ -187,7 +183,6 @@ pub struct SharedCompressorState {
     /// Working queue pointer (switches between main and aux)
     /// Matches C++ AGC's pq_contigs_desc_working
     pub working_queue: Mutex<Arc<BoundedPriorityQueue<Task>>>,
-
     // TODO: Add more shared state as needed:
     // - vv_fallback_minimizers: Mutex<Vec<Vec<Vec<u64>>>>
     // - vv_splitters: Mutex<Vec<Vec<u64>>>
@@ -522,7 +517,10 @@ fn handle_new_splitters_stage(
         let filling_factor = bloom.filling_factor();
         if filling_factor > 0.3 {
             if shared.verbosity > 1 {
-                eprintln!("Bloom filter filling factor {:.2}, resizing...", filling_factor);
+                eprintln!(
+                    "Bloom filter filling factor {:.2}, resizing...",
+                    filling_factor
+                );
             }
 
             // Resize to accommodate current + expected growth
@@ -546,7 +544,10 @@ fn handle_new_splitters_stage(
         let mut raw_contigs = shared.raw_contigs.lock().unwrap();
 
         if shared.verbosity > 0 && !raw_contigs.is_empty() {
-            eprintln!("Adaptive mode: Re-enqueueing {} hard contigs for reprocessing", raw_contigs.len());
+            eprintln!(
+                "Adaptive mode: Re-enqueueing {} hard contigs for reprocessing",
+                raw_contigs.len()
+            );
         }
 
         // Re-enqueue hard contigs into aux_queue with HardContigs stage
@@ -554,7 +555,12 @@ fn handle_new_splitters_stage(
         for (sample_name, contig_name, sequence) in raw_contigs.drain(..) {
             let cost = sequence.len();
             shared.aux_queue.emplace(
-                Task::new_contig(sample_name, contig_name, sequence, ContigProcessingStage::HardContigs),
+                Task::new_contig(
+                    sample_name,
+                    contig_name,
+                    sequence,
+                    ContigProcessingStage::HardContigs,
+                ),
                 1, // priority
                 cost,
             );
@@ -745,18 +751,35 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
             }
 
             // Step 3: Process all segments in this group
-            while let Some((kmer1, kmer2, sample_name, contig_name, seg_data, is_rev_comp, seg_part_no)) = buffered.get_part(group_id) {
+            while let Some((
+                kmer1,
+                kmer2,
+                sample_name,
+                contig_name,
+                seg_data,
+                is_rev_comp,
+                seg_part_no,
+            )) = buffered.get_part(group_id)
+            {
                 // Step 4: Create SegmentGroup on first use (lazy initialization)
                 let mut v_segments = shared.v_segments.lock().unwrap();
-                if group_id >= 0 && (group_id as usize) < v_segments.len() && v_segments[group_id as usize].is_none() {
+                if group_id >= 0
+                    && (group_id as usize) < v_segments.len()
+                    && v_segments[group_id as usize].is_none()
+                {
                     // Get stream IDs for this group
                     if let Some(archive_mutex) = &shared.archive {
                         let archive = archive_mutex.lock().unwrap();
-                        let stream_id = archive.get_stream_id(&ragc_common::stream_delta_name(3000, group_id as u32)).unwrap_or(0);
-                        let ref_stream_id = archive.get_stream_id(&ragc_common::stream_ref_name(3000, group_id as u32)).unwrap_or(0);
+                        let stream_id = archive
+                            .get_stream_id(&ragc_common::stream_delta_name(3000, group_id as u32))
+                            .unwrap_or(0);
+                        let ref_stream_id = archive
+                            .get_stream_id(&ragc_common::stream_ref_name(3000, group_id as u32))
+                            .unwrap_or(0);
                         drop(archive);
 
-                        v_segments[group_id as usize] = Some(SegmentGroup::new(group_id as u32, stream_id, ref_stream_id));
+                        v_segments[group_id as usize] =
+                            Some(SegmentGroup::new(group_id as u32, stream_id, ref_stream_id));
                     }
                 }
 
@@ -938,13 +961,24 @@ pub fn create_agc_archive(
         append_str(&mut data, &ragc_common::AGC_FILE_MINOR.to_string());
 
         append_str(&mut data, "comment");
-        append_str(&mut data, &format!("RAGC v.{}.{}", ragc_common::AGC_FILE_MAJOR, ragc_common::AGC_FILE_MINOR));
+        append_str(
+            &mut data,
+            &format!(
+                "RAGC v.{}.{}",
+                ragc_common::AGC_FILE_MAJOR,
+                ragc_common::AGC_FILE_MINOR
+            ),
+        );
 
         let stream_id = archive.register_stream("file_type_info");
         archive.add_part(stream_id, &data, 7)?; // 7 key-value pairs
 
         if verbosity > 0 {
-            eprintln!("Wrote file_type_info: version {}.{}", ragc_common::AGC_FILE_MAJOR, ragc_common::AGC_FILE_MINOR);
+            eprintln!(
+                "Wrote file_type_info: version {}.{}",
+                ragc_common::AGC_FILE_MAJOR,
+                ragc_common::AGC_FILE_MINOR
+            );
         }
     }
 
@@ -962,7 +996,10 @@ pub fn create_agc_archive(
         archive.add_part(params_stream_id, &params_data, 0)?;
 
         if verbosity > 0 {
-            eprintln!("Wrote params: k={}, segment_size={}", kmer_length, segment_size);
+            eprintln!(
+                "Wrote params: k={}, segment_size={}",
+                kmer_length, segment_size
+            );
         }
     }
 
@@ -990,7 +1027,8 @@ pub fn create_agc_archive(
         verbosity,
         Some(archive.clone()),
         Some(collection.clone()),
-    ).map_err(|e| anyhow::anyhow!(e))?;
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     // Serialize collection metadata to archive
     {
@@ -998,7 +1036,10 @@ pub fn create_agc_archive(
         let mut collection_guard = collection.lock().unwrap();
 
         if verbosity > 0 {
-            eprintln!("Serializing collection metadata for {} samples...", num_samples);
+            eprintln!(
+                "Serializing collection metadata for {} samples...",
+                num_samples
+            );
         }
 
         // Write sample names
@@ -1066,7 +1107,11 @@ fn compress_samples_streaming_with_archive(
     let queue = Arc::new(BoundedPriorityQueue::new(1, queue_capacity as usize));
 
     // Step 2: Worker thread count (agc_compressor.cpp:2134)
-    let no_workers = if num_threads < 8 { num_threads } else { num_threads - 1 };
+    let no_workers = if num_threads < 8 {
+        num_threads
+    } else {
+        num_threads - 1
+    };
 
     // Convert reference k-mers to sorted vectors (for set_difference in adaptive mode)
     let mut v_candidate_kmers: Vec<u64> = candidate_kmers.into_iter().collect();
@@ -1078,7 +1123,7 @@ fn compress_samples_streaming_with_archive(
     // Step 3: Shared state initialization
     // Initialize bloom filter and populate with base splitters
     let mut bloom_filter = crate::bloom_filter::BloomFilter::new(
-        splitters.len() * 8  // 8 bits per splitter
+        splitters.len() * 8, // 8 bits per splitter
     );
     for &kmer in &splitters {
         bloom_filter.insert(kmer);
@@ -1131,7 +1176,7 @@ fn compress_samples_streaming_with_archive(
     // Step 5: Main processing loop (agc_compressor.cpp:2163-2242)
     let mut sample_priority = usize::MAX;
     let mut _cnt_contigs_in_sample = 0;
-    const PACK_CARDINALITY: usize = 50;  // TODO: Get from config
+    const PACK_CARDINALITY: usize = 50; // TODO: Get from config
 
     for (sample_name, file_path) in sample_files {
         if verbosity > 0 {
@@ -1208,11 +1253,7 @@ fn compress_samples_streaming_with_archive(
             };
 
             // Send exactly no_workers sync tokens (0 cost)
-            queue.emplace_many_no_cost(
-                Task::new_sync(sync_stage),
-                sample_priority,
-                no_workers,
-            );
+            queue.emplace_many_no_cost(Task::new_sync(sync_stage), sample_priority, no_workers);
 
             sample_priority -= 1;
         }
@@ -1258,7 +1299,14 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(2));
-        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false, 0, queue.clone()));
+        let shared = Arc::new(SharedCompressorState::new(
+            0,
+            21,
+            false,
+            false,
+            0,
+            queue.clone(),
+        ));
 
         // Mark queue as completed (no tasks)
         queue.mark_completed();
@@ -1288,7 +1336,14 @@ mod tests {
 
         let queue = Arc::new(BoundedPriorityQueue::new(1, 1000));
         let barrier = Arc::new(Barrier::new(1));
-        let shared = Arc::new(SharedCompressorState::new(0, 21, false, false, 0, queue.clone()));
+        let shared = Arc::new(SharedCompressorState::new(
+            0,
+            21,
+            false,
+            false,
+            0,
+            queue.clone(),
+        ));
 
         // Enqueue a simple task
         queue.emplace(

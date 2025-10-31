@@ -53,11 +53,9 @@ fn test_yeast3_streaming_compression() {
     println!("Step 1: Determining splitters from reference sample...");
 
     let reference_path = Path::new(&sample_files[0].1);
-    let (splitters, candidates, duplicates) = determine_splitters_streaming(
-        reference_path,
-        kmer_length,
-        segment_size as usize,
-    ).expect("Failed to determine splitters");
+    let (splitters, candidates, duplicates) =
+        determine_splitters_streaming(reference_path, kmer_length, segment_size as usize)
+            .expect("Failed to determine splitters");
 
     println!("  Found {} splitters", splitters.len());
     println!("  Found {} candidate k-mers", candidates.len());
@@ -80,7 +78,6 @@ fn test_yeast3_streaming_compression() {
         verbosity,
     );
 
-
     assert!(result.is_ok(), "Compression failed: {:?}", result.err());
     println!("  ✓ Compression successful");
 
@@ -89,11 +86,19 @@ fn test_yeast3_streaming_compression() {
     let file_size = metadata.len();
 
     println!("Step 3: Verifying archive...");
-    println!("  Archive size: {} bytes ({:.2} MB)", file_size, file_size as f64 / 1_048_576.0);
+    println!(
+        "  Archive size: {} bytes ({:.2} MB)",
+        file_size,
+        file_size as f64 / 1_048_576.0
+    );
 
     // Sanity check: archive should be at least 1KB and less than source files
     assert!(file_size > 1024, "Archive too small: {} bytes", file_size);
-    assert!(file_size < 50_000_000, "Archive too large: {} bytes", file_size);
+    assert!(
+        file_size < 50_000_000,
+        "Archive too large: {} bytes",
+        file_size
+    );
 
     println!("  ✓ Archive size reasonable");
 
@@ -108,7 +113,12 @@ fn test_yeast3_streaming_compression() {
         let samples = decompressor.list_samples();
         println!("  RAGC found {} samples: {:?}", samples.len(), samples);
 
-        assert_eq!(samples.len(), 3, "RAGC decompressor expected 3 samples, found {}", samples.len());
+        assert_eq!(
+            samples.len(),
+            3,
+            "RAGC decompressor expected 3 samples, found {}",
+            samples.len()
+        );
         println!("  ✓ RAGC decompressor can read archive");
         println!("  ✓ Found all 3 samples");
     }
@@ -131,7 +141,11 @@ fn test_yeast3_streaming_compression() {
 
             // Verify we have 3 samples
             let sample_count = samples_list.lines().count();
-            assert_eq!(sample_count, 3, "Expected 3 samples, found {}", sample_count);
+            assert_eq!(
+                sample_count, 3,
+                "Expected 3 samples, found {}",
+                sample_count
+            );
             println!("  ✓ C++ AGC can read archive");
             println!("  ✓ Found all 3 samples");
         } else {

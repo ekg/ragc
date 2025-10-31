@@ -51,7 +51,10 @@ pub fn determine_splitters(
         .collect();
 
     let mut all_kmers: Vec<u64> = all_kmers_vec.into_iter().flatten().collect();
-    eprintln!("DEBUG: Extracted {} k-mers from reference contigs", all_kmers.len());
+    eprintln!(
+        "DEBUG: Extracted {} k-mers from reference contigs",
+        all_kmers.len()
+    );
 
     // Radix sort (matching C++ AGC's RadixSortMSD)
     all_kmers.radix_sort_unstable();

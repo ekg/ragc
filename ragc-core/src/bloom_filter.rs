@@ -28,7 +28,7 @@ impl BloomFilter {
         let num_words = (size_bits + 63) / 64; // Round up to word boundary
         BloomFilter {
             bits: Mutex::new(vec![0u64; num_words]),
-            num_hashes: 3, // C++ AGC uses 3 hash functions
+            num_hashes: 3,                // C++ AGC uses 3 hash functions
             size_bits: size_bits.max(64), // Minimum size
             num_items: 0,
         }

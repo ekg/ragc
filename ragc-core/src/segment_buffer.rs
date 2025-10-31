@@ -92,7 +92,7 @@ impl SegmentPartList {
         let parts = self.parts.lock().unwrap();
 
         if *virt_begin >= parts.len() {
-            drop(parts);  // Release lock before clearing
+            drop(parts); // Release lock before clearing
             let mut parts = self.parts.lock().unwrap();
             *virt_begin = 0;
             parts.clear();
@@ -283,7 +283,8 @@ impl BufferedSegments {
         // Resize vl_seg_part to accommodate new groups
         let new_size = group_id as usize;
         if self.vl_seg_part.capacity() < new_size {
-            self.vl_seg_part.reserve((new_size as f64 * 1.2) as usize - self.vl_seg_part.len());
+            self.vl_seg_part
+                .reserve((new_size as f64 * 1.2) as usize - self.vl_seg_part.len());
         }
         while self.vl_seg_part.len() < new_size {
             self.vl_seg_part.push(SegmentPartList::new());
@@ -443,7 +444,7 @@ mod tests {
             seg_part_no: 1,
         };
 
-        assert!(part1 < part2);  // Ordered by seg_part_no
+        assert!(part1 < part2); // Ordered by seg_part_no
     }
 
     #[test]
@@ -481,7 +482,7 @@ mod tests {
 
         // Process NEW segments
         let no_new = buf.process_new();
-        assert_eq!(no_new, 1);  // One new group created
+        assert_eq!(no_new, 1); // One new group created
 
         // New group should be at index 10 (after initial 10)
         assert_eq!(buf.get_no_parts(), 11);
@@ -574,7 +575,7 @@ mod tests {
 
         // Should pop in sorted order: 0, 1, 2
         let part0 = buf.get_part(0).unwrap();
-        assert_eq!(part0.6, 0);  // seg_part_no
+        assert_eq!(part0.6, 0); // seg_part_no
 
         let part1 = buf.get_part(0).unwrap();
         assert_eq!(part1.6, 1);
