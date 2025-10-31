@@ -1475,6 +1475,21 @@ impl StreamingCompressor {
                                 let seg1_data = segment_data[..seg1_end].to_vec();
                                 let seg2_data = segment_data[seg2_start_pos..].to_vec();
 
+                                // **C++ AGC compatibility**: Only split if BOTH segments are >= kmer_length
+                                // If either segment would be too short, skip the split
+                                if seg1_data.len() < kmer_len || seg2_data.len() < kmer_len {
+                                    if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+                                        eprintln!(
+                                            "SPLIT_REJECTED: seg1_len={} seg2_len={} < kmer_len={} - using full segment instead",
+                                            seg1_data.len(),
+                                            seg2_data.len(),
+                                            kmer_len
+                                        );
+                                    }
+                                    // Don't split - continue to normal segment processing below
+                                } else {
+                                // Valid split - both segments are long enough
+
                                 // Create first split segment (seg_part_no)
                                 let seg1_info = Self::prepare_segment_info(
                                     &self.config,
@@ -1572,6 +1587,7 @@ impl StreamingCompressor {
                                 seg_part_no += 2; // Increment by 2 for split
                                 total_segments += 2;
                                 did_split = true;
+                                } // End of valid split (both segments >= kmer_length)
                             }
                         }
                     }
