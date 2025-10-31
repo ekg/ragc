@@ -2215,16 +2215,20 @@ impl StreamingCompressor {
             }
         }
 
-        // Flush remaining groups
+        // Flush remaining groups (sorted for determinism - matches C++ AGC)
+        let mut group_keys: Vec<_> = groups.iter().map(|e| e.key().clone()).collect();
+        group_keys.sort_unstable();
+
         if self.config.verbosity > 0 {
-            println!("Flushing {} remaining groups...", groups.len());
+            println!("Flushing {} remaining groups...", group_keys.len());
         }
 
-        for entry in groups.iter() {
-            let (gid, group_writer_mutex) = entry.value();
-            let mut group_writer = group_writer_mutex.lock().unwrap();
+        for key in group_keys {
+            // Remove from DashMap to take ownership (no more ref holding)
+            if let Some((_, (gid, group_writer_mutex))) = groups.remove(&key) {
+                let mut group_writer = group_writer_mutex.lock().unwrap();
 
-            if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
+                if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
                 let compressed_data = compress_segment_configured(
                     &uncompressed_pack.uncompressed_data,
                     self.config.compression_level,
@@ -2270,8 +2274,9 @@ impl StreamingCompressor {
 
                     return Err(anyhow::anyhow!("Channel send failed: {}", e));
                 }
-            }
-        }
+            }  // end if let Some(uncompressed_pack)
+            }  // end if let Some(groups.remove)
+        }  // end for key
 
         // Signal writer and wait
         drop(pack_tx);
