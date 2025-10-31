@@ -83,12 +83,48 @@ Iterator → Queue ──┼─> Worker 2 (local ZSTD ctx) ─┼─> Writer Thr
 ---
 
 ### Phase 2: Worker Thread Architecture
-**Status**: ⏳ Not Started
+**Status**: 🔄 In Progress
 
-**Study**:
-- [ ] Analyze C++ AGC worker loop (agc_compressor.cpp:1108-1139)
-- [ ] Map to RAGC segment processing logic
-- [ ] Identify synchronization points
+**Study**: ✅ COMPLETE
+- [x] Analyzed C++ AGC worker loop (agc_compressor.cpp:1108-1275)
+- [x] Mapped to RAGC segment processing logic
+- [x] Identified synchronization points
+
+**C++ AGC Worker Flow**:
+```cpp
+while (true) {
+    task_t task = pq_contigs_desc_working->PopLarge();
+
+    if (task == empty) continue;
+    if (task == completed) break;
+
+    if (task == registration) {
+        // Synchronization barrier for batch operations
+        barrier.arrive_and_wait();
+        if (thread_id == 0) register_segments();
+        barrier.arrive_and_wait();
+        store_segments(zstd_cctx, zstd_dctx);  // All workers compress & write
+        barrier.arrive_and_wait();
+        continue;
+    }
+
+    // Main processing: compress_contig() → add_segment()
+    compress_contig(task, zstd_cctx, zstd_dctx, thread_id);
+}
+```
+
+**Key Findings**:
+1. Workers pull contigs from `BoundedPriorityQueue`
+2. Workers call `compress_contig()` which segments and compresses
+3. Workers write **directly** to thread-safe archive (no separate writer!)
+4. Barriers coordinate batch operations (register_segments, store_segments)
+
+**RAGC Adaptation**:
+- ✅ RAGC already has separate writer thread (better design!)
+- ✅ Workers can send `CompressedPack` to writer via channel
+- Need: Workers pull from `BoundedPriorityQueue`
+- Need: Workers process contigs (segment → group → compress)
+- Skip: Barriers (RAGC processes incrementally, not in batches)
 
 **Implementation**:
 - [ ] Create `ContigTask` type (matches C++ `task_t`)
