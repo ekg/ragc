@@ -260,14 +260,14 @@ impl GroupWriter {
             self.ref_written = true;
 
             if let Some(ref_stream_id) = self.ref_stream_id {
-                // For now, keep using the old compression (level 17, marker 0)
-                // TODO: Investigate why compress_reference_segment causes data loss
-                let compressed = compress_segment_configured(&segment.data, config.compression_level)?;
+                // Match C++ AGC's compression strategy (segment.h:218-256)
+                // Check repetitiveness and use tuple packing for non-repetitive data
+                let (compressed, marker_byte) = compress_reference_segment(&segment.data)?;
 
                 let (compressed_data, uncompressed_size) =
                     if compressed.len() + 1 < segment.data.len() {
                         let mut compressed_with_marker = compressed;
-                        compressed_with_marker.push(0);  // Always use marker 0 for now
+                        compressed_with_marker.push(marker_byte);
                         (compressed_with_marker, segment.data.len() as u64)
                     } else {
                         (segment.data.clone(), 0)
