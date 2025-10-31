@@ -1934,43 +1934,82 @@ impl StreamingCompressor {
                 let mut segments_registered = 0;
 
                 while let Ok(pack) = pack_rx.recv() {
-                    let mut archive_lock = archive.lock().unwrap();
-                    let mut collection_lock = collection.lock().unwrap();
+                    // Wrap processing in error handler to capture exact failure point
+                    if let Err(e) = (|| -> Result<()> {
+                        let mut archive_lock = archive.lock().unwrap();
+                        let mut collection_lock = collection.lock().unwrap();
 
-                    // Register stream on-demand
-                    let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
-                        id
-                    } else {
-                        let stream_name = if pack.stream_id >= 100000 {
-                            stream_ref_name(archive_version, (pack.stream_id - 100000) as u32)
+                        // Register stream on-demand
+                        let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
+                            id
                         } else {
-                            stream_delta_name(archive_version, pack.group_id)
+                            let stream_name = if pack.stream_id >= 100000 {
+                                stream_ref_name(archive_version, (pack.stream_id - 100000) as u32)
+                            } else {
+                                stream_delta_name(archive_version, pack.group_id)
+                            };
+                            let id = archive_lock.register_stream(&stream_name);
+                            stream_id_map.insert(pack.stream_id, id);
+                            id
                         };
-                        let id = archive_lock.register_stream(&stream_name);
-                        stream_id_map.insert(pack.stream_id, id);
-                        id
-                    };
 
-                    // Register segments in collection
-                    for seg_meta in &pack.segments {
-                        collection_lock.add_segment_placed(
-                            &seg_meta.sample_name,
-                            &seg_meta.contig_name,
-                            seg_meta.seg_part_no,
-                            pack.group_id,
-                            seg_meta.in_group_id,
-                            seg_meta.is_rev_comp,
-                            seg_meta.data_len,
-                        )?;
-                        segments_registered += 1;
+                        // Register segments in collection
+                        for seg_meta in &pack.segments {
+                            // Register sample/contig first (required before add_segment_placed)
+                            if let Err(e) = collection_lock.register_sample_contig(
+                                &seg_meta.sample_name,
+                                &seg_meta.contig_name,
+                            ) {
+                                eprintln!("ERROR in writer thread: register_sample_contig failed");
+                                eprintln!("  Sample: {}", seg_meta.sample_name);
+                                eprintln!("  Contig: {}", seg_meta.contig_name);
+                                eprintln!("  Error: {}", e);
+                                return Err(e);
+                            }
+
+                            if let Err(e) = collection_lock.add_segment_placed(
+                                &seg_meta.sample_name,
+                                &seg_meta.contig_name,
+                                seg_meta.seg_part_no,
+                                pack.group_id,
+                                seg_meta.in_group_id,
+                                seg_meta.is_rev_comp,
+                                seg_meta.data_len,
+                            ) {
+                                eprintln!("ERROR in writer thread: add_segment_placed failed");
+                                eprintln!("  Sample: {}", seg_meta.sample_name);
+                                eprintln!("  Contig: {}", seg_meta.contig_name);
+                                eprintln!("  seg_part_no: {}", seg_meta.seg_part_no);
+                                eprintln!("  group_id: {}", pack.group_id);
+                                eprintln!("  in_group_id: {}", seg_meta.in_group_id);
+                                eprintln!("  is_rev_comp: {}", seg_meta.is_rev_comp);
+                                eprintln!("  data_len: {}", seg_meta.data_len);
+                                eprintln!("  Error: {}", e);
+                                return Err(e);
+                            }
+                            segments_registered += 1;
+                        }
+
+                        // Write compressed data to archive
+                        if let Err(e) = archive_lock.add_part(
+                            actual_stream_id,
+                            &pack.compressed_data,
+                            pack.uncompressed_size,
+                        ) {
+                            eprintln!("ERROR in writer thread: add_part failed");
+                            eprintln!("  stream_id: {}", actual_stream_id);
+                            eprintln!("  group_id: {}", pack.group_id);
+                            eprintln!("  compressed_size: {}", pack.compressed_data.len());
+                            eprintln!("  uncompressed_size: {}", pack.uncompressed_size);
+                            eprintln!("  Error: {}", e);
+                            return Err(e);
+                        }
+
+                        Ok(())
+                    })() {
+                        eprintln!("Writer thread exiting due to error processing pack for group {}", pack.group_id);
+                        return Err(e);
                     }
-
-                    // Write compressed data to archive
-                    archive_lock.add_part(
-                        actual_stream_id,
-                        &pack.compressed_data,
-                        pack.uncompressed_size,
-                    )?;
 
                     packs_written += 1;
                 }
@@ -2032,37 +2071,44 @@ impl StreamingCompressor {
                                 // Create normalized key
                                 let (key, needs_rc) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
 
-                                // Check if group is known
-                                let is_new = !known_groups.contains_key(&key);
-
-                                if is_new {
-                                    // NEW SEGMENT: Create new group
-                                    let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
-                                    known_groups.insert(key.clone(), gid);
-
-                                    // Add terminators
-                                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                                        group_terminators
-                                            .entry(key.kmer_front)
-                                            .or_insert_with(Vec::new)
-                                            .push(key.kmer_back);
-                                        if key.kmer_front != key.kmer_back {
-                                            group_terminators
-                                                .entry(key.kmer_back)
-                                                .or_insert_with(Vec::new)
-                                                .push(key.kmer_front);
-                                        }
+                                // Atomic group creation (fixes race condition!)
+                                // Use entry() API to ensure only one thread creates each group
+                                let gid = match known_groups.entry(key.clone()) {
+                                    dashmap::mapref::entry::Entry::Occupied(e) => {
+                                        // Group already exists
+                                        *e.get()
                                     }
+                                    dashmap::mapref::entry::Entry::Vacant(e) => {
+                                        // NEW SEGMENT: Create new group atomically
+                                        let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                                        e.insert(gid);
 
-                                    let stream_id = gid as usize;
-                                    let ref_stream_id = if gid >= 16 {
-                                        Some(100000 + gid as usize)
-                                    } else {
-                                        None
-                                    };
+                                        // Add terminators
+                                        if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                                            group_terminators
+                                                .entry(key.kmer_front)
+                                                .or_insert_with(Vec::new)
+                                                .push(key.kmer_back);
+                                            if key.kmer_front != key.kmer_back {
+                                                group_terminators
+                                                    .entry(key.kmer_back)
+                                                    .or_insert_with(Vec::new)
+                                                    .push(key.kmer_front);
+                                            }
+                                        }
 
-                                    groups.insert(key.clone(), (gid, Mutex::new(GroupWriter::new(gid, stream_id, ref_stream_id))));
-                                }
+                                        let stream_id = gid as usize;
+                                        let ref_stream_id = if gid >= 16 {
+                                            Some(100000 + gid as usize)
+                                        } else {
+                                            None
+                                        };
+
+                                        groups.insert(key.clone(), (gid, Mutex::new(GroupWriter::new(gid, stream_id, ref_stream_id))));
+
+                                        gid
+                                    }
+                                };
 
                                 // Prepare segment
                                 let seg_info = Self::prepare_segment_info(
@@ -2152,8 +2198,21 @@ impl StreamingCompressor {
         contig_queue.mark_completed();
 
         // Wait for workers
-        for handle in worker_handles {
-            handle.join().map_err(|_| anyhow::anyhow!("Worker thread panicked"))??;
+        for (idx, handle) in worker_handles.into_iter().enumerate() {
+            match handle.join() {
+                Ok(Ok(())) => {
+                    if self.config.verbosity > 1 {
+                        println!("Worker {} joined successfully", idx);
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("ERROR: Worker {} failed: {}", idx, e);
+                    return Err(e);
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!("Worker {} panicked", idx));
+                }
+            }
         }
 
         // Flush remaining groups
@@ -2187,16 +2246,46 @@ impl StreamingCompressor {
                     segments: uncompressed_pack.segments,
                 };
 
-                pack_tx.send(compressed_pack)?;
+                if let Err(e) = pack_tx.send(compressed_pack) {
+                    eprintln!("ERROR: Failed to send pack for group {}: {}", gid, e);
+                    eprintln!("This usually means the writer thread has exited early.");
+                    eprintln!("Checking writer thread status...");
+
+                    // Check if writer is still running
+                    drop(pack_tx);
+                    match writer_handle.join() {
+                        Ok(Ok(count)) => {
+                            eprintln!("Writer thread exited successfully with {} packs written", count);
+                            eprintln!("But we still have groups to flush - this is unexpected!");
+                        }
+                        Ok(Err(writer_err)) => {
+                            eprintln!("Writer thread failed with error: {}", writer_err);
+                            return Err(writer_err);
+                        }
+                        Err(_) => {
+                            eprintln!("Writer thread panicked");
+                            return Err(anyhow::anyhow!("Writer thread panicked"));
+                        }
+                    }
+
+                    return Err(anyhow::anyhow!("Channel send failed: {}", e));
+                }
             }
         }
 
         // Signal writer and wait
         drop(pack_tx);
 
-        let packs_written = writer_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
+        let packs_written = match writer_handle.join() {
+            Ok(Ok(count)) => count,
+            Ok(Err(e)) => {
+                eprintln!("ERROR: Writer thread failed: {}", e);
+                return Err(e);
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!("Writer thread panicked"));
+            }
+        };
 
         if self.config.verbosity > 0 {
             println!("Writer complete: {} packs written", packs_written);
