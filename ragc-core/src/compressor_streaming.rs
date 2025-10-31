@@ -145,6 +145,7 @@ struct PreparedSegment {
 
 /// Contig task for C++ AGC-style contig-level parallelism
 /// Workers pull contigs from queue, segment them, and add to shared groups
+#[derive(Clone, PartialEq, Eq)]
 struct ContigTask {
     sample_name: String,
     contig_name: String,
@@ -1167,7 +1168,7 @@ impl StreamingCompressor {
             println!("=== Pass 2: Segmenting and compressing genomes ===");
         }
 
-        // Pass 2: Use C++ AGC exact architecture (two-phase processing)
+        // Pass 2: Use C++ AGC worker-based architecture (parallel contig processing)
         // Create MultiFileIterator from file paths
         let file_path_bufs: Vec<PathBuf> = fasta_paths
             .iter()
@@ -1177,7 +1178,8 @@ impl StreamingCompressor {
             file_path_bufs,
         )?);
 
-        self.add_segments_with_inline_splits(iterator, &splitters)?;
+        // Use worker-based processing (parallel segmentation!)
+        self.add_segments_with_workers(iterator, &splitters)?;
 
         Ok(())
     }
@@ -1861,6 +1863,372 @@ impl StreamingCompressor {
 
         Ok(())
     }
+
+    /// Worker-based contig processing (matching C++ AGC architecture)
+    ///
+    /// This replaces single-threaded segmentation with parallel workers:
+    /// - Main thread: Streams contigs into BoundedPriorityQueue
+    /// - Worker threads: Pull contigs, segment, compress, send to writer
+    /// - Writer thread: Receives compressed packs, writes to archive
+    ///
+    /// C++ AGC equivalent: start_compressing_threads() + AddSampleFiles()
+    fn add_segments_with_workers(
+        &mut self,
+        mut iterator: Box<dyn ContigIterator>,
+        splitters: &HashSet<u64>,
+    ) -> Result<()> {
+        let num_workers = self.config.num_threads;
+
+        if self.config.verbosity > 0 {
+            println!("Starting C++ AGC-style worker-based compression ({} workers)...", num_workers);
+        }
+
+        // ================================================================
+        // SETUP: Shared state (thread-safe)
+        // ================================================================
+
+        // Queue capacity: 2GB or 192MB/thread (matching C++ AGC line 2150)
+        let queue_capacity = std::cmp::max(
+            2usize << 30,                          // 2GB
+            num_workers * (192usize << 20)         // 192MB/thread
+        );
+
+        // Priority queue for contigs (matching C++ AGC CBoundedPQueue)
+        let contig_queue = BoundedPriorityQueue::new(1, queue_capacity);
+
+        // Shared state for workers (thread-safe with DashMap)
+        let known_groups = Arc::new(DashMap::<SegmentGroupKey, u32>::new());
+        let groups = Arc::new(DashMap::<SegmentGroupKey, (u32, Mutex<GroupWriter>)>::new());
+        let group_terminators = Arc::new(DashMap::<u64, Vec<u64>>::new());
+        let next_group_id = Arc::new(AtomicU32::new(self.next_group_id));
+
+        // Tracking counters
+        let total_segments = Arc::new(AtomicUsize::new(0));
+        let total_bases = Arc::new(AtomicUsize::new(0));
+        let total_contigs = Arc::new(AtomicUsize::new(0));
+
+        // Channel for compressed packs (writer thread)
+        let (pack_tx, pack_rx) = bounded::<CompressedPack>(100);
+
+        // ================================================================
+        // WRITER THREAD (same as existing code)
+        // ================================================================
+        let archive = Arc::new(Mutex::new(std::mem::replace(
+            &mut self.archive,
+            Archive::new_writer(),
+        )));
+        let collection = Arc::new(Mutex::new(std::mem::replace(
+            &mut self.collection,
+            CollectionV3::new(),
+        )));
+
+        let writer_handle = {
+            let archive = archive.clone();
+            let collection = collection.clone();
+            let config = self.config.clone();
+
+            thread::spawn(move || -> Result<usize> {
+                let mut stream_id_map: HashMap<usize, usize> = HashMap::new();
+                let archive_version = AGC_FILE_MAJOR * 1000 + AGC_FILE_MINOR;
+                let mut packs_written = 0;
+                let mut segments_registered = 0;
+
+                while let Ok(pack) = pack_rx.recv() {
+                    let mut archive_lock = archive.lock().unwrap();
+                    let mut collection_lock = collection.lock().unwrap();
+
+                    // Register stream on-demand
+                    let actual_stream_id = if let Some(&id) = stream_id_map.get(&pack.stream_id) {
+                        id
+                    } else {
+                        let stream_name = if pack.stream_id >= 100000 {
+                            stream_ref_name(archive_version, (pack.stream_id - 100000) as u32)
+                        } else {
+                            stream_delta_name(archive_version, pack.group_id)
+                        };
+                        let id = archive_lock.register_stream(&stream_name);
+                        stream_id_map.insert(pack.stream_id, id);
+                        id
+                    };
+
+                    // Register segments in collection
+                    for seg_meta in &pack.segments {
+                        collection_lock.add_segment_placed(
+                            &seg_meta.sample_name,
+                            &seg_meta.contig_name,
+                            seg_meta.seg_part_no,
+                            pack.group_id,
+                            seg_meta.in_group_id,
+                            seg_meta.is_rev_comp,
+                            seg_meta.data_len,
+                        )?;
+                        segments_registered += 1;
+                    }
+
+                    // Write compressed data to archive
+                    archive_lock.add_part(
+                        actual_stream_id,
+                        &pack.compressed_data,
+                        pack.uncompressed_size,
+                    )?;
+
+                    packs_written += 1;
+                }
+
+                if config.verbosity > 0 {
+                    println!("Writer thread complete: wrote {} packs, registered {} segments",
+                        packs_written, segments_registered);
+                }
+                Ok(packs_written)
+            })
+        };
+
+        // ================================================================
+        // WORKER THREADS (matching C++ AGC architecture)
+        // ================================================================
+        let mut worker_handles = Vec::new();
+
+        for worker_id in 0..num_workers {
+            let queue = contig_queue.clone();
+            let known_groups = known_groups.clone();
+            let groups = groups.clone();
+            let group_terminators = group_terminators.clone();
+            let next_group_id = next_group_id.clone();
+            let pack_tx = pack_tx.clone();
+            let splitters = splitters.clone();
+            let config = self.config.clone();
+            let total_segments_counter = total_segments.clone();
+            let total_bases_counter = total_bases.clone();
+
+            let handle = thread::spawn(move || -> Result<()> {
+                // Worker loop (matching C++ AGC lines 1108-1275)
+                loop {
+                    let (result, task_opt) = queue.pop_large();
+
+                    match result {
+                        PopResult::Empty => continue,
+                        PopResult::Completed => break,
+                        PopResult::Normal => {
+                            let task: ContigTask = task_opt.unwrap();
+
+                            // Segment contig at splitters
+                            let segments = split_at_splitters_with_size(
+                                &task.sequence,
+                                &splitters,
+                                config.kmer_length as usize,
+                                config.segment_size as usize,
+                            );
+
+                            total_bases_counter.fetch_add(task.sequence.len(), Ordering::Relaxed);
+
+                            // Process each segment
+                            let mut seg_part_no = 0usize;
+
+                            for segment in segments {
+                                let kmer_front = segment.front_kmer;
+                                let kmer_back = segment.back_kmer;
+                                let segment_data = segment.data;
+
+                                // Create normalized key
+                                let (key, needs_rc) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
+
+                                // Check if group is known
+                                let is_new = !known_groups.contains_key(&key);
+
+                                if is_new {
+                                    // NEW SEGMENT: Create new group
+                                    let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                                    known_groups.insert(key.clone(), gid);
+
+                                    // Add terminators
+                                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                                        group_terminators
+                                            .entry(key.kmer_front)
+                                            .or_insert_with(Vec::new)
+                                            .push(key.kmer_back);
+                                        if key.kmer_front != key.kmer_back {
+                                            group_terminators
+                                                .entry(key.kmer_back)
+                                                .or_insert_with(Vec::new)
+                                                .push(key.kmer_front);
+                                        }
+                                    }
+
+                                    let stream_id = gid as usize;
+                                    let ref_stream_id = if gid >= 16 {
+                                        Some(100000 + gid as usize)
+                                    } else {
+                                        None
+                                    };
+
+                                    groups.insert(key.clone(), (gid, Mutex::new(GroupWriter::new(gid, stream_id, ref_stream_id))));
+                                }
+
+                                // Prepare segment
+                                let seg_info = Self::prepare_segment_info(
+                                    &config,
+                                    &task.sample_name,
+                                    &task.contig_name,
+                                    seg_part_no,
+                                    segment_data,
+                                    Some(kmer_front),
+                                    Some(kmer_back),
+                                )?;
+
+                                // Add to group
+                                if let Some(group_entry) = groups.get(&key) {
+                                    let (gid, group_writer_mutex) = &*group_entry;
+                                    let mut group_writer = group_writer_mutex.lock().unwrap();
+
+                                    if let Some(pack) = group_writer.add_segment(seg_info.segment, &config)? {
+                                        let compressed_pack = match pack {
+                                            PackToWrite::Compressed(cp) => cp,
+                                            PackToWrite::Uncompressed(up) => {
+                                                let compressed_data = compress_segment_configured(
+                                                    &up.uncompressed_data,
+                                                    config.compression_level,
+                                                )?;
+                                                let (final_data, uncompressed_size) =
+                                                    if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                                                        let mut data_with_marker = compressed_data;
+                                                        data_with_marker.push(0);
+                                                        (data_with_marker, up.uncompressed_data.len() as u64)
+                                                    } else {
+                                                        (up.uncompressed_data, 0)
+                                                    };
+                                                CompressedPack {
+                                                    group_id: up.group_id,
+                                                    stream_id: up.stream_id,
+                                                    compressed_data: final_data,
+                                                    uncompressed_size,
+                                                    segments: up.segments,
+                                                }
+                                            }
+                                        };
+                                        pack_tx.send(compressed_pack)?;
+                                    }
+                                }
+
+                                seg_part_no += 1;
+                                total_segments_counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+
+                if config.verbosity > 1 {
+                    println!("Worker {} complete", worker_id);
+                }
+                Ok(())
+            });
+
+            worker_handles.push(handle);
+        }
+
+        // ================================================================
+        // MAIN THREAD: Stream contigs into queue
+        // ================================================================
+        let mut contig_priority = usize::MAX; // Higher priority = processed first
+
+        while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
+            if sequence.is_empty() {
+                continue;
+            }
+
+            total_contigs.fetch_add(1, Ordering::Relaxed);
+
+            let task = ContigTask {
+                sample_name,
+                contig_name,
+                sequence: sequence.clone(),
+            };
+
+            let cost = sequence.len();
+            contig_queue.emplace(task, contig_priority, cost);
+            contig_priority = contig_priority.saturating_sub(1);
+        }
+
+        // Signal completion
+        contig_queue.mark_completed();
+
+        // Wait for workers
+        for handle in worker_handles {
+            handle.join().map_err(|_| anyhow::anyhow!("Worker thread panicked"))??;
+        }
+
+        // Flush remaining groups
+        if self.config.verbosity > 0 {
+            println!("Flushing {} remaining groups...", groups.len());
+        }
+
+        for entry in groups.iter() {
+            let (gid, group_writer_mutex) = entry.value();
+            let mut group_writer = group_writer_mutex.lock().unwrap();
+
+            if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
+                let compressed_data = compress_segment_configured(
+                    &uncompressed_pack.uncompressed_data,
+                    self.config.compression_level,
+                )?;
+                let (final_data, uncompressed_size) =
+                    if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
+                        let mut data_with_marker = compressed_data;
+                        data_with_marker.push(0);
+                        (data_with_marker, uncompressed_pack.uncompressed_data.len() as u64)
+                    } else {
+                        (uncompressed_pack.uncompressed_data, 0)
+                    };
+
+                let compressed_pack = CompressedPack {
+                    group_id: uncompressed_pack.group_id,
+                    stream_id: uncompressed_pack.stream_id,
+                    compressed_data: final_data,
+                    uncompressed_size,
+                    segments: uncompressed_pack.segments,
+                };
+
+                pack_tx.send(compressed_pack)?;
+            }
+        }
+
+        // Signal writer and wait
+        drop(pack_tx);
+
+        let packs_written = writer_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
+
+        if self.config.verbosity > 0 {
+            println!("Writer complete: {} packs written", packs_written);
+        }
+
+        // Update state
+        self.next_group_id = next_group_id.load(Ordering::SeqCst);
+        self.total_segments = total_segments.load(Ordering::Relaxed);
+        self.total_bases_processed = total_bases.load(Ordering::Relaxed);
+
+        // Restore archive and collection
+        self.archive = Arc::try_unwrap(archive)
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap Arc for archive"))?
+            .into_inner()
+            .unwrap();
+        self.collection = Arc::try_unwrap(collection)
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap Arc for collection"))?
+            .into_inner()
+            .unwrap();
+
+        if self.config.verbosity > 0 {
+            println!(
+                "Compression complete: {} contigs, {} bases, {} segments",
+                total_contigs.load(Ordering::Relaxed),
+                total_bases.load(Ordering::Relaxed),
+                total_segments.load(Ordering::Relaxed)
+            );
+        }
+
+        Ok(())
+    }
+
     fn calculate_split_position(
         kmer_front: u64,
         kmer_back: u64,
