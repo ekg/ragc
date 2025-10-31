@@ -55,6 +55,7 @@ fn test_unified_iterator_equivalence() {
         compression_level: 11,
         verbosity: 0, // Quiet for tests
         group_flush_threshold: 0,
+        concatenated_genomes: false,
         periodic_flush_interval: 0,
         num_threads: 1, // FIXME: Multi-threading has race conditions, use single thread for now
         adaptive_mode: false,
