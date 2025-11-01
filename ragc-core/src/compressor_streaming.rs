@@ -2148,25 +2148,33 @@ impl StreamingCompressor {
                                         let mut all_pending = Vec::new();
                                         std::mem::swap(&mut all_pending, &mut *pending_segments.lock().unwrap());
 
-                                        // DON'T SORT! Sorting changes encounter order and creates different group IDs
-                                        // Single-threaded: segments are already in file order
-                                        // Multi-threaded: segments are in non-deterministic order (needs more work)
+                                        // NOTE: Segments must be in FILE ORDER for correct group ID assignment!
+                                        // Group IDs are stored in archive collection and must match contig segment order.
+                                        //
+                                        // Single-threaded: Segments are already in file order ✓
+                                        // Multi-threaded: Segments are in non-deterministic order ✗
+                                        //
+                                        // Attempted fix: Sort by (sample, contig, seg_part_no) → CAUSED DATA CORRUPTION!
+                                        // Alphabetical order != File order (e.g., "chrIX" < "chrV" alphabetically)
+                                        //
+                                        // CORRECT FIX: Add sequence numbers to tasks when queuing, then sort by seq_num
+                                        // This preserves file order even with parallel processing.
 
-                                        // Group segments by k-mer key in ENCOUNTER ORDER (after sorting!)
-                                        // This matches sequential code's behavior: groups created in order segments are encountered
+                                        // Group segments by k-mer key in ENCOUNTER ORDER
+                                        // Groups created in order k-mer pairs first appear (must be file order!)
                                         use std::collections::HashMap;
                                         let mut key_to_segments: HashMap<(u64, u64), Vec<PendingSegment>> = HashMap::new();
-                                        let mut key_order: Vec<(u64, u64)> = Vec::new(); // Track encounter order
+                                        let mut key_order: Vec<(u64, u64)> = Vec::new(); // Track first occurrence in sorted order
 
                                         for seg in all_pending {
                                             let key_tuple = (seg.key.kmer_front, seg.key.kmer_back);
                                             if !key_to_segments.contains_key(&key_tuple) {
-                                                key_order.push(key_tuple); // First time seeing this key
+                                                key_order.push(key_tuple); // First time seeing this k-mer pair in sorted list
                                             }
                                             key_to_segments.entry(key_tuple).or_insert_with(Vec::new).push(seg);
                                         }
 
-                                        // Assign group IDs in ENCOUNTER ORDER (matching sequential code!)
+                                        // Assign group IDs in SORTED ORDER (matching C++ AGC std::set iteration!)
                                         for (kmer_front, kmer_back) in key_order {
                                             let mut segments = key_to_segments.remove(&(kmer_front, kmer_back)).unwrap();
 
