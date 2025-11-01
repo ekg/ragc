@@ -29,12 +29,12 @@ use ragc_common::{
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
-    Arc, Mutex, RwLock,
+    Arc, Barrier, Mutex, RwLock,
 };
 use std::thread;
 
@@ -146,10 +146,29 @@ struct PreparedSegment {
 /// Contig task for C++ AGC-style contig-level parallelism
 /// Workers pull contigs from queue, segment them, and add to shared groups
 #[derive(Clone, PartialEq, Eq)]
-struct ContigTask {
+enum ContigTask {
+    /// Normal contig processing
+    Normal {
+        sample_name: String,
+        contig_name: String,
+        sequence: Contig,
+    },
+    /// Synchronization point: workers wait, thread 0 registers groups
+    Registration,
+}
+
+/// Pending segment awaiting registration
+/// Matches C++ AGC's seg_part_t structure (agc_compressor.h:29-120)
+/// Workers create these during segmentation, thread 0 registers them at barriers
+#[derive(Clone)]
+struct PendingSegment {
+    key: SegmentGroupKey,
     sample_name: String,
     contig_name: String,
-    sequence: Contig,
+    seg_part_no: usize,
+    segment_data: Vec<u8>,
+    kmer_front: u64,
+    kmer_back: u64,
 }
 
 /// Segment group identified by flanking k-mers
@@ -397,6 +416,16 @@ impl GroupWriter {
             uncompressed_data: packed_data,
             segments,
         }))
+    }
+
+    /// Flush any remaining buffered segments as a final pack
+    /// Called at the end of compression to ensure all segments are written
+    fn flush_final(
+        &mut self,
+        config: &StreamingCompressorConfig,
+    ) -> Result<Option<PackToWrite>> {
+        // Prepare pack from any remaining segments (even if less than PACK_CARDINALITY)
+        Ok(self.prepare_pack(config)?.map(PackToWrite::Uncompressed))
     }
 }
 
@@ -1619,15 +1648,6 @@ impl StreamingCompressor {
                         let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
                         known_groups.insert(key.clone(), gid);
 
-                        if total_segments % 1000 == 0 || gid < 100 || gid > 50000 {
-                            println!(
-                                "DEBUG: Created group_id={} at segment {} (total unique groups={})",
-                                gid,
-                                total_segments,
-                                known_groups.len()
-                            );
-                        }
-
                         // Optional debug logging for compatibility testing
                         if std::env::var("RAGC_DEBUG_KMER_PAIRS").is_ok() {
                             eprintln!(
@@ -1902,6 +1922,15 @@ impl StreamingCompressor {
         let group_terminators = Arc::new(DashMap::<u64, Vec<u64>>::new());
         let next_group_id = Arc::new(AtomicU32::new(self.next_group_id));
 
+        // Pending segments storage (C++ AGC-style batch registration)
+        // Workers add segments here during Normal processing
+        // Thread 0 registers them deterministically at Registration barriers
+        let pending_segments = Arc::new(Mutex::new(Vec::<PendingSegment>::new()));
+
+        // Segments ready for compression (after registration)
+        // Map from group_id to Vec<PendingSegment>
+        let segments_to_compress = Arc::new(DashMap::<u32, Vec<PendingSegment>>::new());
+
         // Tracking counters
         let total_segments = Arc::new(AtomicUsize::new(0));
         let total_bases = Arc::new(AtomicUsize::new(0));
@@ -2025,14 +2054,21 @@ impl StreamingCompressor {
         // ================================================================
         // WORKER THREADS (matching C++ AGC architecture)
         // ================================================================
+
+        // Create barrier for synchronization (C++ AGC-style batch processing)
+        let barrier = Arc::new(Barrier::new(num_workers));
+
         let mut worker_handles = Vec::new();
 
         for worker_id in 0..num_workers {
             let queue = contig_queue.clone();
+            let barrier = barrier.clone();
             let known_groups = known_groups.clone();
             let groups = groups.clone();
             let group_terminators = group_terminators.clone();
             let next_group_id = next_group_id.clone();
+            let pending_segments = pending_segments.clone();
+            let segments_to_compress = segments_to_compress.clone();
             let pack_tx = pack_tx.clone();
             let splitters = splitters.clone();
             let config = self.config.clone();
@@ -2050,113 +2086,295 @@ impl StreamingCompressor {
                         PopResult::Normal => {
                             let task: ContigTask = task_opt.unwrap();
 
-                            // Segment contig at splitters
-                            let segments = split_at_splitters_with_size(
-                                &task.sequence,
-                                &splitters,
-                                config.kmer_length as usize,
-                                config.segment_size as usize,
-                            );
+                            // Handle task based on type
+                            match task {
+                                ContigTask::Normal { sample_name, contig_name, sequence } => {
+                                    // Segment contig at splitters
+                                    let segments = split_at_splitters_with_size(
+                                        &sequence,
+                                        &splitters,
+                                        config.kmer_length as usize,
+                                        config.segment_size as usize,
+                                    );
 
-                            total_bases_counter.fetch_add(task.sequence.len(), Ordering::Relaxed);
-
-                            // Process each segment
-                            let mut seg_part_no = 0usize;
-
-                            for segment in segments {
-                                let kmer_front = segment.front_kmer;
-                                let kmer_back = segment.back_kmer;
-                                let segment_data = segment.data;
-
-                                // Create normalized key
-                                let (key, needs_rc) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
-
-                                // Atomic group creation (fixes race condition!)
-                                // Use entry() API to ensure only one thread creates each group
-                                let gid = match known_groups.entry(key.clone()) {
-                                    dashmap::mapref::entry::Entry::Occupied(e) => {
-                                        // Group already exists
-                                        *e.get()
+                                    if config.verbosity > 1 {
+                                        println!("Worker {} processing contig {} (len={}, {} segments)",
+                                            worker_id, contig_name, sequence.len(), segments.len());
                                     }
-                                    dashmap::mapref::entry::Entry::Vacant(e) => {
-                                        // NEW SEGMENT: Create new group atomically
-                                        let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
-                                        e.insert(gid);
 
-                                        // Add terminators
-                                        if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                                            group_terminators
-                                                .entry(key.kmer_front)
-                                                .or_insert_with(Vec::new)
-                                                .push(key.kmer_back);
-                                            if key.kmer_front != key.kmer_back {
-                                                group_terminators
-                                                    .entry(key.kmer_back)
-                                                    .or_insert_with(Vec::new)
-                                                    .push(key.kmer_front);
+                                    total_bases_counter.fetch_add(sequence.len(), Ordering::Relaxed);
+
+                                    // Process each segment
+                                    let mut seg_part_no = 0usize;
+
+                                    for segment in segments {
+                                        let kmer_front = segment.front_kmer;
+                                        let kmer_back = segment.back_kmer;
+                                        let segment_data = segment.data;
+
+                                        // Create normalized key
+                                        let (key, needs_rc) = SegmentGroupKey::new_normalized(kmer_front, kmer_back);
+
+                                        // Store pending segment instead of creating group
+                                        // Thread 0 will register groups deterministically at Registration barrier
+                                        pending_segments.lock().unwrap().push(PendingSegment {
+                                            key,
+                                            sample_name: sample_name.clone(),
+                                            contig_name: contig_name.clone(),
+                                            seg_part_no,
+                                            segment_data,
+                                            kmer_front,
+                                            kmer_back,
+                                        });
+
+                                        seg_part_no += 1;
+                                        total_segments_counter.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+
+                                ContigTask::Registration => {
+                                    // C++ AGC-style batch synchronization (lines 123-130 in THREADING_REFACTOR.md)
+                                    // All workers wait at barrier for deterministic group registration
+                                    if config.verbosity > 1 {
+                                        println!("Worker {} reached registration barrier", worker_id);
+                                    }
+
+                                    // Barrier 1: All workers stop processing
+                                    barrier.wait();
+
+                                    // Phase 3.1: Thread 0 registers groups deterministically (C++ AGC: agc_compressor.cpp:1123)
+                                    if worker_id == 0 {
+                                        // Take all pending segments (swap with empty vec to avoid long lock)
+                                        let mut all_pending = Vec::new();
+                                        std::mem::swap(&mut all_pending, &mut *pending_segments.lock().unwrap());
+
+                                        // DON'T SORT! Sorting changes encounter order and creates different group IDs
+                                        // Single-threaded: segments are already in file order
+                                        // Multi-threaded: segments are in non-deterministic order (needs more work)
+
+                                        // Group segments by k-mer key in ENCOUNTER ORDER (after sorting!)
+                                        // This matches sequential code's behavior: groups created in order segments are encountered
+                                        use std::collections::HashMap;
+                                        let mut key_to_segments: HashMap<(u64, u64), Vec<PendingSegment>> = HashMap::new();
+                                        let mut key_order: Vec<(u64, u64)> = Vec::new(); // Track encounter order
+
+                                        for seg in all_pending {
+                                            let key_tuple = (seg.key.kmer_front, seg.key.kmer_back);
+                                            if !key_to_segments.contains_key(&key_tuple) {
+                                                key_order.push(key_tuple); // First time seeing this key
                                             }
+                                            key_to_segments.entry(key_tuple).or_insert_with(Vec::new).push(seg);
                                         }
 
-                                        let stream_id = gid as usize;
-                                        let ref_stream_id = if gid >= 16 {
-                                            Some(100000 + gid as usize)
+                                        // Assign group IDs in ENCOUNTER ORDER (matching sequential code!)
+                                        for (kmer_front, kmer_back) in key_order {
+                                            let mut segments = key_to_segments.remove(&(kmer_front, kmer_back)).unwrap();
+
+                                            // Sort segments within group by (sample, contig, seg_part_no) for correct ordering
+                                            segments.sort_by(|a, b| {
+                                                (&a.sample_name, &a.contig_name, a.seg_part_no)
+                                                    .cmp(&(&b.sample_name, &b.contig_name, b.seg_part_no))
+                                            });
+
+                                            let key = SegmentGroupKey { kmer_front, kmer_back };
+
+                                            // Check if group already exists, or create new one
+                                            let gid = match known_groups.entry(key.clone()) {
+                                                dashmap::mapref::entry::Entry::Occupied(e) => {
+                                                    // Group already exists from previous registration
+                                                    *e.get()
+                                                }
+                                                dashmap::mapref::entry::Entry::Vacant(e) => {
+                                                    // NEW GROUP: Assign sequential ID
+                                                    let gid = next_group_id.fetch_add(1, Ordering::SeqCst);
+                                                    e.insert(gid);
+
+                                                    // Add terminators (matches C++ AGC logic)
+                                                    if kmer_front != MISSING_KMER && kmer_back != MISSING_KMER {
+                                                        group_terminators
+                                                            .entry(kmer_front)
+                                                            .or_insert_with(Vec::new)
+                                                            .push(kmer_back);
+                                                        if kmer_front != kmer_back {
+                                                            group_terminators
+                                                                .entry(kmer_back)
+                                                                .or_insert_with(Vec::new)
+                                                                .push(kmer_front);
+                                                        }
+                                                    }
+
+                                                    // Create GroupWriter for this group
+                                                    let stream_id = gid as usize;
+                                                    let ref_stream_id = if gid >= 16 {
+                                                        Some(100000 + gid as usize)
+                                                    } else {
+                                                        None
+                                                    };
+                                                    groups.insert(
+                                                        key.clone(),
+                                                        (gid, Mutex::new(GroupWriter::new(gid, stream_id, ref_stream_id))),
+                                                    );
+
+                                                    if config.verbosity > 1 {
+                                                        println!("  Created new group {} for k-mers ({}, {})", gid, kmer_front, kmer_back);
+                                                    }
+
+                                                    gid
+                                                }
+                                            };
+
+                                            // Store segments for compression phase (Phase 4)
+                                            segments_to_compress.insert(gid, segments);
+                                        }
+
+                                        if config.verbosity > 1 {
+                                            println!("Thread 0 registration complete. Total groups: {}", known_groups.len());
+                                        }
+                                    }
+
+                                    // Barrier 2: All workers can continue (after registration)
+                                    barrier.wait();
+
+                                    // Phase 4.1: All workers compress registered segments in parallel
+                                    // (matches C++ AGC store_segments - agc_compressor.cpp:974-1054)
+                                    if config.verbosity > 1 {
+                                        println!("Worker {} starting compression phase", worker_id);
+                                    }
+
+                                    // Collect all group IDs and sort for deterministic processing
+                                    let mut all_group_ids: Vec<u32> = segments_to_compress.iter()
+                                        .map(|entry| *entry.key())
+                                        .collect();
+                                    all_group_ids.sort_unstable();
+
+                                    // Process groups in sorted order (work-stealing with sorted list)
+                                    while !all_group_ids.is_empty() {
+                                        // Try to claim the next group (remove from front for FIFO order)
+                                        let group_opt = if !all_group_ids.is_empty() {
+                                            let gid = all_group_ids.remove(0);
+                                            segments_to_compress.remove(&gid).map(|(k, v)| (k, v))
                                         } else {
                                             None
                                         };
 
-                                        groups.insert(key.clone(), (gid, Mutex::new(GroupWriter::new(gid, stream_id, ref_stream_id))));
+                                        if let Some((gid, segments)) = group_opt {
 
-                                        gid
-                                    }
-                                };
+                                            if config.verbosity > 1 {
+                                                println!("Worker {} processing group {} ({} segments)",
+                                                    worker_id, gid, segments.len());
+                                            }
 
-                                // Prepare segment
-                                let seg_info = Self::prepare_segment_info(
-                                    &config,
-                                    &task.sample_name,
-                                    &task.contig_name,
-                                    seg_part_no,
-                                    segment_data,
-                                    Some(kmer_front),
-                                    Some(kmer_back),
-                                )?;
-
-                                // Add to group
-                                if let Some(group_entry) = groups.get(&key) {
-                                    let (gid, group_writer_mutex) = &*group_entry;
-                                    let mut group_writer = group_writer_mutex.lock().unwrap();
-
-                                    if let Some(pack) = group_writer.add_segment(seg_info.segment, &config)? {
-                                        let compressed_pack = match pack {
-                                            PackToWrite::Compressed(cp) => cp,
-                                            PackToWrite::Uncompressed(up) => {
-                                                let compressed_data = compress_segment_configured(
-                                                    &up.uncompressed_data,
-                                                    config.compression_level,
+                                            // Process all segments in this group
+                                            for segment in segments {
+                                                // Prepare segment info
+                                                let seg_info = Self::prepare_segment_info(
+                                                    &config,
+                                                    &segment.sample_name,
+                                                    &segment.contig_name,
+                                                    segment.seg_part_no,
+                                                    segment.segment_data,
+                                                    Some(segment.kmer_front),
+                                                    Some(segment.kmer_back),
                                                 )?;
-                                                let (final_data, uncompressed_size) =
-                                                    if compressed_data.len() + 1 < up.uncompressed_data.len() {
-                                                        let mut data_with_marker = compressed_data;
-                                                        data_with_marker.push(0);
-                                                        (data_with_marker, up.uncompressed_data.len() as u64)
-                                                    } else {
-                                                        (up.uncompressed_data, 0)
-                                                    };
-                                                CompressedPack {
-                                                    group_id: up.group_id,
-                                                    stream_id: up.stream_id,
-                                                    compressed_data: final_data,
-                                                    uncompressed_size,
-                                                    segments: up.segments,
+
+                                                // Add to group (group exists from registration)
+                                                if let Some(group_entry) = groups.get(&segment.key) {
+                                                    let (_, group_writer_mutex) = &*group_entry;
+                                                    let mut group_writer = group_writer_mutex.lock().unwrap();
+
+                                                    if let Some(pack) = group_writer.add_segment(seg_info.segment, &config)? {
+                                                        // Compress pack if needed
+                                                        let compressed_pack = match pack {
+                                                            PackToWrite::Compressed(cp) => cp,
+                                                            PackToWrite::Uncompressed(up) => {
+                                                                let compressed_data = compress_segment_configured(
+                                                                    &up.uncompressed_data,
+                                                                    config.compression_level,
+                                                                )?;
+                                                                let (final_data, uncompressed_size) =
+                                                                    if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                                                                        let mut data_with_marker = compressed_data;
+                                                                        data_with_marker.push(0);
+                                                                        (data_with_marker, up.uncompressed_data.len() as u64)
+                                                                    } else {
+                                                                        (up.uncompressed_data, 0)
+                                                                    };
+                                                                CompressedPack {
+                                                                    group_id: up.group_id,
+                                                                    stream_id: up.stream_id,
+                                                                    compressed_data: final_data,
+                                                                    uncompressed_size,
+                                                                    segments: up.segments,
+                                                                }
+                                                            }
+                                                        };
+                                                        pack_tx.send(compressed_pack)?;
+                                                    }
                                                 }
                                             }
-                                        };
-                                        pack_tx.send(compressed_pack)?;
+                                        } else {
+                                            // No more groups available
+                                            break;
+                                        }
+                                    }
+
+                                    // Flush any remaining partial packs in all groups (only worker 0)
+                                    if worker_id == 0 {
+                                        if config.verbosity > 1 {
+                                            println!("Worker 0 flushing remaining partial packs from {} groups", groups.len());
+                                        }
+
+                                        // Sort by group_id for deterministic flushing (same order as registration)
+                                        let mut groups_with_ids: Vec<(u32, SegmentGroupKey)> = groups.iter()
+                                            .map(|entry| {
+                                                let key = entry.key().clone();
+                                                let (gid, _) = entry.value();
+                                                (*gid, key)
+                                            })
+                                            .collect();
+                                        groups_with_ids.sort_by_key(|(gid, _)| *gid);
+
+                                        for (_gid, key) in groups_with_ids {
+                                            if let Some(group_entry) = groups.get(&key) {
+                                                let (_, group_writer_mutex) = &*group_entry;
+                                                let mut group_writer = group_writer_mutex.lock().unwrap();
+
+                                                // Flush any remaining segments
+                                                if let Some(pack) = group_writer.flush_final(&config)? {
+                                                    let compressed_pack = match pack {
+                                                        PackToWrite::Compressed(cp) => cp,
+                                                        PackToWrite::Uncompressed(up) => {
+                                                            let compressed_data = compress_segment_configured(
+                                                                &up.uncompressed_data,
+                                                                config.compression_level,
+                                                            )?;
+                                                            let (final_data, uncompressed_size) =
+                                                                if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                                                                    let mut data_with_marker = compressed_data;
+                                                                    data_with_marker.push(0);
+                                                                    (data_with_marker, up.uncompressed_data.len() as u64)
+                                                                } else {
+                                                                    (up.uncompressed_data, 0)
+                                                                };
+                                                            CompressedPack {
+                                                                group_id: up.group_id,
+                                                                stream_id: up.stream_id,
+                                                                compressed_data: final_data,
+                                                                uncompressed_size,
+                                                                segments: up.segments,
+                                                            }
+                                                        }
+                                                    };
+                                                    pack_tx.send(compressed_pack)?;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if config.verbosity > 1 {
+                                        println!("Worker {} completed compression phase", worker_id);
                                     }
                                 }
-
-                                seg_part_no += 1;
-                                total_segments_counter.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -2181,9 +2399,13 @@ impl StreamingCompressor {
                 continue;
             }
 
-            total_contigs.fetch_add(1, Ordering::Relaxed);
+            let contig_count = total_contigs.fetch_add(1, Ordering::Relaxed) + 1;
 
-            let task = ContigTask {
+            if self.config.verbosity > 1 {
+                println!("Main thread: Feeding contig {} (priority {})", contig_name, contig_priority);
+            }
+
+            let task = ContigTask::Normal {
                 sample_name,
                 contig_name,
                 sequence: sequence.clone(),
@@ -2192,9 +2414,27 @@ impl StreamingCompressor {
             let cost = sequence.len();
             contig_queue.emplace(task, contig_priority, cost);
             contig_priority = contig_priority.saturating_sub(1);
+
+            // TODO: Periodically inject Registration task for batch processing (C++ AGC-style)
+            // Disabled for now to simplify debugging
+            // const BATCH_SIZE: usize = 1000;
+            // if contig_count % BATCH_SIZE == 0 {
+            //     contig_queue.emplace_many_no_cost(ContigTask::Registration, usize::MAX - 1, num_workers);
+            // }
         }
 
+        // Final registration phase for remaining segments
+        // Use priority 0 so Registration is processed AFTER all contigs (contigs have usize::MAX down)
+        let registration_priority = 0;
+        if self.config.verbosity > 1 {
+            println!("Main thread: All contigs fed. Injecting final Registration task (priority {})", registration_priority);
+        }
+        contig_queue.emplace_many_no_cost(ContigTask::Registration, registration_priority, num_workers);
+
         // Signal completion
+        if self.config.verbosity > 1 {
+            println!("Main thread: Marking queue as completed");
+        }
         contig_queue.mark_completed();
 
         // Wait for workers
