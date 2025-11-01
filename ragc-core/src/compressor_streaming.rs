@@ -152,6 +152,7 @@ enum ContigTask {
         sample_name: String,
         contig_name: String,
         sequence: Contig,
+        seq_num: u64,  // Sequence number to preserve file order
     },
     /// Synchronization point: workers wait, thread 0 registers groups
     Registration,
@@ -169,6 +170,7 @@ struct PendingSegment {
     segment_data: Vec<u8>,
     kmer_front: u64,
     kmer_back: u64,
+    seq_num: u64,  // Sequence number from parent ContigTask (preserves file order)
 }
 
 /// Segment group identified by flanking k-mers
@@ -2088,7 +2090,7 @@ impl StreamingCompressor {
 
                             // Handle task based on type
                             match task {
-                                ContigTask::Normal { sample_name, contig_name, sequence } => {
+                                ContigTask::Normal { sample_name, contig_name, sequence, seq_num } => {
                                     // Segment contig at splitters
                                     let segments = split_at_splitters_with_size(
                                         &sequence,
@@ -2098,8 +2100,8 @@ impl StreamingCompressor {
                                     );
 
                                     if config.verbosity > 1 {
-                                        println!("Worker {} processing contig {} (len={}, {} segments)",
-                                            worker_id, contig_name, sequence.len(), segments.len());
+                                        println!("Worker {} processing contig {} (seq_num={}, len={}, {} segments)",
+                                            worker_id, contig_name, seq_num, sequence.len(), segments.len());
                                     }
 
                                     total_bases_counter.fetch_add(sequence.len(), Ordering::Relaxed);
@@ -2125,6 +2127,7 @@ impl StreamingCompressor {
                                             segment_data,
                                             kmer_front,
                                             kmer_back,
+                                            seq_num,  // Preserve file order through sequence number
                                         });
 
                                         seg_part_no += 1;
@@ -2148,20 +2151,17 @@ impl StreamingCompressor {
                                         let mut all_pending = Vec::new();
                                         std::mem::swap(&mut all_pending, &mut *pending_segments.lock().unwrap());
 
-                                        // NOTE: Segments must be in FILE ORDER for correct group ID assignment!
-                                        // Group IDs are stored in archive collection and must match contig segment order.
+                                        // CRITICAL: Sort by seq_num to restore FILE ORDER!
+                                        // Each ContigTask gets a seq_num when queued (preserves file order).
+                                        // Workers process tasks in parallel → segments added in non-deterministic order.
+                                        // Sorting by seq_num restores file order for deterministic group ID assignment.
                                         //
-                                        // Single-threaded: Segments are already in file order ✓
-                                        // Multi-threaded: Segments are in non-deterministic order ✗
-                                        //
-                                        // Attempted fix: Sort by (sample, contig, seg_part_no) → CAUSED DATA CORRUPTION!
-                                        // Alphabetical order != File order (e.g., "chrIX" < "chrV" alphabetically)
-                                        //
-                                        // CORRECT FIX: Add sequence numbers to tasks when queuing, then sort by seq_num
-                                        // This preserves file order even with parallel processing.
+                                        // Note: Group IDs MUST match file order, not alphabetical order!
+                                        // (Alphabetical: "chrIX" < "chrV", but file order may have chrV before chrIX)
+                                        all_pending.sort_by_key(|seg| seg.seq_num);
 
-                                        // Group segments by k-mer key in ENCOUNTER ORDER
-                                        // Groups created in order k-mer pairs first appear (must be file order!)
+                                        // Group segments by k-mer key in FILE ORDER (restored via seq_num sort!)
+                                        // Groups created in order k-mer pairs first appear in sorted (= file order) list
                                         use std::collections::HashMap;
                                         let mut key_to_segments: HashMap<(u64, u64), Vec<PendingSegment>> = HashMap::new();
                                         let mut key_order: Vec<(u64, u64)> = Vec::new(); // Track first occurrence in sorted order
@@ -2408,15 +2408,17 @@ impl StreamingCompressor {
             }
 
             let contig_count = total_contigs.fetch_add(1, Ordering::Relaxed) + 1;
+            let seq_num = contig_count as u64;  // Use contig count as sequence number (preserves file order)
 
             if self.config.verbosity > 1 {
-                println!("Main thread: Feeding contig {} (priority {})", contig_name, contig_priority);
+                println!("Main thread: Feeding contig {} (seq_num={}, priority={})", contig_name, seq_num, contig_priority);
             }
 
             let task = ContigTask::Normal {
                 sample_name,
                 contig_name,
                 sequence: sequence.clone(),
+                seq_num,
             };
 
             let cost = sequence.len();

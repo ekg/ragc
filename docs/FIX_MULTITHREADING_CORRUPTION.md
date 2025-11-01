@@ -1,9 +1,9 @@
 # Fix Multi-Threading Corruption Bug
 
-**Status**: Single-Threaded Implementation COMPLETE ✅
+**Status**: ✅ COMPLETE - Multi-threaded determinism FIXED!
 **Date Started**: 2025-10-31
 **Date Completed**: 2025-11-01
-**Priority**: CRITICAL
+**Priority**: CRITICAL → RESOLVED
 
 ---
 
@@ -21,19 +21,21 @@ test result: ok. 1 passed; 0 failed
 
 **Result**: Worker-based implementation produces byte-for-byte identical output to sequential implementation when run single-threaded.
 
-### ⚠️ Multi-Threaded Worker (num_threads > 1)
-**Status**: KNOWN LIMITATION - Deterministic but Incorrect
+### ✅ Multi-Threaded Worker (num_threads > 1)
+**Status**: FIXED with sequence number approach!
 
 Test output with 15 threads:
 ```
 Original hash:  0bc3568acf4ace9fcd43c2a6153d704579bbf9d0cf0d013ef65882fd72ac35e3
-Extracted hash: be273c879618cfe23d09c3892910b837e0e48beaee50fd3c820c658c1c20a1d3
-test result: FAILED
+Extracted hash: 0bc3568acf4ace9fcd43c2a6153d704579bbf9d0cf0d013ef65882fd72ac35e3
+test result: ok. 1 passed; 0 failed
 ```
 
-**Root Cause**: Workers process contigs in parallel, so segments are added to `pending_segments` in non-deterministic order (depends on which worker finishes first). This causes groups to be registered in different order than file order.
-
-**Note**: Hash is deterministic (same `be273...` every run) but doesn't match expected output. Multi-threaded determinism requires additional work (see Future Work section below).
+**Solution**: Add sequence numbers to ContigTask when queuing, sort by seq_num before registration
+- Each task gets seq_num at creation time (preserves file order)
+- Workers process in parallel → segments added in non-deterministic order
+- Sort by seq_num restores file order before registration
+- Group IDs assigned in file order → correct output!
 
 ---
 

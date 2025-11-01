@@ -46,7 +46,7 @@ fn test_streaming_compressor_extraction_correctness() {
             group_flush_threshold: 0,
             concatenated_genomes: false,
             periodic_flush_interval: 0,
-            num_threads: 1,  // Test single-threaded
+            num_threads: 15,  // Test multi-threaded determinism
             adaptive_mode: false,
         };
 
