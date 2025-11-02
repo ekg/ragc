@@ -1428,6 +1428,9 @@ impl StreamingCompressor {
         // This matches C++ AGC: assign seg_part_no DURING processing, accounting for splits immediately
         // NO pre-assigned part numbers = NO duplicate conflicts!
 
+        // PHASE 1 OPTIMIZATION: Buffer packs for parallel compression
+        let mut packs_to_compress = Vec::new();
+
         while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
             if sequence.is_empty() {
                 continue;
@@ -1585,36 +1588,8 @@ impl StreamingCompressor {
                                         .1
                                         .add_segment(seg_info_prepared.segment, &self.config)?
                                     {
-                                        let compressed_pack = match pack {
-                                            PackToWrite::Compressed(cp) => cp,
-                                            PackToWrite::Uncompressed(up) => {
-                                                let compressed_data = compress_segment_configured(
-                                                    &up.uncompressed_data,
-                                                    self.config.compression_level,
-                                                )?;
-                                                let (final_data, uncompressed_size) =
-                                                    if compressed_data.len() + 1
-                                                        < up.uncompressed_data.len()
-                                                    {
-                                                        let mut data_with_marker = compressed_data;
-                                                        data_with_marker.push(0);
-                                                        (
-                                                            data_with_marker,
-                                                            up.uncompressed_data.len() as u64,
-                                                        )
-                                                    } else {
-                                                        (up.uncompressed_data, 0)
-                                                    };
-                                                CompressedPack {
-                                                    group_id: up.group_id,
-                                                    stream_id: up.stream_id,
-                                                    compressed_data: final_data,
-                                                    uncompressed_size,
-                                                    segments: up.segments,
-                                                }
-                                            }
-                                        };
-                                        pack_tx.send(compressed_pack)?;
+                                        // PHASE 1: Buffer instead of compressing immediately
+                                        packs_to_compress.push(pack);
                                     }
                                 }
 
@@ -1695,31 +1670,8 @@ impl StreamingCompressor {
                         if let Some(pack) =
                             group_writer.add_segment(seg_info.segment, &self.config)?
                         {
-                            let compressed_pack = match pack {
-                                PackToWrite::Compressed(cp) => cp,
-                                PackToWrite::Uncompressed(up) => {
-                                    let compressed_data = compress_segment_configured(
-                                        &up.uncompressed_data,
-                                        self.config.compression_level,
-                                    )?;
-                                    let (final_data, uncompressed_size) =
-                                        if compressed_data.len() + 1 < up.uncompressed_data.len() {
-                                            let mut data_with_marker = compressed_data;
-                                            data_with_marker.push(0);
-                                            (data_with_marker, up.uncompressed_data.len() as u64)
-                                        } else {
-                                            (up.uncompressed_data, 0)
-                                        };
-                                    CompressedPack {
-                                        group_id: up.group_id,
-                                        stream_id: up.stream_id,
-                                        compressed_data: final_data,
-                                        uncompressed_size,
-                                        segments: up.segments,
-                                    }
-                                }
-                            };
-                            pack_tx.send(compressed_pack)?;
+                            // PHASE 1: Buffer instead of compressing immediately
+                            packs_to_compress.push(pack);
                         }
 
                         groups.insert(key, (gid, group_writer));
@@ -1768,31 +1720,8 @@ impl StreamingCompressor {
                         if let Some(pack) =
                             group_entry.1.add_segment(seg_info.segment, &self.config)?
                         {
-                            let compressed_pack = match pack {
-                                PackToWrite::Compressed(cp) => cp,
-                                PackToWrite::Uncompressed(up) => {
-                                    let compressed_data = compress_segment_configured(
-                                        &up.uncompressed_data,
-                                        self.config.compression_level,
-                                    )?;
-                                    let (final_data, uncompressed_size) =
-                                        if compressed_data.len() + 1 < up.uncompressed_data.len() {
-                                            let mut data_with_marker = compressed_data;
-                                            data_with_marker.push(0);
-                                            (data_with_marker, up.uncompressed_data.len() as u64)
-                                        } else {
-                                            (up.uncompressed_data, 0)
-                                        };
-                                    CompressedPack {
-                                        group_id: up.group_id,
-                                        stream_id: up.stream_id,
-                                        compressed_data: final_data,
-                                        uncompressed_size,
-                                        segments: up.segments,
-                                    }
-                                }
-                            };
-                            pack_tx.send(compressed_pack)?;
+                            // PHASE 1: Buffer instead of compressing immediately
+                            packs_to_compress.push(pack);
                         }
 
                         seg_part_no += 1; // Increment by 1
@@ -1818,33 +1747,60 @@ impl StreamingCompressor {
                         uncompressed_pack.segments.len()
                     );
                 }
-                let compressed_data = compress_segment_configured(
-                    &uncompressed_pack.uncompressed_data,
-                    self.config.compression_level,
-                )?;
-
-                let (final_data, uncompressed_size) =
-                    if compressed_data.len() + 1 < uncompressed_pack.uncompressed_data.len() {
-                        let mut data_with_marker = compressed_data;
-                        data_with_marker.push(0);
-                        (
-                            data_with_marker,
-                            uncompressed_pack.uncompressed_data.len() as u64,
-                        )
-                    } else {
-                        (uncompressed_pack.uncompressed_data, 0)
-                    };
-
-                let compressed_pack = CompressedPack {
-                    group_id: uncompressed_pack.group_id,
-                    stream_id: uncompressed_pack.stream_id,
-                    compressed_data: final_data,
-                    uncompressed_size,
-                    segments: uncompressed_pack.segments,
-                };
-
-                pack_tx.send(compressed_pack)?;
+                // PHASE 1: Buffer instead of compressing immediately
+                packs_to_compress.push(PackToWrite::Uncompressed(uncompressed_pack));
             }
+        }
+
+        // ================================================================
+        // PHASE 1: PARALLEL COMPRESSION
+        // ================================================================
+        if self.config.verbosity > 0 {
+            println!(
+                "Compressing {} packs in parallel with {} threads...",
+                packs_to_compress.len(),
+                rayon::current_num_threads()
+            );
+        }
+
+        let compression_level = self.config.compression_level;
+        let compressed_packs: Vec<CompressedPack> = packs_to_compress
+            .into_par_iter()
+            .map(|pack| match pack {
+                PackToWrite::Compressed(cp) => cp,
+                PackToWrite::Uncompressed(up) => {
+                    // Compress in parallel!
+                    let compressed_data =
+                        compress_segment_configured(&up.uncompressed_data, compression_level)
+                            .expect("Compression failed");
+
+                    let (final_data, uncompressed_size) =
+                        if compressed_data.len() + 1 < up.uncompressed_data.len() {
+                            let mut data_with_marker = compressed_data;
+                            data_with_marker.push(0);
+                            (data_with_marker, up.uncompressed_data.len() as u64)
+                        } else {
+                            (up.uncompressed_data, 0)
+                        };
+
+                    CompressedPack {
+                        group_id: up.group_id,
+                        stream_id: up.stream_id,
+                        compressed_data: final_data,
+                        uncompressed_size,
+                        segments: up.segments,
+                    }
+                }
+            })
+            .collect();
+
+        if self.config.verbosity > 0 {
+            println!("Parallel compression complete! Sending to writer...");
+        }
+
+        // Send all compressed packs to writer
+        for pack in compressed_packs {
+            pack_tx.send(pack)?;
         }
 
         // ================================================================
