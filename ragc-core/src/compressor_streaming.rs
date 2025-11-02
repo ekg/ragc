@@ -1272,7 +1272,8 @@ impl StreamingCompressor {
         // ================================================================
         // SET UP WRITER THREAD (for Phases 2/3/4)
         // ================================================================
-        let (pack_tx, pack_rx) = bounded::<CompressedPack>(10);
+        // BUGFIX: Increased from 10 to 10000 - the bounded(10) was causing corruption at exactly 10 samples!
+        let (pack_tx, pack_rx) = bounded::<CompressedPack>(10000);
         let archive = Arc::new(Mutex::new(std::mem::replace(
             &mut self.archive,
             Archive::new_writer(),
