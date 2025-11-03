@@ -371,15 +371,20 @@ impl CollectionV3 {
             stored_sample_name = Self::extract_contig_name(contig_name);
         }
 
-        if self.placing_sample_name != stored_sample_name {
-            self.placing_sample_name = stored_sample_name.clone();
-            self.placing_sample_id = *self
-                .sample_ids
-                .get(&stored_sample_name)
-                .context("Sample not found")?;
+        // BUGFIX: Always lookup sample_id fresh instead of caching
+        // The cache was causing segments to be registered to the wrong sample
+        // when GroupWriters buffer segments across sample boundaries
+        let sample_id = *self
+            .sample_ids
+            .get(&stored_sample_name)
+            .context(format!("Sample not found: {}", stored_sample_name))?;
+
+        if std::env::var("RAGC_DEBUG_REGISTER").is_ok() {
+            eprintln!("REGISTER: sample='{}' (id={}), contig='{}', place={}",
+                stored_sample_name, sample_id, contig_name, place);
         }
 
-        let sample = &mut self.sample_desc[self.placing_sample_id];
+        let sample = &mut self.sample_desc[sample_id];
         for contig in &mut sample.contigs {
             if contig.name == contig_name {
                 if place >= contig.segments.len() {

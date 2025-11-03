@@ -317,6 +317,10 @@ impl GroupWriter {
         }
 
         // Buffer the segment
+        if std::env::var("RAGC_DEBUG_BUFFER").is_ok() && self.pending_segments.len() < 3 {
+            eprintln!("BUFFER: group={}, pending={}, adding sample='{}', contig='{}'",
+                self.group_id, self.pending_segments.len(), segment.sample_name, segment.contig_name);
+        }
         self.pending_segments.push(segment);
 
         // Prepare pack if buffer is full
@@ -391,12 +395,27 @@ impl GroupWriter {
 
         // Build segment metadata (NO COMPRESSION HERE!)
         let mut segments = Vec::new();
+
+        if std::env::var("RAGC_DEBUG_FLUSH").is_ok() && self.group_id < 100 {
+            eprintln!("FLUSH: group={}, {} pending segments:", self.group_id, self.pending_segments.len());
+            for (i, seg) in self.pending_segments.iter().enumerate().take(3) {
+                eprintln!("  [{}] sample='{}', contig='{}'", i, seg.sample_name, seg.contig_name);
+            }
+        }
+
         for (idx_in_pack, seg_info) in self.pending_segments.iter().enumerate() {
             let global_in_group_id = if use_lz_encoding {
                 self.segments_written + idx_in_pack + 1 // +1 because reference is at 0
             } else {
                 self.segments_written + idx_in_pack
             };
+
+            if std::env::var("RAGC_DEBUG_IN_GROUP_ID").is_ok() &&
+               (seg_info.sample_name.starts_with("CBM") || seg_info.sample_name.starts_with("ALI")) {
+                eprintln!("ASSIGN in_group_id: group={}, sample='{}', contig='{}', seg_part_no={}, idx_in_pack={}, segments_written={}, in_group_id={}",
+                    self.group_id, seg_info.sample_name, seg_info.contig_name,
+                    seg_info.seg_part_no, idx_in_pack, self.segments_written, global_in_group_id);
+            }
 
             segments.push(SegmentMetadata {
                 sample_name: seg_info.sample_name.clone(),
@@ -408,7 +427,14 @@ impl GroupWriter {
             });
         }
 
+        let prev_segments_written = self.segments_written;
         self.segments_written += self.pending_segments.len();
+
+        if std::env::var("RAGC_DEBUG_SEGMENTS_WRITTEN").is_ok() {
+            eprintln!("FLUSH: group={}, flushed {} segments, segments_written: {} -> {}",
+                self.group_id, self.pending_segments.len(), prev_segments_written, self.segments_written);
+        }
+
         self.pending_segments.clear();
 
         // Return UNCOMPRESSED pack - compression will happen in compression thread pool!
@@ -839,7 +865,38 @@ impl StreamingCompressor {
         }
 
         // Convert to Vec for partitioning across workers
-        let groups_vec: Vec<(SegmentGroupKey, Vec<PreparedSegment>)> = groups.into_iter().collect();
+        let mut groups_vec: Vec<(SegmentGroupKey, Vec<PreparedSegment>)> = groups.into_iter().collect();
+
+        // CRITICAL FIX: Sort groups deterministically BEFORE assigning group_ids
+        // This ensures group_id assignment is consistent across runs, not race-dependent!
+        // Sort by first segment's (sample_name, contig_name, seg_part_no)
+        groups_vec.sort_by(|(_key_a, segs_a), (_key_b, segs_b)| {
+            let seg_a = segs_a.first();
+            let seg_b = segs_b.first();
+            match (seg_a, seg_b) {
+                (Some(a), Some(b)) => {
+                    a.segment.sample_name.cmp(&b.segment.sample_name)
+                        .then(a.segment.contig_name.cmp(&b.segment.contig_name))
+                        .then(a.segment.seg_part_no.cmp(&b.segment.seg_part_no))
+                }
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        // PRE-ASSIGN group_ids based on sorted order (deterministic!)
+        // This replaces the atomic counter race condition
+        let groups_with_ids: Vec<(u32, SegmentGroupKey, Vec<PreparedSegment>)> = groups_vec
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (key, segments))| {
+                let gid = (self.next_group_id as usize + idx) as u32;
+                (gid, key, segments)
+            })
+            .collect();
+
+        if self.config.verbosity > 0 {
+            println!("Phase 2.5: Pre-assigned {} group_ids deterministically", groups_with_ids.len());
+        }
 
         // ==================================================================
         // PHASE 3: Parallel group processing (matching C++ AGC architecture!)
@@ -850,9 +907,6 @@ impl StreamingCompressor {
                 self.config.num_threads
             );
         }
-
-        // Group ID counter for sequential assignment
-        let next_group_id = Arc::new(AtomicUsize::new(self.next_group_id as usize));
 
         // Clone config so we don't borrow self in the parallel closure!
         let config = self.config.clone();
@@ -867,19 +921,16 @@ impl StreamingCompressor {
         // Process groups in parallel using Rayon (like C++ AGC's parallel loop)
         // Each worker gets exclusive groups - NO CHANNELS, NO MUTEX!
         // MEMORY FIX: Use into_par_iter() to consume and move segments instead of cloning!
-        let all_packs: Vec<CompressedPack> = pool.install(|| {
-            groups_vec
+        let mut all_packs: Vec<CompressedPack> = pool.install(|| {
+            groups_with_ids
                 .into_par_iter()
-                .flat_map(|(_key, segments)| {
-                    // DEBUG: Check if we're actually running on multiple threads
-                    eprintln!(
-                        "Thread {:?} processing a group",
-                        std::thread::current().id()
-                    );
-
-                    // Assign group ID sequentially
-                    let gid = next_group_id.fetch_add(1, Ordering::SeqCst) as u32;
+                .flat_map(|(gid, _key, segments)| {
+                    // Use PRE-ASSIGNED group_id (deterministic, no race!)
                     let stream_id = gid as usize;
+
+                    if std::env::var("RAGC_DEBUG_GROUP_ID").is_ok() && gid < 10 {
+                        eprintln!("ASSIGN group_id={} to k-mer group", gid);
+                    }
 
                     const NO_RAW_GROUPS: u32 = 16;
                     let ref_stream_id = if gid >= NO_RAW_GROUPS {
@@ -978,6 +1029,69 @@ impl StreamingCompressor {
             );
         }
 
+        // CRITICAL VALIDATION: Check for pansn group collation bug
+        // This bug has occurred multiple times: segments from different contigs
+        // get mixed together in groups, causing wrong decompression order.
+        // FAIL LOUDLY if we detect segments from the same contig split across packs.
+        if self.config.verbosity > 0 {
+            println!("Phase 3.5: Validating segment ordering (pansn collation check)...");
+        }
+
+        let mut seen_segments: std::collections::HashMap<(String, String, usize), usize> = std::collections::HashMap::new();
+
+        for (pack_idx, pack) in all_packs.iter().enumerate() {
+            for seg in &pack.segments {
+                let key = (seg.sample_name.clone(), seg.contig_name.clone(), seg.seg_part_no);
+
+                if let Some(prev_pack_idx) = seen_segments.insert(key.clone(), pack_idx) {
+                    if prev_pack_idx != pack_idx {
+                        anyhow::bail!(
+                            "FATAL: Pansn group collation detected!\n\
+                             Segment {}#{}[{}] appears in multiple packs ({} and {}).\n\
+                             This means segments from the same contig are being split across groups,\n\
+                             which will cause data corruption during decompression.\n\
+                             \n\
+                             This is a known recurring bug. The issue is that parallel processing\n\
+                             causes segments from a single contig to be distributed across multiple\n\
+                             k-mer groups, and those groups are processed in non-deterministic order.\n\
+                             \n\
+                             FIX: Ensure segments from the same contig stay together and are written\n\
+                             in sequential order.",
+                            seg.sample_name,
+                            seg.contig_name,
+                            seg.seg_part_no,
+                            prev_pack_idx,
+                            pack_idx
+                        );
+                    }
+                }
+            }
+        }
+
+        // CRITICAL: Sort packs by (sample_name, contig_name, seg_part_no) to ensure
+        // segments are registered in the correct order. Without this, parallel processing
+        // causes segments to be registered in non-deterministic order, leading to data
+        // corruption when decompressing (segments read in wrong order).
+        all_packs.sort_by(|a, b| {
+            // Get first segment from each pack for comparison
+            let a_first = a.segments.first();
+            let b_first = b.segments.first();
+
+            match (a_first, b_first) {
+                (Some(a_seg), Some(b_seg)) => {
+                    // Sort by: sample_name, then contig_name, then seg_part_no
+                    a_seg.sample_name.cmp(&b_seg.sample_name)
+                        .then(a_seg.contig_name.cmp(&b_seg.contig_name))
+                        .then(a_seg.seg_part_no.cmp(&b_seg.seg_part_no))
+                }
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        if self.config.verbosity > 0 {
+            println!("Phase 3.6: Sorted {} packs for deterministic segment registration", all_packs.len());
+        }
+
         // ==================================================================
         // PHASE 4: Sequential write (like C++ AGC's single-threaded registration)
         // ==================================================================
@@ -1013,6 +1127,12 @@ impl StreamingCompressor {
                 // Register contig if first time
                 self.collection
                     .register_sample_contig(&seg_meta.sample_name, &seg_meta.contig_name)?;
+
+                if std::env::var("RAGC_DEBUG_REGISTER_DETAIL").is_ok() && seg_meta.sample_name.starts_with("CBM") {
+                    eprintln!("REGISTER_DETAIL: sample='{}', contig='{}', seg_part_no={}, group_id={}, in_group_id={}, data_len={}",
+                        seg_meta.sample_name, seg_meta.contig_name, seg_meta.seg_part_no,
+                        pack.group_id, seg_meta.in_group_id, seg_meta.data_len);
+                }
 
                 // Register segment placement
                 self.collection.add_segment_placed(
@@ -1052,9 +1172,8 @@ impl StreamingCompressor {
         self.total_bases_processed = total_bases_count;
 
         // Update next_group_id for subsequent operations
-        self.next_group_id = Arc::try_unwrap(next_group_id)
-            .map_err(|_| anyhow::anyhow!("Failed to unwrap next_group_id Arc"))?
-            .into_inner() as u32;
+        // Since we pre-assigned IDs, just add the number of groups we processed
+        self.next_group_id += num_groups as u32;
 
         if self.config.verbosity > 0 {
             println!("Processed {contig_count} contigs total");
@@ -1361,6 +1480,7 @@ impl StreamingCompressor {
 
                     // Register segments in collection (seg_part_no already correct from sequential processing!)
                     for seg_meta in &pack.segments {
+
                         // Check for duplicate seg_part_no
                         let key = (
                             seg_meta.sample_name.clone(),
@@ -1439,8 +1559,55 @@ impl StreamingCompressor {
 
             // Log sample changes
             if current_sample != sample_name {
-                if !current_sample.is_empty() && self.config.verbosity > 0 {
-                    println!("Finished processing sample: {}", current_sample);
+                if !current_sample.is_empty() {
+                    if self.config.verbosity > 0 {
+                        println!("Finished processing sample: {}", current_sample);
+                        println!("Flushing all groups to maintain sample ordering...");
+                    }
+
+                    // **CRITICAL FIX**: Flush ALL groups after each sample to ensure proper ordering
+                    // This ensures all packs from haplotype N are added to packs_to_compress
+                    // before any packs from haplotype N+1
+                    // Sort groups by FIRST SEGMENT ORDER, not by k-mer key!
+                    // This maintains correct segment registration order
+
+                    // First, collect (key, first_seg_attrs) for sorting
+                    let mut group_sort_keys: Vec<(SegmentGroupKey, (String, usize))> = groups
+                        .iter()
+                        .map(|(key, (_gid, writer))| {
+                            let first_seg = writer.pending_segments.first();
+                            let sort_key = match first_seg {
+                                Some(seg) => (seg.contig_name.clone(), seg.seg_part_no),
+                                None => (String::new(), usize::MAX),
+                            };
+                            (key.clone(), sort_key)
+                        })
+                        .collect();
+
+                    group_sort_keys.sort_by(|(_, a), (_, b)| a.cmp(b));
+                    let sorted_keys: Vec<_> = group_sort_keys.iter().map(|(key, _)| key.clone()).collect();
+
+                    for key in sorted_keys {
+                        if let Some((gid, group_writer)) = groups.get_mut(&key) {
+                            if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
+                                if self.config.verbosity > 1 {
+                                    println!(
+                                        "  Flushing group_id={}, {} segments",
+                                        gid,
+                                        uncompressed_pack.segments.len()
+                                    );
+                                }
+                                packs_to_compress.push(PackToWrite::Uncompressed(uncompressed_pack));
+                            }
+                        }
+                    }
+
+                    // **CRITICAL**: Clear ALL state so next sample starts completely fresh
+                    // This prevents segments from different samples being mixed in the same group
+                    // and prevents group_id mismatches when samples share k-mer pairs
+                    groups.clear();
+                    known_groups.clear();
+                    group_terminators.clear();
                 }
                 current_sample = sample_name.clone();
                 if self.config.verbosity > 0 {
@@ -1739,17 +1906,35 @@ impl StreamingCompressor {
             println!("Flushing {} remaining groups...", groups.len());
         }
 
-        for (_, (gid, mut group_writer)) in groups {
-            if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
-                if self.config.verbosity > 1 && (gid == 11813 || gid < 100) {
-                    println!(
-                        "  Flushing delta pack for group_id={}, {} segments buffered",
-                        gid,
-                        uncompressed_pack.segments.len()
-                    );
+        // Sort by FIRST SEGMENT ORDER (same fix as sample boundary flush)
+        let mut group_sort_keys: Vec<(SegmentGroupKey, (String, String, usize))> = groups
+            .iter()
+            .map(|(key, (_gid, writer))| {
+                let first_seg = writer.pending_segments.first();
+                let sort_key = match first_seg {
+                    Some(seg) => (seg.sample_name.clone(), seg.contig_name.clone(), seg.seg_part_no),
+                    None => (String::new(), String::new(), usize::MAX),
+                };
+                (key.clone(), sort_key)
+            })
+            .collect();
+
+        group_sort_keys.sort_by(|(_, a), (_, b)| a.cmp(b));
+        let keys_to_flush: Vec<_> = group_sort_keys.iter().map(|(key, _)| key.clone()).collect();
+
+        for key in keys_to_flush {
+            if let Some((gid, mut group_writer)) = groups.remove(&key) {
+                if let Some(uncompressed_pack) = group_writer.prepare_pack(&self.config)? {
+                    if self.config.verbosity > 1 && (gid == 11813 || gid < 100) {
+                        println!(
+                            "  Flushing delta pack for group_id={}, {} segments buffered",
+                            gid,
+                            uncompressed_pack.segments.len()
+                        );
+                    }
+                    // PHASE 1: Buffer instead of compressing immediately
+                    packs_to_compress.push(PackToWrite::Uncompressed(uncompressed_pack));
                 }
-                // PHASE 1: Buffer instead of compressing immediately
-                packs_to_compress.push(PackToWrite::Uncompressed(uncompressed_pack));
             }
         }
 
@@ -1765,9 +1950,10 @@ impl StreamingCompressor {
         }
 
         let compression_level = self.config.compression_level;
-        let compressed_packs: Vec<CompressedPack> = packs_to_compress
+        let mut indexed_packs: Vec<(usize, CompressedPack)> = packs_to_compress
             .into_par_iter()
-            .map(|pack| match pack {
+            .enumerate()
+            .map(|(idx, pack)| (idx, match pack {
                 PackToWrite::Compressed(cp) => cp,
                 PackToWrite::Uncompressed(up) => {
                     // Compress in parallel!
@@ -1792,11 +1978,63 @@ impl StreamingCompressor {
                         segments: up.segments,
                     }
                 }
-            })
+            }))
             .collect();
 
+        // Sort by (sample_name, original_index) to ensure all packs from each sample are grouped together
+        // This ensures "haplotype1, all contigs of it, hap 2 chr1-whatever, hap3..." ordering
+        if self.config.verbosity > 1 {
+            println!("DEBUG: Before sort, showing boundaries:");
+            let mut last_sample = String::new();
+            for (i, (idx, pack)) in indexed_packs.iter().enumerate() {
+                let sample = pack.segments.first().map(|s| s.sample_name.clone()).unwrap_or("NONE".to_string());
+                if sample != last_sample {
+                    println!("  [{}] idx={}, sample={}, group_id={}", i, idx, sample, pack.group_id);
+                    last_sample = sample;
+                }
+            }
+        }
+
+        // Sort by (sample_name, idx) to ensure all packs from each sample are grouped together
+        // while preserving the sequential order within each sample
+        indexed_packs.sort_by(|(idx_a, pack_a), (idx_b, pack_b)| {
+            let sample_a = pack_a.segments.first().map(|s| &s.sample_name);
+            let sample_b = pack_b.segments.first().map(|s| &s.sample_name);
+            sample_a.cmp(&sample_b).then(idx_a.cmp(idx_b))
+        });
+
+        // DEBUG: Show pack distribution per sample
         if self.config.verbosity > 0 {
-            println!("Parallel compression complete! Sending to writer...");
+            let mut sample_pack_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for (_, pack) in &indexed_packs {
+                if let Some(seg) = pack.segments.first() {
+                    *sample_pack_counts.entry(seg.sample_name.clone()).or_insert(0) += 1;
+                }
+            }
+            println!("DEBUG: Pack distribution by sample:");
+            let mut samples: Vec<_> = sample_pack_counts.iter().collect();
+            samples.sort_by_key(|(name, _)| *name);
+            for (sample, count) in samples {
+                println!("  {}: {} packs", sample, count);
+            }
+        }
+
+        if self.config.verbosity > 1 {
+            println!("DEBUG: After sort, showing boundaries:");
+            let mut last_sample = String::new();
+            for (i, (idx, pack)) in indexed_packs.iter().enumerate() {
+                let sample = pack.segments.first().map(|s| s.sample_name.clone()).unwrap_or("NONE".to_string());
+                if sample != last_sample {
+                    println!("  [{}] idx={}, sample={}, group_id={}", i, idx, sample, pack.group_id);
+                    last_sample = sample;
+                }
+            }
+        }
+
+        let compressed_packs: Vec<CompressedPack> = indexed_packs.into_iter().map(|(_, pack)| pack).collect();
+
+        if self.config.verbosity > 0 {
+            println!("Parallel compression complete! Restored sequential order. Sending to writer...");
         }
 
         // Send all compressed packs to writer
@@ -2670,6 +2908,11 @@ impl StreamingCompressor {
                 .collect();
         }
 
+        if std::env::var("RAGC_DEBUG_CREATE").is_ok() && seg_idx < 2 {
+            eprintln!("CREATE SegmentInfo: sample='{}', contig='{}', seg_idx={}",
+                sample_name, contig_name, seg_idx);
+        }
+
         Ok(PreparedSegment {
             key,
             segment: SegmentInfo {
@@ -3245,6 +3488,11 @@ impl StreamingCompressor {
                     base_str
                 );
             }
+        }
+
+        if std::env::var("RAGC_DEBUG_CREATE").is_ok() && seg_part_no < 2 {
+            eprintln!("CREATE SegmentInfo (path2): sample='{}', contig='{}', seg_part_no={}",
+                sample_name, contig_name, seg_part_no);
         }
 
         let seg_info = SegmentInfo {
