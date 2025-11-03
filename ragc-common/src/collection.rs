@@ -380,8 +380,10 @@ impl CollectionV3 {
             .context(format!("Sample not found: {}", stored_sample_name))?;
 
         if std::env::var("RAGC_DEBUG_REGISTER").is_ok() {
-            eprintln!("REGISTER: sample='{}' (id={}), contig='{}', place={}",
-                stored_sample_name, sample_id, contig_name, place);
+            eprintln!(
+                "REGISTER: sample='{}' (id={}), contig='{}', place={}",
+                stored_sample_name, sample_id, contig_name, place
+            );
         }
 
         let sample = &mut self.sample_desc[sample_id];
