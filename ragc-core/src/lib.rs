@@ -128,6 +128,7 @@ pub mod segment;
 pub mod segment_buffer;
 pub mod segment_compression;
 pub mod splitters;
+pub mod streaming_compressor_queue;
 pub mod task;
 pub mod tuple_packing;
 pub mod worker;
