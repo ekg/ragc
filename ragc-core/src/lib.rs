@@ -138,6 +138,7 @@ pub mod zstd_pool;
 pub use compressor::{Compressor, CompressorConfig};
 pub use compressor_streaming::{StreamingCompressor, StreamingCompressorConfig};
 pub use memory_bounded_queue::MemoryBoundedQueue;
+pub use streaming_compressor_queue::{StreamingQueueCompressor, StreamingQueueConfig, QueueStats};
 pub use contig_iterator::{MultiFileIterator, PansnFileIterator};
 pub use decompressor::{Decompressor, DecompressorConfig};
 pub use genome_io::{GenomeIO, GenomeWriter};
