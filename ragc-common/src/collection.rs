@@ -252,7 +252,9 @@ pub struct CollectionV3 {
 
     // State tracking
     prev_sample_name: String,
+    #[allow(dead_code)]
     placing_sample_name: String,
+    #[allow(dead_code)]
     placing_sample_id: usize,
     no_samples_in_last_batch: usize,
 
