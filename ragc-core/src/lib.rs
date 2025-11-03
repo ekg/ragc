@@ -122,6 +122,7 @@ pub mod kmer;
 pub mod kmer_extract;
 pub mod lz_diff;
 pub mod lz_matcher;
+pub mod memory_bounded_queue;
 pub mod priority_queue;
 pub mod segment;
 pub mod segment_buffer;
@@ -135,6 +136,7 @@ pub mod zstd_pool;
 // Re-export commonly used types
 pub use compressor::{Compressor, CompressorConfig};
 pub use compressor_streaming::{StreamingCompressor, StreamingCompressorConfig};
+pub use memory_bounded_queue::MemoryBoundedQueue;
 pub use contig_iterator::{MultiFileIterator, PansnFileIterator};
 pub use decompressor::{Decompressor, DecompressorConfig};
 pub use genome_io::{GenomeIO, GenomeWriter};
