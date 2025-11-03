@@ -66,6 +66,7 @@ struct ContigTask {
 /// use ragc_core::{StreamingQueueCompressor, StreamingQueueConfig};
 /// use std::collections::HashSet;
 ///
+/// # fn main() -> anyhow::Result<()> {
 /// let config = StreamingQueueConfig::default();
 /// let splitters = HashSet::new(); // Normally from reference
 /// let mut compressor = StreamingQueueCompressor::with_splitters(
@@ -75,13 +76,15 @@ struct ContigTask {
 /// )?;
 ///
 /// // Push sequences (blocks when queue is full - automatic backpressure!)
+/// # let sequences = vec![("sample1".to_string(), "chr1".to_string(), vec![0u8; 1000])];
 /// for (sample, contig_name, data) in sequences {
 ///     compressor.push(sample, contig_name, data)?;
 /// }
 ///
 /// // Finalize - waits for all compression to complete
 /// compressor.finalize()?;
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok(())
+/// # }
 /// ```
 pub struct StreamingQueueCompressor {
     queue: Arc<MemoryBoundedQueue<ContigTask>>,
