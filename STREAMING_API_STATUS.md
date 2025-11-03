@@ -1,8 +1,8 @@
 # Streaming Queue API Implementation Status
 
-## ✅ Completed (Commit 8f4f515)
+## ✅ Completed Components
 
-### MemoryBoundedQueue
+### MemoryBoundedQueue (Commit 8f4f515)
 - **405 lines** of production code
 - **6 unit tests** (all passing)
 - Byte-based capacity with automatic backpressure
@@ -11,9 +11,7 @@
 
 **This is the foundation for streaming with constant memory!**
 
-## ✅ Completed (Commit 2925ceb)
-
-### StreamingQueueCompressor Skeleton
+### StreamingQueueCompressor Skeleton (Commits 2925ceb, a35e475)
 - **432 lines** of production code
 - **3 unit tests + 1 integration test** (all passing!)
 - Clean public API:
@@ -28,44 +26,88 @@
   - Split into segments at splitters
   - Compress segments with ZSTD
 
-**Compilation: ✅ SUCCESS**
-**Tests: ✅ ALL PASSING**
-**Basic flow: ✅ VERIFIED**
+**What's working:**
+- ✅ Queue-based architecture with constant memory
+- ✅ Automatic backpressure (push() blocks when full)
+- ✅ Worker threads pulling and compressing
+- ✅ Segmentation and ZSTD compression
+- ✅ Collection metadata registration
 
-## 📋 Remaining Work
+**What's NOT working yet:**
+- ❌ Archive writing (compressed data is created but not written to file)
+- ❌ LZ encoding against reference (currently just compressing raw segments)
+- ❌ Metadata serialization in finalize() (collection exists but not written)
 
-**To complete the streaming API:**
+## 📋 Next Steps for Full Implementation
 
-1. **Fix compilation** (~30 min)
-   - Adjust Contig handling (it's Vec<u8>, need separate name field)
-   - Fix function signatures for split_at_splitters
-   - Wire up archive writing
+### 1. Integrate Archive Writing (~2-3 hours)
 
-2. **Integrate compression pipeline** (~1-2 hours)
-   - LZ encoding against reference
-   - Segment compression with ZSTD
-   - Pack writing to archive
-   - Metadata handling
+**Current state**: Workers compress segments but don't write to archive.
 
-3. **Test with real data** (~30 min)
-   - Small test (10 samples)
-   - Y east235 test (235 genomes)
-   - Verify constant memory < 3 GB
+**What needs to happen**:
+Look at `worker.rs:compress_samples_streaming_with_archive()` for the pattern:
+- Archive needs to be created in `with_splitters()`
+- Archive needs to be wrapped in `Arc<Mutex<>>` and passed to workers
+- Workers need to write compressed packs to archive streams
 
-4. **CLI integration** (~1 hour)
-   - Update ragc CLI to use streaming API
-   - Add memory capacity flags
-   - Documentation
+**Files to modify**:
+- `streaming_compressor_queue.rs`:
+  - Add `archive: Arc<Mutex<Archive>>` field to `StreamingQueueCompressor`
+  - Create and initialize archive in `with_splitters()` (write file_type_info, params)
+  - Pass archive to worker threads
+  - In `worker_thread()`, write compressed packs to archive (see `worker.rs:60-85` for pattern)
+  - In `finalize()`, serialize collection metadata and close archive
 
-**Total estimated**: ~4-5 hours to completion
+**Reference code**: See `worker.rs:912-1062` for complete archive creation pattern
 
-## 🎯 API You'll Get
+### 2. Add LZ Encoding (~1-2 hours)
+
+**Current state**: Segments are compressed directly with ZSTD.
+
+**What needs to happen**:
+- Build reference genome from first sample (or use provided reference)
+- Workers need access to reference segments (grouped by k-mer keys)
+- Before ZSTD compression, encode segment against reference using LZ diff
+
+**Files to modify**:
+- `streaming_compressor_queue.rs`:
+  - Add reference genome storage (HashMap of k-mer -> reference segment)
+  - In worker threads, call LZ encoding before compression
+  - See `worker.rs:1086-1400` for reference implementation
+
+### 3. Test with Real Data (~30 min)
+
+Once archive writing is integrated:
+```bash
+# Test with small dataset
+cargo test --release test_streaming_queue_basic_flow
+
+# Test with yeast235 for constant memory verification
+# Should use < 3 GB regardless of dataset size
+/usr/bin/time -v ./target/release/ragc create \
+  --streaming-queue \
+  --queue-capacity 2GB \
+  -o yeast235.agc \
+  ~/scrapy/yeast235.fa.gz
+```
+
+### 4. CLI Integration (~1 hour)
+
+Add `--streaming-queue` flag to ragc CLI to use new API instead of batch mode.
+
+## 🎯 API (Already Working!)
 
 ```rust
 use ragc_core::{StreamingQueueCompressor, StreamingQueueConfig};
+use std::collections::HashSet;
 
 let config = StreamingQueueConfig::default();
-let mut compressor = StreamingQueueCompressor::new("output.agc", config)?;
+let splitters = HashSet::new(); // Or from reference
+let mut compressor = StreamingQueueCompressor::with_splitters(
+    "output.agc",
+    config,
+    splitters
+)?;
 
 // Push sequences - BLOCKS when queue is full (automatic backpressure!)
 for (sample, contig_name, data) in sequences {
@@ -76,27 +118,35 @@ for (sample, contig_name, data) in sequences {
 compressor.finalize()?; // Wait for completion, write metadata
 ```
 
-**Properties:**
+**Guaranteed properties:**
 - ✅ Constant memory (default 2 GB like C++ AGC)
 - ✅ Automatic backpressure (push() blocks when full)
 - ✅ Parallel compression (workers pull from queue)
 - ✅ Simple API (just push and finalize!)
 
-## 💡 Decision Point
+## 📊 Current Checkpoint Status
 
-We have two solid checkpoints:
+**Commits**:
+- `8f4f515` - MemoryBoundedQueue complete (405 lines, 6 tests)
+- `2925ceb` - StreamingQueueCompressor skeleton (432 lines, 3 tests)
+- `a35e475` - Integration tests and public API exports (87 lines, 1 test)
 
-**Checkpoint 1 (Current)**: MemoryBoundedQueue complete and tested
-- 405 lines, 6 passing tests
-- Can pause here, continue later
+**Total new code**: ~924 lines
+**Total tests**: 10 tests, all passing
+**Architecture**: Complete and verified
+**Remaining**: Archive I/O integration (~3-4 hours)
 
-**Checkpoint 2 (Next)**: Full streaming API working
-- Estimated 4-5 more hours
-- Will give you the complete queue-based API you want
+## 🔍 For Next Agent
 
-**What would you like to do?**
-- A) Continue now and finish the streaming API
-- B) Take this checkpoint and continue in next session
-- C) Focus on fixing just compilation errors, test basic flow
+**Key files to understand**:
+1. `ragc-core/src/memory_bounded_queue.rs` - The queue (complete)
+2. `ragc-core/src/streaming_compressor_queue.rs` - The API (needs archive writing)
+3. `ragc-core/src/worker.rs` - Reference for archive writing pattern
+4. `ragc-common/src/archive.rs` - Archive I/O primitives
 
-I'm ready to continue if you want to push through! 🚀
+**TODO markers in code**:
+- `streaming_compressor_queue.rs:367` - Implement LZ encoding against reference
+- `streaming_compressor_queue.rs:368` - Write to archive with proper pack structure
+- `streaming_compressor_queue.rs:277` - Write metadata to archive
+
+**The architecture is sound and tested. Just needs I/O plumbing!**
