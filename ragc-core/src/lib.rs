@@ -113,7 +113,7 @@
 
 pub mod bloom_filter;
 pub mod compressor;
-pub mod compressor_streaming;
+pub mod _compressor_streaming_old;
 pub mod contig_compression;
 pub mod contig_iterator;
 pub mod decompressor;
@@ -136,7 +136,7 @@ pub mod zstd_pool;
 
 // Re-export commonly used types
 pub use compressor::{Compressor, CompressorConfig};
-pub use compressor_streaming::{StreamingCompressor, StreamingCompressorConfig};
+pub use _compressor_streaming_old::{StreamingCompressor, StreamingCompressorConfig};
 pub use memory_bounded_queue::MemoryBoundedQueue;
 pub use streaming_compressor_queue::{StreamingQueueCompressor, StreamingQueueConfig, QueueStats};
 pub use contig_iterator::{MultiFileIterator, PansnFileIterator};
