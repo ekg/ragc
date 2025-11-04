@@ -6,10 +6,34 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 
 /// A segment descriptor identifying a compressed segment
+///
+/// # Architecture
+///
+/// Segments are organized into groups by terminal k-mers (front and back).
+/// Each group has two streams:
+/// - **ref_stream** (xGr): Contains reference segment (in_group_id = 0)
+/// - **delta_stream** (xGd): Contains LZ-encoded segments (in_group_id = 1, 2, 3, ...)
+///
+/// For groups >= 16 (LZ-enabled):
+/// - Reference is stored raw in ref_stream
+/// - Other segments are LZ-encoded against reference
+///
+/// For groups 0-15 (raw-only):
+/// - No LZ encoding, all segments stored raw
+///
+/// # Critical: in_group_id Indexing
+///
+/// - **in_group_id = 0**: ALWAYS the reference segment (in ref_stream)
+/// - **in_group_id >= 1**: Delta segments (in delta_stream)
+///
+/// IMPORTANT: Do NOT store reference in delta_stream! It must be:
+/// 1. Written to ref_stream
+/// 2. Registered with in_group_id = 0
+/// 3. Not included in delta pack
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SegmentDesc {
     pub group_id: u32,
-    pub in_group_id: u32,
+    pub in_group_id: u32,  // 0 = reference, 1+ = deltas
     pub is_rev_comp: bool,
     pub raw_length: u32,
 }
