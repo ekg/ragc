@@ -82,9 +82,10 @@ struct SegmentGroupBuffer {
     group_id: u32,
     stream_id: usize,      // Delta stream for packed segments
     ref_stream_id: usize,  // Reference stream for first segment
-    reference: Option<Contig>, // First segment (reference for LZ encoding)
-    segments: Vec<BufferedSegment>, // Up to PACK_CARDINALITY segments
+    reference_segment: Option<BufferedSegment>, // First segment (reference for LZ encoding)
+    segments: Vec<BufferedSegment>, // Up to PACK_CARDINALITY segments (EXCLUDING reference)
     ref_written: bool,     // Whether reference has been written
+    segments_written: u32,  // Counter for delta segments written (NOT including reference)
 }
 
 impl SegmentGroupBuffer {
@@ -93,9 +94,10 @@ impl SegmentGroupBuffer {
             group_id,
             stream_id,
             ref_stream_id,
-            reference: None,
+            reference_segment: None,
             segments: Vec::new(),
             ref_written: false,
+            segments_written: 0,
         }
     }
 }
@@ -516,7 +518,8 @@ fn flush_pack(
 ) -> Result<()> {
     use crate::segment_compression::{compress_reference_segment, compress_segment_configured};
 
-    if buffer.segments.is_empty() {
+    // Skip if no segments to write (but still write reference if present)
+    if buffer.segments.is_empty() && buffer.ref_written {
         return Ok(());
     }
 
@@ -524,33 +527,55 @@ fn flush_pack(
 
     // Write reference segment if not already written (first pack for this group)
     if !buffer.ref_written {
-        if let Some(ref_data) = &buffer.reference {
+        if let Some(ref_seg) = &buffer.reference_segment {
             // Compress reference using adaptive compression
-            let (mut compressed, marker) = compress_reference_segment(ref_data)
+            let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
                 .context("Failed to compress reference")?;
             compressed.push(marker);
 
             // Metadata stores the uncompressed size
-            let ref_size = ref_data.len() as u64;
+            let ref_size = ref_seg.data.len() as u64;
 
-            let mut arch = archive.lock().unwrap();
-            arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
-                .context("Failed to write reference")?;
+            {
+                let mut arch = archive.lock().unwrap();
+                arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
+                    .context("Failed to write reference")?;
+            }
+
+            // Register reference in collection with in_group_id = 0
+            {
+                let mut coll = collection.lock().unwrap();
+                coll.add_segment_placed(
+                    &ref_seg.sample_name,
+                    &ref_seg.contig_name,
+                    ref_seg.seg_part_no,
+                    buffer.group_id,
+                    0, // Reference is always at position 0
+                    ref_seg.is_rev_comp,
+                    ref_seg.data.len() as u32,
+                )
+                .context("Failed to register reference")?;
+            }
 
             buffer.ref_written = true;
         }
     }
 
     // Pack segments together with LZ encoding (for groups >= 16)
+    // Note: segments do NOT include the reference - it's stored separately
     let mut packed_data = Vec::new();
     for (idx_in_pack, seg) in buffer.segments.iter().enumerate() {
-        let contig_data = if !use_lz_encoding || idx_in_pack == 0 {
-            // Raw segment (either in raw-only group, or first segment in LZ group)
+        // Delta segments start at in_group_id = 1 (reference is 0)
+        let in_group_id = buffer.segments_written + idx_in_pack as u32 + 1;
+
+        let contig_data = if !use_lz_encoding {
+            // Raw segment (groups 0-15 don't use LZ encoding)
             seg.data.clone()
         } else {
-            // LZ-encoded segment (only for groups 16+ and not first segment)
-            let reference = buffer.reference.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Missing reference for LZ encoding"))?;
+            // LZ-encoded segment (all segments in groups >= 16)
+            let reference = &buffer.reference_segment.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Missing reference for LZ encoding"))?
+                .data;
             let mut lz_diff = LZDiff::new(config.min_match_len as u32);
             lz_diff.prepare(reference);
             lz_diff.encode(&seg.data)
@@ -569,7 +594,7 @@ fn flush_pack(
                 &seg.contig_name,
                 seg.seg_part_no,
                 buffer.group_id,
-                idx_in_pack as u32,
+                in_group_id,  // Start from 1 (reference is 0)
                 seg.is_rev_comp,
                 seg.data.len() as u32,
             )
@@ -577,18 +602,23 @@ fn flush_pack(
         }
     }
 
-    // Compress and write the packed data
-    // The metadata field stores the uncompressed size (including separators)
-    let total_raw_size = packed_data.len() as u64;
+    // Update counter (counts delta segments only, not reference)
+    buffer.segments_written += buffer.segments.len() as u32;
 
-    let mut compressed = compress_segment_configured(&packed_data, config.compression_level)
-        .context("Failed to compress pack")?;
-    compressed.push(0); // Marker 0 = plain ZSTD
+    // Compress and write the packed data (if we have any delta segments)
+    if !packed_data.is_empty() {
+        // The metadata field stores the uncompressed size (including separators)
+        let total_raw_size = packed_data.len() as u64;
 
-    {
-        let mut arch = archive.lock().unwrap();
-        arch.add_part(buffer.stream_id, &compressed, total_raw_size)
-            .context("Failed to write pack")?;
+        let mut compressed = compress_segment_configured(&packed_data, config.compression_level)
+            .context("Failed to compress pack")?;
+        compressed.push(0); // Marker 0 = plain ZSTD
+
+        {
+            let mut arch = archive.lock().unwrap();
+            arch.add_part(buffer.stream_id, &compressed, total_raw_size)
+                .context("Failed to write pack")?;
+        }
     }
 
     // Clear segments for next pack
@@ -675,12 +705,13 @@ fn worker_thread(
                 });
 
                 // Set reference if this is the first segment in the group
-                if buffer.reference.is_none() {
-                    buffer.reference = Some(segment.data.clone());
+                if buffer.reference_segment.is_none() {
+                    buffer.reference_segment = Some(buffered.clone());
+                    // Don't add reference to segments - it's stored separately
+                } else {
+                    // Add non-reference segment to buffer
+                    buffer.segments.push(buffered);
                 }
-
-                // Add segment to buffer
-                buffer.segments.push(buffered);
 
                 // Flush pack if buffer is full
                 if buffer.segments.len() >= PACK_CARDINALITY {
