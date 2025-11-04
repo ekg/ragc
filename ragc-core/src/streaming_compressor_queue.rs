@@ -195,8 +195,9 @@ impl StreamingQueueCompressor {
         let queue = Arc::new(MemoryBoundedQueue::new(config.queue_capacity));
 
         let splitters = Arc::new(splitters);
-        // Start at 16 for LZ groups (< 16 are raw groups, >= 16 are LZ groups with ref streams)
-        let segment_counter = Arc::new(AtomicU32::new(16));
+        // Start at 0 for raw groups (< 16 are raw groups, >= 16 are LZ groups with ref streams)
+        // TODO: Implement LZ groups properly with ref/delta streams
+        let segment_counter = Arc::new(AtomicU32::new(0));
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -486,17 +487,16 @@ fn worker_thread(
             }
 
             // Write segment to archive
-            // TODO: Add LZ differential encoding here before writing
-            // For now, write raw uncompressed data (like batch compressor)
+            // TODO: Add LZ differential encoding and compression
+            // For now, write raw uncompressed data (will add compression next)
             {
                 let mut arch = archive.lock().unwrap();
 
-                // Register stream for this segment
-                let stream_name = ragc_common::stream_ref_name(3000, seg_num);
+                // Register delta stream for this segment (raw groups use delta streams)
+                let stream_name = ragc_common::stream_delta_name(3000, seg_num);
                 let stream_id = arch.register_stream(&stream_name);
 
-                // Write raw uncompressed segment data (metadata=0)
-                // This matches batch compressor format and works with C++ AGC
+                // Write raw uncompressed segment data (metadata=0 means uncompressed)
                 arch.add_part(stream_id, &segment.data, 0)
                     .context("Failed to write segment to archive")?;
             }
