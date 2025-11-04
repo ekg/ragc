@@ -3,7 +3,7 @@
 
 use crate::memory_bounded_queue::MemoryBoundedQueue;
 use crate::segment::split_at_splitters_with_size;
-use crate::segment_compression::compress_segment_configured;
+use crate::segment_compression::{compress_reference_segment, compress_segment_configured};
 use crate::splitters::determine_splitters;
 use anyhow::{Context, Result};
 use ragc_common::{Archive, CollectionV3, Contig};
@@ -195,9 +195,9 @@ impl StreamingQueueCompressor {
         let queue = Arc::new(MemoryBoundedQueue::new(config.queue_capacity));
 
         let splitters = Arc::new(splitters);
-        // Start at 0 for raw groups (< 16 are raw groups, >= 16 are LZ groups with ref streams)
-        // TODO: Implement LZ groups properly with ref/delta streams
-        let segment_counter = Arc::new(AtomicU32::new(0));
+        // Start at 16 for LZ groups (< 16 are raw groups, >= 16 are LZ groups with ref streams)
+        // Each segment becomes its own reference (no LZ differential encoding yet)
+        let segment_counter = Arc::new(AtomicU32::new(16));
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -487,17 +487,25 @@ fn worker_thread(
             }
 
             // Write segment to archive
-            // TODO: Add LZ differential encoding and compression
-            // For now, write raw uncompressed data (will add compression next)
+            // Store as compressed reference (matching batch mode)
+            // TODO: Add LZ differential encoding for subsequent segments in same group
             {
+                // Compress segment using adaptive compression (plain ZSTD or tuple packing)
+                let (mut compressed, marker) = compress_reference_segment(&segment.data)
+                    .context("Failed to compress segment")?;
+
+                // Append marker byte to compressed data
+                // Decompressor pops this byte when metadata != 0
+                compressed.push(marker);
+
                 let mut arch = archive.lock().unwrap();
 
-                // Register delta stream for this segment (raw groups use delta streams)
-                let stream_name = ragc_common::stream_delta_name(3000, seg_num);
+                // Register ref stream for this segment (LZ groups use ref streams for references)
+                let stream_name = ragc_common::stream_ref_name(3000, seg_num);
                 let stream_id = arch.register_stream(&stream_name);
 
-                // Write raw uncompressed segment data (metadata=0 means uncompressed)
-                arch.add_part(stream_id, &segment.data, 0)
+                // Write compressed data with metadata=1 (indicates compressed + marker format)
+                arch.add_part(stream_id, &compressed, 1)
                     .context("Failed to write segment to archive")?;
             }
         }
