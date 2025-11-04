@@ -6,9 +6,10 @@ use crate::segment::split_at_splitters_with_size;
 use crate::segment_compression::compress_segment_configured;
 use crate::splitters::determine_splitters;
 use anyhow::{Context, Result};
-use ragc_common::{CollectionV3, Contig};
+use ragc_common::{Archive, CollectionV3, Contig};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -92,7 +93,8 @@ pub struct StreamingQueueCompressor {
     collection: Arc<Mutex<CollectionV3>>,
     splitters: Arc<HashSet<u64>>,
     config: StreamingQueueConfig,
-    _archive_path: String,
+    archive: Arc<Mutex<Archive>>,
+    segment_counter: Arc<AtomicU32>,
 }
 
 impl StreamingQueueCompressor {
@@ -122,15 +124,79 @@ impl StreamingQueueCompressor {
             eprintln!("  Splitters: {}", splitters.len());
         }
 
+        // Create archive
+        let mut archive = Archive::new_writer();
+        archive.open(output_path)?;
+
         // Create collection
         let mut collection = CollectionV3::new();
         collection.set_config(config.segment_size as u32, config.k as u32, None);
+
+        // CRITICAL: Register collection streams FIRST (C++ AGC compatibility)
+        // C++ AGC expects collection-samples at stream 0, collection-contigs at 1, collection-details at 2
+        collection.prepare_for_compression(&mut archive)?;
+
+        // Write file_type_info stream (after collection streams for C++ AGC compatibility)
+        {
+            let mut data = Vec::new();
+            let append_str = |data: &mut Vec<u8>, s: &str| {
+                data.extend_from_slice(s.as_bytes());
+                data.push(0);
+            };
+
+            append_str(&mut data, "producer");
+            append_str(&mut data, "ragc");
+            append_str(&mut data, "producer_version_major");
+            append_str(&mut data, &ragc_common::AGC_FILE_MAJOR.to_string());
+            append_str(&mut data, "producer_version_minor");
+            append_str(&mut data, &ragc_common::AGC_FILE_MINOR.to_string());
+            append_str(&mut data, "producer_version_build");
+            append_str(&mut data, "0");
+            append_str(&mut data, "file_version_major");
+            append_str(&mut data, &ragc_common::AGC_FILE_MAJOR.to_string());
+            append_str(&mut data, "file_version_minor");
+            append_str(&mut data, &ragc_common::AGC_FILE_MINOR.to_string());
+            append_str(&mut data, "comment");
+            append_str(&mut data, &format!("RAGC v.{}.{}", ragc_common::AGC_FILE_MAJOR, ragc_common::AGC_FILE_MINOR));
+
+            let stream_id = archive.register_stream("file_type_info");
+            archive.add_part(stream_id, &data, 7)?; // 7 key-value pairs
+        }
+
+        // Write params stream
+        {
+            let params_stream_id = archive.register_stream("params");
+            let mut params_data = Vec::new();
+            params_data.extend_from_slice(&(config.k as u32).to_le_bytes());
+            params_data.extend_from_slice(&(config.min_match_len as u32).to_le_bytes());
+            params_data.extend_from_slice(&50u32.to_le_bytes()); // pack_cardinality (default)
+            params_data.extend_from_slice(&(config.segment_size as u32).to_le_bytes());
+            archive.add_part(params_stream_id, &params_data, 0)?;
+        }
+
+        // Write empty splitters stream (C++ AGC compatibility)
+        {
+            let splitters_data = Vec::new();
+            let stream_id = archive.register_stream("splitters");
+            archive.add_part(stream_id, &splitters_data, 0)?;
+        }
+
+        // Write empty segment-splitters stream (C++ AGC compatibility)
+        {
+            let seg_splitters_data = Vec::new();
+            let stream_id = archive.register_stream("segment-splitters");
+            archive.add_part(stream_id, &seg_splitters_data, 0)?;
+        }
+
         let collection = Arc::new(Mutex::new(collection));
+        let archive = Arc::new(Mutex::new(archive));
 
         // Create memory-bounded queue
         let queue = Arc::new(MemoryBoundedQueue::new(config.queue_capacity));
 
         let splitters = Arc::new(splitters);
+        // Start at 16 for LZ groups (< 16 are raw groups, >= 16 are LZ groups with ref streams)
+        let segment_counter = Arc::new(AtomicU32::new(16));
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -138,10 +204,12 @@ impl StreamingQueueCompressor {
             let queue = Arc::clone(&queue);
             let collection = Arc::clone(&collection);
             let splitters = Arc::clone(&splitters);
+            let archive = Arc::clone(&archive);
+            let segment_counter = Arc::clone(&segment_counter);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
-                worker_thread(worker_id, queue, collection, splitters, config)
+                worker_thread(worker_id, queue, collection, splitters, archive, segment_counter, config)
             });
 
             workers.push(handle);
@@ -157,7 +225,8 @@ impl StreamingQueueCompressor {
             collection,
             splitters,
             config,
-            _archive_path: archive_path,
+            archive,
+            segment_counter,
         })
     }
 
@@ -214,10 +283,12 @@ impl StreamingQueueCompressor {
                 let queue = Arc::clone(&self.queue);
                 let collection = Arc::clone(&self.collection);
                 let splitters = Arc::clone(&self.splitters);
+                let archive = Arc::clone(&self.archive);
+                let segment_counter = Arc::clone(&self.segment_counter);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
-                    worker_thread(worker_id, queue, collection, splitters, config)
+                    worker_thread(worker_id, queue, collection, splitters, archive, segment_counter, config)
                 });
 
                 self.workers.push(handle);
@@ -300,8 +371,33 @@ impl StreamingQueueCompressor {
             eprintln!("Writing metadata...");
         }
 
-        // TODO: Write metadata to archive
-        // TODO: Close archive
+        // Get total sample count for metadata writing
+        let num_samples = {
+            let coll = self.collection.lock().unwrap();
+            coll.get_no_samples()
+        };
+
+        // Write collection metadata to archive
+        {
+            let mut archive = self.archive.lock().unwrap();
+            let mut collection = self.collection.lock().unwrap();
+
+            // Write sample names
+            collection.store_batch_sample_names(&mut archive)
+                .context("Failed to write sample names")?;
+
+            // Write contig names and segment details
+            collection.store_contig_batch(&mut archive, 0, num_samples)
+                .context("Failed to write contig batch")?;
+
+            if self.config.verbosity > 0 {
+                eprintln!("Collection metadata written successfully");
+            }
+
+            // Close archive (writes footer)
+            archive.close()
+                .context("Failed to close archive")?;
+        }
 
         if self.config.verbosity > 0 {
             eprintln!("Compression complete!");
@@ -334,10 +430,14 @@ pub struct QueueStats {
 fn worker_thread(
     worker_id: usize,
     queue: Arc<MemoryBoundedQueue<ContigTask>>,
-    _collection: Arc<Mutex<CollectionV3>>,
+    collection: Arc<Mutex<CollectionV3>>,
     splitters: Arc<HashSet<u64>>,
+    archive: Arc<Mutex<Archive>>,
+    segment_counter: Arc<AtomicU32>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
+    use crate::segment_compression::compress_reference_segment;
+
     let mut processed_count = 0;
 
     loop {
@@ -365,16 +465,41 @@ fn worker_thread(
             );
         }
 
-        // Compress each segment
-        for segment in segments {
-            // TODO: Implement LZ encoding against reference
-            // TODO: Write to archive with proper pack structure
+        // Register and compress each segment
+        for (place, segment) in segments.iter().enumerate() {
+            // Get a global segment number for this segment
+            let seg_num = segment_counter.fetch_add(1, Ordering::SeqCst);
 
-            // For now, just compress the segment to verify the pipeline works
-            let _compressed = compress_segment_configured(&segment.data, config.compression_level)
-                .context("Failed to compress segment")?;
+            // Register this segment in the collection
+            {
+                let mut coll = collection.lock().unwrap();
+                coll.add_segment_placed(
+                    &task.sample_name,
+                    &task.contig_name,
+                    place,
+                    seg_num,  // group_id (each segment is its own group for now)
+                    0,         // in_group_id (0 = reference)
+                    false,     // is_rev_comp
+                    segment.data.len() as u32,
+                )
+                .context("Failed to add segment to collection")?;
+            }
 
-            // TODO: Write compressed data to archive
+            // Write segment to archive
+            // TODO: Add LZ differential encoding here before writing
+            // For now, write raw uncompressed data (like batch compressor)
+            {
+                let mut arch = archive.lock().unwrap();
+
+                // Register stream for this segment
+                let stream_name = ragc_common::stream_ref_name(3000, seg_num);
+                let stream_id = arch.register_stream(&stream_name);
+
+                // Write raw uncompressed segment data (metadata=0)
+                // This matches batch compressor format and works with C++ AGC
+                arch.add_part(stream_id, &segment.data, 0)
+                    .context("Failed to write segment to archive")?;
+            }
         }
 
         processed_count += 1;

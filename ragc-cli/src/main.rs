@@ -9,8 +9,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ragc_core::{
-    Decompressor, DecompressorConfig, MultiFileIterator, StreamingCompressor,
-    StreamingCompressorConfig,
+    contig_iterator::ContigIterator, Decompressor, DecompressorConfig, MultiFileIterator,
+    StreamingCompressor, StreamingCompressorConfig, StreamingQueueCompressor,
+    StreamingQueueConfig,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -69,6 +70,18 @@ enum Commands {
         /// Set to 1 for single-threaded compression
         #[arg(short = 't', long)]
         threads: Option<usize>,
+
+        /// Use streaming queue mode for constant memory usage (experimental)
+        /// Processes sequences through a bounded queue with automatic backpressure.
+        /// Guarantees constant memory regardless of dataset size.
+        #[arg(long)]
+        streaming_queue: bool,
+
+        /// Queue capacity in bytes for streaming mode (default: 2GB)
+        /// Ignored if --streaming-queue is not specified.
+        /// Accepts suffixes: K, M, G (e.g., "512M", "2G")
+        #[arg(long, default_value = "2G")]
+        queue_capacity: String,
     },
 
     /// Display information about an AGC archive
@@ -123,6 +136,26 @@ enum Commands {
     },
 }
 
+/// Parse capacity string with suffixes (K, M, G) into bytes
+/// Examples: "512M" -> 536870912, "2G" -> 2147483648
+fn parse_capacity(s: &str) -> Result<usize> {
+    let s = s.trim().to_uppercase();
+
+    if let Some(num_str) = s.strip_suffix('K') {
+        let num: usize = num_str.parse()?;
+        Ok(num * 1024)
+    } else if let Some(num_str) = s.strip_suffix('M') {
+        let num: usize = num_str.parse()?;
+        Ok(num * 1024 * 1024)
+    } else if let Some(num_str) = s.strip_suffix('G') {
+        let num: usize = num_str.parse()?;
+        Ok(num * 1024 * 1024 * 1024)
+    } else {
+        // No suffix, parse as bytes
+        Ok(s.parse()?)
+    }
+}
+
 /// Extract sample name from file path by stripping all genomic file extensions
 /// Examples:
 ///   scerevisiae8.fa.gz -> scerevisiae8
@@ -170,6 +203,8 @@ fn main() -> Result<()> {
             adaptive,
             concatenated,
             threads,
+            streaming_queue,
+            queue_capacity,
         } => create_archive(
             output,
             inputs,
@@ -181,6 +216,8 @@ fn main() -> Result<()> {
             adaptive,
             concatenated,
             threads,
+            streaming_queue,
+            &queue_capacity,
         )?,
 
         Commands::Info { archive } => {
@@ -220,6 +257,8 @@ fn create_archive(
     adaptive: bool,
     concatenated: bool,
     threads: Option<usize>,
+    streaming_queue: bool,
+    queue_capacity_str: &str,
 ) -> Result<()> {
     // Determine thread count (use provided or auto-detect)
     let num_threads = threads.unwrap_or_else(|| {
@@ -240,6 +279,11 @@ fn create_archive(
         eprintln!("  min match length: {min_match_len}");
         eprintln!("  compression level: {compression_level}");
         eprintln!("  threads: {num_threads}");
+        if streaming_queue {
+            let capacity = parse_capacity(queue_capacity_str)?;
+            eprintln!("  streaming queue mode: enabled (constant memory)");
+            eprintln!("  queue capacity: {} bytes ({:.2} GB)", capacity, capacity as f64 / 1024.0 / 1024.0 / 1024.0);
+        }
         if adaptive {
             eprintln!("  adaptive mode: enabled (pangenome-aware splitters)");
         }
@@ -249,7 +293,53 @@ fn create_archive(
         eprintln!();
     }
 
-    // Use default config and override CLI params (including threads)
+    // Branch: Streaming queue mode vs. batch mode
+    if streaming_queue {
+        // Streaming queue mode: constant memory with bounded queue
+        if adaptive || concatenated {
+            anyhow::bail!("Streaming queue mode does not support --adaptive or --concatenated flags yet");
+        }
+
+        let output_str = output
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid output path"))?;
+
+        let queue_capacity = parse_capacity(queue_capacity_str)?;
+        let config = StreamingQueueConfig {
+            k: kmer_length as usize,
+            segment_size: segment_size as usize,
+            min_match_len: min_match_len as usize,
+            queue_capacity,
+            num_threads,
+            verbosity: verbosity as usize,
+            ..StreamingQueueConfig::default()
+        };
+
+        // Create compressor with empty splitters (will be determined from first contig)
+        let mut compressor = StreamingQueueCompressor::with_splitters(
+            output_str,
+            config,
+            std::collections::HashSet::new(),
+        )?;
+
+        // Process all input files
+        let mut iterator = MultiFileIterator::new(inputs.clone())?;
+        while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
+            if !sequence.is_empty() {
+                compressor.push(sample_name, contig_name, sequence)?;
+            }
+        }
+
+        compressor.finalize()?;
+
+        if verbosity > 0 {
+            eprintln!("\nArchive created successfully: {output:?}");
+        }
+
+        return Ok(());
+    }
+
+    // Batch mode: regular StreamingCompressor
     let config = StreamingCompressorConfig {
         kmer_length,
         segment_size,
