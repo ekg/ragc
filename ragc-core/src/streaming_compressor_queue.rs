@@ -1,13 +1,13 @@
 // Queue-based streaming compressor API
 // Provides simple push() interface with automatic backpressure and constant memory usage
 
+use crate::lz_diff::LZDiff;
 use crate::memory_bounded_queue::MemoryBoundedQueue;
 use crate::segment::split_at_splitters_with_size;
-use crate::segment_compression::{compress_reference_segment, compress_segment_configured};
 use crate::splitters::determine_splitters;
 use anyhow::{Context, Result};
-use ragc_common::{Archive, CollectionV3, Contig};
-use std::collections::HashSet;
+use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +60,51 @@ struct ContigTask {
     data: Contig, // Vec<u8>
 }
 
+/// Segment group identified by flanking k-mers (matching batch mode)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SegmentGroupKey {
+    kmer_front: u64,
+    kmer_back: u64,
+}
+
+/// Buffered segment waiting to be packed
+#[derive(Debug, Clone)]
+struct BufferedSegment {
+    sample_name: String,
+    contig_name: String,
+    seg_part_no: usize,
+    data: Contig,
+    is_rev_comp: bool,
+}
+
+/// Buffer for a segment group (packs 50 segments together)
+struct SegmentGroupBuffer {
+    group_id: u32,
+    stream_id: usize,      // Delta stream for packed segments
+    ref_stream_id: usize,  // Reference stream for first segment
+    reference: Option<Contig>, // First segment (reference for LZ encoding)
+    segments: Vec<BufferedSegment>, // Up to PACK_CARDINALITY segments
+    ref_written: bool,     // Whether reference has been written
+}
+
+impl SegmentGroupBuffer {
+    fn new(group_id: u32, stream_id: usize, ref_stream_id: usize) -> Self {
+        Self {
+            group_id,
+            stream_id,
+            ref_stream_id,
+            reference: None,
+            segments: Vec::new(),
+            ref_written: false,
+        }
+    }
+}
+
+/// Pack size (C++ AGC default)
+const PACK_CARDINALITY: usize = 50;
+/// First 16 groups are raw-only (no LZ encoding)
+const NO_RAW_GROUPS: u32 = 16;
+
 /// Streaming compressor with queue-based API
 ///
 /// # Example
@@ -94,7 +139,8 @@ pub struct StreamingQueueCompressor {
     splitters: Arc<HashSet<u64>>,
     config: StreamingQueueConfig,
     archive: Arc<Mutex<Archive>>,
-    segment_counter: Arc<AtomicU32>,
+    segment_groups: Arc<Mutex<HashMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    group_counter: Arc<AtomicU32>, // Starts at 16 for LZ groups
 }
 
 impl StreamingQueueCompressor {
@@ -195,9 +241,10 @@ impl StreamingQueueCompressor {
         let queue = Arc::new(MemoryBoundedQueue::new(config.queue_capacity));
 
         let splitters = Arc::new(splitters);
-        // Start at 16 for LZ groups (< 16 are raw groups, >= 16 are LZ groups with ref streams)
-        // Each segment becomes its own reference (no LZ differential encoding yet)
-        let segment_counter = Arc::new(AtomicU32::new(16));
+
+        // Segment grouping for LZ packing
+        let segment_groups = Arc::new(Mutex::new(HashMap::new()));
+        let group_counter = Arc::new(AtomicU32::new(NO_RAW_GROUPS)); // Start at 16 for LZ groups
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -206,11 +253,12 @@ impl StreamingQueueCompressor {
             let collection = Arc::clone(&collection);
             let splitters = Arc::clone(&splitters);
             let archive = Arc::clone(&archive);
-            let segment_counter = Arc::clone(&segment_counter);
+            let segment_groups = Arc::clone(&segment_groups);
+            let group_counter = Arc::clone(&group_counter);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
-                worker_thread(worker_id, queue, collection, splitters, archive, segment_counter, config)
+                worker_thread(worker_id, queue, collection, splitters, archive, segment_groups, group_counter, config)
             });
 
             workers.push(handle);
@@ -227,7 +275,8 @@ impl StreamingQueueCompressor {
             splitters,
             config,
             archive,
-            segment_counter,
+            segment_groups,
+            group_counter,
         })
     }
 
@@ -285,11 +334,12 @@ impl StreamingQueueCompressor {
                 let collection = Arc::clone(&self.collection);
                 let splitters = Arc::clone(&self.splitters);
                 let archive = Arc::clone(&self.archive);
-                let segment_counter = Arc::clone(&self.segment_counter);
+                let segment_groups = Arc::clone(&self.segment_groups);
+                let group_counter = Arc::clone(&self.group_counter);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
-                    worker_thread(worker_id, queue, collection, splitters, archive, segment_counter, config)
+                    worker_thread(worker_id, queue, collection, splitters, archive, segment_groups, group_counter, config)
                 });
 
                 self.workers.push(handle);
@@ -369,6 +419,36 @@ impl StreamingQueueCompressor {
 
         if self.config.verbosity > 0 {
             eprintln!("All workers finished!");
+            eprintln!("Flushing remaining segment packs...");
+        }
+
+        // Flush all remaining partial packs
+        {
+            let mut groups = self.segment_groups.lock().unwrap();
+            let num_groups = groups.len();
+
+            for (key, buffer) in groups.iter_mut() {
+                if !buffer.segments.is_empty() {
+                    if self.config.verbosity > 1 {
+                        eprintln!(
+                            "Flushing group {} with {} segments (k-mers: {:#x}, {:#x})",
+                            buffer.group_id,
+                            buffer.segments.len(),
+                            key.kmer_front,
+                            key.kmer_back
+                        );
+                    }
+                    flush_pack(buffer, &self.collection, &self.archive, &self.config)
+                        .context("Failed to flush remaining pack")?;
+                }
+            }
+
+            if self.config.verbosity > 0 {
+                eprintln!("Flushed {} segment groups", num_groups);
+            }
+        }
+
+        if self.config.verbosity > 0 {
             eprintln!("Writing metadata...");
         }
 
@@ -427,6 +507,96 @@ pub struct QueueStats {
     pub is_closed: bool,
 }
 
+/// Flush a complete pack of segments (compress, LZ encode, write to archive)
+fn flush_pack(
+    buffer: &mut SegmentGroupBuffer,
+    collection: &Arc<Mutex<CollectionV3>>,
+    archive: &Arc<Mutex<Archive>>,
+    config: &StreamingQueueConfig,
+) -> Result<()> {
+    use crate::segment_compression::{compress_reference_segment, compress_segment_configured};
+
+    if buffer.segments.is_empty() {
+        return Ok(());
+    }
+
+    let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
+
+    // Write reference segment if not already written (first pack for this group)
+    if !buffer.ref_written {
+        if let Some(ref_data) = &buffer.reference {
+            // Compress reference using adaptive compression
+            let (mut compressed, marker) = compress_reference_segment(ref_data)
+                .context("Failed to compress reference")?;
+            compressed.push(marker);
+
+            // Metadata stores the uncompressed size
+            let ref_size = ref_data.len() as u64;
+
+            let mut arch = archive.lock().unwrap();
+            arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
+                .context("Failed to write reference")?;
+
+            buffer.ref_written = true;
+        }
+    }
+
+    // Pack segments together with LZ encoding (for groups >= 16)
+    let mut packed_data = Vec::new();
+    for (idx_in_pack, seg) in buffer.segments.iter().enumerate() {
+        let contig_data = if !use_lz_encoding || idx_in_pack == 0 {
+            // Raw segment (either in raw-only group, or first segment in LZ group)
+            seg.data.clone()
+        } else {
+            // LZ-encoded segment (only for groups 16+ and not first segment)
+            let reference = buffer.reference.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Missing reference for LZ encoding"))?;
+            let mut lz_diff = LZDiff::new(config.min_match_len as u32);
+            lz_diff.prepare(reference);
+            lz_diff.encode(&seg.data)
+        };
+
+        // Add contig data
+        packed_data.extend_from_slice(&contig_data);
+        // Add separator (0xFF)
+        packed_data.push(CONTIG_SEPARATOR);
+
+        // Register in collection
+        {
+            let mut coll = collection.lock().unwrap();
+            coll.add_segment_placed(
+                &seg.sample_name,
+                &seg.contig_name,
+                seg.seg_part_no,
+                buffer.group_id,
+                idx_in_pack as u32,
+                seg.is_rev_comp,
+                seg.data.len() as u32,
+            )
+            .context("Failed to register segment")?;
+        }
+    }
+
+    // Compress and write the packed data
+    // The metadata field stores the uncompressed size (including separators)
+    let total_raw_size = packed_data.len() as u64;
+
+    let mut compressed = compress_segment_configured(&packed_data, config.compression_level)
+        .context("Failed to compress pack")?;
+    compressed.push(0); // Marker 0 = plain ZSTD
+
+    {
+        let mut arch = archive.lock().unwrap();
+        arch.add_part(buffer.stream_id, &compressed, total_raw_size)
+            .context("Failed to write pack")?;
+    }
+
+    // Clear segments for next pack
+    buffer.segments.clear();
+
+    Ok(())
+}
+
 /// Worker thread that pulls from queue and compresses
 fn worker_thread(
     worker_id: usize,
@@ -434,11 +604,10 @@ fn worker_thread(
     collection: Arc<Mutex<CollectionV3>>,
     splitters: Arc<HashSet<u64>>,
     archive: Arc<Mutex<Archive>>,
-    segment_counter: Arc<AtomicU32>,
+    segment_groups: Arc<Mutex<HashMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    group_counter: Arc<AtomicU32>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
-    use crate::segment_compression::compress_reference_segment;
-
     let mut processed_count = 0;
 
     loop {
@@ -466,47 +635,58 @@ fn worker_thread(
             );
         }
 
-        // Register and compress each segment
+        // Buffer segments for packing (matching batch mode)
         for (place, segment) in segments.iter().enumerate() {
-            // Get a global segment number for this segment
-            let seg_num = segment_counter.fetch_add(1, Ordering::SeqCst);
+            // Create grouping key from terminal k-mers
+            let key = SegmentGroupKey {
+                kmer_front: segment.front_kmer,
+                kmer_back: segment.back_kmer,
+            };
 
-            // Register this segment in the collection
+            // Create buffered segment
+            let buffered = BufferedSegment {
+                sample_name: task.sample_name.clone(),
+                contig_name: task.contig_name.clone(),
+                seg_part_no: place,
+                data: segment.data.clone(),
+                is_rev_comp: false,
+            };
+
+            // Lock segment groups and add segment to buffer
             {
-                let mut coll = collection.lock().unwrap();
-                coll.add_segment_placed(
-                    &task.sample_name,
-                    &task.contig_name,
-                    place,
-                    seg_num,  // group_id (each segment is its own group for now)
-                    0,         // in_group_id (0 = reference)
-                    false,     // is_rev_comp
-                    segment.data.len() as u32,
-                )
-                .context("Failed to add segment to collection")?;
-            }
+                let mut groups = segment_groups.lock().unwrap();
 
-            // Write segment to archive
-            // Store as compressed reference (matching batch mode)
-            // TODO: Add LZ differential encoding for subsequent segments in same group
-            {
-                // Compress segment using adaptive compression (plain ZSTD or tuple packing)
-                let (mut compressed, marker) = compress_reference_segment(&segment.data)
-                    .context("Failed to compress segment")?;
+                // Get or create buffer for this group
+                let buffer = groups.entry(key).or_insert_with(|| {
+                    // Allocate new group ID
+                    let group_id = group_counter.fetch_add(1, Ordering::SeqCst);
 
-                // Append marker byte to compressed data
-                // Decompressor pops this byte when metadata != 0
-                compressed.push(marker);
+                    // Register streams for this group
+                    let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
 
-                let mut arch = archive.lock().unwrap();
+                    let mut arch = archive.lock().unwrap();
+                    let stream_id = arch.register_stream(&delta_stream_name);
+                    let ref_stream_id = arch.register_stream(&ref_stream_name);
+                    drop(arch);
 
-                // Register ref stream for this segment (LZ groups use ref streams for references)
-                let stream_name = ragc_common::stream_ref_name(3000, seg_num);
-                let stream_id = arch.register_stream(&stream_name);
+                    SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+                });
 
-                // Write compressed data with metadata=1 (indicates compressed + marker format)
-                arch.add_part(stream_id, &compressed, 1)
-                    .context("Failed to write segment to archive")?;
+                // Set reference if this is the first segment in the group
+                if buffer.reference.is_none() {
+                    buffer.reference = Some(segment.data.clone());
+                }
+
+                // Add segment to buffer
+                buffer.segments.push(buffered);
+
+                // Flush pack if buffer is full
+                if buffer.segments.len() >= PACK_CARDINALITY {
+                    flush_pack(buffer, &collection, &archive, &config)
+                        .context("Failed to flush pack")?;
+                }
             }
         }
 
