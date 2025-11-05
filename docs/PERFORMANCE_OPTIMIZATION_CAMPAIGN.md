@@ -135,10 +135,32 @@ let splitters = ragc_core::determine_splitters_streaming(
 
 **Solution**: Determine splitters from ALL samples (or aggregate them) to find conserved k-mer positions that work across all genomes
 
-**Next Steps**:
-- Fix splitter determination to use all samples
-- Test that group count drops to ~200-300 for 10 samples
-- Verify archive size matches C++ AGC (5.4 MB)
+**Attempted Fix #1: FAILED - Union of All Files**:
+
+Changed CLI to aggregate splitters from ALL input files (union):
+```rust
+for input in inputs.iter() {
+    let (file_splitters, _, _) = determine_splitters_streaming(input, ...)?;
+    all_splitters.extend(file_splitters);  // Union
+}
+```
+
+**Results**:
+- Splitters: 12,160 (vs ~1,200 from first file)
+- Groups: 17,947 (vs 2,079 baseline)
+- Archive: 7.9 MB (vs 6.9 MB baseline = **15% WORSE!**)
+- Correctness: ✅ Maintained
+
+**Why It Failed**:
+Union creates TOO MANY splitters → too many segment boundaries → MORE groups, not fewer!
+
+**Lesson Learned**:
+We don't want ALL k-mers from all samples. We want CONSERVED k-mers that work across samples.
+
+**Real Solution** (TBD - needs investigation):
+1. **Option A**: Use adaptive mode (-a flag) like C++ AGC might
+2. **Option B**: Find k-mers that appear in N+ samples (intersection/frequency filter)
+3. **Option C**: Check if test should use single multi-sample file vs separate files
 
 ---
 
