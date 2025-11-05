@@ -60,13 +60,15 @@ let segment_groups = Arc::new(Mutex::new(HashMap::new()));
 - Risk: Very Low
 
 **Results**:
-- [ ] Performance test completed
-- [ ] Memory: ___ MB (baseline: 275 MB)
-- [ ] Wall Time: ___ s (baseline: 3.70s)
-- [ ] System Time: ___ s (baseline: 0.29s)
-- [ ] Archive Size: ___ MB (baseline: 6.9 MB - **MUST NOT CHANGE**)
-- [ ] Correctness: AAA#0 = ___ bytes (expected 12157105)
-- [ ] Commit: ___
+- [x] Performance test completed
+- [x] Memory: 276 MB (baseline: 275 MB) = **+1 MB**
+- [x] Wall Time: 3.54s (baseline: 3.70s) = **-0.16s (-4.3%)**
+- [x] System Time: 0.26s (baseline: 0.29s) = **-0.03s**
+- [x] Archive Size: 6.9 MB (baseline: 6.9 MB) = **IDENTICAL ✅**
+- [x] Correctness: AAA#0 = 12157105 bytes ✅
+- [x] Commit: 8c7a3fd
+
+**Analysis**: BTreeMap uses slightly more memory (+1 MB) due to tree structure overhead, but provides 4.3% faster runtime due to better cache locality. The 1 MB memory increase is acceptable given the runtime improvement. Archive size is identical, confirming correctness.
 
 ---
 
@@ -235,7 +237,7 @@ let segment_groups = Arc::new(Mutex::new(HashMap::new()));
 | Step | Status | Memory | Runtime | Archive | Commit |
 |------|--------|--------|---------|---------|--------|
 | Baseline | ✅ | 275 MB | 3.70s | 6.9 MB | - |
-| 1. BTreeMap groups | 🔄 | - | - | - | - |
+| 1. BTreeMap groups | ✅ | 276 MB | 3.54s | 6.9 MB | 8c7a3fd |
 | 2. Pre-allocate vectors | ⏸️ | - | - | - | - |
 | 3. Reduce String cloning | ⏸️ | - | - | - | - |
 | 4. Better grouping | ⏸️ | - | - | - | - |

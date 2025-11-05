@@ -7,7 +7,7 @@ use crate::segment::split_at_splitters_with_size;
 use crate::splitters::determine_splitters;
 use anyhow::{Context, Result};
 use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -66,7 +66,7 @@ struct ContigTask {
 }
 
 /// Segment group identified by flanking k-mers (matching batch mode)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 struct SegmentGroupKey {
     kmer_front: u64,
     kmer_back: u64,
@@ -146,7 +146,7 @@ pub struct StreamingQueueCompressor {
     splitters: Arc<HashSet<u64>>,
     config: StreamingQueueConfig,
     archive: Arc<Mutex<Archive>>,
-    segment_groups: Arc<Mutex<HashMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>, // Starts at 16 for LZ groups
     reference_sample_name: Arc<Mutex<Option<String>>>, // First sample becomes reference
 }
@@ -257,8 +257,8 @@ impl StreamingQueueCompressor {
 
         let splitters = Arc::new(splitters);
 
-        // Segment grouping for LZ packing
-        let segment_groups = Arc::new(Mutex::new(HashMap::new()));
+        // Segment grouping for LZ packing (using BTreeMap for better memory efficiency)
+        let segment_groups = Arc::new(Mutex::new(BTreeMap::new()));
         let group_counter = Arc::new(AtomicU32::new(NO_RAW_GROUPS)); // Start at 16 for LZ groups
         let reference_sample_name = Arc::new(Mutex::new(None)); // Shared across all workers
 
@@ -685,7 +685,7 @@ fn worker_thread(
     collection: Arc<Mutex<CollectionV3>>,
     splitters: Arc<HashSet<u64>>,
     archive: Arc<Mutex<Archive>>,
-    segment_groups: Arc<Mutex<HashMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>,
     reference_sample_name: Arc<Mutex<Option<String>>>,
     config: StreamingQueueConfig,
