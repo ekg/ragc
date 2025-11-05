@@ -22,7 +22,8 @@ ragc (Rust + AGC) is a ground-up rewrite of AGC in Rust that:
 - ✅ Continuous Integration with C++ compatibility verification
 - ✅ Multi-sample, multi-contig support
 - ✅ Splitter-based segmentation with per-group buffering
-- ✅ Parallel multi-threaded compression (3-stage pipeline: workers → compression pool → writer)
+- ✅ **Streaming queue compression (default)** - constant memory usage with 2GB bounded queue
+- ✅ PanSN format support (sample#haplotype#chromosome) for both single-file and multi-file modes
 
 **Not Yet Implemented:**
 - ⚠️ Some CLI commands (getcol, etc.)
@@ -44,8 +45,17 @@ The binary will be at `./target/release/ragc`.
 ### Compress genomes into AGC archive
 
 ```bash
-# Create archive from FASTA file(s)
+# Create archive from FASTA file(s) - uses streaming queue mode by default
 ragc create --output mygenomes.agc sample1.fasta
+
+# Create archive from multiple files (PanSN multi-file mode)
+ragc create --output mygenomes.agc sample*.fasta
+
+# Create from single PanSN-formatted file (sample#haplotype#chromosome)
+ragc create --output mygenomes.agc all_samples.fa.gz
+
+# Use legacy batch mode (higher memory, slightly slower)
+ragc create --output mygenomes.agc --batch sample1.fasta
 
 # Or use stdin
 cat sample1.fasta | ragc create --output mygenomes.agc -
