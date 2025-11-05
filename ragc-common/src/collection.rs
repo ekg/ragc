@@ -33,7 +33,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SegmentDesc {
     pub group_id: u32,
-    pub in_group_id: u32,  // 0 = reference, 1+ = deltas
+    pub in_group_id: u32, // 0 = reference, 1+ = deltas
     pub is_rev_comp: bool,
     pub raw_length: u32,
 }

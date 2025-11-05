@@ -10,8 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ragc_core::{
     contig_iterator::ContigIterator, Decompressor, DecompressorConfig, MultiFileIterator,
-    StreamingCompressor, StreamingCompressorConfig, StreamingQueueCompressor,
-    StreamingQueueConfig,
+    StreamingCompressor, StreamingCompressorConfig, StreamingQueueCompressor, StreamingQueueConfig,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -281,7 +280,11 @@ fn create_archive(
         if !batch {
             let capacity = parse_capacity(queue_capacity_str)?;
             eprintln!("  mode: streaming queue (constant memory, default)");
-            eprintln!("  queue capacity: {} bytes ({:.2} GB)", capacity, capacity as f64 / 1024.0 / 1024.0 / 1024.0);
+            eprintln!(
+                "  queue capacity: {} bytes ({:.2} GB)",
+                capacity,
+                capacity as f64 / 1024.0 / 1024.0 / 1024.0
+            );
         } else {
             eprintln!("  mode: batch (legacy)");
         }
@@ -298,7 +301,9 @@ fn create_archive(
     if !batch {
         // Streaming queue mode: constant memory with bounded queue (DEFAULT)
         if adaptive || concatenated {
-            anyhow::bail!("Streaming queue mode does not support --adaptive or --concatenated flags yet");
+            anyhow::bail!(
+                "Streaming queue mode does not support --adaptive or --concatenated flags yet"
+            );
         }
 
         let output_str = output
@@ -330,7 +335,8 @@ fn create_archive(
             &inputs[0],
             kmer_length as usize,
             segment_size as usize,
-        )?.0;
+        )?
+        .0;
 
         if verbosity > 0 {
             eprintln!("Found {} splitters", splitters.len());
@@ -338,11 +344,8 @@ fn create_archive(
         }
 
         // Create compressor with splitters from first file
-        let mut compressor = StreamingQueueCompressor::with_splitters(
-            output_str,
-            config,
-            splitters,
-        )?;
+        let mut compressor =
+            StreamingQueueCompressor::with_splitters(output_str, config, splitters)?;
 
         // Process all input files
         let mut iterator = MultiFileIterator::new(inputs.clone())?;

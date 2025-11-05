@@ -85,12 +85,12 @@ struct BufferedSegment {
 /// Buffer for a segment group (packs 50 segments together)
 struct SegmentGroupBuffer {
     group_id: u32,
-    stream_id: usize,      // Delta stream for packed segments
-    ref_stream_id: usize,  // Reference stream for first segment
+    stream_id: usize,                           // Delta stream for packed segments
+    ref_stream_id: usize,                       // Reference stream for first segment
     reference_segment: Option<BufferedSegment>, // First segment (reference for LZ encoding)
     segments: Vec<BufferedSegment>, // Up to PACK_CARDINALITY segments (EXCLUDING reference)
-    ref_written: bool,     // Whether reference has been written
-    segments_written: u32,  // Counter for delta segments written (NOT including reference)
+    ref_written: bool,              // Whether reference has been written
+    segments_written: u32,          // Counter for delta segments written (NOT including reference)
 }
 
 impl SegmentGroupBuffer {
@@ -211,7 +211,14 @@ impl StreamingQueueCompressor {
             append_str(&mut data, "file_version_minor");
             append_str(&mut data, &ragc_common::AGC_FILE_MINOR.to_string());
             append_str(&mut data, "comment");
-            append_str(&mut data, &format!("RAGC v.{}.{}", ragc_common::AGC_FILE_MAJOR, ragc_common::AGC_FILE_MINOR));
+            append_str(
+                &mut data,
+                &format!(
+                    "RAGC v.{}.{}",
+                    ragc_common::AGC_FILE_MAJOR,
+                    ragc_common::AGC_FILE_MINOR
+                ),
+            );
 
             let stream_id = archive.register_stream("file_type_info");
             archive.add_part(stream_id, &data, 7)?; // 7 key-value pairs
@@ -268,7 +275,17 @@ impl StreamingQueueCompressor {
             let config = config.clone();
 
             let handle = thread::spawn(move || {
-                worker_thread(worker_id, queue, collection, splitters, archive, segment_groups, group_counter, reference_sample_name, config)
+                worker_thread(
+                    worker_id,
+                    queue,
+                    collection,
+                    splitters,
+                    archive,
+                    segment_groups,
+                    group_counter,
+                    reference_sample_name,
+                    config,
+                )
             });
 
             workers.push(handle);
@@ -317,12 +334,7 @@ impl StreamingQueueCompressor {
     /// compressor.push("sample1".to_string(), "chr1".to_string(), vec![b'A', b'T', b'G', b'C'])?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn push(
-        &mut self,
-        sample_name: String,
-        contig_name: String,
-        data: Contig,
-    ) -> Result<()> {
+    pub fn push(&mut self, sample_name: String, contig_name: String, data: Contig) -> Result<()> {
         // If no splitters yet, determine from this contig
         if self.splitters.is_empty() && self.workers.is_empty() {
             if self.config.verbosity > 0 {
@@ -351,7 +363,17 @@ impl StreamingQueueCompressor {
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
-                    worker_thread(worker_id, queue, collection, splitters, archive, segment_groups, group_counter, reference_sample_name, config)
+                    worker_thread(
+                        worker_id,
+                        queue,
+                        collection,
+                        splitters,
+                        archive,
+                        segment_groups,
+                        group_counter,
+                        reference_sample_name,
+                        config,
+                    )
                 });
 
                 self.workers.push(handle);
@@ -426,10 +448,7 @@ impl StreamingQueueCompressor {
         self.queue.close();
 
         if self.config.verbosity > 0 {
-            eprintln!(
-                "  Waiting for {} workers to finish...",
-                self.workers.len()
-            );
+            eprintln!("  Waiting for {} workers to finish...", self.workers.len());
         }
 
         // Wait for all workers to finish
@@ -488,11 +507,13 @@ impl StreamingQueueCompressor {
             let mut collection = self.collection.lock().unwrap();
 
             // Write sample names
-            collection.store_batch_sample_names(&mut archive)
+            collection
+                .store_batch_sample_names(&mut archive)
                 .context("Failed to write sample names")?;
 
             // Write contig names and segment details
-            collection.store_contig_batch(&mut archive, 0, num_samples)
+            collection
+                .store_contig_batch(&mut archive, 0, num_samples)
                 .context("Failed to write contig batch")?;
 
             if self.config.verbosity > 0 {
@@ -500,8 +521,7 @@ impl StreamingQueueCompressor {
             }
 
             // Close archive (writes footer)
-            archive.close()
-                .context("Failed to close archive")?;
+            archive.close().context("Failed to close archive")?;
         }
 
         if self.config.verbosity > 0 {
@@ -551,7 +571,10 @@ fn flush_pack(
     if !buffer.ref_written {
         if let Some(ref_seg) = &buffer.reference_segment {
             if config.verbosity > 1 {
-                eprintln!("  Flushing group {}: reference from {}", buffer.group_id, ref_seg.sample_name);
+                eprintln!(
+                    "  Flushing group {}: reference from {}",
+                    buffer.group_id, ref_seg.sample_name
+                );
             }
             // Compress reference using adaptive compression
             let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
@@ -584,7 +607,10 @@ fn flush_pack(
 
             buffer.ref_written = true;
         } else if config.verbosity > 1 {
-            eprintln!("  Group {}: flushing without reference (will use raw encoding)", buffer.group_id);
+            eprintln!(
+                "  Group {}: flushing without reference (will use raw encoding)",
+                buffer.group_id
+            );
         }
     }
 
@@ -619,7 +645,7 @@ fn flush_pack(
                 &seg.contig_name,
                 seg.seg_part_no,
                 buffer.group_id,
-                in_group_id,  // Start from 1 (reference is 0)
+                in_group_id, // Start from 1 (reference is 0)
                 seg.is_rev_comp,
                 seg.data.len() as u32,
             )
@@ -680,7 +706,8 @@ fn worker_thread(
         };
 
         // Split into segments
-        let segments = split_at_splitters_with_size(&task.data, &splitters, config.k, config.segment_size);
+        let segments =
+            split_at_splitters_with_size(&task.data, &splitters, config.k, config.segment_size);
 
         if config.verbosity > 2 {
             eprintln!(
@@ -718,8 +745,10 @@ fn worker_thread(
                     let group_id = group_counter.fetch_add(1, Ordering::SeqCst);
 
                     // Register streams for this group
-                    let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                    let archive_version =
+                        ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                    let delta_stream_name =
+                        ragc_common::stream_delta_name(archive_version, group_id);
                     let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
 
                     let mut arch = archive.lock().unwrap();
@@ -734,7 +763,10 @@ fn worker_thread(
                 if buffer.reference_segment.is_none() {
                     // This is the first segment for this group - becomes reference
                     if config.verbosity > 1 {
-                        eprintln!("  Group {}: Setting reference from {}", buffer.group_id, task.sample_name);
+                        eprintln!(
+                            "  Group {}: Setting reference from {}",
+                            buffer.group_id, task.sample_name
+                        );
                     }
                     buffer.reference_segment = Some(buffered.clone());
                     // Don't add reference to segments - it's stored separately

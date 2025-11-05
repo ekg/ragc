@@ -21,8 +21,8 @@ pub struct MemoryBoundedQueue<T> {
 
 struct QueueInner<T> {
     items: VecDeque<(T, usize)>, // (item, size_bytes)
-    current_size: usize,          // Total bytes currently in queue
-    closed: bool,                 // No more pushes allowed
+    current_size: usize,         // Total bytes currently in queue
+    closed: bool,                // No more pushes allowed
 }
 
 impl<T> MemoryBoundedQueue<T> {

@@ -2,8 +2,8 @@
 
 use ragc_core::{StreamingQueueCompressor, StreamingQueueConfig};
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 #[test]
@@ -13,8 +13,8 @@ fn test_streaming_queue_yeast10() -> anyhow::Result<()> {
 
     // First 10 yeast samples (sequential processing for multi-file mode)
     let sample_files = vec![
-        "AAA#0.fa", "AAB#0.fa", "AAC#0.fa", "AAR#0.fa", "ABA#0.fa",
-        "ABH#0.fa", "ACA#0.fa", "ACH#0.fa", "ADE#0.fa", "ADI#0.fa",
+        "AAA#0.fa", "AAB#0.fa", "AAC#0.fa", "AAR#0.fa", "ABA#0.fa", "ABH#0.fa", "ACA#0.fa",
+        "ACH#0.fa", "ADE#0.fa", "ADI#0.fa",
     ];
 
     let config = StreamingQueueConfig {
@@ -61,7 +61,11 @@ fn test_streaming_queue_yeast10() -> anyhow::Result<()> {
             if line.starts_with('>') {
                 // Flush previous contig if any
                 if !current_data.is_empty() {
-                    compressor.push(current_sample.clone(), current_contig.clone(), current_data.clone())?;
+                    compressor.push(
+                        current_sample.clone(),
+                        current_contig.clone(),
+                        current_data.clone(),
+                    )?;
                     current_data.clear();
                 }
 
