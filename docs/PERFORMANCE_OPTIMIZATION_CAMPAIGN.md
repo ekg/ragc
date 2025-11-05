@@ -72,6 +72,48 @@ let segment_groups = Arc::new(Mutex::new(HashMap::new()));
 
 ---
 
+## 🔍 CRITICAL FINDING: Root Cause of Archive Bloat
+
+**Date**: 2025-11-05
+
+### Investigation Results
+
+After Step 1, investigated why RAGC produces 27% larger archives than C++ AGC (6.9 MB vs 5.4 MB).
+
+**Test Setup**:
+- Dataset: yeast10 (first 10 samples from yeast235)
+- Parameters: `-k 21 -s 10000 -m 20`
+
+**Single Sample Test** (AAA#0 only):
+- RAGC: 2.93 MB
+- C++ AGC: 2.97 MB
+- **Result**: RAGC is 1.13% SMALLER ✅
+
+**Multi-Sample Test** (10 samples):
+- RAGC: 6.9 MB
+- C++ AGC: 5.4 MB
+- **Result**: RAGC is 27% LARGER ❌
+
+**Root Cause Identified**:
+- RAGC creates **2079 groups** for just 10 samples!
+- That's ~208 groups per sample
+- Single-sample compression is PERFECT, so the issue is purely in multi-sample differential encoding
+- Too many groups = poor compression because similar segments aren't grouped together
+
+**What This Means**:
+1. The basic compression algorithm is correct (single sample proves this)
+2. The segment grouping logic is broken or suboptimal
+3. Segments that should be grouped together (by k-mer boundaries) are being split into separate groups
+4. This prevents effective LZ differential encoding across related genomes
+
+**Next Steps**:
+- Investigate segment grouping logic in `streaming_compressor_queue.rs`
+- Understand why so many groups are created
+- Compare with C++ AGC's grouping strategy
+- Fix grouping to reduce group count dramatically (target: ~200-300 groups for 10 samples, not 2079)
+
+---
+
 ### Step 2: Optimize Rayon Thread Count for Small Workloads ⏸️ PENDING
 
 **File**: `ragc-core/src/compressor_streaming.rs`
