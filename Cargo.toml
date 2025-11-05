@@ -10,7 +10,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 authors = ["Erik Garrison <erik.garrison@gmail.com>"]
-license = "GPL-3.0"
+license = "MIT"
 repository = "https://github.com/ekg/ragc"
 homepage = "https://github.com/ekg/ragc"
 documentation = "https://docs.rs/ragc"
@@ -58,6 +58,3 @@ sha2 = "0.10"
 
 # CPU detection
 num_cpus = "1.16"
-
-# FASTA indexing and random access
-faigz-rs = { git = "https://github.com/waveygang/faigz-rs.git" }

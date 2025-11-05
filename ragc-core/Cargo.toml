@@ -13,7 +13,7 @@ description = "Core compression and decompression algorithms for the AGC genome 
 
 [dependencies]
 # Local dependencies
-ragc-common = { path = "../ragc-common" }
+ragc-common = { path = "../ragc-common", version = "0.1.0" }
 
 # Workspace dependencies
 serde = { workspace = true }
@@ -33,11 +33,6 @@ sha2 = { workspace = true }
 byteorder = "1.5"
 rdst = "0.20"
 num_cpus = { workspace = true }
-faigz-rs = { workspace = true, optional = true }
-
-[features]
-default = ["indexed-fasta"]
-indexed-fasta = ["faigz-rs"]
 
 [dev-dependencies]
 sha2 = { workspace = true }

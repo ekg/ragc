@@ -331,7 +331,9 @@ This implementation was created as a guided development with Claude Code. The co
 
 ## License
 
-[Same as original AGC project]
+MIT License - same as the original C++ AGC project.
+
+See [LICENSE](LICENSE) file for full text.
 
 ## Acknowledgments
 

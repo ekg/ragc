@@ -21,8 +21,8 @@ path = "src/bin/split_fasta.rs"
 
 [dependencies]
 # Local dependencies
-ragc-common = { path = "../ragc-common" }
-ragc-core = { path = "../ragc-core" }
+ragc-common = { path = "../ragc-common", version = "0.1.0" }
+ragc-core = { path = "../ragc-core", version = "0.1.0" }
 
 # Workspace dependencies
 clap = { workspace = true }
@@ -35,6 +35,5 @@ flate2 = "1.0"
 tikv-jemallocator = { version = "0.5", optional = true }
 
 [features]
-default = ["indexed-fasta"]
-indexed-fasta = ["ragc-core/indexed-fasta"]
+default = []
 jemalloc = ["tikv-jemallocator"]
