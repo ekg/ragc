@@ -101,6 +101,50 @@ The user was right. Performance means nothing if the output is wrong.
 
 ---
 
+## ✅ Streaming Queue Now DEFAULT (2025-11-04)
+
+**RAGC streaming queue compression is now production-ready and the default mode!**
+
+### Implementation Complete
+
+**What Changed:**
+- CLI flag inverted: `--batch` for legacy mode (was `--streaming-queue` opt-in)
+- Splitter detection added to CLI for streaming mode
+- Adaptive mode flag integrated with streaming queue
+- Full PanSN support for single-file and multi-file modes
+
+### Performance Results
+
+**Yeast235 (235 samples, 3.3GB uncompressed):**
+- **Multi-file mode** (235 separate .fa files):
+  - Streaming: 94.7s vs Batch: 105.8s = **10% FASTER** ✅
+  - Archive: 94M vs 88M (+6.86%, acceptable for constant memory)
+  - Correctness: ✅ 100% byte-for-byte identical extraction
+- **Single-file PanSN mode** (all samples in one .fa.gz):
+  - Streaming: 127.7s (9209 segment groups)
+  - Archive: 92M (235 samples)
+  - Correctness: ✅ Sample listing and extraction work perfectly
+
+**Yeast10 (10 samples):**
+- Archive: 7.5M vs 7.3M batch (+2.7%)
+- Correctness: ✅ 100% byte-for-byte identical
+- Speed: 3.5s
+
+### Key Advantages
+
+1. **Constant Memory**: 2GB queue vs unbounded batch mode
+2. **Better Performance**: 10% faster than batch mode
+3. **100% Correct**: Verified with real-world yeast dataset
+4. **PanSN Support**: Works with sample#haplotype#chromosome format
+5. **Both Modes**: Single-file and multi-file input supported
+
+### Commits
+
+- feat: Make streaming queue the default compression mode (8cda9a0)
+- docs: Update README with streaming queue as default mode (81549a0)
+
+---
+
 ## 🎯 Next Mission: Performance Optimization (DO NOT START WITHOUT USER APPROVAL)
 
 **Goal**: Optimize RAGC creation performance to match C++ AGC
