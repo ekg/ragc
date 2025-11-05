@@ -71,14 +71,13 @@ enum Commands {
         #[arg(short = 't', long)]
         threads: Option<usize>,
 
-        /// Use streaming queue mode for constant memory usage (experimental)
-        /// Processes sequences through a bounded queue with automatic backpressure.
-        /// Guarantees constant memory regardless of dataset size.
+        /// Use legacy batch mode instead of streaming queue (for debugging/comparison)
+        /// By default, uses streaming queue mode for constant memory usage.
         #[arg(long)]
-        streaming_queue: bool,
+        batch: bool,
 
         /// Queue capacity in bytes for streaming mode (default: 2GB)
-        /// Ignored if --streaming-queue is not specified.
+        /// Only applies to streaming queue mode (not --batch).
         /// Accepts suffixes: K, M, G (e.g., "512M", "2G")
         #[arg(long, default_value = "2G")]
         queue_capacity: String,
@@ -203,7 +202,7 @@ fn main() -> Result<()> {
             adaptive,
             concatenated,
             threads,
-            streaming_queue,
+            batch,
             queue_capacity,
         } => create_archive(
             output,
@@ -216,7 +215,7 @@ fn main() -> Result<()> {
             adaptive,
             concatenated,
             threads,
-            streaming_queue,
+            batch,
             &queue_capacity,
         )?,
 
@@ -257,7 +256,7 @@ fn create_archive(
     adaptive: bool,
     concatenated: bool,
     threads: Option<usize>,
-    streaming_queue: bool,
+    batch: bool,
     queue_capacity_str: &str,
 ) -> Result<()> {
     // Determine thread count (use provided or auto-detect)
@@ -279,10 +278,12 @@ fn create_archive(
         eprintln!("  min match length: {min_match_len}");
         eprintln!("  compression level: {compression_level}");
         eprintln!("  threads: {num_threads}");
-        if streaming_queue {
+        if !batch {
             let capacity = parse_capacity(queue_capacity_str)?;
-            eprintln!("  streaming queue mode: enabled (constant memory)");
+            eprintln!("  mode: streaming queue (constant memory, default)");
             eprintln!("  queue capacity: {} bytes ({:.2} GB)", capacity, capacity as f64 / 1024.0 / 1024.0 / 1024.0);
+        } else {
+            eprintln!("  mode: batch (legacy)");
         }
         if adaptive {
             eprintln!("  adaptive mode: enabled (pangenome-aware splitters)");
@@ -293,9 +294,9 @@ fn create_archive(
         eprintln!();
     }
 
-    // Branch: Streaming queue mode vs. batch mode
-    if streaming_queue {
-        // Streaming queue mode: constant memory with bounded queue
+    // Branch: Streaming queue mode (default) vs. batch mode (legacy)
+    if !batch {
+        // Streaming queue mode: constant memory with bounded queue (DEFAULT)
         if adaptive || concatenated {
             anyhow::bail!("Streaming queue mode does not support --adaptive or --concatenated flags yet");
         }
@@ -312,14 +313,35 @@ fn create_archive(
             queue_capacity,
             num_threads,
             verbosity: verbosity as usize,
+            adaptive_mode: adaptive,
             ..StreamingQueueConfig::default()
         };
 
-        // Create compressor with empty splitters (will be determined from first contig)
+        // Detect splitters from first input file
+        if inputs.is_empty() {
+            anyhow::bail!("No input files provided");
+        }
+
+        if verbosity > 0 {
+            eprintln!("Detecting splitters from first input file: {:?}", inputs[0]);
+        }
+
+        let splitters = ragc_core::determine_splitters_streaming(
+            &inputs[0],
+            kmer_length as usize,
+            segment_size as usize,
+        )?.0;
+
+        if verbosity > 0 {
+            eprintln!("Found {} splitters", splitters.len());
+            eprintln!();
+        }
+
+        // Create compressor with splitters from first file
         let mut compressor = StreamingQueueCompressor::with_splitters(
             output_str,
             config,
-            std::collections::HashSet::new(),
+            splitters,
         )?;
 
         // Process all input files

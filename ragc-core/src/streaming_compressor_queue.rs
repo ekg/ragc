@@ -36,6 +36,10 @@ pub struct StreamingQueueConfig {
 
     /// Verbosity level
     pub verbosity: usize,
+
+    /// Adaptive mode: find new splitters for samples that can't be segmented well
+    /// (matches C++ AGC -a flag)
+    pub adaptive_mode: bool,
 }
 
 impl Default for StreamingQueueConfig {
@@ -48,6 +52,7 @@ impl Default for StreamingQueueConfig {
             num_threads: rayon::current_num_threads().max(4),
             queue_capacity: 2 * 1024 * 1024 * 1024, // 2 GB like C++ AGC
             verbosity: 1,
+            adaptive_mode: false, // Default matches C++ AGC (adaptive mode off)
         }
     }
 }
@@ -143,6 +148,7 @@ pub struct StreamingQueueCompressor {
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<HashMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>, // Starts at 16 for LZ groups
+    reference_sample_name: Arc<Mutex<Option<String>>>, // First sample becomes reference
 }
 
 impl StreamingQueueCompressor {
@@ -247,6 +253,7 @@ impl StreamingQueueCompressor {
         // Segment grouping for LZ packing
         let segment_groups = Arc::new(Mutex::new(HashMap::new()));
         let group_counter = Arc::new(AtomicU32::new(NO_RAW_GROUPS)); // Start at 16 for LZ groups
+        let reference_sample_name = Arc::new(Mutex::new(None)); // Shared across all workers
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -257,10 +264,11 @@ impl StreamingQueueCompressor {
             let archive = Arc::clone(&archive);
             let segment_groups = Arc::clone(&segment_groups);
             let group_counter = Arc::clone(&group_counter);
+            let reference_sample_name = Arc::clone(&reference_sample_name);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
-                worker_thread(worker_id, queue, collection, splitters, archive, segment_groups, group_counter, config)
+                worker_thread(worker_id, queue, collection, splitters, archive, segment_groups, group_counter, reference_sample_name, config)
             });
 
             workers.push(handle);
@@ -279,6 +287,7 @@ impl StreamingQueueCompressor {
             archive,
             segment_groups,
             group_counter,
+            reference_sample_name,
         })
     }
 
@@ -338,10 +347,11 @@ impl StreamingQueueCompressor {
                 let archive = Arc::clone(&self.archive);
                 let segment_groups = Arc::clone(&self.segment_groups);
                 let group_counter = Arc::clone(&self.group_counter);
+                let reference_sample_name = Arc::clone(&self.reference_sample_name);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
-                    worker_thread(worker_id, queue, collection, splitters, archive, segment_groups, group_counter, config)
+                    worker_thread(worker_id, queue, collection, splitters, archive, segment_groups, group_counter, reference_sample_name, config)
                 });
 
                 self.workers.push(handle);
@@ -358,6 +368,17 @@ impl StreamingQueueCompressor {
             collection
                 .register_sample_contig(&sample_name, &contig_name)
                 .context("Failed to register contig")?;
+        }
+
+        // Set first sample as reference (multi-file mode)
+        {
+            let mut ref_sample = self.reference_sample_name.lock().unwrap();
+            if ref_sample.is_none() {
+                if self.config.verbosity > 0 {
+                    eprintln!("Using first sample ({}) as reference", sample_name);
+                }
+                *ref_sample = Some(sample_name.clone());
+            }
         }
 
         // Calculate task size
@@ -430,7 +451,8 @@ impl StreamingQueueCompressor {
             let num_groups = groups.len();
 
             for (key, buffer) in groups.iter_mut() {
-                if !buffer.segments.is_empty() {
+                // Flush if there are delta segments OR if reference hasn't been written
+                if !buffer.segments.is_empty() || !buffer.ref_written {
                     if self.config.verbosity > 1 {
                         eprintln!(
                             "Flushing group {} with {} segments (k-mers: {:#x}, {:#x})",
@@ -528,6 +550,9 @@ fn flush_pack(
     // Write reference segment if not already written (first pack for this group)
     if !buffer.ref_written {
         if let Some(ref_seg) = &buffer.reference_segment {
+            if config.verbosity > 1 {
+                eprintln!("  Flushing group {}: reference from {}", buffer.group_id, ref_seg.sample_name);
+            }
             // Compress reference using adaptive compression
             let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
                 .context("Failed to compress reference")?;
@@ -558,24 +583,24 @@ fn flush_pack(
             }
 
             buffer.ref_written = true;
+        } else if config.verbosity > 1 {
+            eprintln!("  Group {}: flushing without reference (will use raw encoding)", buffer.group_id);
         }
     }
 
-    // Pack segments together with LZ encoding (for groups >= 16)
+    // Pack segments together
     // Note: segments do NOT include the reference - it's stored separately
     let mut packed_data = Vec::new();
     for (idx_in_pack, seg) in buffer.segments.iter().enumerate() {
         // Delta segments start at in_group_id = 1 (reference is 0)
         let in_group_id = buffer.segments_written + idx_in_pack as u32 + 1;
 
-        let contig_data = if !use_lz_encoding {
-            // Raw segment (groups 0-15 don't use LZ encoding)
+        let contig_data = if !use_lz_encoding || buffer.reference_segment.is_none() {
+            // Raw segment: groups 0-15 OR groups without reference
             seg.data.clone()
         } else {
-            // LZ-encoded segment (all segments in groups >= 16)
-            let reference = &buffer.reference_segment.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Missing reference for LZ encoding"))?
-                .data;
+            // LZ-encoded segment (groups >= 16 with reference)
+            let reference = &buffer.reference_segment.as_ref().unwrap().data;
             let mut lz_diff = LZDiff::new(config.min_match_len as u32);
             lz_diff.prepare(reference);
             lz_diff.encode(&seg.data)
@@ -636,6 +661,7 @@ fn worker_thread(
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<HashMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>,
+    reference_sample_name: Arc<Mutex<Option<String>>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
@@ -704,12 +730,16 @@ fn worker_thread(
                     SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                 });
 
-                // Set reference if this is the first segment in the group
+                // First segment in group becomes reference (regardless of sample)
                 if buffer.reference_segment.is_none() {
+                    // This is the first segment for this group - becomes reference
+                    if config.verbosity > 1 {
+                        eprintln!("  Group {}: Setting reference from {}", buffer.group_id, task.sample_name);
+                    }
                     buffer.reference_segment = Some(buffered.clone());
                     // Don't add reference to segments - it's stored separately
                 } else {
-                    // Add non-reference segment to buffer
+                    // Subsequent segments are deltas (LZ-encoded against reference)
                     buffer.segments.push(buffered);
                 }
 
