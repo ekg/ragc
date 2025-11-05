@@ -7,6 +7,7 @@ use std::fs::File;
 use std::path::Path;
 
 #[test]
+#[ignore] // Requires external yeast data files in ~/scrapy/yeast235_samples
 fn test_streaming_queue_yeast10() -> anyhow::Result<()> {
     let samples_dir = std::env::var("HOME").unwrap() + "/scrapy/yeast235_samples";
 
