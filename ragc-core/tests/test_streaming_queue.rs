@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Integration test for StreamingQueueCompressor
 // Verifies basic push() API and worker thread operation
 

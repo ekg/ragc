@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Round-trip compression test
 // Verifies that we can create an archive and read it back
 

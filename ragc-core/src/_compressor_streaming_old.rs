@@ -13,7 +13,7 @@ fn estimate_memory_mb<T>(items: &[T]) -> f64 {
 use crate::{
     contig_iterator::ContigIterator,
     genome_io::GenomeIO,
-    kmer::{reverse_complement, Kmer, KmerMode},
+    kmer::{Kmer, KmerMode},
     lz_diff::LZDiff,
     priority_queue::{BoundedPriorityQueue, PopResult},
     segment::{split_at_splitters_with_size, MISSING_KMER},
@@ -28,13 +28,13 @@ use ragc_common::{
     AGC_FILE_MINOR, CONTIG_SEPARATOR,
 };
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use sha2::Digest;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU32, AtomicUsize, Ordering},
-    Arc, Barrier, Mutex, RwLock,
+    Arc, Barrier, Mutex,
 };
 use std::thread;
 

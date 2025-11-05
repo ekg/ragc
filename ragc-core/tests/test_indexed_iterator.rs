@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 #[cfg(feature = "indexed-fasta")]
 #[cfg(test)]
 mod tests {

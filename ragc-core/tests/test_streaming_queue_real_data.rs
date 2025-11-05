@@ -1,7 +1,7 @@
+#![allow(clippy::all)]
 // Test streaming queue compressor with first 10 yeast samples (sequential multi-file mode)
 
 use ragc_core::{StreamingQueueCompressor, StreamingQueueConfig};
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;

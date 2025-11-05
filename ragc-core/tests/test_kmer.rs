@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Integration test for k-mer operations
 // Should produce output identical to C++ test_kmer
 

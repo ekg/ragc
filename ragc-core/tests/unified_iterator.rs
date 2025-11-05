@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Integration test: Verify PansnFileIterator and MultiFileIterator produce equivalent archives
 //
 // This test ensures both input methods (single pansn file vs multiple sample files)

@@ -1,3 +1,8 @@
+#![allow(clippy::all)]
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(private_interfaces)]
 //! Core compression and decompression algorithms for the AGC genome compression format.
 //!
 //! This crate implements the complete AGC compression pipeline with full C++ AGC

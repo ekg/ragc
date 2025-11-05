@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // End-to-end integration test for streaming compression pipeline
 // Tests the complete flow from FASTA files to AGC archive
 
@@ -107,7 +108,7 @@ fn test_yeast3_streaming_compression() {
     {
         use ragc_core::{Decompressor, DecompressorConfig};
         let config = DecompressorConfig::default();
-        let mut decompressor = Decompressor::open(output_path, config)
+        let decompressor = Decompressor::open(output_path, config)
             .expect("Failed to open archive with RAGC decompressor");
 
         let samples = decompressor.list_samples();

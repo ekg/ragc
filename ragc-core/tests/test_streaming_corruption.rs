@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Minimal test to reproduce StreamingCompressor data corruption
 use ragc_core::{Decompressor, DecompressorConfig};
 use ragc_core::{StreamingCompressor, StreamingCompressorConfig};

@@ -238,7 +238,7 @@ fn add_segment(
     // Add first segment (or whole segment if no split)
     if group_id.is_some() {
         // KNOWN segment
-        let mut buffered = ctx.buffered_segments.lock().unwrap();
+        let buffered = ctx.buffered_segments.lock().unwrap();
         buffered.add_known(
             group_id.unwrap(),
             MISSING_KMER,
@@ -251,7 +251,7 @@ fn add_segment(
         );
     } else {
         // NEW segment
-        let mut buffered = ctx.buffered_segments.lock().unwrap();
+        let buffered = ctx.buffered_segments.lock().unwrap();
         buffered.add_new(
             pk.0,
             pk.1,
@@ -273,7 +273,7 @@ fn add_segment(
         let group_id2 = map_segments.get(&pk2_key).copied();
         drop(map_segments);
 
-        let mut buffered = ctx.buffered_segments.lock().unwrap();
+        let buffered = ctx.buffered_segments.lock().unwrap();
         if let Some(gid2) = group_id2 {
             // KNOWN segment
             buffered.add_known(

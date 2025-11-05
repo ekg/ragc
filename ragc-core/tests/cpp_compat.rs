@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 //! Integration tests for C++ compatibility
 //!
 //! These tests verify that ragc produces archives that are bit-compatible

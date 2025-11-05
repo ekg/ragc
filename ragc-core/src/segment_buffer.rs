@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Block size for atomic work distribution
 /// Matches C++ AGC's PART_ID_STEP (agc_compressor.h)

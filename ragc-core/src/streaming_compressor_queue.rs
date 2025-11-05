@@ -438,7 +438,7 @@ impl StreamingQueueCompressor {
     /// compressor.finalize()?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn finalize(mut self) -> Result<()> {
+    pub fn finalize(self) -> Result<()> {
         if self.config.verbosity > 0 {
             eprintln!("Finalizing compression...");
             eprintln!("  Closing queue...");

@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Integration test for FASTA parsing
 // Should produce output identical to C++ test_fasta_parser
 

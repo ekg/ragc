@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Integration test for splitter identification
 // Should produce output identical to C++ test_splitters
 

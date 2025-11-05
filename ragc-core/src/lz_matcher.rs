@@ -168,7 +168,7 @@ fn find_best_match(
         }
 
         // Backward match (only if we have previous literals in text)
-        let mut len_bck = 0;
+        let len_bck = 0;
         let max_bck = no_prev_literals.min(ref_pos);
         // Note: text pointer is at current position, so we need to access negative indices
         // This is only valid if we're not at the start of the text

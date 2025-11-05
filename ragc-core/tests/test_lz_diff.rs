@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Integration test for LZ diff encoding/decoding
 // Should produce output identical to C++ test_lz_diff
 

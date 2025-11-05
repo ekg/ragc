@@ -5,7 +5,7 @@ use crate::{
     genome_io::GenomeWriter,
     kmer::reverse_complement,
     lz_diff::LZDiff,
-    segment_compression::{decompress_segment, decompress_segment_with_marker},
+    segment_compression::decompress_segment_with_marker,
 };
 use anyhow::{anyhow, Context, Result};
 use ragc_common::{

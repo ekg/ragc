@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 // Full round-trip test: FASTA → AGC → FASTA
 // Verifies that we can compress and decompress without data loss
 
