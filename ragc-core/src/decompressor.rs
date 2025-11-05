@@ -2,9 +2,7 @@
 // Extracts genomes from AGC archives
 
 use crate::{
-    genome_io::GenomeWriter,
-    kmer::reverse_complement,
-    lz_diff::LZDiff,
+    genome_io::GenomeWriter, kmer::reverse_complement, lz_diff::LZDiff,
     segment_compression::decompress_segment_with_marker,
 };
 use anyhow::{anyhow, Context, Result};
