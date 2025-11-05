@@ -106,11 +106,39 @@ After Step 1, investigated why RAGC produces 27% larger archives than C++ AGC (6
 3. Segments that should be grouped together (by k-mer boundaries) are being split into separate groups
 4. This prevents effective LZ differential encoding across related genomes
 
+**Deep Dive - Grouping Logic**:
+
+Investigated `streaming_compressor_queue.rs:724-760`:
+- Each segment creates a `SegmentGroupKey` from `(front_kmer, back_kmer)`
+- Each unique key gets a NEW group via `groups.entry(key).or_insert_with()`
+- This is correct! The problem is that k-mer boundaries are misaligned across samples
+
+**ROOT CAUSE IDENTIFIED** (`ragc-cli/src/main.rs:334-339`):
+
+```rust
+let splitters = ragc_core::determine_splitters_streaming(
+    &inputs[0],  // ← BUG: Only uses first file!
+    ...
+```
+
+**The Bug**: Splitters are determined from **ONLY the first input file** (AAA#0.fa), then used to split ALL samples!
+
+**Why This Breaks Everything**:
+1. AAA#0-specific k-mers may not exist in AAB#0, AAC#0, etc. due to mutations
+2. When other samples have variations at those positions, they get different k-mer boundaries
+3. Different boundaries → different (front, back) k-mers → different groups
+4. Result: 2079 groups instead of ~200-300!
+
+**Proof**:
+- Single sample (AAA#0 only): 2.93 MB (splitters from same file → perfect)
+- Multi-sample (10 samples): 6.9 MB (splitters from AAA#0 only → 27% bloat)
+
+**Solution**: Determine splitters from ALL samples (or aggregate them) to find conserved k-mer positions that work across all genomes
+
 **Next Steps**:
-- Investigate segment grouping logic in `streaming_compressor_queue.rs`
-- Understand why so many groups are created
-- Compare with C++ AGC's grouping strategy
-- Fix grouping to reduce group count dramatically (target: ~200-300 groups for 10 samples, not 2079)
+- Fix splitter determination to use all samples
+- Test that group count drops to ~200-300 for 10 samples
+- Verify archive size matches C++ AGC (5.4 MB)
 
 ---
 
