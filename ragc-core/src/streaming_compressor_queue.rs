@@ -91,6 +91,7 @@ struct SegmentGroupBuffer {
     segments: Vec<BufferedSegment>, // Up to PACK_CARDINALITY segments (EXCLUDING reference)
     ref_written: bool,              // Whether reference has been written
     segments_written: u32,          // Counter for delta segments written (NOT including reference)
+    lz_diff: Option<LZDiff>,        // LZ encoder prepared once with reference, reused for all segments (matches C++ AGC CSegment::lz_diff)
 }
 
 impl SegmentGroupBuffer {
@@ -103,6 +104,7 @@ impl SegmentGroupBuffer {
             segments: Vec::new(),
             ref_written: false,
             segments_written: 0,
+            lz_diff: None,  // Prepared when reference is written (matches C++ AGC segment.cpp line 43)
         }
     }
 }
@@ -606,6 +608,14 @@ fn flush_pack(
             }
 
             buffer.ref_written = true;
+
+            // Prepare LZ encoder with reference (matching C++ AGC segment.cpp line 43: lz_diff->Prepare(s))
+            // This is done ONCE when the reference is written, then reused for all subsequent segments
+            if use_lz_encoding {
+                let mut lz = LZDiff::new(config.min_match_len as u32);
+                lz.prepare(&ref_seg.data);
+                buffer.lz_diff = Some(lz);
+            }
         } else if config.verbosity > 1 {
             eprintln!(
                 "  Group {}: flushing without reference (will use raw encoding)",
@@ -626,10 +636,11 @@ fn flush_pack(
             seg.data.clone()
         } else {
             // LZ-encoded segment (groups >= 16 with reference)
-            let reference = &buffer.reference_segment.as_ref().unwrap().data;
-            let mut lz_diff = LZDiff::new(config.min_match_len as u32);
-            lz_diff.prepare(reference);
-            lz_diff.encode(&seg.data)
+            // Reuse prepared lz_diff (matching C++ AGC segment.cpp line 59: lz_diff->Encode(s, delta))
+            // The lz_diff was prepared ONCE with the reference, now we just encode each segment
+            buffer.lz_diff.as_mut()
+                .expect("lz_diff should be prepared when reference is written")
+                .encode(&seg.data)
         };
 
         // Add contig data
@@ -720,10 +731,57 @@ fn worker_thread(
 
         // Buffer segments for packing (matching batch mode)
         for (place, segment) in segments.iter().enumerate() {
-            // Create grouping key from terminal k-mers
+            // Match C++ AGC Case 2: Normalize segment group key by ensuring front <= back
+            // (agc_compressor.cpp lines 1306-1327)
+            use crate::segment::MISSING_KMER;
+
+            let (key_front, key_back, should_reverse) =
+                if segment.front_kmer != MISSING_KMER && segment.back_kmer != MISSING_KMER {
+                    // Both k-mers present - normalize by ensuring front <= back
+                    if segment.front_kmer <= segment.back_kmer {
+                        // Already normalized - keep original orientation
+                        if config.verbosity > 2 {
+                            eprintln!(
+                                "RAGC_CASE2_KEEP: sample={} front={} back={} len={}",
+                                task.sample_name, segment.front_kmer, segment.back_kmer, segment.data.len()
+                            );
+                        }
+                        (segment.front_kmer, segment.back_kmer, false)
+                    } else {
+                        // Swap k-mers and reverse complement data
+                        if config.verbosity > 2 {
+                            eprintln!(
+                                "RAGC_CASE2_SWAP: sample={} front={} back={} -> key=({},{}) len={}",
+                                task.sample_name, segment.front_kmer, segment.back_kmer,
+                                segment.back_kmer, segment.front_kmer, segment.data.len()
+                            );
+                        }
+                        (segment.back_kmer, segment.front_kmer, true)
+                    }
+                } else {
+                    // At least one k-mer is MISSING - use as-is (Cases 1, 3, 4)
+                    (segment.front_kmer, segment.back_kmer, false)
+                };
+
+            // Create grouping key from normalized k-mers
             let key = SegmentGroupKey {
-                kmer_front: segment.front_kmer,
-                kmer_back: segment.back_kmer,
+                kmer_front: key_front,
+                kmer_back: key_back,
+            };
+
+            // Reverse complement data if needed (matching C++ AGC lines 1315-1316, 1320-1321)
+            let segment_data = if should_reverse {
+                segment.data.iter().rev().map(|&base| {
+                    match base {
+                        0 => 3, // A -> T
+                        1 => 2, // C -> G
+                        2 => 1, // G -> C
+                        3 => 0, // T -> A
+                        _ => base, // N or other non-ACGT
+                    }
+                }).collect()
+            } else {
+                segment.data.clone()
             };
 
             // Create buffered segment
@@ -731,8 +789,8 @@ fn worker_thread(
                 sample_name: task.sample_name.clone(),
                 contig_name: task.contig_name.clone(),
                 seg_part_no: place,
-                data: segment.data.clone(),
-                is_rev_comp: false,
+                data: segment_data,
+                is_rev_comp: should_reverse,
             };
 
             // Lock segment groups and add segment to buffer
