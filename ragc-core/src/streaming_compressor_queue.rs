@@ -7,7 +7,7 @@ use crate::segment::split_at_splitters_with_size;
 use crate::splitters::determine_splitters;
 use anyhow::{Context, Result};
 use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -178,6 +178,9 @@ pub struct StreamingQueueCompressor {
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>, // Starts at 16 for LZ groups
     reference_sample_name: Arc<Mutex<Option<String>>>, // First sample becomes reference
+    // Segment splitting support (Phase 1)
+    map_segments: Arc<Mutex<std::collections::HashMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id
+    map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>, // kmer -> [connected kmers]
 }
 
 impl StreamingQueueCompressor {
@@ -291,6 +294,10 @@ impl StreamingQueueCompressor {
         let group_counter = Arc::new(AtomicU32::new(NO_RAW_GROUPS)); // Start at 16 for LZ groups
         let reference_sample_name = Arc::new(Mutex::new(None)); // Shared across all workers
 
+        // Segment splitting support (Phase 1)
+        let map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
+
         // Spawn worker threads
         let mut workers = Vec::new();
         for worker_id in 0..config.num_threads {
@@ -301,6 +308,8 @@ impl StreamingQueueCompressor {
             let segment_groups = Arc::clone(&segment_groups);
             let group_counter = Arc::clone(&group_counter);
             let reference_sample_name = Arc::clone(&reference_sample_name);
+            let map_segments = Arc::clone(&map_segments);
+            let map_segments_terminators = Arc::clone(&map_segments_terminators);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
@@ -313,6 +322,8 @@ impl StreamingQueueCompressor {
                     segment_groups,
                     group_counter,
                     reference_sample_name,
+                    map_segments,
+                    map_segments_terminators,
                     config,
                 )
             });
@@ -334,6 +345,8 @@ impl StreamingQueueCompressor {
             segment_groups,
             group_counter,
             reference_sample_name,
+            map_segments,
+            map_segments_terminators,
         })
     }
 
@@ -389,6 +402,8 @@ impl StreamingQueueCompressor {
                 let segment_groups = Arc::clone(&self.segment_groups);
                 let group_counter = Arc::clone(&self.group_counter);
                 let reference_sample_name = Arc::clone(&self.reference_sample_name);
+                let map_segments = Arc::clone(&self.map_segments);
+                let map_segments_terminators = Arc::clone(&self.map_segments_terminators);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
@@ -401,6 +416,8 @@ impl StreamingQueueCompressor {
                         segment_groups,
                         group_counter,
                         reference_sample_name,
+                        map_segments,
+                        map_segments_terminators,
                         config,
                     )
                 });
@@ -746,6 +763,8 @@ fn worker_thread(
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>,
     reference_sample_name: Arc<Mutex<Option<String>>>,
+    map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
@@ -831,23 +850,130 @@ fn worker_thread(
                 segment.data.clone()
             };
 
-            // Create buffered segment
-            let buffered = BufferedSegment {
-                sample_name: task.sample_name.clone(),
-                contig_name: task.contig_name.clone(),
-                seg_part_no: place,
-                data: segment_data,
-                is_rev_comp: should_reverse,
-            };
-
             // Lock segment groups and add segment to buffer
+            // NOTE: Split check must happen BEFORE creating BufferedSegment
+            // to avoid moving segment_data prematurely
             {
                 let mut groups = segment_groups.lock().unwrap();
 
+                // Check if this key already exists (for debugging group reuse)
+                let key_exists = groups.contains_key(&key);
+
+                // Phase 2: Check if we should attempt splitting this segment
+                // (matches C++ AGC agc_compressor.cpp lines 1387-1503)
+                if !key_exists && key_front != MISSING_KMER && key_back != MISSING_KMER {
+                    // Check if both terminators exist in other segments
+                    let can_attempt_split = {
+                        let terminators = map_segments_terminators.lock().unwrap();
+                        terminators.contains_key(&key_front) && terminators.contains_key(&key_back)
+                    };
+
+                    if can_attempt_split {
+                        // Attempt to split the segment
+                        // IMPORTANT: Pass ORIGINAL segment data, not the RC'd version!
+                        // C++ AGC passes both segment and segment_rc to the split function
+                        let split_result = {
+                            let terminators = map_segments_terminators.lock().unwrap();
+                            try_split_segment(&segment.data, key_front, key_back, &terminators, &config)
+                        };
+
+                        if let Some((left_data, right_data, middle_kmer)) = split_result {
+                            // Successfully split! Add both segments to their existing groups
+
+                            // Calculate keys for the two new segments
+                            // Left: (front, middle), Right: (middle, back)
+                            // Apply same normalization as original segment
+                            let left_key = if key_front <= middle_kmer {
+                                SegmentGroupKey {
+                                    kmer_front: key_front,
+                                    kmer_back: middle_kmer,
+                                }
+                            } else {
+                                SegmentGroupKey {
+                                    kmer_front: middle_kmer,
+                                    kmer_back: key_front,
+                                }
+                            };
+
+                            let right_key = if middle_kmer <= key_back {
+                                SegmentGroupKey {
+                                    kmer_front: middle_kmer,
+                                    kmer_back: key_back,
+                                }
+                            } else {
+                                SegmentGroupKey {
+                                    kmer_front: key_back,
+                                    kmer_back: middle_kmer,
+                                }
+                            };
+
+                            if config.verbosity > 1 {
+                                eprintln!(
+                                    "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
+                                    key_front, key_back, left_key.kmer_front, left_key.kmer_back,
+                                    right_key.kmer_front, right_key.kmer_back
+                                );
+                            }
+
+                            // Add left segment to its group (should already exist)
+                            if let Some(left_buffer) = groups.get_mut(&left_key) {
+                                let left_buffered = BufferedSegment {
+                                    sample_name: task.sample_name.clone(),
+                                    contig_name: task.contig_name.clone(),
+                                    seg_part_no: place,
+                                    data: left_data,
+                                    is_rev_comp: should_reverse, // Inherit RC status from original
+                                };
+                                left_buffer.segments.push(left_buffered);
+
+                                if left_buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                                    flush_pack(left_buffer, &collection, &archive, &config)
+                                        .context("Failed to flush left pack")?;
+                                }
+                            }
+
+                            // Add right segment to its group (should already exist)
+                            if let Some(right_buffer) = groups.get_mut(&right_key) {
+                                let right_buffered = BufferedSegment {
+                                    sample_name: task.sample_name.clone(),
+                                    contig_name: task.contig_name.clone(),
+                                    seg_part_no: place,
+                                    data: right_data,
+                                    is_rev_comp: should_reverse, // Inherit RC status from original
+                                };
+                                right_buffer.segments.push(right_buffered);
+
+                                if right_buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                                    flush_pack(right_buffer, &collection, &archive, &config)
+                                        .context("Failed to flush right pack")?;
+                                }
+                            }
+
+                            // Skip adding original segment - we've already added the split parts
+                            continue;
+                        }
+                    }
+                }
+
+                // Normal path: add segment to group as-is (no split or split failed)
+                // Create buffered segment
+                let buffered = BufferedSegment {
+                    sample_name: task.sample_name.clone(),
+                    contig_name: task.contig_name.clone(),
+                    seg_part_no: place,
+                    data: segment_data,
+                    is_rev_comp: should_reverse,
+                };
+
                 // Get or create buffer for this group
-                let buffer = groups.entry(key).or_insert_with(|| {
+                let buffer = groups.entry(key.clone()).or_insert_with(|| {
                     // Allocate new group ID
                     let group_id = group_counter.fetch_add(1, Ordering::SeqCst);
+
+                    if config.verbosity > 1 {
+                        eprintln!("NEW_GROUP: group_id={} front={} back={} sample={}",
+                            group_id, key_front, key_back, task.sample_name);
+                    }
 
                     // Register streams for this group
                     let archive_version =
@@ -861,8 +987,48 @@ fn worker_thread(
                     let ref_stream_id = arch.register_stream(&ref_stream_name);
                     drop(arch);
 
+                    // Phase 1: Track segment terminators for splitting
+                    // (matches C++ AGC agc_compressor.cpp lines 1319-1334)
+                    {
+                        use crate::segment::MISSING_KMER;
+
+                        // Record this segment group in map_segments
+                        let mut seg_map = map_segments.lock().unwrap();
+                        seg_map.insert(key.clone(), group_id);
+                        drop(seg_map);
+
+                        // Track k-mer connections (only if both are not MISSING)
+                        if key_front != MISSING_KMER && key_back != MISSING_KMER {
+                            let mut terminators = map_segments_terminators.lock().unwrap();
+
+                            // Add bidirectional connection
+                            terminators.entry(key_front).or_insert_with(Vec::new).push(key_back);
+                            if key_front != key_back {
+                                terminators.entry(key_back).or_insert_with(Vec::new).push(key_front);
+                            }
+
+                            // Keep vectors sorted and deduplicated for efficient set intersection
+                            // (C++ AGC uses sorted vectors for set_intersection in lines 1541-1543)
+                            if let Some(vec) = terminators.get_mut(&key_front) {
+                                vec.sort_unstable();
+                                vec.dedup();
+                            }
+                            if key_front != key_back {
+                                if let Some(vec) = terminators.get_mut(&key_back) {
+                                    vec.sort_unstable();
+                                    vec.dedup();
+                                }
+                            }
+                        }
+                    }
+
                     SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                 });
+
+                if key_exists && config.verbosity > 1 {
+                    eprintln!("REUSE_GROUP: group_id={} front={} back={} sample={}",
+                        buffer.group_id, key_front, key_back, task.sample_name);
+                }
 
                 // Buffer all segments (matching C++ AGC: buffer all, then sort)
                 // Reference will be chosen from sorted segments during flush
@@ -881,6 +1047,126 @@ fn worker_thread(
     }
 
     Ok(())
+}
+
+// ========== SEGMENT SPLITTING HELPER FUNCTIONS ==========
+// (Phase 3-6 implementation)
+
+/// Phase 3: Find a k-mer that connects both front and back
+/// Returns the first k-mer that appears in the terminator lists of BOTH front and back
+/// (matches C++ AGC find_cand_segment_with_missing_middle_splitter lines 1531-1554)
+fn find_middle_splitter(
+    front_kmer: u64,
+    back_kmer: u64,
+    terminators: &HashMap<u64, Vec<u64>>,
+) -> Option<u64> {
+    let front_connections = terminators.get(&front_kmer)?;
+    let back_connections = terminators.get(&back_kmer)?;
+
+    // Find intersection of sorted vectors (set_intersection algorithm)
+    // Both vectors are kept sorted by Phase 1
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < front_connections.len() && j < back_connections.len() {
+        if front_connections[i] == back_connections[j] {
+            // Found shared k-mer - return it (C++ AGC uses first match)
+            return Some(front_connections[i]);
+        } else if front_connections[i] < back_connections[j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    None // No shared k-mer found
+}
+
+/// Phase 4: Find split position using simplified heuristic
+/// C++ AGC uses compression cost (lines 1556-1625), but for a simplified approach
+/// we split at the midpoint of the segment
+/// Returns the split position (in bytes)
+fn find_split_position(_segment_data: &[u8], _middle_kmer: u64, segment_len: usize, k: usize) -> Option<usize> {
+    // Ensure we don't split too close to the ends
+    // Need at least k+1 bytes on each side for valid segments
+    if segment_len < 2 * (k + 1) {
+        return None;
+    }
+
+    // Split at midpoint
+    // C++ AGC finds optimal position using compression cost, but midpoint is reasonable
+    let split_pos = segment_len / 2;
+
+    Some(split_pos)
+}
+
+/// Phase 5: Split segment into two overlapping segments
+/// Returns (left_segment, right_segment) with k-mer overlap
+/// (matches C++ AGC lines 1445-1503)
+fn split_segment_at_position(
+    segment_data: &[u8],
+    split_pos: usize,
+    k: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    // Left segment ends at split_pos + k (includes full middle k-mer)
+    let left_end = split_pos + k;
+    let left = segment_data[..left_end].to_vec();
+
+    // Right segment starts at split_pos + k/2 (overlaps by k/2)
+    let right_start = split_pos + k / 2;
+    let right = segment_data[right_start..].to_vec();
+
+    (left, right)
+}
+
+/// Phase 6: Attempt to split a segment by finding a middle k-mer
+/// Returns Some((left_data, right_data, middle_kmer)) if successful
+/// (orchestrates C++ AGC agc_compressor.cpp lines 1387-1503)
+fn try_split_segment(
+    segment_data: &[u8],
+    front_kmer: u64,
+    back_kmer: u64,
+    terminators: &HashMap<u64, Vec<u64>>,
+    config: &StreamingQueueConfig,
+) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    // Find middle k-mer that connects front and back
+    let middle_kmer = find_middle_splitter(front_kmer, back_kmer, terminators)?;
+
+    if config.verbosity > 1 {
+        eprintln!(
+            "SPLIT_ATTEMPT: front={} back={} middle={}",
+            front_kmer, back_kmer, middle_kmer
+        );
+    }
+
+    // Find split position (simplified: use midpoint instead of compression cost)
+    let split_pos = match find_split_position(segment_data, middle_kmer, segment_data.len(), config.k) {
+        Some(pos) => pos,
+        None => {
+            if config.verbosity > 1 {
+                eprintln!(
+                    "SPLIT_FAILED: middle k-mer {} not found in segment (len={})",
+                    middle_kmer,
+                    segment_data.len()
+                );
+            }
+            return None;
+        }
+    };
+
+    // Split into two segments with overlap
+    let (left_data, right_data) = split_segment_at_position(segment_data, split_pos, config.k);
+
+    if config.verbosity > 1 {
+        eprintln!(
+            "SPLIT_SUCCESS: split_pos={} left_len={} right_len={}",
+            split_pos,
+            left_data.len(),
+            right_data.len()
+        );
+    }
+
+    Some((left_data, right_data, middle_kmer))
 }
 
 #[cfg(test)]

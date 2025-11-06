@@ -127,6 +127,11 @@ pub fn split_at_splitters_with_size(
                             // Normal case: both k-mers present
                             (front_kmer, kmer_value)
                         };
+                        // Note: Contig name is logged at call site, this is just position info
+                        eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={}",
+                            pos, kmer_value, segment_start, segment_end, segment_data.len(),
+                            if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
+                            if seg_back == MISSING_KMER { "MISSING".to_string() } else { seg_back.to_string() });
                         segments.push(Segment::new(segment_data, seg_front, seg_back));
                     }
 
@@ -203,12 +208,17 @@ pub fn split_at_splitters_with_size(
                 // K-mer is NOT dir-oriented: swap to (MISSING, kmer)
                 (MISSING_KMER, front_kmer)
             };
+            eprintln!("RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back={}",
+                segment_start, contig.len(), segment_data.len(),
+                if final_front == MISSING_KMER { "MISSING".to_string() } else { final_front.to_string() },
+                if final_back == MISSING_KMER { "MISSING".to_string() } else { final_back.to_string() });
             segments.push(Segment::new(segment_data, final_front, final_back));
         }
     }
 
     // If no segments were created, return entire contig as one segment
     if segments.is_empty() {
+        eprintln!("RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING", contig.len());
         segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER));
     }
 
@@ -264,6 +274,10 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
                     let segment_data = contig[segment_start..segment_end].to_vec();
 
                     if !segment_data.is_empty() {
+                        eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={}",
+                            pos, kmer_value, segment_start, segment_end, segment_data.len(),
+                            if front_kmer == MISSING_KMER { "MISSING".to_string() } else { front_kmer.to_string() },
+                            kmer_value);
                         segments.push(Segment::new(segment_data, front_kmer, kmer_value));
                     }
 
@@ -279,12 +293,16 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
     if segment_start < contig.len() {
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
+            eprintln!("RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back=MISSING",
+                segment_start, contig.len(), segment_data.len(),
+                if front_kmer == MISSING_KMER { "MISSING".to_string() } else { front_kmer.to_string() });
             segments.push(Segment::new(segment_data, front_kmer, MISSING_KMER));
         }
     }
 
     // If no segments were created (no splitters), return entire contig as one segment
     if segments.is_empty() {
+        eprintln!("RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING", contig.len());
         segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER));
     }
 

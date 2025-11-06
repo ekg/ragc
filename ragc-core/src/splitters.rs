@@ -241,8 +241,10 @@ fn find_actual_splitters_in_contig(
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
     let mut current_len = segment_size; // Start ready to split
     let mut recent_kmers = Vec::new();
+    let mut pos = 0usize;
 
     for &base in contig {
+        let current_pos = pos;
         if base > 3 {
             kmer.reset();
             recent_kmers.clear();
@@ -255,6 +257,7 @@ fn find_actual_splitters_in_contig(
 
                 if current_len >= segment_size && candidates.contains(&kmer_value) {
                     // This candidate is actually used!
+                    eprintln!("DEBUG_RAGC_SPLITTER_USED: pos={} kmer={} current_len={}", current_pos, kmer_value, current_len);
                     used_splitters.push(kmer_value);
                     current_len = 0;
                     kmer.reset();
@@ -264,11 +267,13 @@ fn find_actual_splitters_in_contig(
         }
 
         current_len += 1;
+        pos += 1;
     }
 
     // Try to add rightmost candidate k-mer
     for &kmer_value in recent_kmers.iter().rev() {
         if candidates.contains(&kmer_value) {
+            eprintln!("DEBUG_RAGC_SPLITTER_USED_RIGHTMOST: kmer={}", kmer_value);
             used_splitters.push(kmer_value);
             break;
         }
