@@ -73,13 +73,40 @@ struct SegmentGroupKey {
 }
 
 /// Buffered segment waiting to be packed
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferedSegment {
     sample_name: String,
     contig_name: String,
     seg_part_no: usize,
     data: Contig,
     is_rev_comp: bool,
+}
+
+// Match C++ AGC sorting order (agc_compressor.h lines 112-119)
+// Sort by: sample_name, then contig_name, then seg_part_no
+impl PartialOrd for BufferedSegment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BufferedSegment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // First compare by sample_name
+        match self.sample_name.cmp(&other.sample_name) {
+            std::cmp::Ordering::Equal => {
+                // Then by contig_name
+                match self.contig_name.cmp(&other.contig_name) {
+                    std::cmp::Ordering::Equal => {
+                        // Finally by seg_part_no
+                        self.seg_part_no.cmp(&other.seg_part_no)
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 /// Buffer for a segment group (packs 50 segments together)
@@ -569,103 +596,123 @@ fn flush_pack(
 
     let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
 
+    // Sort segments to match C++ AGC (agc_compressor.h line 362: p->sort())
+    // This ensures the reference is chosen deterministically (alphabetically first sample/contig/part)
+    // instead of "whichever arrives first"
+    buffer.segments.sort();
+
     // Write reference segment if not already written (first pack for this group)
-    if !buffer.ref_written {
-        if let Some(ref_seg) = &buffer.reference_segment {
-            if config.verbosity > 1 {
-                eprintln!(
-                    "  Flushing group {}: reference from {}",
-                    buffer.group_id, ref_seg.sample_name
-                );
-            }
-            // Compress reference using adaptive compression
-            let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
-                .context("Failed to compress reference")?;
-            compressed.push(marker);
+    // Extract reference from sorted segments (matching C++ AGC: first segment after sort becomes reference)
+    if !buffer.ref_written && !buffer.segments.is_empty() {
+        // Remove first segment (alphabetically first) to use as reference
+        let ref_seg = buffer.segments.remove(0);
 
-            // Metadata stores the uncompressed size
-            let ref_size = ref_seg.data.len() as u64;
-
-            {
-                let mut arch = archive.lock().unwrap();
-                arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
-                    .context("Failed to write reference")?;
-            }
-
-            // Register reference in collection with in_group_id = 0
-            {
-                let mut coll = collection.lock().unwrap();
-                coll.add_segment_placed(
-                    &ref_seg.sample_name,
-                    &ref_seg.contig_name,
-                    ref_seg.seg_part_no,
-                    buffer.group_id,
-                    0, // Reference is always at position 0
-                    ref_seg.is_rev_comp,
-                    ref_seg.data.len() as u32,
-                )
-                .context("Failed to register reference")?;
-            }
-
-            buffer.ref_written = true;
-
-            // Prepare LZ encoder with reference (matching C++ AGC segment.cpp line 43: lz_diff->Prepare(s))
-            // This is done ONCE when the reference is written, then reused for all subsequent segments
-            if use_lz_encoding {
-                let mut lz = LZDiff::new(config.min_match_len as u32);
-                lz.prepare(&ref_seg.data);
-                buffer.lz_diff = Some(lz);
-            }
-        } else if config.verbosity > 1 {
+        if config.verbosity > 1 {
             eprintln!(
-                "  Group {}: flushing without reference (will use raw encoding)",
-                buffer.group_id
+                "  Flushing group {}: reference from {} (chosen from {} sorted segments)",
+                buffer.group_id, ref_seg.sample_name, buffer.segments.len() + 1
             );
+        }
+
+        // Compress reference using adaptive compression
+        let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
+            .context("Failed to compress reference")?;
+        compressed.push(marker);
+
+        // Metadata stores the uncompressed size
+        let ref_size = ref_seg.data.len() as u64;
+
+        {
+            let mut arch = archive.lock().unwrap();
+            arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
+                .context("Failed to write reference")?;
+        }
+
+        // Register reference in collection with in_group_id = 0
+        {
+            let mut coll = collection.lock().unwrap();
+            coll.add_segment_placed(
+                &ref_seg.sample_name,
+                &ref_seg.contig_name,
+                ref_seg.seg_part_no,
+                buffer.group_id,
+                0, // Reference is always at position 0
+                ref_seg.is_rev_comp,
+                ref_seg.data.len() as u32,
+            )
+            .context("Failed to register reference")?;
+        }
+
+        buffer.ref_written = true;
+        buffer.reference_segment = Some(ref_seg.clone()); // Store for LZ encoding
+
+        // Prepare LZ encoder with reference (matching C++ AGC segment.cpp line 43: lz_diff->Prepare(s))
+        // This is done ONCE when the reference is written, then reused for all subsequent segments
+        if use_lz_encoding {
+            let mut lz = LZDiff::new(config.min_match_len as u32);
+            lz.prepare(&ref_seg.data);
+            buffer.lz_diff = Some(lz);
         }
     }
 
-    // Pack segments together
+    // Pack segments together with delta deduplication (matching C++ AGC segment.cpp lines 66-74)
     // Note: segments do NOT include the reference - it's stored separately
-    let mut packed_data = Vec::new();
-    for (idx_in_pack, seg) in buffer.segments.iter().enumerate() {
-        // Delta segments start at in_group_id = 1 (reference is 0)
-        let in_group_id = buffer.segments_written + idx_in_pack as u32 + 1;
+    let mut unique_deltas: Vec<Vec<u8>> = Vec::new(); // v_lzp in C++ AGC
+    let mut segment_delta_indices: Vec<u32> = Vec::new(); // Which unique delta each segment uses
 
+    // First pass: encode segments and deduplicate deltas
+    for seg in buffer.segments.iter() {
         let contig_data = if !use_lz_encoding || buffer.reference_segment.is_none() {
             // Raw segment: groups 0-15 OR groups without reference
             seg.data.clone()
         } else {
             // LZ-encoded segment (groups >= 16 with reference)
             // Reuse prepared lz_diff (matching C++ AGC segment.cpp line 59: lz_diff->Encode(s, delta))
-            // The lz_diff was prepared ONCE with the reference, now we just encode each segment
             buffer.lz_diff.as_mut()
                 .expect("lz_diff should be prepared when reference is written")
                 .encode(&seg.data)
         };
 
-        // Add contig data
-        packed_data.extend_from_slice(&contig_data);
-        // Add separator (0xFF)
-        packed_data.push(CONTIG_SEPARATOR);
-
-        // Register in collection
-        {
-            let mut coll = collection.lock().unwrap();
-            coll.add_segment_placed(
-                &seg.sample_name,
-                &seg.contig_name,
-                seg.seg_part_no,
-                buffer.group_id,
-                in_group_id, // Start from 1 (reference is 0)
-                seg.is_rev_comp,
-                seg.data.len() as u32,
-            )
-            .context("Failed to register segment")?;
+        // Check if this delta already exists (matching C++ AGC segment.cpp line 66)
+        if let Some(existing_idx) = unique_deltas.iter().position(|d| d == &contig_data) {
+            // Reuse existing delta (matching C++ AGC segment.cpp line 69)
+            segment_delta_indices.push(existing_idx as u32);
+        } else {
+            // New unique delta - add it (matching C++ AGC segment.cpp line 74)
+            segment_delta_indices.push(unique_deltas.len() as u32);
+            unique_deltas.push(contig_data);
         }
     }
 
-    // Update counter (counts delta segments only, not reference)
-    buffer.segments_written += buffer.segments.len() as u32;
+    // Second pass: pack unique deltas and register segments
+    let mut packed_data = Vec::new();
+    for delta in unique_deltas.iter() {
+        packed_data.extend_from_slice(delta);
+        packed_data.push(CONTIG_SEPARATOR);
+    }
+
+    // Register segments in collection with their delta indices
+    for (seg, &delta_idx) in buffer.segments.iter().zip(segment_delta_indices.iter()) {
+        // in_group_id represents which delta this segment uses
+        // 0 = reference, 1+ = delta index (offset by buffer.segments_written and +1 for reference)
+        let in_group_id = buffer.segments_written + delta_idx + 1;
+
+        let mut coll = collection.lock().unwrap();
+        coll.add_segment_placed(
+            &seg.sample_name,
+            &seg.contig_name,
+            seg.seg_part_no,
+            buffer.group_id,
+            in_group_id,
+            seg.is_rev_comp,
+            seg.data.len() as u32,
+        )
+        .context("Failed to register segment")?;
+    }
+
+    // Update counter (counts UNIQUE deltas only, not reference or duplicates)
+    // This matches C++ AGC which increments no_seqs only when adding new deltas (segment.cpp line 77)
+    buffer.segments_written += unique_deltas.len() as u32;
 
     // Compress and write the packed data (if we have any delta segments)
     if !packed_data.is_empty() {
@@ -817,24 +864,13 @@ fn worker_thread(
                     SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                 });
 
-                // First segment in group becomes reference (regardless of sample)
-                if buffer.reference_segment.is_none() {
-                    // This is the first segment for this group - becomes reference
-                    if config.verbosity > 1 {
-                        eprintln!(
-                            "  Group {}: Setting reference from {}",
-                            buffer.group_id, task.sample_name
-                        );
-                    }
-                    buffer.reference_segment = Some(buffered.clone());
-                    // Don't add reference to segments - it's stored separately
-                } else {
-                    // Subsequent segments are deltas (LZ-encoded against reference)
-                    buffer.segments.push(buffered);
-                }
+                // Buffer all segments (matching C++ AGC: buffer all, then sort)
+                // Reference will be chosen from sorted segments during flush
+                buffer.segments.push(buffered);
 
                 // Flush pack if buffer is full
-                if buffer.segments.len() >= PACK_CARDINALITY {
+                // Note: +1 because first segment will become reference
+                if buffer.segments.len() >= PACK_CARDINALITY + 1 {
                     flush_pack(buffer, &collection, &archive, &config)
                         .context("Failed to flush pack")?;
                 }
