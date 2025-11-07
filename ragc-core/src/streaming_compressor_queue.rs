@@ -1314,19 +1314,25 @@ fn find_split_position(_segment_data: &[u8], _middle_kmer: u64, segment_len: usi
 
 /// Phase 5: Split segment into two overlapping segments
 /// Returns (left_segment, right_segment) with k-mer overlap
-/// (matches C++ AGC lines 1445-1503)
+/// (matches C++ AGC lines 1461-1464)
 fn split_segment_at_position(
     segment_data: &[u8],
     split_pos: usize,
     k: usize,
 ) -> (Vec<u8>, Vec<u8>) {
-    // Left segment ends at split_pos + k (includes full middle k-mer)
-    let left_end = split_pos + k;
-    let left = segment_data[..left_end].to_vec();
+    // C++ AGC creates overlap of k bytes (not k/2!):
+    //   seg2_start_pos = left_size - kmer_length / 2
+    //   segment2 starts at seg2_start_pos
+    //   segment ends at seg2_start_pos + kmer_length
+    // This creates k bytes of overlap: [split_pos - k/2 .. split_pos + k/2]
+    let seg2_start_pos = split_pos.saturating_sub(k / 2);
 
-    // Right segment starts at split_pos + k/2 (overlaps by k/2)
-    let right_start = split_pos + k / 2;
-    let right = segment_data[right_start..].to_vec();
+    // Right segment: [seg2_start_pos .. end]
+    let right = segment_data[seg2_start_pos..].to_vec();
+
+    // Left segment: [0 .. seg2_start_pos + k]
+    let left_end = seg2_start_pos + k;
+    let left = segment_data[..left_end].to_vec();
 
     (left, right)
 }
@@ -1374,9 +1380,11 @@ fn try_split_segment_with_cost(
             let best_pos = segment_len / 2;
 
             // Validate split position creates valid segments
-            // Left segment will be [0..best_pos+k], right will be [best_pos+k/2..]
-            let left_size = best_pos + k;
-            let right_size = segment_len.saturating_sub(best_pos + k / 2);
+            // seg2_start_pos = best_pos - k/2
+            // Left: [0..best_pos + k/2], Right: [best_pos - k/2..end]
+            let seg2_start_pos = best_pos.saturating_sub(k / 2);
+            let left_size = seg2_start_pos + k;
+            let right_size = segment_len.saturating_sub(seg2_start_pos);
 
             // Both segments must be at least k+1 bytes
             if left_size < k + 1 || right_size < k + 1 || left_size > segment_len {
@@ -1458,9 +1466,12 @@ fn try_split_segment_with_cost(
     }
 
     // Calculate the ACTUAL sizes after splitting with k-mer overlap
-    // Left segment will be [0..best_pos+k], right will be [best_pos+k/2..]
-    let left_size = best_pos + k;
-    let right_size = segment_data.len().saturating_sub(best_pos + k / 2);
+    // seg2_start_pos = best_pos - k/2
+    // Left segment: [0..best_pos - k/2 + k] = [0..best_pos + k/2]
+    // Right segment: [best_pos - k/2..end]
+    let seg2_start_pos = best_pos.saturating_sub(k / 2);
+    let left_size = seg2_start_pos + k; // = best_pos + k/2
+    let right_size = segment_data.len().saturating_sub(seg2_start_pos);
 
     // Both segments must be at least k+1 bytes to extract k-mers
     // Also check left doesn't exceed segment bounds
