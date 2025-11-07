@@ -420,7 +420,8 @@ mod tests {
 
     #[test]
     fn test_missing_kmer_constant() {
-        assert_eq!(MISSING_KMER, !0u64);
+        // MISSING_KMER must be 0 to match C++ AGC (not u64::MAX)
+        assert_eq!(MISSING_KMER, 0);
     }
 
     #[test]
