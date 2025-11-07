@@ -1032,9 +1032,7 @@ fn worker_thread(
                         };
 
                         if let Some((left_data, right_data, middle_kmer)) = split_result {
-                            // Successfully split! Add both segments to their existing groups
-
-                            // Calculate keys for the two new segments
+                            // Calculate keys for the two new segments FIRST
                             // Left: (front, middle), Right: (middle, back)
                             // Apply same normalization as original segment
                             let left_key = if key_front <= middle_kmer {
@@ -1061,16 +1059,24 @@ fn worker_thread(
                                 }
                             };
 
-                            if config.verbosity > 1 {
-                                eprintln!(
-                                    "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
-                                    key_front, key_back, left_key.kmer_front, left_key.kmer_back,
-                                    right_key.kmer_front, right_key.kmer_back
-                                );
-                            }
+                            // CRITICAL: Only use the split if BOTH groups already exist in the global registry
+                            // (matches C++ AGC behavior - don't split if either group is missing)
+                            let both_groups_exist = {
+                                let map = map_segments.lock().unwrap();
+                                map.contains_key(&left_key) && map.contains_key(&right_key)
+                            };
 
-                            // Add left segment to its group (should already exist)
-                            if let Some(left_buffer) = groups.get_mut(&left_key) {
+                            if both_groups_exist {
+                                if config.verbosity > 1 {
+                                    eprintln!(
+                                        "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
+                                        key_front, key_back, left_key.kmer_front, left_key.kmer_back,
+                                        right_key.kmer_front, right_key.kmer_back
+                                    );
+                                }
+
+                                // Add left segment to its group
+                                if let Some(left_buffer) = groups.get_mut(&left_key) {
                                 let left_buffered = BufferedSegment {
                                     sample_name: task.sample_name.clone(),
                                     contig_name: task.contig_name.clone(),
@@ -1103,13 +1109,23 @@ fn worker_thread(
                                 }
                             }
 
-                            // Skip adding original segment - we've already added the split parts
-                            continue;
+                                // Skip adding original segment - we've already added the split parts
+                                continue;
+                            } else {
+                                // One or both split groups don't exist yet
+                                // Fall through to normal path to create group for unsplit segment
+                                if config.verbosity > 1 {
+                                    eprintln!(
+                                        "SPLIT_SKIPPED: original=({},{}) middle={} - split groups don't both exist yet",
+                                        key_front, key_back, middle_kmer
+                                    );
+                                }
+                            }
                         }
                     }
                 }
 
-                // Normal path: add segment to group as-is (no split or split failed)
+                // Normal path: add segment to group as-is (no split or split groups don't exist)
                 // Create buffered segment
                 let buffered = BufferedSegment {
                     sample_name: task.sample_name.clone(),
