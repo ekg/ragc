@@ -797,6 +797,11 @@ fn worker_thread(
 
         // Buffer segments for packing (matching batch mode)
         for (place, segment) in segments.iter().enumerate() {
+            // DEBUG: Output every segment for comparison with C++ AGC
+            eprintln!("RAGC_SEGMENT: sample={} contig={} part={} len={} front={} back={}",
+                task.sample_name, task.contig_name, place, segment.data.len(),
+                segment.front_kmer, segment.back_kmer);
+
             // Match C++ AGC Case 2: Normalize segment group key by ensuring front <= back
             // (agc_compressor.cpp lines 1306-1327)
             use crate::segment::MISSING_KMER;
