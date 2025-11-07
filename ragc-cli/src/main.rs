@@ -348,32 +348,14 @@ fn create_archive(
             StreamingQueueCompressor::with_splitters(output_str, config, splitters)?;
 
         // Process all input files
-        // Buffer and sort contigs by size to match C++ AGC's priority queue behavior
+        // C++ AGC registers contigs in FILE ORDER (as read from FASTA),
+        // then uses priority queue for PROCESSING efficiency only.
+        // We must preserve file order for correct metadata storage.
         let mut iterator = MultiFileIterator::new(inputs.clone())?;
-        let mut all_contigs = Vec::new();
         while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
             if !sequence.is_empty() {
-                all_contigs.push((sample_name, contig_name, sequence));
+                compressor.push(sample_name, contig_name, sequence)?;
             }
-        }
-
-        // Sort contigs within each sample by size (largest first)
-        // This matches C++ AGC's priority queue: pq_contigs_desc->Emplace(..., sample_priority, cost)
-        // where cost = contig.size()
-        all_contigs.sort_by(|a, b| {
-            // First by sample name (to keep samples together)
-            match a.0.cmp(&b.0) {
-                std::cmp::Ordering::Equal => {
-                    // Then by size descending (largest first)
-                    b.2.len().cmp(&a.2.len())
-                }
-                other => other,
-            }
-        });
-
-        // Push sorted contigs to compressor
-        for (sample_name, contig_name, sequence) in all_contigs {
-            compressor.push(sample_name, contig_name, sequence)?;
         }
 
         compressor.finalize()?;
