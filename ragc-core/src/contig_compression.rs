@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 /// Contig type (vector of nucleotides in numeric encoding)
 pub type Contig = Vec<u8>;
 
-/// Missing k-mer marker (both k1 and k2 = ~0 means no terminal splitters)
-pub const MISSING_KMER: u64 = !0u64;
+/// Missing k-mer marker (both k1 and k2 = 0 means no terminal splitters)
+pub const MISSING_KMER: u64 = 0;
 
 /// Segment part for inline buffering
 #[derive(Debug, Clone)]

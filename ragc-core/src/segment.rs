@@ -5,9 +5,9 @@ use crate::kmer::{Kmer, KmerMode};
 use ragc_common::Contig;
 use std::collections::HashSet;
 
-/// Missing k-mer sentinel value (matches C++ AGC's ~0ull)
+/// Missing k-mer sentinel value (matches C++ AGC's 0)
 /// Used when a segment doesn't have a front or back k-mer (e.g., at contig boundaries)
-pub const MISSING_KMER: u64 = u64::MAX;
+pub const MISSING_KMER: u64 = 0;
 
 /// A segment of a contig bounded by splitter k-mers
 #[derive(Debug, Clone, PartialEq, Eq)]
