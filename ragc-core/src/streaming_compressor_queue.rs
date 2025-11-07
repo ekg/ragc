@@ -753,17 +753,94 @@ fn flush_pack(
     Ok(())
 }
 
+/// Write reference segment immediately when first segment arrives in group
+/// (Matches C++ AGC segment.cpp lines 41-48: if (no_seqs == 0) writes reference right away)
+/// This ensures LZ encoding works correctly for subsequent segments
+fn write_reference_immediately(
+    segment: &BufferedSegment,
+    buffer: &mut SegmentGroupBuffer,
+    collection: &Arc<Mutex<CollectionV3>>,
+    archive: &Arc<Mutex<Archive>>,
+    config: &StreamingQueueConfig,
+) -> Result<()> {
+    use crate::segment_compression::compress_reference_segment;
+
+    if config.verbosity > 1 {
+        eprintln!(
+            "  Writing immediate reference for group {}: {} {}:{} (part {})",
+            buffer.group_id, segment.sample_name, segment.contig_name,
+            segment.seg_part_no, segment.seg_part_no
+        );
+    }
+
+    // 1. Compress reference using adaptive compression (matching flush_pack lines 635-637)
+    let (mut compressed, marker) = compress_reference_segment(&segment.data)
+        .context("Failed to compress reference")?;
+    compressed.push(marker);
+
+    // Metadata stores the uncompressed size
+    let ref_size = segment.data.len() as u64;
+
+    // 2. Write to archive immediately (matching C++ AGC segment.cpp line 43: store_in_archive)
+    {
+        let mut arch = archive.lock().unwrap();
+        arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
+            .context("Failed to write immediate reference")?;
+    }
+
+    // 3. Register reference in collection with in_group_id = 0 (matching flush_pack lines 650-661)
+    {
+        let mut coll = collection.lock().unwrap();
+        coll.add_segment_placed(
+            &segment.sample_name,
+            &segment.contig_name,
+            segment.seg_part_no,
+            buffer.group_id,
+            0, // Reference is always at position 0
+            segment.is_rev_comp,
+            segment.data.len() as u32,
+        )
+        .context("Failed to register immediate reference")?;
+    }
+
+    // 4. Mark reference as written and store for LZ encoding (matching flush_pack lines 663-664)
+    buffer.ref_written = true;
+    buffer.reference_segment = Some(segment.clone());
+
+    // 5. Prepare LZ encoder with reference (matching C++ AGC segment.cpp line 43: lz_diff->Prepare(s))
+    // This is done ONCE when the reference is written, then reused for all subsequent segments
+    let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
+    if use_lz_encoding {
+        let mut lz = LZDiff::new(config.min_match_len as u32);
+        lz.prepare(&segment.data);
+        buffer.lz_diff = Some(lz);
+    }
+
+    Ok(())
+}
+
+/// Compute reverse complement of a sequence
+fn reverse_complement_sequence(seq: &[u8]) -> Vec<u8> {
+    use crate::kmer::reverse_complement;
+    seq.iter()
+        .rev()
+        .map(|&base| reverse_complement(base as u64) as u8)
+        .collect()
+}
+
 /// Find best existing group for a segment with only one k-mer present
 /// (Implements C++ AGC's find_cand_segment_with_one_splitter logic from lines 1659-1745)
 fn find_group_with_one_kmer(
     kmer: u64,
     kmer_is_dir: bool,
-    segment_len: usize,
+    segment_data: &[u8],      // Segment data in forward orientation
+    segment_data_rc: &[u8],   // Segment data in reverse complement
     map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     config: &StreamingQueueConfig,
 ) -> (u64, u64, bool) {
+    let segment_len = segment_data.len();
     use crate::segment::MISSING_KMER;
 
     // Look up kmer in terminators map to find connected k-mers
@@ -857,16 +934,75 @@ fn find_group_with_one_kmer(
         }
     });
 
-    // Pick the first (best) candidate
-    // NOTE: C++ AGC also tests compression (lines 1732-1745) but we skip that for now
-    let best = &candidates[0];
+    // Test compression for each candidate (C++ AGC lines 1732-1745)
+    // Pick candidate with smallest LZ-encoded size
+    let mut best_key_front = candidates[0].0;
+    let mut best_key_back = candidates[0].1;
+    let mut best_needs_rc = candidates[0].2;
+    let mut best_estim_size = if segment_len < 16 {
+        segment_len
+    } else {
+        segment_len - 16
+    };
 
-    if config.verbosity > 1 {
-        eprintln!("RAGC_CASE3_PICKED: kmer={} best=({},{}) rc={} ref_size={} segment_size={}",
-            kmer, best.0, best.1, best.2, best.3, segment_len);
+    {
+        let groups = segment_groups.lock().unwrap();
+
+        for &(key_front, key_back, needs_rc, _ref_size) in &candidates {
+            let cand_key = SegmentGroupKey {
+                kmer_front: key_front,
+                kmer_back: key_back,
+            };
+
+            // Get the reference segment for this candidate
+            if let Some(group_buffer) = groups.get(&cand_key) {
+                if let Some(ref_seg) = &group_buffer.reference_segment {
+                    // Test LZ encoding against this reference (C++ AGC line 1734: estimate())
+                    let mut lz = LZDiff::new(config.min_match_len as u32);
+                    lz.prepare(&ref_seg.data);
+
+                    // Choose segment orientation based on needs_rc
+                    let target_data = if needs_rc {
+                        segment_data_rc.to_vec()
+                    } else {
+                        segment_data.to_vec()
+                    };
+
+                    let encoded = lz.encode(&target_data);
+                    let estim_size = encoded.len();
+
+                    if config.verbosity > 2 {
+                        eprintln!(
+                            "RAGC_CASE3_ESTIMATE: kmer={} cand=({},{}) rc={} ref_len={} target_len={} encoded={}",
+                            kmer, key_front, key_back, needs_rc, ref_seg.data.len(), target_data.len(), estim_size
+                        );
+                    }
+
+                    // Update best if this candidate compresses better
+                    // (C++ AGC lines 1737-1743)
+                    let cand_pk = (key_front, key_back);
+                    let best_pk = (best_key_front, best_key_back);
+
+                    if estim_size < best_estim_size
+                        || (estim_size == best_estim_size && cand_pk < best_pk)
+                        || (estim_size == best_estim_size && cand_pk == best_pk && !needs_rc)
+                    {
+                        best_estim_size = estim_size;
+                        best_key_front = key_front;
+                        best_key_back = key_back;
+                        best_needs_rc = needs_rc;
+                    }
+                }
+            }
+        }
     }
 
-    (best.0, best.1, best.2)
+    if config.verbosity > 1 {
+        eprintln!("RAGC_CASE3_PICKED: kmer={} best=({},{}) rc={} estim_size={} segment_size={}",
+            kmer, best_key_front, best_key_back, best_needs_rc, best_estim_size, segment_len);
+    }
+
+    (best_key_front, best_key_back, best_needs_rc)
 }
 
 /// Worker thread that pulls from queue and compresses
@@ -948,10 +1084,12 @@ fn worker_thread(
                 } else if segment.front_kmer != MISSING_KMER {
                     // Case 3a: Only front k-mer present
                     // (matches C++ AGC lines 1341-1361: find_cand_segment_with_one_splitter)
+                    let segment_rc = reverse_complement_sequence(&segment.data);
                     let (found_front, found_back, found_rc) = find_group_with_one_kmer(
                         segment.front_kmer,
                         segment.front_kmer_is_dir,
-                        segment.data.len(),
+                        &segment.data,
+                        &segment_rc,
                         &map_segments_terminators,
                         &map_segments,
                         &segment_groups,
@@ -965,10 +1103,12 @@ fn worker_thread(
                     // (matches C++ AGC lines 1363-1385: find_cand_segment_with_one_splitter)
                     // C++ AGC does swap_dir_rc() (line 1369) which INVERTS the orientation
                     // So we pass !is_dir to find_group_with_one_kmer
+                    let segment_rc = reverse_complement_sequence(&segment.data);
                     let (found_front, found_back, found_rc) = find_group_with_one_kmer(
                         segment.back_kmer,  // Use canonical k-mer directly
                         !segment.back_kmer_is_dir,  // INVERT orientation to match swap_dir_rc()
-                        segment.data.len(),
+                        &segment.data,
+                        &segment_rc,
                         &map_segments_terminators,
                         &map_segments,
                         &segment_groups,
@@ -1216,12 +1356,22 @@ fn worker_thread(
                         buffer.group_id, key_front, key_back, task.sample_name);
                 }
 
-                // Buffer all segments (matching C++ AGC: buffer all, then sort)
-                // Reference will be chosen from sorted segments during flush
-                buffer.segments.push(buffered);
+                // CRITICAL: Match C++ AGC behavior - write reference IMMEDIATELY
+                // (C++ AGC segment.cpp lines 41-48: if (no_seqs == 0) writes reference right away)
+                if buffer.reference_segment.is_none() && buffer.segments.is_empty() {
+                    // This is the FIRST segment in this group - make it the reference NOW
+                    // (matches C++ AGC: lz_diff->Prepare(s); store_in_archive(s, zstd_cctx);)
+                    if let Err(e) = write_reference_immediately(&buffered, buffer, &collection, &archive, &config) {
+                        eprintln!("ERROR: Failed to write immediate reference: {}", e);
+                        // Fall back to buffering
+                        buffer.segments.push(buffered);
+                    }
+                } else {
+                    // Subsequent segments - buffer them
+                    buffer.segments.push(buffered);
+                }
 
                 // Flush pack if buffer is full
-                // Note: +1 because first segment will become reference
                 if buffer.segments.len() >= PACK_CARDINALITY + 1 {
                     flush_pack(buffer, &collection, &archive, &config)
                         .context("Failed to flush pack")?;

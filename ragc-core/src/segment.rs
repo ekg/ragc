@@ -158,10 +158,9 @@ pub fn split_at_splitters_with_size(
                     }
 
                     // Reset for next segment
-                    // CRITICAL: Create (k-1)-byte overlap to match C++ AGC behavior
-                    // C++ AGC does: start_pos += part.size() - (kmer_length - 1)
-                    // which creates (k-1) byte overlap, NOT k bytes!
-                    let new_start = (pos + 1).saturating_sub(k - 1);
+                    // CRITICAL: Create k-byte overlap to match C++ AGC behavior
+                    // Each segment must include the FULL k-mer at the start
+                    let new_start = (pos + 1).saturating_sub(k);
                     if debug {
                         eprintln!("  Setting segment_start: {} -> {} (overlap of {} bytes)", segment_start, new_start, (pos + 1) - new_start);
                     }

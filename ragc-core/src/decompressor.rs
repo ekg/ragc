@@ -338,9 +338,9 @@ impl Decompressor {
                 }
                 contig.extend_from_slice(&segment_data);
             } else {
-                // Subsequent segments: skip first (kmer_length-1) bases (overlap with previous segment)
-                // C++ AGC creates (k-1) byte overlap, not k bytes!
-                let overlap = (self.kmer_length - 1) as usize;
+                // Subsequent segments: skip first k bases (full k-mer overlap)
+                // Each segment includes the FULL k-mer at the start
+                let overlap = self.kmer_length as usize;
                 if segment_data.len() < overlap {
                     eprintln!(
                         "ERROR: Segment {} too short! Length={}, overlap={}",
