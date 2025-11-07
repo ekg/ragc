@@ -5,9 +5,9 @@ use crate::kmer::{Kmer, KmerMode};
 use ragc_common::Contig;
 use std::collections::HashSet;
 
-/// Missing k-mer sentinel value (matches C++ AGC's 0)
+/// Missing k-mer sentinel value (matches C++ AGC's kmer_t(-1) = u64::MAX)
 /// Used when a segment doesn't have a front or back k-mer (e.g., at contig boundaries)
-pub const MISSING_KMER: u64 = 0;
+pub const MISSING_KMER: u64 = u64::MAX;
 
 /// A segment of a contig bounded by splitter k-mers
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,22 +218,6 @@ pub fn split_at_splitters_with_size(
     if segments.is_empty() {
         eprintln!("RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING", contig.len());
         segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false));
-    }
-
-    // CRITICAL FIX: Merge final segment with previous if it's too short for overlap
-    // Segments after the first must be >= k bytes to handle the k-base overlap
-    if segments.len() >= 2 {
-        let last_idx = segments.len() - 1;
-        if segments[last_idx].data.len() < k {
-            // Merge last two segments
-            let last_seg = segments.pop().unwrap();
-            let second_last = segments.last_mut().unwrap();
-
-            // Append last segment data to second-last
-            second_last.data.extend_from_slice(&last_seg.data);
-            // Keep the back_kmer from the merged segment (should be 0 for final segment)
-            second_last.back_kmer = last_seg.back_kmer;
-        }
     }
 
     segments
