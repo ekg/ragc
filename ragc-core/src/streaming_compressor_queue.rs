@@ -181,6 +181,10 @@ pub struct StreamingQueueCompressor {
     // Segment splitting support (Phase 1)
     map_segments: Arc<Mutex<std::collections::HashMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id
     map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>, // kmer -> [connected kmers]
+
+    // Track segment splits for renumbering subsequent segments
+    // Maps (sample_name, contig_name, original_place) -> number of splits inserted before this position
+    split_offsets: Arc<Mutex<std::collections::HashMap<(String, String, usize), usize>>>,
 }
 
 impl StreamingQueueCompressor {
@@ -297,6 +301,7 @@ impl StreamingQueueCompressor {
         // Segment splitting support (Phase 1)
         let map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
         let map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -310,6 +315,7 @@ impl StreamingQueueCompressor {
             let reference_sample_name = Arc::clone(&reference_sample_name);
             let map_segments = Arc::clone(&map_segments);
             let map_segments_terminators = Arc::clone(&map_segments_terminators);
+            let split_offsets = Arc::clone(&split_offsets);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
@@ -324,6 +330,7 @@ impl StreamingQueueCompressor {
                     reference_sample_name,
                     map_segments,
                     map_segments_terminators,
+                    split_offsets,
                     config,
                 )
             });
@@ -347,6 +354,7 @@ impl StreamingQueueCompressor {
             reference_sample_name,
             map_segments,
             map_segments_terminators,
+            split_offsets,
         })
     }
 
@@ -404,6 +412,7 @@ impl StreamingQueueCompressor {
                 let reference_sample_name = Arc::clone(&self.reference_sample_name);
                 let map_segments = Arc::clone(&self.map_segments);
                 let map_segments_terminators = Arc::clone(&self.map_segments_terminators);
+                let split_offsets = Arc::clone(&self.split_offsets);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
@@ -418,6 +427,7 @@ impl StreamingQueueCompressor {
                         reference_sample_name,
                         map_segments,
                         map_segments_terminators,
+                        split_offsets,
                         config,
                     )
                 });
@@ -1017,6 +1027,7 @@ fn worker_thread(
     reference_sample_name: Arc<Mutex<Option<String>>>,
     map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
@@ -1048,7 +1059,21 @@ fn worker_thread(
         }
 
         // Buffer segments for packing (matching batch mode)
-        for (place, segment) in segments.iter().enumerate() {
+        for (original_place, segment) in segments.iter().enumerate() {
+            // Calculate adjusted place based on prior splits in this contig
+            // (matches C++ AGC lines 2033-2036: increment seg_part_no twice when split occurs)
+            let place = {
+                let offsets = split_offsets.lock().unwrap();
+                let mut adjusted = original_place;
+                // Count how many splits occurred before this position
+                for pos in 0..original_place {
+                    if offsets.contains_key(&(task.sample_name.clone(), task.contig_name.clone(), pos)) {
+                        adjusted += 1;
+                    }
+                }
+                adjusted
+            };
+
             // DEBUG: Output every segment for comparison with C++ AGC
             eprintln!("RAGC_SEGMENT: sample={} contig={} part={} len={} front={} back={}",
                 task.sample_name, task.contig_name, place, segment.data.len(),
@@ -1150,8 +1175,12 @@ fn worker_thread(
             {
                 let mut groups = segment_groups.lock().unwrap();
 
-                // Check if this key already exists (for debugging group reuse)
-                let key_exists = groups.contains_key(&key);
+                // Check if this key already exists in GLOBAL registry (NOT local groups!)
+                // (matches C++ AGC: p == map_segments.end() check at line 1382)
+                let key_exists = {
+                    let seg_map = map_segments.lock().unwrap();
+                    seg_map.contains_key(&key)
+                };
 
                 // Phase 2: Check if we should attempt splitting this segment
                 // (matches C++ AGC agc_compressor.cpp lines 1387-1503)
@@ -1230,14 +1259,15 @@ fn worker_thread(
                                     );
                                 }
 
-                                // Add left segment to its group
+                                // Add left segment to its existing group
+                                // (matches C++ AGC line 1507: add_known with actual segment data)
                                 if let Some(left_buffer) = groups.get_mut(&left_key) {
                                     let left_buffered = BufferedSegment {
                                         sample_name: task.sample_name.clone(),
                                         contig_name: task.contig_name.clone(),
                                         seg_part_no: place,
                                         data: left_data,
-                                        is_rev_comp: should_reverse, // Inherit RC status from original
+                                        is_rev_comp: should_reverse,
                                     };
                                     left_buffer.segments.push(left_buffered);
 
@@ -1247,14 +1277,15 @@ fn worker_thread(
                                     }
                                 }
 
-                                // Add right segment to its group (should already exist)
+                                // Add right segment to its existing group
+                                // (matches C++ AGC line 1510: add_known with actual segment data)
                                 if let Some(right_buffer) = groups.get_mut(&right_key) {
                                     let right_buffered = BufferedSegment {
                                         sample_name: task.sample_name.clone(),
                                         contig_name: task.contig_name.clone(),
-                                        seg_part_no: place,
+                                        seg_part_no: place + 1,
                                         data: right_data,
-                                        is_rev_comp: should_reverse, // Inherit RC status from original
+                                        is_rev_comp: should_reverse,
                                     };
                                     right_buffer.segments.push(right_buffered);
 
@@ -1264,7 +1295,14 @@ fn worker_thread(
                                     }
                                 }
 
-                                // Skip adding original segment - we've already added the split parts
+                                // Record this split so subsequent segments from this contig get shifted
+                                // (matches C++ AGC lines 2033-2036: ++seg_part_no twice when split)
+                                {
+                                    let mut offsets = split_offsets.lock().unwrap();
+                                    offsets.insert((task.sample_name.clone(), task.contig_name.clone(), original_place), 1);
+                                }
+
+                                // Skip adding original segment - we've added the split parts
                                 continue;
                             }
                             // If split_result was None, fall through to normal path
