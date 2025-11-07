@@ -753,6 +753,122 @@ fn flush_pack(
     Ok(())
 }
 
+/// Find best existing group for a segment with only one k-mer present
+/// (Implements C++ AGC's find_cand_segment_with_one_splitter logic from lines 1659-1745)
+fn find_group_with_one_kmer(
+    kmer: u64,
+    kmer_is_dir: bool,
+    segment_len: usize,
+    map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    config: &StreamingQueueConfig,
+) -> (u64, u64, bool) {
+    use crate::segment::MISSING_KMER;
+
+    // Look up kmer in terminators map to find connected k-mers
+    let connected_kmers = {
+        let terminators = map_segments_terminators.lock().unwrap();
+        match terminators.get(&kmer) {
+            Some(vec) => vec.clone(),
+            None => {
+                // No connections found - create new group with MISSING
+                // Match C++ AGC lines 1671-1679: check is_dir_oriented()
+                if kmer_is_dir {
+                    // Dir-oriented: (kmer, MISSING) with rc=false
+                    if config.verbosity > 1 {
+                        eprintln!("RAGC_CASE3_NO_CONNECTION: kmer={} is_dir=true -> ({}, MISSING) rc=false", kmer, kmer);
+                    }
+                    return (kmer, MISSING_KMER, false);
+                } else {
+                    // NOT dir-oriented: (MISSING, kmer) with rc=true
+                    if config.verbosity > 1 {
+                        eprintln!("RAGC_CASE3_NO_CONNECTION: kmer={} is_dir=false -> (MISSING, {}) rc=true", kmer, kmer);
+                    }
+                    return (MISSING_KMER, kmer, true);
+                }
+            }
+        }
+    };
+
+    if config.verbosity > 1 {
+        eprintln!("RAGC_CASE3_FOUND_CONNECTIONS: kmer={} connections={}",
+            kmer, connected_kmers.len());
+    }
+
+    // Build list of candidate groups
+    // Each candidate: (key_front, key_back, needs_rc, ref_segment_size)
+    let mut candidates: Vec<(u64, u64, bool, usize)> = Vec::new();
+
+    {
+        let groups = segment_groups.lock().unwrap();
+        let seg_map = map_segments.lock().unwrap();
+
+        for &cand_kmer in &connected_kmers {
+            // Create candidate group key normalized (smaller, larger)
+            // C++ AGC lines 1691-1704
+            let (key_front, key_back, needs_rc) = if cand_kmer < kmer {
+                // cand_kmer is smaller - it goes first
+                // This means we need to RC (C++ AGC line 1696: get<2>(ck) = true)
+                (cand_kmer, kmer, true)
+            } else {
+                // kmer is smaller - it goes first
+                // No RC needed (C++ AGC line 1703: get<2>(ck) = false)
+                (kmer, cand_kmer, false)
+            };
+
+            let cand_key = SegmentGroupKey {
+                kmer_front: key_front,
+                kmer_back: key_back,
+            };
+
+            // Check if this group exists and get its reference segment size
+            if let Some(group_buffer) = groups.get(&cand_key) {
+                // Get reference segment size if available
+                let ref_size = if let Some(ref_seg) = &group_buffer.reference_segment {
+                    ref_seg.data.len()
+                } else {
+                    segment_len // No reference yet, use current segment size
+                };
+
+                candidates.push((key_front, key_back, needs_rc, ref_size));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        // No existing groups found - create new with MISSING
+        if config.verbosity > 1 {
+            eprintln!("RAGC_CASE3_NO_CANDIDATES: kmer={} -> (kmer, MISSING)", kmer);
+        }
+        return (kmer, MISSING_KMER, false);
+    }
+
+    // Sort candidates by reference segment size (C++ AGC lines 1710-1719)
+    // Prefer candidates with ref size closest to our segment size
+    candidates.sort_by(|a, b| {
+        let a_diff = (a.3 as i64 - segment_len as i64).abs();
+        let b_diff = (b.3 as i64 - segment_len as i64).abs();
+
+        if a_diff != b_diff {
+            a_diff.cmp(&b_diff)
+        } else {
+            a.3.cmp(&b.3) // If equal distance, prefer smaller ref size
+        }
+    });
+
+    // Pick the first (best) candidate
+    // NOTE: C++ AGC also tests compression (lines 1732-1745) but we skip that for now
+    let best = &candidates[0];
+
+    if config.verbosity > 1 {
+        eprintln!("RAGC_CASE3_PICKED: kmer={} best=({},{}) rc={} ref_size={} segment_size={}",
+            kmer, best.0, best.1, best.2, best.3, segment_len);
+    }
+
+    (best.0, best.1, best.2)
+}
+
 /// Worker thread that pulls from queue and compresses
 fn worker_thread(
     worker_id: usize,
@@ -829,8 +945,41 @@ fn worker_thread(
                         }
                         (segment.back_kmer, segment.front_kmer, true)
                     }
+                } else if segment.front_kmer != MISSING_KMER {
+                    // Case 3a: Only front k-mer present
+                    // (matches C++ AGC lines 1341-1361: find_cand_segment_with_one_splitter)
+                    let (found_front, found_back, found_rc) = find_group_with_one_kmer(
+                        segment.front_kmer,
+                        segment.front_kmer_is_dir,
+                        segment.data.len(),
+                        &map_segments_terminators,
+                        &map_segments,
+                        &segment_groups,
+                        &config,
+                    );
+                    eprintln!("RAGC_CASE3A: sample={} front_only={} is_dir={} -> key=({},{}) store_rc={}",
+                        task.sample_name, segment.front_kmer, segment.front_kmer_is_dir, found_front, found_back, found_rc);
+                    (found_front, found_back, found_rc)
+                } else if segment.back_kmer != MISSING_KMER {
+                    // Case 3b: Only back k-mer present
+                    // (matches C++ AGC lines 1363-1385: find_cand_segment_with_one_splitter)
+                    // C++ AGC does swap_dir_rc() (line 1369) which INVERTS the orientation
+                    // So we pass !is_dir to find_group_with_one_kmer
+                    let (found_front, found_back, found_rc) = find_group_with_one_kmer(
+                        segment.back_kmer,  // Use canonical k-mer directly
+                        !segment.back_kmer_is_dir,  // INVERT orientation to match swap_dir_rc()
+                        segment.data.len(),
+                        &map_segments_terminators,
+                        &map_segments,
+                        &segment_groups,
+                        &config,
+                    );
+                    eprintln!("RAGC_CASE3B: sample={} back_only={} is_dir={} swapped_is_dir={} -> key=({},{}) store_rc={}",
+                        task.sample_name, segment.back_kmer, segment.back_kmer_is_dir, !segment.back_kmer_is_dir, found_front, found_back, !found_rc);
+                    // Invert the RC flag (matches C++ AGC line 1374: store_rc = !store_dir)
+                    (found_front, found_back, !found_rc)
                 } else {
-                    // At least one k-mer is MISSING - use as-is (Cases 1, 3, 4)
+                    // Case 1 or 4: Both MISSING - use as-is
                     (segment.front_kmer, segment.back_kmer, false)
                 };
 
