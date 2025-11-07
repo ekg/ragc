@@ -79,10 +79,18 @@ pub fn split_at_splitters_with_size(
     k: usize,
     _min_segment_size: usize,
 ) -> Vec<Segment> {
+    let debug = std::env::var("RAGC_DEBUG_SEGMENT_COVERAGE").is_ok();
+    if debug {
+        eprintln!("\n=== SEGMENTATION START: contig_len={} k={} ===", contig.len(), k);
+    }
+
     let mut segments = Vec::new();
 
     if contig.len() < k {
         // Contig too short for k-mers, return as single segment
+        if debug {
+            eprintln!("Contig too short for k-mers, returning as single segment");
+        }
         return vec![Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false)];
     }
 
@@ -129,18 +137,35 @@ pub fn split_at_splitters_with_size(
                             (front_kmer, kmer_value, front_kmer_is_dir, is_dir)
                         };
                         // Note: Contig name is logged at call site, this is just position info
-                        eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={}",
-                            pos, kmer_value, segment_start, segment_end, segment_data.len(),
-                            if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
-                            if seg_back == MISSING_KMER { "MISSING".to_string() } else { seg_back.to_string() });
+                        if debug {
+                            eprintln!("  MAIN_LOOP_SPLIT: segment=[{}..{}) len={}", segment_start, segment_end, segment_data.len());
+                        }
+                        if std::env::var("RAGC_DEBUG_OVERLAP").is_ok() {
+                            let first_5: Vec<u8> = segment_data.iter().take(5).copied().collect();
+                            let last_5: Vec<u8> = segment_data.iter().rev().take(5).rev().copied().collect();
+                            eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={} first_5={:?} last_5={:?}",
+                                pos, kmer_value, segment_start, segment_end, segment_data.len(),
+                                if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
+                                if seg_back == MISSING_KMER { "MISSING".to_string() } else { seg_back.to_string() },
+                                first_5, last_5);
+                        } else {
+                            eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={}",
+                                pos, kmer_value, segment_start, segment_end, segment_data.len(),
+                                if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
+                                if seg_back == MISSING_KMER { "MISSING".to_string() } else { seg_back.to_string() });
+                        }
                         segments.push(Segment::new(segment_data, seg_front, seg_back, seg_front_is_dir, seg_back_is_dir));
                     }
 
                     // Reset for next segment
-                    // CRITICAL: Create k-base overlap so decompressor can skip first k bases
-                    // The k-mer ends at position pos, occupies [pos-k+1, pos]
-                    // Next segment should start at pos-k+1 to create k-base overlap
-                    segment_start = (pos + 1).saturating_sub(k);
+                    // CRITICAL: Create (k-1)-byte overlap to match C++ AGC behavior
+                    // C++ AGC does: start_pos += part.size() - (kmer_length - 1)
+                    // which creates (k-1) byte overlap, NOT k bytes!
+                    let new_start = (pos + 1).saturating_sub(k - 1);
+                    if debug {
+                        eprintln!("  Setting segment_start: {} -> {} (overlap of {} bytes)", segment_start, new_start, (pos + 1) - new_start);
+                    }
+                    segment_start = new_start;
                     front_kmer = kmer_value;
                     front_kmer_is_dir = is_dir;
                     recent_kmers.clear();
@@ -153,10 +178,18 @@ pub fn split_at_splitters_with_size(
     // At end of contig, look backward through recent k-mers to find rightmost splitter
     // CRITICAL: Only split if the remaining data after the splitter will be >= k bytes
     // This ensures C++ AGC can skip k overlap bytes without hitting corruption
+    if debug {
+        eprintln!("\n=== END-OF-CONTIG HANDLING ===");
+        eprintln!("  segment_start={}, contig.len()={}, recent_kmers.len()={}", segment_start, contig.len(), recent_kmers.len());
+    }
     for (pos, kmer_value, is_dir) in recent_kmers.iter().rev() {
         if splitters.contains(kmer_value) {
             let segment_end = pos + 1;
             let remaining_after = contig.len() - segment_end;
+
+            if debug {
+                eprintln!("  Found splitter at pos={}, remaining_after={}", pos, remaining_after);
+            }
 
             // Only split here if remaining data is > k bytes
             // (We need > k, not >= k, because after creating k-base overlap,
@@ -165,9 +198,16 @@ pub fn split_at_splitters_with_size(
                 if segment_end > segment_start {
                     let segment_data = contig[segment_start..segment_end].to_vec();
                     if !segment_data.is_empty() {
+                        if debug {
+                            eprintln!("  END_SPLIT: segment=[{}..{}) len={}, remaining={}", segment_start, segment_end, segment_data.len(), remaining_after);
+                        }
                         segments.push(Segment::new(segment_data, front_kmer, *kmer_value, front_kmer_is_dir, *is_dir));
-                        // Create k-base overlap for next segment
-                        segment_start = (pos + 1).saturating_sub(k);
+                        // Create (k-1)-byte overlap for next segment (matching C++ AGC)
+                        let new_start = (pos + 1).saturating_sub(k - 1);
+                        if debug {
+                            eprintln!("  Setting segment_start: {} -> {}", segment_start, new_start);
+                        }
+                        segment_start = new_start;
                         front_kmer = *kmer_value;
                         front_kmer_is_dir = *is_dir;
                     }
@@ -179,12 +219,19 @@ pub fn split_at_splitters_with_size(
                 if segment_end > segment_start {
                     let segment_data = contig[segment_start..segment_end].to_vec();
                     if !segment_data.is_empty() {
+                        if debug {
+                            eprintln!("  END_EXACT: segment=[{}..{}) len={}", segment_start, segment_end, segment_data.len());
+                        }
                         segments.push(Segment::new(segment_data, front_kmer, *kmer_value, front_kmer_is_dir, *is_dir));
                         // Mark that we've consumed the entire contig
                         segment_start = contig.len();
                     }
                 }
                 break;
+            } else {
+                if debug {
+                    eprintln!("  SKIP: remaining_after={} <= k={}, continuing backward search", remaining_after, k);
+                }
             }
             // Otherwise, continue looking for an earlier splitter that leaves enough room
         }
@@ -194,6 +241,10 @@ pub fn split_at_splitters_with_size(
     // This will either be:
     // - The entire remainder if no suitable splitter was found, OR
     // - A segment >= k bytes if we split at a splitter that left enough room
+    if debug {
+        eprintln!("\n=== FINAL SEGMENT ===");
+        eprintln!("  segment_start={}, contig.len()={}", segment_start, contig.len());
+    }
     if segment_start < contig.len() {
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
@@ -205,6 +256,9 @@ pub fn split_at_splitters_with_size(
                 // Front k-mer present, back is MISSING (end of contig)
                 (front_kmer, MISSING_KMER)
             };
+            if debug {
+                eprintln!("  FINAL: segment=[{}..{}) len={}", segment_start, contig.len(), segment_data.len());
+            }
             eprintln!("RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back={}",
                 segment_start, contig.len(), segment_data.len(),
                 if final_front == MISSING_KMER { "MISSING".to_string() } else { final_front.to_string() },
@@ -216,8 +270,45 @@ pub fn split_at_splitters_with_size(
 
     // If no segments were created, return entire contig as one segment
     if segments.is_empty() {
+        if debug {
+            eprintln!("  NO_SPLIT: Returning entire contig as single segment");
+        }
         eprintln!("RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING", contig.len());
         segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false));
+    }
+
+    // Summary
+    if debug {
+        eprintln!("\n=== SEGMENTATION SUMMARY ===");
+        eprintln!("  Original contig length: {}", contig.len());
+        eprintln!("  Number of segments: {}", segments.len());
+        let total_segment_bytes: usize = segments.iter().map(|s| s.len()).sum();
+        eprintln!("  Total segment bytes: {}", total_segment_bytes);
+
+        // Calculate expected reconstructed size
+        let expected_size = if segments.is_empty() {
+            0
+        } else if segments.len() == 1 {
+            segments[0].len()
+        } else {
+            // First segment contributes all bytes, subsequent segments skip (k-1) overlap
+            segments[0].len() + segments[1..].iter().map(|s| s.len().saturating_sub(k - 1)).sum::<usize>()
+        };
+        eprintln!("  Expected reconstructed size: {} (with {} overlaps of {} bytes)",
+                  expected_size, segments.len().saturating_sub(1), k - 1);
+
+        if expected_size != contig.len() {
+            eprintln!("  ⚠️  SIZE MISMATCH: Expected {} but contig is {} (diff: {})",
+                      expected_size, contig.len(), contig.len() as i64 - expected_size as i64);
+        } else {
+            eprintln!("  ✓ Size matches!");
+        }
+
+        // Show segment ranges to identify gaps
+        eprintln!("\n  Segment coverage:");
+        for (i, seg) in segments.iter().enumerate() {
+            eprintln!("    Segment {}: len={}", i, seg.len());
+        }
     }
 
     segments

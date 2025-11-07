@@ -215,7 +215,7 @@ pub fn determine_splitters_streaming(
             // CRITICAL: Only process FIRST sample (matching C++ AGC)
             // C++ AGC's determine_splitters() only processes the reference file
             if !sequence.is_empty() && sample_name == reference_sample {
-                let used = find_actual_splitters_in_contig(&sequence, &candidates, k, segment_size);
+                let used = find_actual_splitters_in_contig_named(&sequence, &_contig_name, &candidates, k, segment_size);
                 splitters.extend(used);
             }
         }
@@ -224,6 +224,69 @@ pub fn determine_splitters_streaming(
     eprintln!("DEBUG: {} actually-used splitters", splitters.len());
 
     Ok((splitters, candidates, duplicates))
+}
+
+/// Find which candidate k-mers are actually used as splitters in a contig (with name for debugging)
+fn find_actual_splitters_in_contig_named(
+    contig: &Contig,
+    contig_name: &str,
+    candidates: &HashSet<u64>,
+    k: usize,
+    segment_size: usize,
+) -> Vec<u64> {
+    use crate::kmer::{Kmer, KmerMode};
+
+    let mut used_splitters = Vec::new();
+    let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
+    let mut current_len = segment_size; // Start ready to split
+    let mut recent_kmers = Vec::new();
+    let mut pos = 0usize;
+
+    for &base in contig {
+        let current_pos = pos;
+        if base > 3 {
+            kmer.reset();
+            recent_kmers.clear();
+        } else {
+            kmer.insert(base as u64);
+
+            if kmer.is_full() {
+                let kmer_value = kmer.data();
+                recent_kmers.push(kmer_value);
+
+                // DEBUG: Log specific k-mers we're investigating
+                if kmer_value == 4991190226639519744 || kmer_value == 1518275220618608640 {
+                    eprintln!("DEBUG_RAGC_FOUND_KMER: contig={} pos={} kmer={} current_len={} is_candidate={} will_mark={}",
+                              contig_name, current_pos, kmer_value, current_len,
+                              candidates.contains(&kmer_value),
+                              current_len >= segment_size && candidates.contains(&kmer_value));
+                }
+
+                if current_len >= segment_size && candidates.contains(&kmer_value) {
+                    // This candidate is actually used!
+                    eprintln!("DEBUG_RAGC_SPLITTER_USED: contig={} pos={} kmer={} current_len={}", contig_name, current_pos, kmer_value, current_len);
+                    used_splitters.push(kmer_value);
+                    current_len = 0;
+                    kmer.reset();
+                    recent_kmers.clear();
+                }
+            }
+        }
+
+        current_len += 1;
+        pos += 1;
+    }
+
+    // Try to add rightmost candidate k-mer
+    for &kmer_value in recent_kmers.iter().rev() {
+        if candidates.contains(&kmer_value) {
+            eprintln!("DEBUG_RAGC_SPLITTER_USED_RIGHTMOST: contig={} kmer={}", contig_name, kmer_value);
+            used_splitters.push(kmer_value);
+            break;
+        }
+    }
+
+    used_splitters
 }
 
 /// Find which candidate k-mers are actually used as splitters in a contig
@@ -254,6 +317,14 @@ fn find_actual_splitters_in_contig(
             if kmer.is_full() {
                 let kmer_value = kmer.data();
                 recent_kmers.push(kmer_value);
+
+                // DEBUG: Log the specific k-mer we're looking for
+                if kmer_value == 4991190226639519744 {
+                    eprintln!("DEBUG_RAGC_FOUND_KMER: pos={} kmer={} current_len={} is_candidate={} will_mark={}",
+                              current_pos, kmer_value, current_len,
+                              candidates.contains(&kmer_value),
+                              current_len >= segment_size && candidates.contains(&kmer_value));
+                }
 
                 if current_len >= segment_size && candidates.contains(&kmer_value) {
                     // This candidate is actually used!

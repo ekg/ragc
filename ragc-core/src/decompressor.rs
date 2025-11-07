@@ -316,6 +316,11 @@ impl Decompressor {
     /// Reconstruct a contig from its segment descriptors
     fn reconstruct_contig(&mut self, segments: &[SegmentDesc]) -> Result<Contig> {
         let mut contig = Contig::new();
+        let should_debug = std::env::var("RAGC_DEBUG_RECONSTRUCT").is_ok() && segments.len() > 1;
+
+        if should_debug {
+            eprintln!("DEBUG_RECONSTRUCT: {} segments, k={}", segments.len(), self.kmer_length);
+        }
 
         for (i, segment_desc) in segments.iter().enumerate() {
             let mut segment_data = self.get_segment(segment_desc)?;
@@ -327,24 +332,39 @@ impl Decompressor {
 
             if i == 0 {
                 // First segment: add completely
+                if should_debug {
+                    let last_k: Vec<u8> = segment_data.iter().rev().take(self.kmer_length as usize).rev().copied().collect();
+                    eprintln!("  Seg {}: len={} (added fully), last_{}_bytes={:?}, contig_len={}", i, segment_data.len(), self.kmer_length, last_k, contig.len() + segment_data.len());
+                }
                 contig.extend_from_slice(&segment_data);
             } else {
-                // Subsequent segments: skip first kmer_length bases (overlap with previous segment)
-                if segment_data.len() < self.kmer_length as usize {
+                // Subsequent segments: skip first (kmer_length-1) bases (overlap with previous segment)
+                // C++ AGC creates (k-1) byte overlap, not k bytes!
+                let overlap = (self.kmer_length - 1) as usize;
+                if segment_data.len() < overlap {
                     eprintln!(
-                        "ERROR: Segment {} too short! Length={}, kmer_length={}",
+                        "ERROR: Segment {} too short! Length={}, overlap={}",
                         i,
                         segment_data.len(),
-                        self.kmer_length
+                        overlap
                     );
                     eprintln!(
                         "  Segment desc: group_id={}, in_group_id={}, raw_length={}",
                         segment_desc.group_id, segment_desc.in_group_id, segment_desc.raw_length
                     );
-                    anyhow::bail!("Corrupted archive: segment too short (segment {}, got {} bytes, need at least {} bytes)", i, segment_data.len(), self.kmer_length);
+                    anyhow::bail!("Corrupted archive: segment too short (segment {}, got {} bytes, need at least {} bytes)", i, segment_data.len(), overlap);
                 }
-                contig.extend_from_slice(&segment_data[self.kmer_length as usize..]);
+                let added = segment_data.len() - overlap;
+                let first_k: Vec<u8> = segment_data.iter().take(overlap).copied().collect();
+                if should_debug {
+                    eprintln!("  Seg {}: len={} (skip {}), first_{}_bytes={:?}, added={}, contig_len={}", i, segment_data.len(), overlap, overlap, first_k, added, contig.len() + added);
+                }
+                contig.extend_from_slice(&segment_data[overlap..]);
             }
+        }
+
+        if should_debug {
+            eprintln!("  Final contig length: {}", contig.len());
         }
 
         Ok(contig)
