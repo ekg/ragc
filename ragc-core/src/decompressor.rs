@@ -246,14 +246,19 @@ impl Decompressor {
 
     /// Extract all contigs from a sample
     pub fn get_sample(&mut self, sample_name: &str) -> Result<Vec<(String, Contig)>> {
-        // Load contig batch if needed (either None or Some(0))
+        // Load ALL contig batches if needed (FIX: was only loading batch 0)
         if self
             .collection
             .get_no_contigs(sample_name)
             .is_none_or(|count| count == 0)
         {
-            let _num_samples = self.collection.get_no_samples();
-            self.collection.load_contig_batch(&mut self.archive, 0)?;
+            // Get number of contig batches from the archive
+            let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
+
+            // Load ALL contig batches, not just batch 0
+            for batch_id in 0..num_batches {
+                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+            }
         }
 
         let sample_desc = self

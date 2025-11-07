@@ -445,6 +445,14 @@ impl CollectionV3 {
             .map(|&id| self.sample_desc[id].contigs.len())
     }
 
+    /// Get number of contig batches from archive
+    pub fn get_no_contig_batches(&self, archive: &Archive) -> Result<usize> {
+        let contig_stream_id = self
+            .collection_contigs_id
+            .context("collection-contigs stream not found")?;
+        Ok(archive.get_num_parts(contig_stream_id))
+    }
+
     /// Get contig list for a sample
     pub fn get_contig_list(&self, sample_name: &str) -> Option<Vec<String>> {
         self.sample_ids.get(sample_name).map(|&id| {

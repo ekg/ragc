@@ -3,7 +3,7 @@
 
 use crate::lz_diff::LZDiff;
 use crate::memory_bounded_queue::MemoryBoundedQueue;
-use crate::segment::split_at_splitters_with_size;
+use crate::segment::{split_at_splitters_with_size, MISSING_KMER};
 use crate::splitters::determine_splitters;
 use anyhow::{Context, Result};
 use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
@@ -1016,57 +1016,72 @@ fn worker_thread(
                 // Phase 2: Check if we should attempt splitting this segment
                 // (matches C++ AGC agc_compressor.cpp lines 1387-1503)
                 if !key_exists && key_front != MISSING_KMER && key_back != MISSING_KMER {
-                    // Check if both terminators exist in other segments
-                    let can_attempt_split = {
+                    // CRITICAL: First attempt to find middle splitter
+                    let middle_kmer_opt = {
                         let terminators = map_segments_terminators.lock().unwrap();
-                        terminators.contains_key(&key_front) && terminators.contains_key(&key_back)
+                        find_middle_splitter(key_front, key_back, &terminators)
                     };
 
-                    if can_attempt_split {
-                        // Attempt to split the segment
-                        // IMPORTANT: Pass ORIGINAL segment data, not the RC'd version!
-                        // C++ AGC passes both segment and segment_rc to the split function
-                        let split_result = {
-                            let terminators = map_segments_terminators.lock().unwrap();
-                            try_split_segment(&segment.data, key_front, key_back, &terminators, &config)
+                    if let Some(middle_kmer) = middle_kmer_opt {
+                        // Found potential middle k-mer
+                        // Now check if BOTH split groups already exist in map_segments
+                        // (This is the key difference from just checking terminators!)
+                        let left_key = if key_front <= middle_kmer {
+                            SegmentGroupKey {
+                                kmer_front: key_front,
+                                kmer_back: middle_kmer,
+                            }
+                        } else {
+                            SegmentGroupKey {
+                                kmer_front: middle_kmer,
+                                kmer_back: key_front,
+                            }
                         };
 
-                        if let Some((left_data, right_data, middle_kmer)) = split_result {
-                            // Calculate keys for the two new segments FIRST
-                            // Left: (front, middle), Right: (middle, back)
-                            // Apply same normalization as original segment
-                            let left_key = if key_front <= middle_kmer {
-                                SegmentGroupKey {
-                                    kmer_front: key_front,
-                                    kmer_back: middle_kmer,
-                                }
-                            } else {
-                                SegmentGroupKey {
-                                    kmer_front: middle_kmer,
-                                    kmer_back: key_front,
-                                }
-                            };
+                        let right_key = if middle_kmer <= key_back {
+                            SegmentGroupKey {
+                                kmer_front: middle_kmer,
+                                kmer_back: key_back,
+                            }
+                        } else {
+                            SegmentGroupKey {
+                                kmer_front: key_back,
+                                kmer_back: middle_kmer,
+                            }
+                        };
 
-                            let right_key = if middle_kmer <= key_back {
-                                SegmentGroupKey {
-                                    kmer_front: middle_kmer,
-                                    kmer_back: key_back,
-                                }
-                            } else {
-                                SegmentGroupKey {
-                                    kmer_front: key_back,
-                                    kmer_back: middle_kmer,
-                                }
-                            };
+                        // CRITICAL: Only split if BOTH groups already exist in the global registry
+                        // (matches C++ AGC behavior - don't split if either group is missing)
+                        let both_groups_exist = {
+                            let map = map_segments.lock().unwrap();
+                            let left_exists = map.contains_key(&left_key);
+                            let right_exists = map.contains_key(&right_key);
 
-                            // CRITICAL: Only use the split if BOTH groups already exist in the global registry
-                            // (matches C++ AGC behavior - don't split if either group is missing)
-                            let both_groups_exist = {
-                                let map = map_segments.lock().unwrap();
-                                map.contains_key(&left_key) && map.contains_key(&right_key)
-                            };
+                            if config.verbosity > 1 {
+                                eprintln!(
+                                    "SPLIT_CHECK: original=({},{}) middle={} left_exists={} right_exists={}",
+                                    key_front, key_back, middle_kmer, left_exists, right_exists
+                                );
+                            }
 
-                            if both_groups_exist {
+                            left_exists && right_exists
+                        };
+
+                        if both_groups_exist {
+                            // Both split groups exist - attempt split using compression cost
+                            // (matches C++ AGC agc_compressor.cpp lines 1387-1503)
+                            let split_result = try_split_segment_with_cost(
+                                &segment.data,
+                                key_front,
+                                key_back,
+                                middle_kmer,
+                                &left_key,
+                                &right_key,
+                                &groups,
+                                &config,
+                            );
+
+                            if let Some((left_data, right_data, _mid)) = split_result {
                                 if config.verbosity > 1 {
                                     eprintln!(
                                         "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
@@ -1077,49 +1092,50 @@ fn worker_thread(
 
                                 // Add left segment to its group
                                 if let Some(left_buffer) = groups.get_mut(&left_key) {
-                                let left_buffered = BufferedSegment {
-                                    sample_name: task.sample_name.clone(),
-                                    contig_name: task.contig_name.clone(),
-                                    seg_part_no: place,
-                                    data: left_data,
-                                    is_rev_comp: should_reverse, // Inherit RC status from original
-                                };
-                                left_buffer.segments.push(left_buffered);
+                                    let left_buffered = BufferedSegment {
+                                        sample_name: task.sample_name.clone(),
+                                        contig_name: task.contig_name.clone(),
+                                        seg_part_no: place,
+                                        data: left_data,
+                                        is_rev_comp: should_reverse, // Inherit RC status from original
+                                    };
+                                    left_buffer.segments.push(left_buffered);
 
-                                if left_buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                                    flush_pack(left_buffer, &collection, &archive, &config)
-                                        .context("Failed to flush left pack")?;
+                                    if left_buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                                        flush_pack(left_buffer, &collection, &archive, &config)
+                                            .context("Failed to flush left pack")?;
+                                    }
                                 }
-                            }
 
-                            // Add right segment to its group (should already exist)
-                            if let Some(right_buffer) = groups.get_mut(&right_key) {
-                                let right_buffered = BufferedSegment {
-                                    sample_name: task.sample_name.clone(),
-                                    contig_name: task.contig_name.clone(),
-                                    seg_part_no: place,
-                                    data: right_data,
-                                    is_rev_comp: should_reverse, // Inherit RC status from original
-                                };
-                                right_buffer.segments.push(right_buffered);
+                                // Add right segment to its group (should already exist)
+                                if let Some(right_buffer) = groups.get_mut(&right_key) {
+                                    let right_buffered = BufferedSegment {
+                                        sample_name: task.sample_name.clone(),
+                                        contig_name: task.contig_name.clone(),
+                                        seg_part_no: place,
+                                        data: right_data,
+                                        is_rev_comp: should_reverse, // Inherit RC status from original
+                                    };
+                                    right_buffer.segments.push(right_buffered);
 
-                                if right_buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                                    flush_pack(right_buffer, &collection, &archive, &config)
-                                        .context("Failed to flush right pack")?;
+                                    if right_buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                                        flush_pack(right_buffer, &collection, &archive, &config)
+                                            .context("Failed to flush right pack")?;
+                                    }
                                 }
-                            }
 
                                 // Skip adding original segment - we've already added the split parts
                                 continue;
-                            } else {
-                                // One or both split groups don't exist yet
-                                // Fall through to normal path to create group for unsplit segment
-                                if config.verbosity > 1 {
-                                    eprintln!(
-                                        "SPLIT_SKIPPED: original=({},{}) middle={} - split groups don't both exist yet",
-                                        key_front, key_back, middle_kmer
-                                    );
-                                }
+                            }
+                            // If split_result was None, fall through to normal path
+                        } else {
+                            // One or both split groups don't exist yet
+                            // Fall through to normal path to create group for unsplit segment
+                            if config.verbosity > 1 {
+                                eprintln!(
+                                    "SPLIT_SKIPPED: original=({},{}) middle={} - split groups don't both exist yet",
+                                    key_front, key_back, middle_kmer
+                                );
                             }
                         }
                     }
@@ -1237,11 +1253,13 @@ fn find_middle_splitter(
     // Both vectors are kept sorted by Phase 1
     let mut i = 0;
     let mut j = 0;
+    let mut shared_kmers = Vec::new();
 
     while i < front_connections.len() && j < back_connections.len() {
         if front_connections[i] == back_connections[j] {
-            // Found shared k-mer - return it (C++ AGC uses first match)
-            return Some(front_connections[i]);
+            shared_kmers.push(front_connections[i]);
+            i += 1;
+            j += 1;
         } else if front_connections[i] < back_connections[j] {
             i += 1;
         } else {
@@ -1249,7 +1267,31 @@ fn find_middle_splitter(
         }
     }
 
-    None // No shared k-mer found
+    // Filter out MISSING_KMER (matches C++ AGC removing ~0ull)
+    shared_kmers.retain(|&k| k != MISSING_KMER);
+
+    // Debug: log shared k-mers for problematic segment
+    if front_kmer == 1069640192651952128 && back_kmer == 6115888448806060032 {
+        eprintln!("DEBUG_SHARED: front={} back={} shared_count={}",
+                  front_kmer, back_kmer, shared_kmers.len());
+        eprintln!("  front_connections={} back_connections={}",
+                  front_connections.len(), back_connections.len());
+        eprint!("  front[0-4]: ");
+        for k in front_connections.iter().take(5) {
+            eprint!("{} ", k);
+        }
+        eprintln!();
+        eprint!("  back[0-4]: ");
+        for k in back_connections.iter().take(5) {
+            eprint!("{} ", k);
+        }
+        eprintln!();
+        for (idx, k) in shared_kmers.iter().take(5).enumerate() {
+            eprintln!("  shared[{}] = {}", idx, k);
+        }
+    }
+
+    shared_kmers.first().copied()
 }
 
 /// Phase 4: Find split position using simplified heuristic
@@ -1289,19 +1331,20 @@ fn split_segment_at_position(
     (left, right)
 }
 
-/// Phase 6: Attempt to split a segment by finding a middle k-mer
-/// Returns Some((left_data, right_data, middle_kmer)) if successful
-/// (orchestrates C++ AGC agc_compressor.cpp lines 1387-1503)
-fn try_split_segment(
-    segment_data: &[u8],
+/// Phase 6: Attempt to split using compression cost heuristic (EXACT C++ AGC algorithm)
+/// Matches agc_compressor.cpp lines 1387-1503 and 1531-1663
+/// Returns Some((left_data, right_data, middle_kmer)) if split is beneficial
+/// Returns None if split would be degenerate (creates segments too small)
+fn try_split_segment_with_cost(
+    segment_data: &Contig,
     front_kmer: u64,
     back_kmer: u64,
-    terminators: &HashMap<u64, Vec<u64>>,
+    middle_kmer: u64,
+    left_key: &SegmentGroupKey,
+    right_key: &SegmentGroupKey,
+    groups: &BTreeMap<SegmentGroupKey, SegmentGroupBuffer>,
     config: &StreamingQueueConfig,
 ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
-    // Find middle k-mer that connects front and back
-    let middle_kmer = find_middle_splitter(front_kmer, back_kmer, terminators)?;
-
     if config.verbosity > 1 {
         eprintln!(
             "SPLIT_ATTEMPT: front={} back={} middle={}",
@@ -1309,28 +1352,137 @@ fn try_split_segment(
         );
     }
 
-    // Find split position (simplified: use midpoint instead of compression cost)
-    let split_pos = match find_split_position(segment_data, middle_kmer, segment_data.len(), config.k) {
-        Some(pos) => pos,
-        None => {
+    // Get left and right group buffers
+    let left_buffer = groups.get(left_key)?;
+    let right_buffer = groups.get(right_key)?;
+
+    // Check if both groups have LZDiff prepared (need reference written)
+    // Matches C++ AGC segment.cpp:101-116 (get_coding_cost checks ref_size == 0)
+    let (left_lz, right_lz) = match (&left_buffer.lz_diff, &right_buffer.lz_diff) {
+        (Some(left), Some(right)) => (left, right),
+        _ => {
+            // No reference yet, can't calculate compression cost
+            // Fall back to midpoint heuristic (not perfect, but better than not splitting)
+            if config.verbosity > 1 {
+                eprintln!("SPLIT_FALLBACK: using midpoint (LZDiff not ready)");
+            }
+
+            let k = config.k;
+            let segment_len = segment_data.len();
+
+            // Use midpoint
+            let best_pos = segment_len / 2;
+
+            // Validate split position creates valid segments
+            // Left segment will be [0..best_pos+k], right will be [best_pos+k/2..]
+            let left_size = best_pos + k;
+            let right_size = segment_len.saturating_sub(best_pos + k / 2);
+
+            // Both segments must be at least k+1 bytes
+            if left_size < k + 1 || right_size < k + 1 || left_size > segment_len {
+                if config.verbosity > 1 {
+                    eprintln!(
+                        "SPLIT_SKIP: midpoint fallback would create invalid segments (left={}, right={}, need at least {})",
+                        left_size, right_size, k + 1
+                    );
+                }
+                return None;
+            }
+
+            let (left_data, right_data) = split_segment_at_position(segment_data.as_slice(), best_pos, k);
+
             if config.verbosity > 1 {
                 eprintln!(
-                    "SPLIT_FAILED: middle k-mer {} not found in segment (len={})",
-                    middle_kmer,
-                    segment_data.len()
+                    "SPLIT_SUCCESS: midpoint_fallback pos={} left_len={} right_len={}",
+                    best_pos, left_data.len(), right_data.len()
                 );
             }
-            return None;
+
+            return Some((left_data, right_data, middle_kmer));
         }
     };
 
-    // Split into two segments with overlap
-    let (left_data, right_data) = split_segment_at_position(segment_data, split_pos, config.k);
+    // Calculate compression costs for both split groups
+    // Matches C++ AGC agc_compressor.cpp:1598-1635
+    let v_costs1 = left_lz.get_coding_cost_vector(segment_data, true); // prefix_costs=true
+    let v_costs2 = right_lz.get_coding_cost_vector(segment_data, false); // prefix_costs=false (suffix)
+
+    if v_costs1.is_empty() || v_costs2.is_empty() {
+        if config.verbosity > 1 {
+            eprintln!("SPLIT_SKIP: cost vectors empty");
+        }
+        return None;
+    }
+
+    if v_costs1.len() != v_costs2.len() {
+        if config.verbosity > 1 {
+            eprintln!("SPLIT_SKIP: cost vector length mismatch");
+        }
+        return None;
+    }
+
+    // Find position with minimum combined cost
+    // Matches C++ AGC agc_compressor.cpp:1663-1674
+    let mut best_sum = u32::MAX;
+    let mut best_pos = 0usize;
+
+    for i in 0..v_costs1.len() {
+        let cs = v_costs1[i].saturating_add(v_costs2[i]);
+        if cs < best_sum {
+            best_sum = cs;
+            best_pos = i;
+        }
+    }
+
+    // Apply degenerate position rules (C++ AGC agc_compressor.cpp:1676-1679)
+    // If split would create segments too small, force to 0 or full size
+    let k = config.k;
+    if best_pos < k + 1 {
+        best_pos = 0; // Too close to start
+    }
+    if best_pos + k + 1 > v_costs1.len() {
+        best_pos = v_costs1.len(); // Too close to end
+    }
+
+    // Check if split is degenerate (C++ AGC agc_compressor.cpp:1442-1459)
+    // After adjustment, check if we're at the extremes (no split)
+    if best_pos == 0 || best_pos >= segment_data.len() {
+        // Degenerate split - position at or beyond segment boundaries
+        if config.verbosity > 1 {
+            eprintln!(
+                "SPLIT_DEGENERATE: best_pos={} at boundary (segment len={}) - NOT splitting",
+                best_pos, segment_data.len()
+            );
+        }
+        return None;
+    }
+
+    // Calculate the ACTUAL sizes after splitting with k-mer overlap
+    // Left segment will be [0..best_pos+k], right will be [best_pos+k/2..]
+    let left_size = best_pos + k;
+    let right_size = segment_data.len().saturating_sub(best_pos + k / 2);
+
+    // Both segments must be at least k+1 bytes to extract k-mers
+    // Also check left doesn't exceed segment bounds
+    if left_size < k + 1 || right_size < k + 1 || left_size > segment_data.len() {
+        // Degenerate split - segments too small or out of bounds
+        if config.verbosity > 1 {
+            eprintln!(
+                "SPLIT_DEGENERATE: best_pos={} left_size={} right_size={} (need {}-{}) - NOT splitting",
+                best_pos, left_size, right_size, k + 1, segment_data.len()
+            );
+        }
+        return None;
+    }
+
+    // Split at best position
+    let (left_data, right_data) = split_segment_at_position(segment_data.as_slice(), best_pos, k);
 
     if config.verbosity > 1 {
         eprintln!(
-            "SPLIT_SUCCESS: split_pos={} left_len={} right_len={}",
-            split_pos,
+            "SPLIT_SUCCESS: best_pos={} cost={} left_len={} right_len={}",
+            best_pos,
+            best_sum,
             left_data.len(),
             right_data.len()
         );
