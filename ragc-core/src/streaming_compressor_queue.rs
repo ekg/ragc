@@ -808,7 +808,7 @@ fn worker_thread(
 
             let (key_front, key_back, should_reverse) =
                 if segment.front_kmer != MISSING_KMER && segment.back_kmer != MISSING_KMER {
-                    // Both k-mers present - normalize by ensuring front <= back
+                    // Case 2: Both k-mers present - normalize by ensuring front <= back
                     if segment.front_kmer <= segment.back_kmer {
                         // Already normalized - keep original orientation
                         if config.verbosity > 2 {
@@ -829,8 +829,56 @@ fn worker_thread(
                         }
                         (segment.back_kmer, segment.front_kmer, true)
                     }
+                } else if segment.front_kmer != MISSING_KMER {
+                    // Case 3a: Only front k-mer present - try to find existing group with this k-mer
+                    // (matches C++ AGC lines 1341-1361: find_cand_segment_with_one_splitter)
+                    let existing_key = {
+                        let groups = segment_groups.lock().unwrap();
+                        groups.keys().find(|k|
+                            k.kmer_front == segment.front_kmer || k.kmer_back == segment.front_kmer
+                        ).cloned()
+                    };
+
+                    if let Some(existing_key) = existing_key {
+                        // Found existing group - use its key
+                        if config.verbosity > 1 {
+                            eprintln!("RAGC_CASE3A_REUSE: front={} -> existing=({},{})",
+                                segment.front_kmer, existing_key.kmer_front, existing_key.kmer_back);
+                        }
+                        (existing_key.kmer_front, existing_key.kmer_back, false)
+                    } else {
+                        // No existing group - create new with MISSING back
+                        if config.verbosity > 1 {
+                            eprintln!("RAGC_CASE3A_NEW: front={} back=MISSING", segment.front_kmer);
+                        }
+                        (segment.front_kmer, MISSING_KMER, false)
+                    }
+                } else if segment.back_kmer != MISSING_KMER {
+                    // Case 3b: Only back k-mer present - try to find existing group with this k-mer
+                    // (matches C++ AGC lines 1363-1385: find_cand_segment_with_one_splitter)
+                    let existing_key = {
+                        let groups = segment_groups.lock().unwrap();
+                        groups.keys().find(|k|
+                            k.kmer_front == segment.back_kmer || k.kmer_back == segment.back_kmer
+                        ).cloned()
+                    };
+
+                    if let Some(existing_key) = existing_key {
+                        // Found existing group - use its key
+                        if config.verbosity > 1 {
+                            eprintln!("RAGC_CASE3B_REUSE: back={} -> existing=({},{})",
+                                segment.back_kmer, existing_key.kmer_front, existing_key.kmer_back);
+                        }
+                        (existing_key.kmer_front, existing_key.kmer_back, false)
+                    } else {
+                        // No existing group - create new with MISSING front
+                        if config.verbosity > 1 {
+                            eprintln!("RAGC_CASE3B_NEW: front=MISSING back={}", segment.back_kmer);
+                        }
+                        (MISSING_KMER, segment.back_kmer, false)
+                    }
                 } else {
-                    // At least one k-mer is MISSING - use as-is (Cases 1, 3, 4)
+                    // Case 1 or 4: Both MISSING - use as-is
                     (segment.front_kmer, segment.back_kmer, false)
                 };
 
