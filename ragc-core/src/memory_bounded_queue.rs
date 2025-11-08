@@ -1,32 +1,60 @@
-// Memory-bounded queue with backpressure
+// Memory-bounded priority queue with backpressure
 // Matches C++ AGC's CBoundedPQueue behavior
 
-use std::collections::VecDeque;
+use std::collections::BinaryHeap;
 use std::sync::{Arc, Condvar, Mutex};
 
-/// A queue bounded by total bytes (not item count)
+/// A priority queue bounded by total bytes (not item count)
 ///
 /// Key properties:
+/// - Items are ordered by their `Ord` implementation (higher priority first)
 /// - `push()` blocks when adding would exceed capacity
-/// - `pull()` blocks when queue is empty (returns None when closed)
+/// - `pull()` returns highest priority item, blocks when queue is empty (returns None when closed)
 /// - Provides automatic backpressure for constant memory usage
 ///
 /// This matches C++ AGC's CBoundedPQueue architecture.
-pub struct MemoryBoundedQueue<T> {
+pub struct MemoryBoundedQueue<T: Ord> {
     inner: Arc<Mutex<QueueInner<T>>>,
     capacity_bytes: usize,
     not_full: Arc<Condvar>,
     not_empty: Arc<Condvar>,
 }
 
-struct QueueInner<T> {
-    items: VecDeque<(T, usize)>, // (item, size_bytes)
-    current_size: usize,         // Total bytes currently in queue
-    closed: bool,                // No more pushes allowed
+// Wrapper to include size with item while ordering only by item priority
+#[derive(Debug)]
+struct PriorityItem<T: Ord> {
+    item: T,
+    size: usize,
 }
 
-impl<T> MemoryBoundedQueue<T> {
-    /// Create a new memory-bounded queue
+impl<T: Ord> Ord for PriorityItem<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.item.cmp(&other.item)
+    }
+}
+
+impl<T: Ord> PartialOrd for PriorityItem<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: Ord> PartialEq for PriorityItem<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.item == other.item
+    }
+}
+
+impl<T: Ord> Eq for PriorityItem<T> {}
+
+struct QueueInner<T: Ord> {
+    items: BinaryHeap<PriorityItem<T>>, // Max-heap ordered by item priority
+    current_size: usize,                 // Total bytes currently in queue
+    closed: bool,                        // No more pushes allowed
+}
+
+impl<T: Ord> MemoryBoundedQueue<T> {
+    /// Create a new memory-bounded priority queue
     ///
     /// # Arguments
     /// * `capacity_bytes` - Maximum total bytes allowed in queue
@@ -34,12 +62,13 @@ impl<T> MemoryBoundedQueue<T> {
     /// # Example
     /// ```
     /// use ragc_core::MemoryBoundedQueue;
-    /// let queue: MemoryBoundedQueue<Vec<u8>> = MemoryBoundedQueue::new(2 * 1024 * 1024 * 1024); // 2 GB
+    /// // Note: T must implement Ord for priority ordering
+    /// let queue: MemoryBoundedQueue<usize> = MemoryBoundedQueue::new(2 * 1024 * 1024 * 1024); // 2 GB
     /// ```
     pub fn new(capacity_bytes: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(QueueInner {
-                items: VecDeque::new(),
+                items: BinaryHeap::new(),
                 current_size: 0,
                 closed: false,
             })),
@@ -78,8 +107,8 @@ impl<T> MemoryBoundedQueue<T> {
             return Err(PushError::Closed);
         }
 
-        // Add item
-        inner.items.push_back((item, size_bytes));
+        // Add item (BinaryHeap maintains priority order)
+        inner.items.push(PriorityItem { item, size: size_bytes });
         inner.current_size += size_bytes;
 
         // Signal that queue is not empty
@@ -102,8 +131,8 @@ impl<T> MemoryBoundedQueue<T> {
             return Err(TryPushError::WouldBlock);
         }
 
-        // Add item
-        inner.items.push_back((item, size_bytes));
+        // Add item (BinaryHeap maintains priority order)
+        inner.items.push(PriorityItem { item, size: size_bytes });
         inner.current_size += size_bytes;
 
         // Signal that queue is not empty
@@ -112,17 +141,19 @@ impl<T> MemoryBoundedQueue<T> {
         Ok(())
     }
 
-    /// Pull an item from the queue
+    /// Pull highest-priority item from the queue
     ///
     /// **BLOCKS** if queue is empty.
     /// Returns `None` if queue is closed and empty.
     ///
+    /// Items are returned in priority order (highest priority first).
+    ///
     /// # Example
     /// ```no_run
     /// # use ragc_core::MemoryBoundedQueue;
-    /// # let queue: MemoryBoundedQueue<Vec<u8>> = MemoryBoundedQueue::new(1024);
+    /// # let queue: MemoryBoundedQueue<usize> = MemoryBoundedQueue::new(1024);
     /// while let Some(item) = queue.pull() {
-    ///     // process(item);
+    ///     // process highest-priority item
     /// }
     /// // Queue is closed and empty - we're done!
     /// ```
@@ -139,17 +170,17 @@ impl<T> MemoryBoundedQueue<T> {
             return None;
         }
 
-        // Remove item
-        let (item, size) = inner.items.pop_front().unwrap();
-        inner.current_size -= size;
+        // Remove highest-priority item (BinaryHeap::pop returns max element)
+        let priority_item = inner.items.pop().unwrap();
+        inner.current_size -= priority_item.size;
 
         // Signal that queue has space
         self.not_full.notify_one();
 
-        Some(item)
+        Some(priority_item.item)
     }
 
-    /// Try to pull without blocking
+    /// Try to pull highest-priority item without blocking
     ///
     /// Returns `None` if queue is empty (even if not closed).
     pub fn try_pull(&self) -> Option<T> {
@@ -159,14 +190,14 @@ impl<T> MemoryBoundedQueue<T> {
             return None;
         }
 
-        // Remove item
-        let (item, size) = inner.items.pop_front().unwrap();
-        inner.current_size -= size;
+        // Remove highest-priority item (BinaryHeap::pop returns max element)
+        let priority_item = inner.items.pop().unwrap();
+        inner.current_size -= priority_item.size;
 
         // Signal that queue has space
         self.not_full.notify_one();
 
-        Some(item)
+        Some(priority_item.item)
     }
 
     /// Close the queue
@@ -211,7 +242,7 @@ impl<T> MemoryBoundedQueue<T> {
 }
 
 // Make queue cloneable (clones share the same underlying queue)
-impl<T> Clone for MemoryBoundedQueue<T> {
+impl<T: Ord> Clone for MemoryBoundedQueue<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),

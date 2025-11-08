@@ -59,10 +59,48 @@ impl Default for StreamingQueueConfig {
 
 /// Task to be processed by workers
 /// Note: Contig is type alias for Vec<u8>, so we store the name separately
+///
+/// Priority ordering matches C++ AGC:
+/// - Higher sample_priority first (sample1 > sample2 > sample3...)
+/// - Within same sample, larger cost (contig size) first
+#[derive(Clone)]
 struct ContigTask {
     sample_name: String,
     contig_name: String,
     data: Contig, // Vec<u8>
+    sample_priority: i32, // Higher = process first (decreases for each sample)
+    cost: usize,  // Contig size in bytes
+}
+
+// Implement priority ordering for BinaryHeap (max-heap)
+// BinaryHeap pops the "greatest" element, so we want:
+// - Higher sample_priority = greater
+// - Larger cost = greater (within same sample_priority)
+impl PartialEq for ContigTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.sample_priority == other.sample_priority && self.cost == other.cost
+    }
+}
+
+impl Eq for ContigTask {}
+
+impl PartialOrd for ContigTask {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ContigTask {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // First compare by sample_priority (higher priority first)
+        match self.sample_priority.cmp(&other.sample_priority) {
+            std::cmp::Ordering::Equal => {
+                // Then by cost (larger cost first)
+                self.cost.cmp(&other.cost)
+            }
+            other_ord => other_ord,
+        }
+    }
 }
 
 /// Segment group identified by flanking k-mers (matching batch mode)
@@ -186,6 +224,11 @@ pub struct StreamingQueueCompressor {
     // Track segment splits for renumbering subsequent segments
     // Maps (sample_name, contig_name, original_place) -> number of splits inserted before this position
     split_offsets: Arc<Mutex<std::collections::HashMap<(String, String, usize), usize>>>,
+
+    // Priority assignment for interleaved processing (matches C++ AGC)
+    // Higher priority = processed first (sample1 > sample2 > sample3...)
+    sample_priorities: Arc<Mutex<std::collections::HashMap<String, i32>>>, // sample_name -> priority
+    next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
 }
 
 impl StreamingQueueCompressor {
@@ -305,6 +348,10 @@ impl StreamingQueueCompressor {
         let map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
         let split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(HashMap::new()));
 
+        // Priority tracking for interleaved processing (matches C++ AGC)
+        let sample_priorities: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
+
         // Spawn worker threads
         let mut workers = Vec::new();
         for worker_id in 0..config.num_threads {
@@ -360,6 +407,8 @@ impl StreamingQueueCompressor {
             map_segments,
             map_segments_terminators,
             split_offsets,
+            sample_priorities,
+            next_priority,
         })
     }
 
@@ -466,17 +515,34 @@ impl StreamingQueueCompressor {
             }
         }
 
-        // Calculate task size
+        // Calculate task size and cost
         let task_size = data.len();
+        let cost = data.len(); // Matches C++ AGC: cost = contig size
 
-        // Create task
+        // Get or assign priority for this sample (matches C++ AGC priority queue)
+        // Higher priority = processed first (decreases for each new sample)
+        let sample_priority = {
+            let mut priorities = self.sample_priorities.lock().unwrap();
+            *priorities.entry(sample_name.clone()).or_insert_with(|| {
+                // First time seeing this sample - assign new priority
+                let mut next_p = self.next_priority.lock().unwrap();
+                let priority = *next_p;
+                *next_p -= 1; // Decrement for next sample (C++ AGC uses --sample_priority)
+                priority
+            })
+        };
+
+        // Create task with priority information
         let task = ContigTask {
             sample_name,
             contig_name,
             data,
+            sample_priority,
+            cost,
         };
 
         // Push to queue (BLOCKS if queue is full!)
+        // Queue is now a priority queue - highest priority processed first
         self.queue
             .push(task, task_size)
             .context("Failed to push to queue")?;
