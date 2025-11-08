@@ -148,6 +148,22 @@ enum Commands {
         #[arg(short = 'g', long)]
         group_id: Option<u32>,
 
+        /// Show only single-segment groups (for debugging fragmentation)
+        #[arg(long)]
+        single_groups: bool,
+
+        /// Look up segment by sample name
+        #[arg(long)]
+        sample: Option<String>,
+
+        /// Look up segment by contig name (requires --sample)
+        #[arg(long)]
+        contig: Option<String>,
+
+        /// Look up segment by index (requires --sample and --contig)
+        #[arg(long)]
+        index: Option<usize>,
+
         /// Verbosity level (0=quiet, 1=normal, 2=verbose)
         #[arg(short = 'v', long, default_value_t = 0)]
         verbosity: u32,
@@ -263,6 +279,10 @@ fn main() -> Result<()> {
             archive,
             segments,
             group_id,
+            single_groups,
+            sample,
+            contig,
+            index,
             verbosity,
         } => {
             let config = inspect::InspectConfig {
@@ -270,6 +290,10 @@ fn main() -> Result<()> {
                 show_groups: true,
                 show_segments: segments,
                 group_id_filter: group_id,
+                sample_filter: sample,
+                contig_filter: contig,
+                segment_index: index,
+                show_single_segment_groups: single_groups,
             };
             inspect::inspect_archive(archive, config)?
         }

@@ -11,6 +11,10 @@ pub struct InspectConfig {
     pub show_groups: bool,
     pub show_segments: bool,
     pub group_id_filter: Option<u32>,
+    pub sample_filter: Option<String>,
+    pub contig_filter: Option<String>,
+    pub segment_index: Option<usize>,
+    pub show_single_segment_groups: bool,
 }
 
 impl Default for InspectConfig {
@@ -20,6 +24,10 @@ impl Default for InspectConfig {
             show_groups: true,
             show_segments: false,
             group_id_filter: None,
+            sample_filter: None,
+            contig_filter: None,
+            segment_index: None,
+            show_single_segment_groups: false,
         }
     }
 }
@@ -41,6 +49,18 @@ pub fn inspect_archive(archive_path: PathBuf, config: InspectConfig) -> Result<(
     // Show basic statistics
     let samples = decompressor.list_samples();
     println!("Samples: {}", samples.len());
+
+    // Check if this is a segment lookup query
+    if let (Some(sample), Some(contig), Some(idx)) =
+        (&config.sample_filter, &config.contig_filter, config.segment_index) {
+        lookup_segment(&mut decompressor, sample, contig, idx)?;
+        return Ok(());
+    }
+
+    if config.show_single_segment_groups {
+        show_single_segment_groups(&mut decompressor)?;
+        return Ok(());
+    }
 
     if config.show_groups {
         inspect_groups(&mut decompressor, &config)?;
@@ -113,6 +133,68 @@ fn inspect_segments(decompressor: &mut Decompressor, config: &InspectConfig) -> 
         for (i, seg) in filtered_segments.iter().enumerate() {
             println!("    [{}] group={}, in_group={}, rc={}, len={}",
                      i, seg.group_id, seg.in_group_id, seg.is_rev_comp, seg.raw_length);
+        }
+    }
+
+    Ok(())
+}
+
+/// Look up which group a specific segment ended up in
+fn lookup_segment(decompressor: &mut Decompressor, sample: &str, contig: &str, index: usize) -> Result<()> {
+    println!("\n=== Segment Lookup ===");
+    println!("Sample: {}", sample);
+    println!("Contig: {}", contig);
+    println!("Index:  {}", index);
+    println!();
+
+    let all_segments = decompressor.get_all_segments()?;
+
+    for (sample_name, contig_name, segments) in &all_segments {
+        if sample_name == sample && contig_name == contig {
+            if index < segments.len() {
+                let seg = &segments[index];
+                println!("Found segment:");
+                println!("  Group ID:    {}", seg.group_id);
+                println!("  In-group ID: {}", seg.in_group_id);
+                println!("  Rev comp:    {}", seg.is_rev_comp);
+                println!("  Length:      {}", seg.raw_length);
+                return Ok(());
+            } else {
+                println!("ERROR: Index {} out of range (contig has {} segments)", index, segments.len());
+                return Ok(());
+            }
+        }
+    }
+
+    println!("ERROR: Segment not found (check sample/contig names)");
+    Ok(())
+}
+
+/// Show all single-segment groups for comparison
+fn show_single_segment_groups(decompressor: &mut Decompressor) -> Result<()> {
+    println!("\n=== Single-Segment Groups ===");
+
+    let group_stats = decompressor.get_group_statistics()?;
+    let all_segments = decompressor.get_all_segments()?;
+
+    // Find all groups with exactly 1 segment
+    let single_groups: Vec<_> = group_stats.iter()
+        .filter(|(_, total, _, _)| *total == 1)
+        .map(|(gid, _, _, _)| *gid)
+        .collect();
+
+    println!("Total single-segment groups: {}", single_groups.len());
+    println!();
+
+    for group_id in &single_groups {
+        // Find the segment in this group
+        for (sample_name, contig_name, segments) in &all_segments {
+            for (idx, seg) in segments.iter().enumerate() {
+                if seg.group_id == *group_id {
+                    println!("Group {}: {}/{} segment[{}] len={} rc={}",
+                             group_id, sample_name, contig_name, idx, seg.raw_length, seg.is_rev_comp);
+                }
+            }
         }
     }
 

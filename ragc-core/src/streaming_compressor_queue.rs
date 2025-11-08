@@ -1196,11 +1196,29 @@ fn worker_thread(
             {
                 let mut groups = segment_groups.lock().unwrap();
 
-                // Check if this key already exists in GLOBAL registry (NOT local groups!)
-                // (matches C++ AGC: p == map_segments.end() check at line 1382)
-                let key_exists = {
-                    let seg_map = map_segments.lock().unwrap();
-                    seg_map.contains_key(&key)
+                // ATOMIC check-and-insert using map_segments as source of truth
+                // (matches C++ AGC: seg_map_mtx.lock() then find/insert at line 1020-1025)
+                // Uses HashMap::entry() for truly atomic get-or-insert
+                let (key_exists, final_group_id) = {
+                    let mut seg_map = map_segments.lock().unwrap();
+                    let entry = seg_map.entry(key.clone());
+                    match entry {
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            // Key exists - use existing group_id
+                            (true, *e.get())
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            // Key doesn't exist - allocate new group_id and insert atomically
+                            let new_group_id = if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
+                                key.kmer_front as u32  // Raw groups use ID from key
+                            } else {
+                                group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
+                            };
+                            e.insert(new_group_id);
+                            (false, new_group_id)
+                        }
+                    }
+                    // Lock released here after truly atomic check-and-allocate-and-insert
                 };
 
                 // Phase 2: Check if we should attempt splitting this segment
@@ -1351,15 +1369,9 @@ fn worker_thread(
                 };
 
                 // Get or create buffer for this group
+                // Use final_group_id from atomic check-and-insert above
                 let buffer = groups.entry(key.clone()).or_insert_with(|| {
-                    // Allocate group ID: raw groups (0-15) use ID from key, LZ groups use counter
-                    let group_id = if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
-                        // Raw group: ID already encoded in kmer_front (0-15)
-                        key.kmer_front as u32
-                    } else {
-                        // LZ group: allocate from pool starting at 16
-                        group_counter.fetch_add(1, Ordering::SeqCst)
-                    };
+                    let group_id = final_group_id;  // Use pre-allocated/existing group_id
 
                     if config.verbosity > 1 {
                         eprintln!("NEW_GROUP: group_id={} front={} back={} sample={}",
@@ -1380,13 +1392,9 @@ fn worker_thread(
 
                     // Phase 1: Track segment terminators for splitting
                     // (matches C++ AGC agc_compressor.cpp lines 1319-1334)
+                    // NOTE: map_segments insert already done atomically above - skip duplicate insert
                     {
                         use crate::segment::MISSING_KMER;
-
-                        // Record this segment group in map_segments
-                        let mut seg_map = map_segments.lock().unwrap();
-                        seg_map.insert(key.clone(), group_id);
-                        drop(seg_map);
 
                         // Track k-mer connections (only if both are not MISSING)
                         if key_front != MISSING_KMER && key_back != MISSING_KMER {
