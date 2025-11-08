@@ -130,7 +130,7 @@ pub fn determine_splitters_streaming(
     k: usize,
     segment_size: usize,
 ) -> Result<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> {
-    // Pass 1a: Stream through file to collect k-mers from FIRST SAMPLE only (matching C++ AGC)
+    // Pass 1a: Stream through file to collect k-mers from ALL contigs (matching C++ AGC)
     eprintln!("DEBUG: Pass 1 - Collecting k-mers from reference (streaming)...");
     let mut all_kmers = Vec::new();
     let mut reference_sample = String::new();
@@ -145,17 +145,15 @@ pub fn determine_splitters_streaming(
                 if reference_sample.is_empty() {
                     reference_sample = sample_name.clone();
                     eprintln!(
-                        "DEBUG: Collecting k-mers from FIRST sample only ({})",
+                        "DEBUG: Collecting k-mers from ALL contigs (first sample: {})",
                         reference_sample
                     );
                 }
 
-                // CRITICAL: Only collect k-mers from FIRST sample (matching C++ AGC)
-                // C++ AGC's determine_splitters() only processes the reference file
-                if sample_name == reference_sample {
-                    let contig_kmers = enumerate_kmers(&sequence, k);
-                    all_kmers.extend(contig_kmers);
-                }
+                // FIXED: Collect k-mers from ALL contigs (matching C++ AGC)
+                // C++ AGC's determine_splitters() processes all contigs in reference file
+                let contig_kmers = enumerate_kmers(&sequence, k);
+                all_kmers.extend(contig_kmers);
             }
         }
     }
@@ -203,18 +201,18 @@ pub fn determine_splitters_streaming(
         candidates.len()
     );
 
-    // Pass 2: Stream through file again to find actually-used splitters from reference sample only
+    // Pass 2: Stream through file again to find actually-used splitters from ALL contigs
     eprintln!("DEBUG: Pass 2 - Finding actually-used splitters (streaming)...");
     let mut splitters = HashSet::new();
 
     {
         let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
-        while let Some((_full_header, sample_name, _contig_name, sequence)) =
+        while let Some((_full_header, _sample_name, _contig_name, sequence)) =
             reader.read_contig_with_sample()?
         {
-            // CRITICAL: Only process FIRST sample (matching C++ AGC)
-            // C++ AGC's determine_splitters() only processes the reference file
-            if !sequence.is_empty() && sample_name == reference_sample {
+            // FIXED: Process ALL contigs (matching C++ AGC)
+            // C++ AGC's determine_splitters() processes all contigs in reference file
+            if !sequence.is_empty() {
                 let used = find_actual_splitters_in_contig_named(&sequence, &_contig_name, &candidates, k, segment_size);
                 splitters.extend(used);
             }
