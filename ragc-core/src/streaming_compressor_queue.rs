@@ -1324,25 +1324,35 @@ fn worker_thread(
                             }
                         };
 
-                        // CRITICAL: Only split if BOTH groups already exist in the global registry
-                        // (matches C++ AGC behavior - don't split if either group is missing)
-                        let both_groups_exist = {
+                        // CRITICAL: Only split if BOTH groups exist AND have references written
+                        // (LZDiff must be prepared for compression cost calculation)
+                        // Groups might exist in map_segments but not have references yet (race condition)
+                        let both_groups_exist_with_refs = {
                             let map = map_segments.lock().unwrap();
                             let left_exists = map.contains_key(&left_key);
                             let right_exists = map.contains_key(&right_key);
+                            drop(map);
+
+                            // Also check that both groups have LZDiff prepared
+                            let left_has_ref = groups.get(&left_key)
+                                .and_then(|buf| buf.lz_diff.as_ref())
+                                .is_some();
+                            let right_has_ref = groups.get(&right_key)
+                                .and_then(|buf| buf.lz_diff.as_ref())
+                                .is_some();
 
                             if config.verbosity > 1 {
                                 eprintln!(
-                                    "SPLIT_CHECK: original=({},{}) middle={} left_exists={} right_exists={}",
-                                    key_front, key_back, middle_kmer, left_exists, right_exists
+                                    "SPLIT_CHECK: original=({},{}) middle={} left_exists={} right_exists={} left_has_ref={} right_has_ref={}",
+                                    key_front, key_back, middle_kmer, left_exists, right_exists, left_has_ref, right_has_ref
                                 );
                             }
 
-                            left_exists && right_exists
+                            left_exists && right_exists && left_has_ref && right_has_ref
                         };
 
-                        if both_groups_exist {
-                            // Both split groups exist - attempt split using compression cost
+                        if both_groups_exist_with_refs {
+                            // Both split groups exist AND have references - attempt split using compression cost
                             // (matches C++ AGC agc_compressor.cpp lines 1387-1503)
                             let split_result = try_split_segment_with_cost(
                                 &segment.data,
