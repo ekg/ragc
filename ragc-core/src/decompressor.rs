@@ -729,6 +729,82 @@ impl Decompressor {
         Ok(())
     }
 
+    /// Get archive inspection data for debugging/comparison
+    /// Returns: (group_id, num_segments, num_reference_segments, num_delta_segments)
+    pub fn get_group_statistics(&mut self) -> Result<Vec<(u32, usize, usize, usize)>> {
+        use std::collections::HashMap;
+
+        // Load ALL contig batches to get complete segment information
+        let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
+        for batch_id in 0..num_batches {
+            self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+        }
+
+        let sample_names = self.list_samples();
+
+        // Now collect statistics about groups
+        let mut group_stats: HashMap<u32, (usize, usize, usize)> = HashMap::new();
+
+        for sample_name in &sample_names {
+            let contig_list = self.collection.get_contig_list(sample_name)
+                .ok_or_else(|| anyhow!("Failed to get contig list for {}", sample_name))?;
+
+            for contig_name in &contig_list {
+                if let Some(segments) = self.collection.get_contig_desc(sample_name, contig_name) {
+                    for seg in segments {
+                        let entry = group_stats.entry(seg.group_id).or_insert((0, 0, 0));
+                        entry.0 += 1; // total segments
+                        // Raw groups (0-15) have NO references - all segments are raw/delta
+                        // LZ groups (16+) have references at in_group_id==0
+                        if seg.group_id >= 16 && seg.in_group_id == 0 {
+                            entry.1 += 1; // reference segments (LZ groups only)
+                        } else {
+                            entry.2 += 1; // delta/raw segments
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut stats: Vec<_> = group_stats.into_iter()
+            .map(|(gid, (total, refs, deltas))| (gid, total, refs, deltas))
+            .collect();
+        stats.sort_by_key(|s| s.0);
+
+        Ok(stats)
+    }
+
+    /// Get detailed segment information for all contigs
+    /// Returns: Vec<(sample_name, contig_name, Vec<SegmentDesc>)>
+    pub fn get_all_segments(&mut self) -> Result<Vec<(String, String, Vec<SegmentDesc>)>> {
+        // Load ALL contig batches
+        let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
+        for batch_id in 0..num_batches {
+            self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+        }
+
+        let sample_names = self.list_samples();
+        let mut all_segments = Vec::new();
+
+        for sample_name in &sample_names {
+
+            let contig_list = self.collection.get_contig_list(sample_name)
+                .ok_or_else(|| anyhow!("Failed to get contig list for {}", sample_name))?;
+
+            for contig_name in &contig_list {
+                if let Some(segments) = self.collection.get_contig_desc(sample_name, contig_name) {
+                    all_segments.push((
+                        sample_name.clone(),
+                        contig_name.clone(),
+                        segments.to_vec(),
+                    ));
+                }
+            }
+        }
+
+        Ok(all_segments)
+    }
+
     /// Close the archive
     pub fn close(mut self) -> Result<()> {
         self.archive.close()

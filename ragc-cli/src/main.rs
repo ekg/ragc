@@ -6,6 +6,8 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod inspect;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ragc_core::{
@@ -132,6 +134,24 @@ enum Commands {
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
     },
+
+    /// Inspect archive structure (groups, segments, compression details)
+    Inspect {
+        /// Input archive file path
+        archive: PathBuf,
+
+        /// Show detailed segment information
+        #[arg(short = 's', long)]
+        segments: bool,
+
+        /// Filter by specific group ID
+        #[arg(short = 'g', long)]
+        group_id: Option<u32>,
+
+        /// Verbosity level (0=quiet, 1=normal, 2=verbose)
+        #[arg(short = 'v', long, default_value_t = 0)]
+        verbosity: u32,
+    },
 }
 
 /// Parse capacity string with suffixes (K, M, G) into bytes
@@ -238,6 +258,21 @@ fn main() -> Result<()> {
             samples,
             output,
         } => listctg_command(archive, samples, output)?,
+
+        Commands::Inspect {
+            archive,
+            segments,
+            group_id,
+            verbosity,
+        } => {
+            let config = inspect::InspectConfig {
+                verbosity,
+                show_groups: true,
+                show_segments: segments,
+                group_id_filter: group_id,
+            };
+            inspect::inspect_archive(archive, config)?
+        }
     }
 
     Ok(())

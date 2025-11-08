@@ -177,6 +177,7 @@ pub struct StreamingQueueCompressor {
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>, // Starts at 16 for LZ groups
+    raw_group_counter: Arc<AtomicU32>, // Round-robin counter for raw groups (0-15)
     reference_sample_name: Arc<Mutex<Option<String>>>, // First sample becomes reference
     // Segment splitting support (Phase 1)
     map_segments: Arc<Mutex<std::collections::HashMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id
@@ -295,7 +296,8 @@ impl StreamingQueueCompressor {
 
         // Segment grouping for LZ packing (using BTreeMap for better memory efficiency)
         let segment_groups = Arc::new(Mutex::new(BTreeMap::new()));
-        let group_counter = Arc::new(AtomicU32::new(NO_RAW_GROUPS)); // Start at 16 for LZ groups
+        let group_counter = Arc::new(AtomicU32::new(NO_RAW_GROUPS)); // Start at 16 (LZ groups), raw groups 0-15 handled separately
+        let raw_group_counter = Arc::new(AtomicU32::new(0)); // Round-robin counter for raw groups (0-15)
         let reference_sample_name = Arc::new(Mutex::new(None)); // Shared across all workers
 
         // Segment splitting support (Phase 1)
@@ -312,6 +314,7 @@ impl StreamingQueueCompressor {
             let archive = Arc::clone(&archive);
             let segment_groups = Arc::clone(&segment_groups);
             let group_counter = Arc::clone(&group_counter);
+            let raw_group_counter = Arc::clone(&raw_group_counter);
             let reference_sample_name = Arc::clone(&reference_sample_name);
             let map_segments = Arc::clone(&map_segments);
             let map_segments_terminators = Arc::clone(&map_segments_terminators);
@@ -327,6 +330,7 @@ impl StreamingQueueCompressor {
                     archive,
                     segment_groups,
                     group_counter,
+                    raw_group_counter,
                     reference_sample_name,
                     map_segments,
                     map_segments_terminators,
@@ -351,6 +355,7 @@ impl StreamingQueueCompressor {
             archive,
             segment_groups,
             group_counter,
+            raw_group_counter,
             reference_sample_name,
             map_segments,
             map_segments_terminators,
@@ -409,6 +414,7 @@ impl StreamingQueueCompressor {
                 let archive = Arc::clone(&self.archive);
                 let segment_groups = Arc::clone(&self.segment_groups);
                 let group_counter = Arc::clone(&self.group_counter);
+                let raw_group_counter = Arc::clone(&self.raw_group_counter);
                 let reference_sample_name = Arc::clone(&self.reference_sample_name);
                 let map_segments = Arc::clone(&self.map_segments);
                 let map_segments_terminators = Arc::clone(&self.map_segments_terminators);
@@ -424,6 +430,7 @@ impl StreamingQueueCompressor {
                         archive,
                         segment_groups,
                         group_counter,
+                        raw_group_counter,
                         reference_sample_name,
                         map_segments,
                         map_segments_terminators,
@@ -630,7 +637,8 @@ fn flush_pack(
 
     // Write reference segment if not already written (first pack for this group)
     // Extract reference from sorted segments (matching C++ AGC: first segment after sort becomes reference)
-    if !buffer.ref_written && !buffer.segments.is_empty() {
+    // NOTE: Raw groups (0-15) do NOT have a reference - all segments stored raw
+    if use_lz_encoding && !buffer.ref_written && !buffer.segments.is_empty() {
         // Remove first segment (alphabetically first) to use as reference
         let ref_seg = buffer.segments.remove(0);
 
@@ -722,6 +730,7 @@ fn flush_pack(
     for (seg, &delta_idx) in buffer.segments.iter().zip(segment_delta_indices.iter()) {
         // in_group_id represents which delta this segment uses
         // 0 = reference, 1+ = delta index (offset by buffer.segments_written and +1 for reference)
+        // NOTE: Raw groups (0-15) don't have references, but still use 1+ indexing to match C++ AGC
         let in_group_id = buffer.segments_written + delta_idx + 1;
 
         let mut coll = collection.lock().unwrap();
@@ -1024,6 +1033,7 @@ fn worker_thread(
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>,
+    raw_group_counter: Arc<AtomicU32>,
     reference_sample_name: Arc<Mutex<Option<String>>>,
     map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
@@ -1149,9 +1159,20 @@ fn worker_thread(
                 };
 
             // Create grouping key from normalized k-mers
-            let key = SegmentGroupKey {
-                kmer_front: key_front,
-                kmer_back: key_back,
+            // For raw segments (both k-mers MISSING), use round-robin distribution
+            // across groups 0-15 to match C++ AGC behavior
+            let key = if key_front == MISSING_KMER && key_back == MISSING_KMER {
+                let raw_id = raw_group_counter.fetch_add(1, Ordering::SeqCst);
+                let raw_group = raw_id % NO_RAW_GROUPS;
+                SegmentGroupKey {
+                    kmer_front: raw_group as u64,
+                    kmer_back: MISSING_KMER,
+                }
+            } else {
+                SegmentGroupKey {
+                    kmer_front: key_front,
+                    kmer_back: key_back,
+                }
             };
 
             // Reverse complement data if needed (matching C++ AGC lines 1315-1316, 1320-1321)
@@ -1331,8 +1352,14 @@ fn worker_thread(
 
                 // Get or create buffer for this group
                 let buffer = groups.entry(key.clone()).or_insert_with(|| {
-                    // Allocate new group ID
-                    let group_id = group_counter.fetch_add(1, Ordering::SeqCst);
+                    // Allocate group ID: raw groups (0-15) use ID from key, LZ groups use counter
+                    let group_id = if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
+                        // Raw group: ID already encoded in kmer_front (0-15)
+                        key.kmer_front as u32
+                    } else {
+                        // LZ group: allocate from pool starting at 16
+                        group_counter.fetch_add(1, Ordering::SeqCst)
+                    };
 
                     if config.verbosity > 1 {
                         eprintln!("NEW_GROUP: group_id={} front={} back={} sample={}",
