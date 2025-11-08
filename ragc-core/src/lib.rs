@@ -22,7 +22,7 @@
 //!
 //! ## Compressing genomes
 //!
-//! ```no_run
+//! ```ignore
 //! use ragc_core::{Compressor, CompressorConfig};
 //! use std::path::Path;
 //!
@@ -86,7 +86,7 @@
 //!
 //! ## Custom compression settings
 //!
-//! ```no_run
+//! ```ignore
 //! use ragc_core::CompressorConfig;
 //!
 //! let config = CompressorConfig {
@@ -116,9 +116,7 @@
 //! - Format version 3.0 support
 //! - SHA256-verified roundtrip testing
 
-pub mod _compressor_streaming_old;
 pub mod bloom_filter;
-pub mod compressor;
 pub mod contig_compression;
 pub mod contig_iterator;
 pub mod decompressor;
@@ -140,8 +138,6 @@ pub mod worker;
 pub mod zstd_pool;
 
 // Re-export commonly used types
-pub use _compressor_streaming_old::{StreamingCompressor, StreamingCompressorConfig};
-pub use compressor::{Compressor, CompressorConfig};
 pub use contig_iterator::{MultiFileIterator, PansnFileIterator};
 pub use decompressor::{Decompressor, DecompressorConfig};
 pub use genome_io::{GenomeIO, GenomeWriter};

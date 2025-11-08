@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ragc_core::{
     contig_iterator::ContigIterator, Decompressor, DecompressorConfig, MultiFileIterator,
-    StreamingCompressor, StreamingCompressorConfig, StreamingQueueCompressor, StreamingQueueConfig,
+    StreamingQueueCompressor, StreamingQueueConfig,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -365,124 +365,6 @@ fn create_archive(
         }
 
         return Ok(());
-    }
-
-    // Batch mode: regular StreamingCompressor
-    let config = StreamingCompressorConfig {
-        kmer_length,
-        segment_size,
-        min_match_len,
-        compression_level,
-        verbosity,
-        adaptive_mode: adaptive,
-        concatenated_genomes: concatenated,
-        num_threads,
-        ..StreamingCompressorConfig::default()
-    };
-
-    let output_str = output
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid output path"))?;
-
-    let mut compressor = StreamingCompressor::new(output_str, config)?;
-
-    // Detect if we have multi-sample FASTAs (sample names in headers)
-    // or separate files (sample names from filenames)
-    if inputs.len() == 1 {
-        // Single input file - check if it's multi-sample
-        let input_path = &inputs[0];
-        if !input_path.exists() {
-            anyhow::bail!("Input file not found: {input_path:?}");
-        }
-
-        let is_multi_sample = StreamingCompressor::detect_multi_sample_fasta(input_path)?;
-
-        if is_multi_sample {
-            // Multi-sample FASTA: group by sample names in headers
-            if verbosity > 0 {
-                eprintln!("Detected multi-sample FASTA format (sample#haplotype#chromosome)");
-                eprintln!("Will group contigs by sample names extracted from headers");
-                eprintln!();
-            }
-
-            // Try indexed iterator first (fast random access if .fai exists)
-            // Fall back to buffered in-memory reordering if no index
-            #[cfg(feature = "indexed-fasta")]
-            {
-                use ragc_core::contig_iterator::IndexedPansnFileIterator;
-                match IndexedPansnFileIterator::new(input_path) {
-                    Ok(indexed_iter) => {
-                        if verbosity > 0 {
-                            eprintln!("Using indexed random access (.fai index found)");
-                            eprintln!();
-                        }
-                        compressor.add_contigs_with_splitters(Box::new(indexed_iter))?;
-                    }
-                    Err(_) => {
-                        // No index, use buffered approach
-                        use ragc_core::contig_iterator::BufferedPansnFileIterator;
-                        if verbosity > 0 {
-                            eprintln!("Using buffered in-memory reordering (no .fai index)");
-                            eprintln!();
-                        }
-                        let iterator = BufferedPansnFileIterator::new(input_path)?;
-                        compressor.add_contigs_with_splitters(Box::new(iterator))?;
-                    }
-                }
-            }
-
-            #[cfg(not(feature = "indexed-fasta"))]
-            {
-                use ragc_core::contig_iterator::BufferedPansnFileIterator;
-                if verbosity > 0 {
-                    eprintln!("Using buffered in-memory reordering");
-                    eprintln!();
-                }
-                let iterator = BufferedPansnFileIterator::new(input_path)?;
-                compressor.add_contigs_with_splitters(Box::new(iterator))?;
-            }
-        } else {
-            // Single-sample file: use filename as sample name, with splitter-based segmentation
-            if verbosity > 0 {
-                eprintln!("Processing as single-sample file (sample name from filename)");
-                eprintln!("Using splitter-based segmentation (matching C++ AGC behavior)");
-                eprintln!();
-            }
-            let sample_name = extract_sample_name(input_path);
-            compressor.add_fasta_files_with_splitters(&[(sample_name, input_path.as_path())])?;
-        }
-    } else {
-        // Multiple input files: treat each file as a separate sample
-        // Use C++ AGC behavior: find splitters from first file only
-        if verbosity > 0 {
-            eprintln!("Processing multiple files (each file is a separate sample)");
-            eprintln!("Using first file for splitter determination (matching C++ AGC)");
-            eprintln!();
-        }
-
-        let mut file_paths_with_names = Vec::new();
-        for input_path in &inputs {
-            if !input_path.exists() {
-                eprintln!("Warning: Input file not found: {input_path:?}");
-                continue;
-            }
-            let sample_name = extract_sample_name(input_path);
-            file_paths_with_names.push((sample_name, input_path.as_path()));
-        }
-
-        compressor.add_fasta_files_with_splitters(&file_paths_with_names)?;
-    }
-
-    // Finalize the archive
-    if verbosity > 0 {
-        eprintln!();
-        eprintln!("Finalizing archive...");
-    }
-
-    compressor.finalize()?;
-
-    if verbosity > 0 {
-        eprintln!("Archive created successfully: {output:?}");
     }
 
     Ok(())
