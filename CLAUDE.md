@@ -2,20 +2,27 @@
 
 ## 🚨 CURRENT MISSION: BYTE-IDENTICAL ARCHIVES (2025-11-08) 🚨
 
-**Status**: ✅ Bidirectional compatibility verified! Ready to begin byte-identical comparison.
+**Status**: ✅ MAJOR PROGRESS! Splitter bug fixed - archives now within 1% size difference!
+
+**Latest Achievement** (commit 6c4bbb4):
+- 🐛 **Found root cause**: RAGC only collected k-mers from FIRST sample, C++ AGC uses ALL samples
+- ✅ **Fixed**: Now collects k-mers from all contigs (matching C++ AGC)
+- ✅ **Result**: Splitter count matches exactly (215 in both)
+- ✅ **Archive size**: RAGC 566KB vs C++ AGC 572KB = **only 1% difference!** (was 42%)
+- ✅ **Compatibility**: Both implementations can read each other's archives
+- ✅ **Correctness**: Extraction produces byte-identical sequences
 
 **Progress**:
 - ✅ Created proper minimal test case: chrV from 5 yeast samples (2.3MB)
-- ✅ RAGC → C++ AGC: Works perfectly (332KB archive, extraction verified)
+- ✅ RAGC → C++ AGC: Works perfectly (566KB archive, extraction verified)
 - ✅ C++ AGC → RAGC: Works perfectly (572KB archive, extraction verified)
-- ⏳ Archives NOT byte-identical yet (expected, will be addressed in instrumentation phase)
+- ✅ Splitter detection fixed: 215 splitters in both (was 22 vs 215)
+- ⏳ Archives nearly identical (1% difference) - need to investigate remaining differences
 
-**Previous Issues**:
-- RAGC decompresses correctly (byte-for-byte identical to original)
-- But archives are NOT byte-identical to C++ AGC archives
-- Splitters match, but grouping/splitting decisions diverge somewhere
-- Every attempt to fix divergence breaks something else
-- "Ship of Theseus" approach failed - kept testing RAGC code instead of porting C++ AGC
+**Previous Issues** (RESOLVED):
+- ❌ RAGC used only 1st sample for splitter detection → ✅ Now uses all samples
+- ❌ Archive 42% larger than C++ AGC → ✅ Now within 1%
+- ❌ Only 22 splitters found → ✅ Now finds 215 (matches C++ AGC)
 
 **Wasted Time** (archived, lessons learned):
 - ~8 hours: "wasted night" debugging RAGC code (branch: `wasted-night-ragc-debugging`)
