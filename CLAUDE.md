@@ -1,5 +1,129 @@
 # RAGC Development Activity Log
 
+## 🚨 CURRENT MISSION: BYTE-IDENTICAL ARCHIVES (2025-11-08) 🚨
+
+**Status**: After 2 weeks of work, RAGC produces correct decompression but archives are ~27% larger than C++ AGC
+
+**The Problem**:
+- RAGC decompresses correctly (byte-for-byte identical to original)
+- But archives are NOT byte-identical to C++ AGC archives
+- Splitters match, but grouping/splitting decisions diverge somewhere
+- Every attempt to fix divergence breaks something else
+- "Ship of Theseus" approach failed - kept testing RAGC code instead of porting C++ AGC
+
+**Wasted Time**:
+- ~8 hours: "wasted night" debugging RAGC code (branch: `wasted-night-ragc-debugging`)
+- ~30 min: "wasted morning" testing RAGC's GenomeIO (branch: `wasted-morning`)
+- Total: Multiple failed attempts at fixing divergence, confusion about what's happening
+
+### THE NEW APPROACH: Minimal Test Case with Ruthless Discipline
+
+**Goal**: Make RAGC produce BIT-FOR-BIT IDENTICAL archives to C++ AGC
+
+**Method**: Systematic comparison on the simplest possible test case
+
+#### Step 1: Create Minimal Test Case
+- **Input**: ONE chromosome from ONE sample (e.g., yeast chr1, or even 10KB synthetic sequence)
+- **Parameters**: Single-threaded (`-t 1`) for both RAGC and C++ AGC to eliminate non-determinism
+- **Baseline**: Run C++ AGC, save archive SHA256 as target
+
+#### Step 2: Instrument BOTH Implementations Heavily
+Log EVERYTHING at each stage:
+1. **Splitters**: Position, k-mer value, contig
+2. **Segments**: Start, end, front k-mer, back k-mer, length
+3. **Grouping**: Which segments → which group, WHY (k-mer match logic)
+4. **Splitting**: Is segment split? At what position? Compression cost before/after?
+5. **LZ encoding**: Match positions, lengths, literal runs
+6. **ZSTD**: Input size, output size per segment group
+
+#### Step 3: Side-by-Side Log Comparison
+- Run both implementations with full logging
+- Diff the logs line by line
+- Find the EXACT FIRST LINE where they diverge
+- That's the bug
+
+#### Step 4: Study and Document the Divergence
+- **Examine**: What does C++ AGC do at this point?
+- **Compare**: What does RAGC do instead?
+- **Understand**: WHY the difference (algorithm logic, off-by-one, wrong formula, etc.)
+- **Document**: Write down the exact issue in commit message format
+
+#### Step 5: Implement ONLY That One Fix
+- **NO other changes**
+- **NO refactoring**
+- **NO "while I'm here" fixes**
+- ONE divergence, ONE fix
+- The user does NOT review - I must get it right through systematic analysis
+
+#### Step 6: Verify Archives Are Byte-Identical
+```bash
+# After applying fix
+cargo build --release
+./target/release/ragc create -o ragc_test.agc -k 21 -s 10000 -m 20 -t 1 minimal_test.fa
+/home/erik/agc/bin/agc create -o cpp_test.agc -k 21 -s 10000 -l 20 -t 1 minimal_test.fa
+
+# MUST be identical
+sha256sum ragc_test.agc cpp_test.agc
+diff ragc_test.agc cpp_test.agc  # Should output nothing
+```
+
+#### Step 7: If Archives Diverge - REVERT IMMEDIATELY
+- The fix broke something
+- Revert with `git checkout -- .`
+- Re-analyze the logs
+- Try a different fix
+
+### Workflow Summary
+
+**I will autonomously**:
+1. Create minimal test case (single chromosome, single sample)
+2. Instrument both C++ AGC and RAGC with extensive logging
+3. Run both, diff logs, find first divergence
+4. Study the C++ AGC code to understand correct behavior
+5. Fix RAGC to match
+6. Verify byte-identical archives
+7. Commit if successful, revert if not
+8. Repeat until archives match
+
+**User will**:
+- Observe progress
+- Intervene only if I get stuck or confused
+
+### CRITICAL RULES
+
+**BEFORE any code change:**
+1. ✅ Know EXACTLY which line in the logs diverges
+2. ✅ Understand WHY it diverges (what C++ AGC does vs RAGC)
+3. ✅ Have a specific, minimal fix
+
+**AFTER any code change:**
+1. ✅ Rebuild and re-run test
+2. ✅ Verify SHA256 match (if not → REVERT)
+3. ✅ Re-generate logs and confirm divergence is fixed
+4. ✅ Commit with message describing exact divergence fixed
+
+**NEVER:**
+- ❌ Make changes without knowing exact divergence point
+- ❌ Change multiple things at once
+- ❌ Continue if archives don't match byte-for-byte
+- ❌ Accept "close enough" (must be IDENTICAL)
+
+### Why This Will Work
+
+Previous attempts failed because:
+1. Used complex multi-sample datasets (too many variables)
+2. Made multiple changes at once (couldn't isolate root cause)
+3. Tested RAGC code instead of comparing to C++ AGC behavior
+4. Accepted "close enough" instead of demanding byte-identical
+
+This approach:
+1. Minimal test case = minimal variables
+2. Heavy instrumentation = exact divergence point visible
+3. One fix at a time = can isolate what works/breaks
+4. Byte-identical verification = no ambiguity about success
+
+---
+
 ## 🔥 CORE DEVELOPMENT PRINCIPLES 🔥
 
 **NO SIMPLIFICATIONS. NO COMPROMISES.**
