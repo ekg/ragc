@@ -578,8 +578,26 @@ impl StreamingQueueCompressor {
     /// # let mut compressor = StreamingQueueCompressor::with_splitters("out.agc", StreamingQueueConfig::default(), HashSet::new())?;
     /// // ... push sequences ...
     /// compressor.finalize()?;
-    /// # Ok::<(), anyhow::Error>(())
+    /// # Ok::<(), antml:Error>(())
     /// ```
+    pub fn drain(&self) -> Result<()> {
+        if self.config.verbosity > 0 {
+            eprintln!("Draining queue (waiting for {} items to be processed)...", self.queue.len());
+        }
+
+        // Wait for queue to empty
+        // Poll every 100ms until queue is empty
+        while self.queue.len() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        if self.config.verbosity > 0 {
+            eprintln!("Queue drained - all queued contigs processed");
+        }
+
+        Ok(())
+    }
+
     pub fn finalize(self) -> Result<()> {
         if self.config.verbosity > 0 {
             eprintln!("Finalizing compression...");
@@ -1309,39 +1327,29 @@ fn worker_thread(
             {
                 let mut groups = segment_groups.lock().unwrap();
 
-                // ATOMIC check-and-insert using map_segments as source of truth
-                // (matches C++ AGC: seg_map_mtx.lock() then find/insert at line 1020-1025)
-                // Uses HashMap::entry() for truly atomic get-or-insert
-                let (key_exists, final_group_id) = {
-                    let mut seg_map = map_segments.lock().unwrap();
-                    let entry = seg_map.entry(key.clone());
-                    match entry {
-                        std::collections::hash_map::Entry::Occupied(e) => {
-                            // Key exists - use existing group_id
-                            (true, *e.get())
-                        }
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            // Key doesn't exist - allocate new group_id and insert atomically
-                            let new_group_id = if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
-                                key.kmer_front as u32  // Raw groups use ID from key
-                            } else {
-                                group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
-                            };
-                            e.insert(new_group_id);
-                            (false, new_group_id)
-                        }
-                    }
-                    // Lock released here after truly atomic check-and-allocate-and-insert
+                // Phase 1: Check if group already exists
+                // (matches C++ AGC: seg_map_mtx.lock() then find at line 1020)
+                let key_exists = {
+                    let seg_map = map_segments.lock().unwrap();
+                    seg_map.contains_key(&key)
                 };
 
-                // Phase 2: Check if we should attempt splitting this segment
-                // (matches C++ AGC agc_compressor.cpp lines 1387-1503)
-                if !key_exists && key_front != MISSING_KMER && key_back != MISSING_KMER {
+                // Phase 2: Try to split into existing groups
+                // CRITICAL: C++ AGC splits BEFORE checking new/known (line 1453)
+                // So we attempt splits for ALL segments, not just new groups!
+                if key_front != MISSING_KMER && key_back != MISSING_KMER {
                     // CRITICAL: First attempt to find middle splitter
                     let middle_kmer_opt = {
                         let terminators = map_segments_terminators.lock().unwrap();
                         find_middle_splitter(key_front, key_back, &terminators)
                     };
+
+                    if config.verbosity > 0 {
+                        if middle_kmer_opt.is_some() {
+                            eprintln!("DEBUG_SPLIT: Found middle k-mer for ({},{}) sample={}",
+                                key_front, key_back, task.sample_name);
+                        }
+                    }
 
                     if let Some(middle_kmer) = middle_kmer_opt {
                         // Found potential middle k-mer
@@ -1391,6 +1399,11 @@ fn worker_thread(
                         if both_groups_exist {
                             // Both split groups exist - attempt split using compression cost
                             // (matches C++ AGC agc_compressor.cpp lines 1387-1503)
+                            if config.verbosity > 0 {
+                                eprintln!("DEBUG_SPLIT: Attempting cost-based split for ({},{}) sample={}",
+                                    key_front, key_back, task.sample_name);
+                            }
+
                             let split_result = try_split_segment_with_cost(
                                 &segment.data,
                                 key_front,
@@ -1398,65 +1411,86 @@ fn worker_thread(
                                 middle_kmer,
                                 &left_key,
                                 &right_key,
-                                &groups,
                                 &map_segments,
                                 &reference_segments,
                                 &config,
                             );
 
                             if let Some((left_data, right_data, _mid)) = split_result {
+                                // Check if this is a degenerate split (one side empty)
+                                let is_degenerate_left = left_data.is_empty();
+                                let is_degenerate_right = right_data.is_empty();
+
                                 if config.verbosity > 1 {
-                                    eprintln!(
-                                        "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
-                                        key_front, key_back, left_key.kmer_front, left_key.kmer_back,
-                                        right_key.kmer_front, right_key.kmer_back
-                                    );
-                                }
-
-                                // Add left segment to its existing group
-                                // (matches C++ AGC line 1507: add_known with actual segment data)
-                                if let Some(left_buffer) = groups.get_mut(&left_key) {
-                                    let left_buffered = BufferedSegment {
-                                        sample_name: task.sample_name.clone(),
-                                        contig_name: task.contig_name.clone(),
-                                        seg_part_no: place,
-                                        data: left_data,
-                                        is_rev_comp: should_reverse,
-                                    };
-                                    left_buffer.segments.push(left_buffered);
-
-                                    if left_buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                                        flush_pack(left_buffer, &collection, &archive, &config)
-                                            .context("Failed to flush left pack")?;
+                                    if is_degenerate_right {
+                                        eprintln!(
+                                            "SPLIT_DEGENERATE_RIGHT: ({},{}) -> left_only=({},{})",
+                                            key_front, key_back, left_key.kmer_front, left_key.kmer_back
+                                        );
+                                    } else if is_degenerate_left {
+                                        eprintln!(
+                                            "SPLIT_DEGENERATE_LEFT: ({},{}) -> right_only=({},{})",
+                                            key_front, key_back, right_key.kmer_front, right_key.kmer_back
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
+                                            key_front, key_back, left_key.kmer_front, left_key.kmer_back,
+                                            right_key.kmer_front, right_key.kmer_back
+                                        );
                                     }
                                 }
 
-                                // Add right segment to its existing group
-                                // (matches C++ AGC line 1510: add_known with actual segment data)
-                                if let Some(right_buffer) = groups.get_mut(&right_key) {
-                                    let right_buffered = BufferedSegment {
-                                        sample_name: task.sample_name.clone(),
-                                        contig_name: task.contig_name.clone(),
-                                        seg_part_no: place + 1,
-                                        data: right_data,
-                                        is_rev_comp: should_reverse,
-                                    };
-                                    right_buffer.segments.push(right_buffered);
+                                // Add left segment to its existing group (unless degenerate right)
+                                // (matches C++ AGC line 1507: add_known with actual segment data)
+                                if !is_degenerate_right {
+                                    if let Some(left_buffer) = groups.get_mut(&left_key) {
+                                        let left_buffered = BufferedSegment {
+                                            sample_name: task.sample_name.clone(),
+                                            contig_name: task.contig_name.clone(),
+                                            seg_part_no: place,
+                                            data: left_data,
+                                            is_rev_comp: should_reverse,
+                                        };
+                                        left_buffer.segments.push(left_buffered);
 
-                                    if right_buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                                        flush_pack(right_buffer, &collection, &archive, &config)
-                                            .context("Failed to flush right pack")?;
+                                        if left_buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                                            flush_pack(left_buffer, &collection, &archive, &config)
+                                                .context("Failed to flush left pack")?;
+                                        }
+                                    }
+                                }
+
+                                // Add right segment to its existing group (unless degenerate left)
+                                // (matches C++ AGC line 1510: add_known with actual segment data)
+                                if !is_degenerate_left {
+                                    if let Some(right_buffer) = groups.get_mut(&right_key) {
+                                        let seg_part = if is_degenerate_right { place } else { place + 1 };
+                                        let right_buffered = BufferedSegment {
+                                            sample_name: task.sample_name.clone(),
+                                            contig_name: task.contig_name.clone(),
+                                            seg_part_no: seg_part,
+                                            data: right_data,
+                                            is_rev_comp: should_reverse,
+                                        };
+                                        right_buffer.segments.push(right_buffered);
+
+                                        if right_buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                                            flush_pack(right_buffer, &collection, &archive, &config)
+                                                .context("Failed to flush right pack")?;
+                                        }
                                     }
                                 }
 
                                 // Record this split so subsequent segments from this contig get shifted
                                 // (matches C++ AGC lines 2033-2036: ++seg_part_no twice when split)
-                                {
+                                // For degenerate splits, only increment once (no actual split)
+                                if !is_degenerate_left && !is_degenerate_right {
                                     let mut offsets = split_offsets.lock().unwrap();
                                     offsets.insert((task.sample_name.clone(), task.contig_name.clone(), original_place), 1);
                                 }
 
-                                // Skip adding original segment - we've added the split parts
+                                // Skip adding original segment - we've added the split/reclassified segment
                                 continue;
                             }
                             // If split_result was None, fall through to normal path
@@ -1473,7 +1507,7 @@ fn worker_thread(
                     }
                 }
 
-                // Normal path: add segment to group as-is (no split or split groups don't exist)
+                // Phase 3: Normal path - add segment to group as-is (group exists, or split failed/impossible)
                 // Create buffered segment
                 let buffered = BufferedSegment {
                     sample_name: task.sample_name.clone(),
@@ -1484,9 +1518,51 @@ fn worker_thread(
                 };
 
                 // Get or create buffer for this group
-                // Use final_group_id from atomic check-and-insert above
+                // If group doesn't exist yet, allocate group_id and insert into map_segments NOW
                 let buffer = groups.entry(key.clone()).or_insert_with(|| {
-                    let group_id = final_group_id;  // Use pre-allocated/existing group_id
+                    // Allocate new group_id and atomically insert into map_segments
+                    // (This happens ONLY when split failed or wasn't possible)
+                    let group_id = {
+                        let mut seg_map = map_segments.lock().unwrap();
+                        *seg_map.entry(key.clone()).or_insert_with(|| {
+                            if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
+                                key.kmer_front as u32  // Raw groups use ID from key
+                            } else {
+                                group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
+                            }
+                        })
+                    };
+
+                    // Update terminators map (matches C++ AGC agc_compressor.cpp:1017-1023)
+                    // This is CRITICAL for split functionality - without this, find_middle_splitter() returns None!
+                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                        let mut term_map = map_segments_terminators.lock().unwrap();
+
+                        // Add bidirectional edge: front -> back
+                        term_map.entry(key.kmer_front)
+                            .or_insert_with(Vec::new)
+                            .push(key.kmer_back);
+
+                        // Add bidirectional edge: back -> front (if different)
+                        if key.kmer_front != key.kmer_back {
+                            term_map.entry(key.kmer_back)
+                                .or_insert_with(Vec::new)
+                                .push(key.kmer_front);
+                        }
+
+                        // Sort to maintain sorted order for set_intersection
+                        // C++ AGC sorts immediately after each insertion (line 1018, 1023)
+                        if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
+                            front_vec.sort_unstable();
+                            front_vec.dedup();  // Remove duplicates
+                        }
+                        if key.kmer_front != key.kmer_back {
+                            if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
+                                back_vec.sort_unstable();
+                                back_vec.dedup();  // Remove duplicates
+                            }
+                        }
+                    }
 
                     if config.verbosity > 1 {
                         eprintln!("NEW_GROUP: group_id={} front={} back={} sample={}",
@@ -1686,7 +1762,6 @@ fn try_split_segment_with_cost(
     middle_kmer: u64,
     left_key: &SegmentGroupKey,
     right_key: &SegmentGroupKey,
-    groups: &BTreeMap<SegmentGroupKey, SegmentGroupBuffer>,
     map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
@@ -1698,15 +1773,12 @@ fn try_split_segment_with_cost(
         );
     }
 
-    // Get left and right group buffers
-    let left_buffer = groups.get(left_key)?;
-    let right_buffer = groups.get(right_key)?;
+    // Prepare LZDiff for both groups from persistent storage
+    // C++ AGC uses global v_segments[segment_id] (agc_compressor.cpp:1535-1536)
+    // RAGC uses reference_segments HashMap - ALWAYS prepare on-demand
+    // Don't require groups to be in local buffer (other workers may have created them)
 
-    // Prepare LZDiff for both groups (either from buffer or on-demand from persistent storage)
-    // C++ AGC ALWAYS has reference available via v_segments[segment_id] (agc_compressor.cpp:1535-1536)
-    // RAGC must prepare LZDiff on-demand from reference_segments if not in buffer
-
-    // Helper to prepare LZDiff on-demand if not in buffer
+    // Helper to prepare LZDiff from global reference_segments
     let prepare_on_demand = |key: &SegmentGroupKey, label: &str| -> Option<LZDiff> {
         let map_segments_locked = map_segments.lock().unwrap();
         let ref_segments_locked = reference_segments.lock().unwrap();
@@ -1714,9 +1786,9 @@ fn try_split_segment_with_cost(
         if let Some(&segment_id) = map_segments_locked.get(key) {
             if let Some(ref_data) = ref_segments_locked.get(&segment_id) {
                 // Reference exists! Prepare LZDiff on-demand
-                if config.verbosity > 1 {
+                if config.verbosity > 0 {
                     eprintln!(
-                        "LZDIFF_ON_DEMAND: {}_key=({},{}) segment_id={} ref_size={}",
+                        "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} ref_size={}",
                         label, key.kmer_front, key.kmer_back, segment_id, ref_data.len()
                     );
                 }
@@ -1724,6 +1796,22 @@ fn try_split_segment_with_cost(
                 let mut lz = LZDiff::new(config.min_match_len as u32);
                 lz.prepare(ref_data);
                 return Some(lz);
+            } else {
+                // Segment ID exists but no reference data
+                if config.verbosity > 0 {
+                    eprintln!(
+                        "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} BUT NO REFERENCE DATA!",
+                        label, key.kmer_front, key.kmer_back, segment_id
+                    );
+                }
+            }
+        } else {
+            // Group doesn't exist in map_segments (should not happen if both_groups_exist passed)
+            if config.verbosity > 0 {
+                eprintln!(
+                    "DEBUG_LZDIFF: {}_key=({},{}) NOT IN MAP_SEGMENTS!",
+                    label, key.kmer_front, key.kmer_back
+                );
             }
         }
         None
@@ -1731,34 +1819,21 @@ fn try_split_segment_with_cost(
 
     // Calculate compression costs for both split groups
     // Matches C++ AGC agc_compressor.cpp:1598-1635
-    let v_costs1 = if let Some(lz) = &left_buffer.lz_diff {
-        // Use from buffer
-        if config.verbosity > 1 {
-            eprintln!("LZDIFF_FROM_BUFFER: left_key=({},{})", left_key.kmer_front, left_key.kmer_back);
-        }
-        lz.get_coding_cost_vector(segment_data, true)
-    } else if let Some(lz) = prepare_on_demand(left_key, "left") {
-        // Prepare on-demand
+    // ALWAYS prepare on-demand from global reference_segments (like C++ v_segments)
+    let v_costs1 = if let Some(lz) = prepare_on_demand(left_key, "left") {
         lz.get_coding_cost_vector(segment_data, true)
     } else {
-        // No reference available
+        // No reference available - group hasn't written reference yet
         if config.verbosity > 1 {
             eprintln!("SPLIT_SKIP: left group has no reference yet");
         }
         return None;
     };
 
-    let v_costs2 = if let Some(lz) = &right_buffer.lz_diff {
-        // Use from buffer
-        if config.verbosity > 1 {
-            eprintln!("LZDIFF_FROM_BUFFER: right_key=({},{})", right_key.kmer_front, right_key.kmer_back);
-        }
-        lz.get_coding_cost_vector(segment_data, false)
-    } else if let Some(lz) = prepare_on_demand(right_key, "right") {
-        // Prepare on-demand
+    let v_costs2 = if let Some(lz) = prepare_on_demand(right_key, "right") {
         lz.get_coding_cost_vector(segment_data, false)
     } else {
-        // No reference available
+        // No reference available - group hasn't written reference yet
         if config.verbosity > 1 {
             eprintln!("SPLIT_SKIP: right group has no reference yet");
         }
@@ -1802,17 +1877,31 @@ fn try_split_segment_with_cost(
         best_pos = v_costs1.len(); // Too close to end
     }
 
-    // Check if split is degenerate (C++ AGC agc_compressor.cpp:1442-1459)
-    // After adjustment, check if we're at the extremes (no split)
-    if best_pos == 0 || best_pos >= segment_data.len() {
-        // Degenerate split - position at or beyond segment boundaries
+    // Check if split is degenerate (C++ AGC agc_compressor.cpp:1400-1415)
+    // C++ AGC ACCEPTS degenerate splits and assigns whole segment to one group
+    let left_size = best_pos;
+    let right_size = segment_data.len().saturating_sub(best_pos);
+
+    if left_size == 0 {
+        // Degenerate: whole segment matches RIGHT group
+        // Return empty left, full segment as right (C++ AGC line 1400-1407)
         if config.verbosity > 1 {
             eprintln!(
-                "SPLIT_DEGENERATE: best_pos={} at boundary (segment len={}) - NOT splitting",
-                best_pos, segment_data.len()
+                "SPLIT_DEGENERATE_RIGHT: best_pos=0, assigning whole segment to RIGHT group"
             );
         }
-        return None;
+        return Some((Vec::new(), segment_data.to_vec(), middle_kmer));
+    }
+
+    if right_size == 0 {
+        // Degenerate: whole segment matches LEFT group
+        // Return full segment as left, empty right (C++ AGC line 1408-1415)
+        if config.verbosity > 1 {
+            eprintln!(
+                "SPLIT_DEGENERATE_LEFT: best_pos=len, assigning whole segment to LEFT group"
+            );
+        }
+        return Some((segment_data.to_vec(), Vec::new(), middle_kmer));
     }
 
     // Calculate the ACTUAL sizes after splitting with k-mer overlap

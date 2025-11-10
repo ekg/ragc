@@ -406,14 +406,45 @@ fn create_archive(
         let mut compressor =
             StreamingQueueCompressor::with_splitters(output_str, config, splitters)?;
 
-        // Process all input files
-        // C++ AGC registers contigs in FILE ORDER (as read from FASTA),
-        // then uses priority queue for PROCESSING efficiency only.
-        // We must preserve file order for correct metadata storage.
-        let mut iterator = MultiFileIterator::new(inputs.clone())?;
-        while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
+        // CRITICAL: Process reference sample (first file) completely BEFORE other samples
+        // This matches C++ AGC architecture and ensures splits work correctly.
+        // C++ AGC loads the entire reference sample first, creating all its segment groups
+        // and terminators, then processes remaining samples. This allows splits to find
+        // target groups that already exist in map_segments.
+
+        if verbosity > 0 {
+            eprintln!("Processing reference sample (first input): {:?}", inputs[0]);
+        }
+
+        // Process ONLY the first file (reference sample)
+        let mut ref_iterator = MultiFileIterator::new(vec![inputs[0].clone()])?;
+        while let Some((sample_name, contig_name, sequence)) = ref_iterator.next_contig()? {
             if !sequence.is_empty() {
                 compressor.push(sample_name, contig_name, sequence)?;
+            }
+        }
+
+        // Wait for reference sample to be completely processed
+        // This ensures all reference groups and terminators are created before
+        // we start processing other samples
+        if verbosity > 0 {
+            eprintln!("Reference sample queued - waiting for processing to complete...");
+        }
+        compressor.drain()?;
+
+        if verbosity > 0 {
+            eprintln!("Reference sample complete! Processing remaining {} samples...", inputs.len() - 1);
+            eprintln!();
+        }
+
+        // Now process remaining samples
+        // At this point, all reference groups exist, so splits can happen
+        if inputs.len() > 1 {
+            let mut remaining_iterator = MultiFileIterator::new(inputs[1..].to_vec())?;
+            while let Some((sample_name, contig_name, sequence)) = remaining_iterator.next_contig()? {
+                if !sequence.is_empty() {
+                    compressor.push(sample_name, contig_name, sequence)?;
+                }
             }
         }
 
