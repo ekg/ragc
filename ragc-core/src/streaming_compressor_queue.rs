@@ -221,6 +221,11 @@ pub struct StreamingQueueCompressor {
     map_segments: Arc<Mutex<std::collections::HashMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id
     map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>, // kmer -> [connected kmers]
 
+    // Persistent reference segment storage (matches C++ AGC v_segments)
+    // Stores reference segment data even after groups are flushed, enabling LZ cost estimation
+    // for subsequent samples (fixes multi-sample group fragmentation bug)
+    reference_segments: Arc<Mutex<std::collections::HashMap<u32, Vec<u8>>>>, // group_id -> reference segment data
+
     // Track segment splits for renumbering subsequent segments
     // Maps (sample_name, contig_name, original_place) -> number of splits inserted before this position
     split_offsets: Arc<Mutex<std::collections::HashMap<(String, String, usize), usize>>>,
@@ -348,6 +353,9 @@ impl StreamingQueueCompressor {
         let map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
         let split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(HashMap::new()));
 
+        // Persistent reference segment storage (matches C++ AGC v_segments)
+        let reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+
         // Priority tracking for interleaved processing (matches C++ AGC)
         let sample_priorities: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
@@ -365,6 +373,7 @@ impl StreamingQueueCompressor {
             let reference_sample_name = Arc::clone(&reference_sample_name);
             let map_segments = Arc::clone(&map_segments);
             let map_segments_terminators = Arc::clone(&map_segments_terminators);
+            let reference_segments = Arc::clone(&reference_segments);
             let split_offsets = Arc::clone(&split_offsets);
             let config = config.clone();
 
@@ -381,6 +390,7 @@ impl StreamingQueueCompressor {
                     reference_sample_name,
                     map_segments,
                     map_segments_terminators,
+                    reference_segments,
                     split_offsets,
                     config,
                 )
@@ -406,6 +416,7 @@ impl StreamingQueueCompressor {
             reference_sample_name,
             map_segments,
             map_segments_terminators,
+            reference_segments,
             split_offsets,
             sample_priorities,
             next_priority,
@@ -467,6 +478,7 @@ impl StreamingQueueCompressor {
                 let reference_sample_name = Arc::clone(&self.reference_sample_name);
                 let map_segments = Arc::clone(&self.map_segments);
                 let map_segments_terminators = Arc::clone(&self.map_segments_terminators);
+                let reference_segments = Arc::clone(&self.reference_segments);
                 let split_offsets = Arc::clone(&self.split_offsets);
                 let config = self.config.clone();
 
@@ -483,6 +495,7 @@ impl StreamingQueueCompressor {
                         reference_sample_name,
                         map_segments,
                         map_segments_terminators,
+                        reference_segments,
                         split_offsets,
                         config,
                     )
@@ -846,6 +859,7 @@ fn write_reference_immediately(
     buffer: &mut SegmentGroupBuffer,
     collection: &Arc<Mutex<CollectionV3>>,
     archive: &Arc<Mutex<Archive>>,
+    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
 ) -> Result<()> {
     use crate::segment_compression::compress_reference_segment;
@@ -892,6 +906,13 @@ fn write_reference_immediately(
     buffer.ref_written = true;
     buffer.reference_segment = Some(segment.clone());
 
+    // 4b. Store reference data persistently (matching C++ AGC v_segments)
+    // This enables LZ cost estimation for subsequent samples even after flush
+    {
+        let mut ref_segs = reference_segments.lock().unwrap();
+        ref_segs.insert(buffer.group_id, segment.data.clone());
+    }
+
     // 5. Prepare LZ encoder with reference (matching C++ AGC segment.cpp line 43: lz_diff->Prepare(s))
     // This is done ONCE when the reference is written, then reused for all subsequent segments
     let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
@@ -923,6 +944,7 @@ fn find_group_with_one_kmer(
     map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
 ) -> (u64, u64, bool) {
     let segment_len = segment_data.len();
@@ -965,6 +987,7 @@ fn find_group_with_one_kmer(
     {
         let groups = segment_groups.lock().unwrap();
         let seg_map = map_segments.lock().unwrap();
+        let ref_segs = reference_segments.lock().unwrap();
 
         for &cand_kmer in &connected_kmers {
             // Create candidate group key normalized (smaller, larger)
@@ -984,13 +1007,23 @@ fn find_group_with_one_kmer(
                 kmer_back: key_back,
             };
 
-            // Check if this group exists and get its reference segment size
-            if let Some(group_buffer) = groups.get(&cand_key) {
-                // Get reference segment size if available
-                let ref_size = if let Some(ref_seg) = &group_buffer.reference_segment {
-                    ref_seg.data.len()
+            // Check if this group exists in global registry (matching C++ AGC line 1711)
+            // CRITICAL FIX: Use seg_map to check ALL groups, not just buffered ones
+            if let Some(&group_id) = seg_map.get(&cand_key) {
+                // Get reference segment size from buffer OR persistent storage
+                let ref_size = if let Some(group_buffer) = groups.get(&cand_key) {
+                    // Group in buffer - get size from buffer
+                    if let Some(ref_seg) = &group_buffer.reference_segment {
+                        ref_seg.data.len()
+                    } else {
+                        segment_len // No reference yet, use current segment size
+                    }
+                } else if let Some(ref_data) = ref_segs.get(&group_id) {
+                    // Group flushed - get size from persistent storage
+                    ref_data.len()
                 } else {
-                    segment_len // No reference yet, use current segment size
+                    // Group exists but no reference data yet
+                    segment_len
                 };
 
                 candidates.push((key_front, key_back, needs_rc, ref_size));
@@ -1032,6 +1065,8 @@ fn find_group_with_one_kmer(
 
     {
         let groups = segment_groups.lock().unwrap();
+        let seg_map = map_segments.lock().unwrap();
+        let ref_segs = reference_segments.lock().unwrap();
 
         for &(key_front, key_back, needs_rc, _ref_size) in &candidates {
             let cand_key = SegmentGroupKey {
@@ -1039,44 +1074,53 @@ fn find_group_with_one_kmer(
                 kmer_back: key_back,
             };
 
-            // Get the reference segment for this candidate
-            if let Some(group_buffer) = groups.get(&cand_key) {
-                if let Some(ref_seg) = &group_buffer.reference_segment {
-                    // Test LZ encoding against this reference (C++ AGC line 1734: estimate())
-                    let mut lz = LZDiff::new(config.min_match_len as u32);
-                    lz.prepare(&ref_seg.data);
+            // Get the reference segment for this candidate from buffer OR persistent storage
+            // CRITICAL FIX: Check persistent storage for flushed groups (matching C++ AGC v_segments)
+            let ref_data_opt: Option<&[u8]> = if let Some(group_buffer) = groups.get(&cand_key) {
+                // Group in buffer - get reference from buffer
+                group_buffer.reference_segment.as_ref().map(|seg| seg.data.as_slice())
+            } else if let Some(&group_id) = seg_map.get(&cand_key) {
+                // Group flushed - get reference from persistent storage
+                ref_segs.get(&group_id).map(|data| data.as_slice())
+            } else {
+                None
+            };
 
-                    // Choose segment orientation based on needs_rc
-                    let target_data = if needs_rc {
-                        segment_data_rc.to_vec()
-                    } else {
-                        segment_data.to_vec()
-                    };
+            if let Some(ref_data) = ref_data_opt {
+                // Test LZ encoding against this reference (C++ AGC line 1734: estimate())
+                let mut lz = LZDiff::new(config.min_match_len as u32);
+                lz.prepare(&ref_data.to_vec());
 
-                    let encoded = lz.encode(&target_data);
-                    let estim_size = encoded.len();
+                // Choose segment orientation based on needs_rc
+                let target_data = if needs_rc {
+                    segment_data_rc.to_vec()
+                } else {
+                    segment_data.to_vec()
+                };
 
-                    if config.verbosity > 2 {
-                        eprintln!(
-                            "RAGC_CASE3_ESTIMATE: kmer={} cand=({},{}) rc={} ref_len={} target_len={} encoded={}",
-                            kmer, key_front, key_back, needs_rc, ref_seg.data.len(), target_data.len(), estim_size
-                        );
-                    }
+                let encoded = lz.encode(&target_data);
+                let estim_size = encoded.len();
 
-                    // Update best if this candidate compresses better
-                    // (C++ AGC lines 1737-1743)
-                    let cand_pk = (key_front, key_back);
-                    let best_pk = (best_key_front, best_key_back);
+                if config.verbosity > 2 {
+                    eprintln!(
+                        "RAGC_CASE3_ESTIMATE: kmer={} cand=({},{}) rc={} ref_len={} target_len={} encoded={}",
+                        kmer, key_front, key_back, needs_rc, ref_data.len(), target_data.len(), estim_size
+                    );
+                }
 
-                    if estim_size < best_estim_size
-                        || (estim_size == best_estim_size && cand_pk < best_pk)
-                        || (estim_size == best_estim_size && cand_pk == best_pk && !needs_rc)
-                    {
-                        best_estim_size = estim_size;
-                        best_key_front = key_front;
-                        best_key_back = key_back;
-                        best_needs_rc = needs_rc;
-                    }
+                // Update best if this candidate compresses better
+                // (C++ AGC lines 1737-1743)
+                let cand_pk = (key_front, key_back);
+                let best_pk = (best_key_front, best_key_back);
+
+                if estim_size < best_estim_size
+                    || (estim_size == best_estim_size && cand_pk < best_pk)
+                    || (estim_size == best_estim_size && cand_pk == best_pk && !needs_rc)
+                {
+                    best_estim_size = estim_size;
+                    best_key_front = key_front;
+                    best_key_back = key_back;
+                    best_needs_rc = needs_rc;
                 }
             }
         }
@@ -1103,6 +1147,7 @@ fn worker_thread(
     reference_sample_name: Arc<Mutex<Option<String>>>,
     map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
@@ -1194,6 +1239,7 @@ fn worker_thread(
                         &map_segments_terminators,
                         &map_segments,
                         &segment_groups,
+                        &reference_segments,
                         &config,
                     );
                     eprintln!("RAGC_CASE3A: sample={} front_only={} is_dir={} -> key=({},{}) store_rc={}",
@@ -1213,6 +1259,7 @@ fn worker_thread(
                         &map_segments_terminators,
                         &map_segments,
                         &segment_groups,
+                        &reference_segments,
                         &config,
                     );
                     eprintln!("RAGC_CASE3B: sample={} back_only={} is_dir={} swapped_is_dir={} -> key=({},{}) store_rc={}",
@@ -1500,7 +1547,7 @@ fn worker_thread(
                 if buffer.reference_segment.is_none() && buffer.segments.is_empty() {
                     // This is the FIRST segment in this group - make it the reference NOW
                     // (matches C++ AGC: lz_diff->Prepare(s); store_in_archive(s, zstd_cctx);)
-                    if let Err(e) = write_reference_immediately(&buffered, buffer, &collection, &archive, &config) {
+                    if let Err(e) = write_reference_immediately(&buffered, buffer, &collection, &archive, &reference_segments, &config) {
                         eprintln!("ERROR: Failed to write immediate reference: {}", e);
                         // Fall back to buffering
                         buffer.segments.push(buffered);
