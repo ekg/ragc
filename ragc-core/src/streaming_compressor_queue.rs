@@ -1399,6 +1399,8 @@ fn worker_thread(
                                 &left_key,
                                 &right_key,
                                 &groups,
+                                &map_segments,
+                                &reference_segments,
                                 &config,
                             );
 
@@ -1685,6 +1687,8 @@ fn try_split_segment_with_cost(
     left_key: &SegmentGroupKey,
     right_key: &SegmentGroupKey,
     groups: &BTreeMap<SegmentGroupKey, SegmentGroupBuffer>,
+    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
 ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
     if config.verbosity > 1 {
@@ -1699,50 +1703,19 @@ fn try_split_segment_with_cost(
     let right_buffer = groups.get(right_key)?;
 
     // Check if both groups have LZDiff prepared (need reference written)
-    // Matches C++ AGC segment.cpp:101-116 (get_coding_cost checks ref_size == 0)
+    // C++ AGC ALWAYS has reference available via v_segments[segment_id] (line 1535-1536)
+    // RAGC CRITICAL FIX: Do NOT split if LZDiff not ready - return None instead of midpoint fallback
+    // This matches C++ AGC behavior: only split when compression cost can be calculated
     let (left_lz, right_lz) = match (&left_buffer.lz_diff, &right_buffer.lz_diff) {
         (Some(left), Some(right)) => (left, right),
         _ => {
-            // No reference yet, can't calculate compression cost
-            // Fall back to midpoint heuristic (not perfect, but better than not splitting)
+            // LZDiff not ready - skip split
+            // This is CORRECT: C++ AGC only splits when it can prove beneficial via compression cost
+            // The old midpoint fallback was creating 3,750 extra segments!
             if config.verbosity > 1 {
-                eprintln!("SPLIT_FALLBACK: using midpoint (LZDiff not ready)");
+                eprintln!("SPLIT_SKIP: LZDiff not ready for cost calculation");
             }
-
-            let k = config.k;
-            let segment_len = segment_data.len();
-
-            // Use midpoint
-            let best_pos = segment_len / 2;
-
-            // Validate split position creates valid segments
-            // seg2_start_pos = best_pos - k/2
-            // Left: [0..best_pos + k/2], Right: [best_pos - k/2..end]
-            let seg2_start_pos = best_pos.saturating_sub(k / 2);
-            let left_size = seg2_start_pos + k;
-            let right_size = segment_len.saturating_sub(seg2_start_pos);
-
-            // Both segments must be at least k+1 bytes
-            if left_size < k + 1 || right_size < k + 1 || left_size > segment_len {
-                if config.verbosity > 1 {
-                    eprintln!(
-                        "SPLIT_SKIP: midpoint fallback would create invalid segments (left={}, right={}, need at least {})",
-                        left_size, right_size, k + 1
-                    );
-                }
-                return None;
-            }
-
-            let (left_data, right_data) = split_segment_at_position(segment_data.as_slice(), best_pos, k);
-
-            if config.verbosity > 1 {
-                eprintln!(
-                    "SPLIT_SUCCESS: midpoint_fallback pos={} left_len={} right_len={}",
-                    best_pos, left_data.len(), right_data.len()
-                );
-            }
-
-            return Some((left_data, right_data, middle_kmer));
+            return None;
         }
     };
 
