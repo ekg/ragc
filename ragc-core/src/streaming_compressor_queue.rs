@@ -1708,22 +1708,43 @@ fn find_middle_splitter(
     shared_kmers.first().copied()
 }
 
-/// Phase 4: Find split position using simplified heuristic
-/// C++ AGC uses compression cost (lines 1556-1625), but for a simplified approach
-/// we split at the midpoint of the segment
-/// Returns the split position (in bytes)
-fn find_split_position(_segment_data: &[u8], _middle_kmer: u64, segment_len: usize, k: usize) -> Option<usize> {
+/// Phase 4: Find split position by scanning for middle k-mer
+/// Scans the segment to find where the middle k-mer actually occurs
+/// Returns the split position (in bytes) at the END of the middle k-mer
+fn find_split_position(segment_data: &[u8], middle_kmer: u64, segment_len: usize, k: usize) -> Option<usize> {
+    use crate::kmer::{Kmer, KmerMode};
+
     // Ensure we don't split too close to the ends
     // Need at least k+1 bytes on each side for valid segments
     if segment_len < 2 * (k + 1) {
         return None;
     }
 
-    // Split at midpoint
-    // C++ AGC finds optimal position using compression cost, but midpoint is reasonable
-    let split_pos = segment_len / 2;
+    // Scan segment to find where middle_kmer occurs
+    let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
 
-    Some(split_pos)
+    for (pos, &base) in segment_data.iter().enumerate() {
+        kmer.insert(base as u64);
+
+        if kmer.is_full() {
+            let current_kmer = kmer.data_canonical();
+            if current_kmer == middle_kmer {
+                // Found the middle k-mer! Position is at the end of the k-mer
+                let split_pos = pos + 1;
+
+                // Validate: ensure we have enough space on both sides
+                let left_size = split_pos;
+                let right_size = segment_len - split_pos + k;
+
+                if left_size >= k + 1 && right_size >= k + 1 {
+                    return Some(split_pos);
+                }
+            }
+        }
+    }
+
+    // Middle k-mer not found in segment - shouldn't happen but handle gracefully
+    None
 }
 
 /// Phase 5: Split segment into two overlapping segments
