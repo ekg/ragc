@@ -1246,44 +1246,21 @@ fn worker_thread(
                         (segment.back_kmer, segment.front_kmer, true)
                     }
                 } else if segment.front_kmer != MISSING_KMER {
-                    // Case 3a: Only front k-mer present
-                    // (matches C++ AGC lines 1341-1361: find_cand_segment_with_one_splitter)
-                    let segment_rc = reverse_complement_sequence(&segment.data);
-                    let (found_front, found_back, found_rc) = find_group_with_one_kmer(
-                        segment.front_kmer,
-                        segment.front_kmer_is_dir,
-                        &segment.data,
-                        &segment_rc,
-                        &map_segments_terminators,
-                        &map_segments,
-                        &segment_groups,
-                        &reference_segments,
-                        &config,
-                    );
-                    eprintln!("RAGC_CASE3A: sample={} front_only={} is_dir={} -> key=({},{}) store_rc={}",
-                        task.sample_name, segment.front_kmer, segment.front_kmer_is_dir, found_front, found_back, found_rc);
-                    (found_front, found_back, found_rc)
+                    // Case 3a: Only front k-mer present, back is MISSING (terminator)
+                    // This means the segment ends at a contig boundary
+                    // C++ AGC doesn't add terminator pairs to map_segments (lines 1020-1030)
+                    // So we should create a new group directly, not look up connections
+                    eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} back=MISSING -> key=({},{}) store_rc=false",
+                        task.sample_name, segment.front_kmer, segment.front_kmer, MISSING_KMER);
+                    (segment.front_kmer, segment.back_kmer, false)
                 } else if segment.back_kmer != MISSING_KMER {
-                    // Case 3b: Only back k-mer present
-                    // (matches C++ AGC lines 1363-1385: find_cand_segment_with_one_splitter)
-                    // C++ AGC does swap_dir_rc() (line 1369) which INVERTS the orientation
-                    // So we pass !is_dir to find_group_with_one_kmer
-                    let segment_rc = reverse_complement_sequence(&segment.data);
-                    let (found_front, found_back, found_rc) = find_group_with_one_kmer(
-                        segment.back_kmer,  // Use canonical k-mer directly
-                        !segment.back_kmer_is_dir,  // INVERT orientation to match swap_dir_rc()
-                        &segment.data,
-                        &segment_rc,
-                        &map_segments_terminators,
-                        &map_segments,
-                        &segment_groups,
-                        &reference_segments,
-                        &config,
-                    );
-                    eprintln!("RAGC_CASE3B: sample={} back_only={} is_dir={} swapped_is_dir={} -> key=({},{}) store_rc={}",
-                        task.sample_name, segment.back_kmer, segment.back_kmer_is_dir, !segment.back_kmer_is_dir, found_front, found_back, !found_rc);
-                    // Invert the RC flag (matches C++ AGC line 1374: store_rc = !store_dir)
-                    (found_front, found_back, !found_rc)
+                    // Case 3b: Only back k-mer present, front is MISSING (terminator)
+                    // This means the segment starts at a contig boundary
+                    // C++ AGC doesn't add terminator pairs to map_segments (lines 1020-1030)
+                    // So we should create a new group directly, not look up connections
+                    eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} -> key=({},{}) store_rc=false",
+                        task.sample_name, segment.back_kmer, MISSING_KMER, segment.back_kmer);
+                    (segment.front_kmer, segment.back_kmer, false)
                 } else {
                     // Case 1 or 4: Both MISSING - use as-is
                     (segment.front_kmer, segment.back_kmer, false)
@@ -1441,9 +1418,9 @@ fn worker_thread(
                                     }
                                 }
 
-                                // Add left segment to its existing group (unless degenerate right)
+                                // Add left segment to its existing group (unless degenerate left)
                                 // (matches C++ AGC line 1507: add_known with actual segment data)
-                                if !is_degenerate_right {
+                                if !is_degenerate_left {
                                     if let Some(left_buffer) = groups.get_mut(&left_key) {
                                         let left_buffered = BufferedSegment {
                                             sample_name: task.sample_name.clone(),
@@ -1461,11 +1438,12 @@ fn worker_thread(
                                     }
                                 }
 
-                                // Add right segment to its existing group (unless degenerate left)
+                                // Add right segment to its existing group (unless degenerate right)
                                 // (matches C++ AGC line 1510: add_known with actual segment data)
-                                if !is_degenerate_left {
+                                if !is_degenerate_right {
                                     if let Some(right_buffer) = groups.get_mut(&right_key) {
-                                        let seg_part = if is_degenerate_right { place } else { place + 1 };
+                                        // Fix: Use place when LEFT is degenerate (prevents gap in segment indices)
+                                        let seg_part = if is_degenerate_left { place } else { place + 1 };
                                         let right_buffered = BufferedSegment {
                                             sample_name: task.sample_name.clone(),
                                             contig_name: task.contig_name.clone(),
@@ -1925,27 +1903,8 @@ fn try_split_segment_with_cost(
         return Some((segment_data.to_vec(), Vec::new(), middle_kmer));
     }
 
-    // Calculate the ACTUAL sizes after splitting with k-mer overlap
-    // seg2_start_pos = best_pos - k/2
-    // Left segment: [0..best_pos - k/2 + k] = [0..best_pos + k/2]
-    // Right segment: [best_pos - k/2..end]
-    let seg2_start_pos = best_pos.saturating_sub(k / 2);
-    let left_size = seg2_start_pos + k; // = best_pos + k/2
-    let right_size = segment_data.len().saturating_sub(seg2_start_pos);
-
-    // Both segments must be at least k+1 bytes to extract k-mers
-    // Also check left doesn't exceed segment bounds
-    if left_size < k + 1 || right_size < k + 1 || left_size > segment_data.len() {
-        // Degenerate split - segments too small or out of bounds
-        if config.verbosity > 1 {
-            eprintln!(
-                "SPLIT_DEGENERATE: best_pos={} left_size={} right_size={} (need {}-{}) - NOT splitting",
-                best_pos, left_size, right_size, k + 1, segment_data.len()
-            );
-        }
-        return None;
-    }
-
+    // Non-degenerate split: proceed directly (matches C++ AGC line 1434-1438)
+    // C++ AGC does NOT validate sizes after degenerate position rules
     // Split at best position
     let (left_data, right_data) = split_segment_at_position(segment_data.as_slice(), best_pos, k);
 

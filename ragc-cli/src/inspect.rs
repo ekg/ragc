@@ -15,6 +15,7 @@ pub struct InspectConfig {
     pub contig_filter: Option<String>,
     pub segment_index: Option<usize>,
     pub show_single_segment_groups: bool,
+    pub show_segment_layout: bool,
 }
 
 impl Default for InspectConfig {
@@ -28,6 +29,7 @@ impl Default for InspectConfig {
             contig_filter: None,
             segment_index: None,
             show_single_segment_groups: false,
+            show_segment_layout: false,
         }
     }
 }
@@ -59,6 +61,11 @@ pub fn inspect_archive(archive_path: PathBuf, config: InspectConfig) -> Result<(
 
     if config.show_single_segment_groups {
         show_single_segment_groups(&mut decompressor)?;
+        return Ok(());
+    }
+
+    if config.show_segment_layout {
+        show_segment_layout(&mut decompressor)?;
         return Ok(());
     }
 
@@ -195,6 +202,24 @@ fn show_single_segment_groups(decompressor: &mut Decompressor) -> Result<()> {
                              group_id, sample_name, contig_name, idx, seg.raw_length, seg.is_rev_comp);
                 }
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show segment layout in CSV format for comparison between implementations
+fn show_segment_layout(decompressor: &mut Decompressor) -> Result<()> {
+    let all_segments = decompressor.get_all_segments()?;
+
+    // CSV header
+    println!("sample,contig,segment_index,group_id,in_group_id,raw_length");
+
+    for (sample_name, contig_name, segments) in &all_segments {
+        for (seg_idx, seg) in segments.iter().enumerate() {
+            println!("{},{},{},{},{},{}",
+                sample_name, contig_name, seg_idx,
+                seg.group_id, seg.in_group_id, seg.raw_length);
         }
     }
 

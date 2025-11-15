@@ -152,6 +152,10 @@ enum Commands {
         #[arg(long)]
         single_groups: bool,
 
+        /// Show segment layout in CSV format for comparison
+        #[arg(long)]
+        segment_layout: bool,
+
         /// Look up segment by sample name
         #[arg(long)]
         sample: Option<String>,
@@ -280,6 +284,7 @@ fn main() -> Result<()> {
             segments,
             group_id,
             single_groups,
+            segment_layout,
             sample,
             contig,
             index,
@@ -294,6 +299,7 @@ fn main() -> Result<()> {
                 contig_filter: contig,
                 segment_index: index,
                 show_single_segment_groups: single_groups,
+                show_segment_layout: segment_layout,
             };
             inspect::inspect_archive(archive, config)?
         }
