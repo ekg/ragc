@@ -1819,7 +1819,7 @@ fn try_split_segment_with_cost(
     // Calculate compression costs for both split groups
     // Matches C++ AGC agc_compressor.cpp:1598-1635
     // ALWAYS prepare on-demand from global reference_segments (like C++ v_segments)
-    let v_costs1 = if let Some(lz) = prepare_on_demand(left_key, "left") {
+    let mut v_costs1 = if let Some(lz) = prepare_on_demand(left_key, "left") {
         lz.get_coding_cost_vector(segment_data, true)
     } else {
         // No reference available - group hasn't written reference yet
@@ -1829,7 +1829,7 @@ fn try_split_segment_with_cost(
         return None;
     };
 
-    let v_costs2 = if let Some(lz) = prepare_on_demand(right_key, "right") {
+    let mut v_costs2 = if let Some(lz) = prepare_on_demand(right_key, "right") {
         lz.get_coding_cost_vector(segment_data, false)
     } else {
         // No reference available - group hasn't written reference yet
@@ -1838,6 +1838,22 @@ fn try_split_segment_with_cost(
         }
         return None;
     };
+
+    // CRITICAL: Compute cumulative sums (C++ AGC lines 1568, 1587/1592)
+    // v_costs1: cumulative sum from left (position i = cost of [0..i])
+    // v_costs2: cumulative sum from right (position i = cost of [i..end])
+    let mut sum = 0u32;
+    for cost in v_costs1.iter_mut() {
+        sum = sum.saturating_add(*cost);
+        *cost = sum;
+    }
+
+    // v_costs2 needs reverse cumulative sum (right to left)
+    sum = 0u32;
+    for cost in v_costs2.iter_mut().rev() {
+        sum = sum.saturating_add(*cost);
+        *cost = sum;
+    }
 
     if v_costs1.is_empty() || v_costs2.is_empty() {
         if config.verbosity > 1 {
@@ -1869,11 +1885,19 @@ fn try_split_segment_with_cost(
     // Apply degenerate position rules (C++ AGC agc_compressor.cpp:1676-1679)
     // If split would create segments too small, force to 0 or full size
     let k = config.k;
+    let original_best_pos = best_pos;  // Save for logging
     if best_pos < k + 1 {
         best_pos = 0; // Too close to start
     }
     if best_pos + k + 1 > v_costs1.len() {
         best_pos = v_costs1.len(); // Too close to end
+    }
+
+    if config.verbosity > 1 && original_best_pos != best_pos {
+        eprintln!(
+            "COST_CALC: original_best_pos={} forced_to={} (len={}, k+1={})",
+            original_best_pos, best_pos, v_costs1.len(), k + 1
+        );
     }
 
     // Check if split is degenerate (C++ AGC agc_compressor.cpp:1400-1415)
