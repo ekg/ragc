@@ -1,5 +1,36 @@
 # RAGC Development Activity Log
 
+## 🔬 HOW TO VERIFY ARCHIVES ARE THE SAME 🔬
+
+**THE FUNDAMENTAL METHOD: SEGMENT LAYOUT COMPARISON**
+
+Archives are identical when their segment layouts match exactly. This is verified by comparing CSV exports:
+
+```bash
+# Export segment layouts from both implementations
+./target/release/ragc inspect /tmp/cpp_test.agc --segment-layout > cpp_layout.csv
+./target/release/ragc inspect /tmp/ragc_test.agc --segment-layout > ragc_layout.csv
+
+# Compare line by line
+diff cpp_layout.csv ragc_layout.csv
+```
+
+**What to look for in the CSV:**
+- `sample,contig,segment_index,group_id,in_group_id,raw_length`
+- Each line represents one segment
+- **Segments must match**: same index → same group_id, in_group_id, raw_length
+- **Different segment lengths = fundamental segmentation error**
+- **Different grouping = grouping algorithm error**
+
+**If segment layouts differ, this indicates:**
+1. **Different raw_length at same index**: Splitter detection bug (segments created at different boundaries)
+2. **Different group_id**: Grouping algorithm divergence
+3. **Different in_group_id**: Group ordering/assignment issue
+
+**This comparison reveals the EXACT point of divergence** - which sample, which contig, which segment index - making debugging systematic instead of guesswork.
+
+---
+
 ## 🚨 CURRENT MISSION: BYTE-IDENTICAL ARCHIVES (2025-11-08) 🚨
 
 **Status**: ✅ MAJOR PROGRESS! Splitter bug fixed - archives now within 1% size difference!

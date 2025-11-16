@@ -1314,7 +1314,7 @@ fn worker_thread(
                 // Phase 2: Try to split into existing groups
                 // CRITICAL: C++ AGC splits BEFORE checking new/known (line 1453)
                 // So we attempt splits for ALL segments, not just new groups!
-                if key_front != MISSING_KMER && key_back != MISSING_KMER {
+                if !key_exists && key_front != MISSING_KMER && key_back != MISSING_KMER {
                     // CRITICAL: First attempt to find middle splitter
                     let middle_kmer_opt = {
                         let terminators = map_segments_terminators.lock().unwrap();
