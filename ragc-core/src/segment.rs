@@ -174,67 +174,10 @@ pub fn split_at_splitters_with_size(
         }
     }
 
-    // At end of contig, look backward through recent k-mers to find rightmost splitter
-    // CRITICAL: Only split if the remaining data after the splitter will be >= k bytes
-    // This ensures C++ AGC can skip k overlap bytes without hitting corruption
-    if debug {
-        eprintln!("\n=== END-OF-CONTIG HANDLING ===");
-        eprintln!("  segment_start={}, contig.len()={}, recent_kmers.len()={}", segment_start, contig.len(), recent_kmers.len());
-    }
-    for (pos, kmer_value, is_dir) in recent_kmers.iter().rev() {
-        if splitters.contains(kmer_value) {
-            let segment_end = pos + 1;
-            let remaining_after = contig.len() - segment_end;
-
-            if debug {
-                eprintln!("  Found splitter at pos={}, remaining_after={}", pos, remaining_after);
-            }
-
-            // Only split here if remaining data is > k bytes
-            // (We need > k, not >= k, because after creating k-base overlap,
-            // the final segment must still have > k bytes for C++ AGC decompressor)
-            if remaining_after > k {
-                if segment_end > segment_start {
-                    let segment_data = contig[segment_start..segment_end].to_vec();
-                    if !segment_data.is_empty() {
-                        if debug {
-                            eprintln!("  END_SPLIT: segment=[{}..{}) len={}, remaining={}", segment_start, segment_end, segment_data.len(), remaining_after);
-                        }
-                        segments.push(Segment::new(segment_data, front_kmer, *kmer_value, front_kmer_is_dir, *is_dir));
-                        // Create (k-1)-byte overlap for next segment (matching C++ AGC)
-                        let new_start = (pos + 1).saturating_sub(k - 1);
-                        if debug {
-                            eprintln!("  Setting segment_start: {} -> {}", segment_start, new_start);
-                        }
-                        segment_start = new_start;
-                        front_kmer = *kmer_value;
-                        front_kmer_is_dir = *is_dir;
-                    }
-                }
-                break;
-            } else if remaining_after == 0 {
-                // Splitter is exactly at contig end - include it in current segment
-                // and don't update segment_start (no next segment to create)
-                if segment_end > segment_start {
-                    let segment_data = contig[segment_start..segment_end].to_vec();
-                    if !segment_data.is_empty() {
-                        if debug {
-                            eprintln!("  END_EXACT: segment=[{}..{}) len={}", segment_start, segment_end, segment_data.len());
-                        }
-                        segments.push(Segment::new(segment_data, front_kmer, *kmer_value, front_kmer_is_dir, *is_dir));
-                        // Mark that we've consumed the entire contig
-                        segment_start = contig.len();
-                    }
-                }
-                break;
-            } else {
-                if debug {
-                    eprintln!("  SKIP: remaining_after={} <= k={}, continuing backward search", remaining_after, k);
-                }
-            }
-            // Otherwise, continue looking for an earlier splitter that leaves enough room
-        }
-    }
+    // End-of-contig handling: C++ AGC segmentation does not perform any
+    // backward search for a last-minute splitter. It simply splits at every
+    // occurrence encountered in the main loop and then emits the final segment.
+    // We therefore intentionally do nothing here to match C++ behavior exactly.
 
     // Add any remaining data as final segment
     // This will either be:

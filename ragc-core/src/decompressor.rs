@@ -62,8 +62,8 @@ pub struct Decompressor {
 
     // Archive parameters
     _segment_size: u32,
-    kmer_length: u32,
-    min_match_len: u32,
+    pub kmer_length: u32,
+    pub min_match_len: u32,
 
     // Archive path for cloning
     archive_path: String,
@@ -242,6 +242,68 @@ impl Decompressor {
 
         // Reconstruct contig from segments
         self.reconstruct_contig(&segments)
+    }
+
+    /// Public: get segment descriptors for a contig
+    pub fn get_contig_segments_desc(
+        &mut self,
+        sample_name: &str,
+        contig_name: &str,
+    ) -> Result<Vec<ragc_common::SegmentDesc>> {
+        // Ensure batches loaded
+        if self
+            .collection
+            .get_no_contigs(sample_name)
+            .is_none_or(|count| count == 0)
+        {
+            let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
+            for batch_id in 0..num_batches {
+                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+            }
+        }
+        self.collection
+            .get_contig_desc(sample_name, contig_name)
+            .ok_or_else(|| anyhow!("Contig not found: {}/{}", sample_name, contig_name))
+    }
+
+    /// Public: get raw segment data for a specific segment descriptor
+    pub fn get_segment_data_by_desc(&mut self, desc: &ragc_common::SegmentDesc) -> Result<Contig> {
+        self.get_segment(desc)
+    }
+
+    /// Public: get the reference segment for a group (loads and caches if needed)
+    pub fn get_reference_segment(&mut self, group_id: u32) -> Result<Contig> {
+        if let Some(ref_data) = self.segment_cache.get(&group_id) {
+            return Ok(ref_data.clone());
+        }
+
+        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+        let ref_stream_name = stream_ref_name(archive_version, group_id);
+        let stream_id = self
+            .archive
+            .get_stream_id(&ref_stream_name)
+            .ok_or_else(|| anyhow!("Reference stream not found: {}", ref_stream_name))?;
+
+        let (mut data, metadata) = self.archive.get_part_by_id(stream_id, 0)?;
+        // Decompress if needed; metadata holds original length for packed format
+        let decompressed = if data.is_empty() {
+            Vec::new()
+        } else if data.last() == Some(&0) {
+            // Plain ZSTD stream with marker 0
+            data.pop();
+            decompress_segment_with_marker(&data, 0)?
+        } else {
+            // Tuple-packed with marker 1
+            let marker = data.pop().unwrap();
+            decompress_segment_with_marker(&data, marker)?
+        };
+
+        // Unpack 2-bit encoded reference to 1-byte bases if needed
+        // decompress_segment_with_marker returns bytes in the stored format for references
+        // Our helper already returns decompressed raw bytes for references
+        let reference = decompressed;
+        self.segment_cache.insert(group_id, reference.clone());
+        Ok(reference)
     }
 
     /// Extract all contigs from a sample
@@ -810,4 +872,3 @@ impl Decompressor {
         self.archive.close()
     }
 }
-

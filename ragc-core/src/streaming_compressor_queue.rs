@@ -641,7 +641,7 @@ impl StreamingQueueCompressor {
                             key.kmer_back
                         );
                     }
-                    flush_pack(buffer, &self.collection, &self.archive, &self.config)
+                    flush_pack(buffer, &self.collection, &self.archive, &self.config, &self.reference_segments)
                         .context("Failed to flush remaining pack")?;
                 }
             }
@@ -717,6 +717,7 @@ fn flush_pack(
     collection: &Arc<Mutex<CollectionV3>>,
     archive: &Arc<Mutex<Archive>>,
     config: &StreamingQueueConfig,
+    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
 ) -> Result<()> {
     use crate::segment_compression::{compress_reference_segment, compress_segment_configured};
 
@@ -777,6 +778,13 @@ fn flush_pack(
 
         buffer.ref_written = true;
         buffer.reference_segment = Some(ref_seg.clone()); // Store for LZ encoding
+
+        // Store reference in global map for split cost validation
+        // This matches C++ AGC's v_segments which keeps all segment data in memory
+        {
+            let mut ref_segs = reference_segments.lock().unwrap();
+            ref_segs.insert(buffer.group_id, ref_seg.data.clone());
+        }
 
         // Prepare LZ encoder with reference (matching C++ AGC segment.cpp line 43: lz_diff->Prepare(s))
         // This is done ONCE when the reference is written, then reused for all subsequent segments
@@ -1356,132 +1364,153 @@ fn worker_thread(
                             }
                         };
 
-                        // CRITICAL: Only split if BOTH groups already exist in the global registry
-                        // (matches C++ AGC behavior - don't split if either group is missing)
-                        let both_groups_exist = {
-                            let map = map_segments.lock().unwrap();
-                            let left_exists = map.contains_key(&left_key);
-                            let right_exists = map.contains_key(&right_key);
+                        // CRITICAL: C++ AGC only checks if k-mers exist as TERMINATORS (line 1379-1382)
+                        // This is already validated by find_middle_splitter above!
+                        // Do NOT check if groups exist - splits can create NEW groups
+                        if config.verbosity > 0 {
+                            eprintln!("DEBUG_SPLIT: Attempting cost-based split for ({},{}) sample={}",
+                                key_front, key_back, task.sample_name);
+                        }
 
-                            if config.verbosity > 1 {
-                                eprintln!(
-                                    "SPLIT_CHECK: original=({},{}) middle={} left_exists={} right_exists={}",
-                                    key_front, key_back, middle_kmer, left_exists, right_exists
-                                );
-                            }
-
-                            left_exists && right_exists
+                        // CRITICAL: Pass k-mers matching segment orientation
+                        // When should_reverse=true, segment_data is RC, so pass original k-mers
+                        let (split_front, split_back) = if should_reverse {
+                            // Segment was reversed: pass original front/back (before normalization)
+                            (segment.front_kmer, segment.back_kmer)
+                        } else {
+                            // Segment in original orientation: use normalized keys
+                            (key_front, key_back)
                         };
 
-                        if both_groups_exist {
-                            // Both split groups exist - attempt split using compression cost
-                            // (matches C++ AGC agc_compressor.cpp lines 1387-1503)
-                            if config.verbosity > 0 {
-                                eprintln!("DEBUG_SPLIT: Attempting cost-based split for ({},{}) sample={}",
-                                    key_front, key_back, task.sample_name);
-                            }
+                        let split_result = try_split_segment_with_cost(
+                            &segment_data,
+                            split_front,
+                            split_back,
+                            middle_kmer,
+                            &left_key,
+                            &right_key,
+                            &map_segments,
+                            &reference_segments,
+                            &config,
+                        );
 
-                            let split_result = try_split_segment_with_cost(
-                                &segment.data,
-                                key_front,
-                                key_back,
-                                middle_kmer,
-                                &left_key,
-                                &right_key,
-                                &map_segments,
-                                &reference_segments,
-                                &config,
-                            );
+                        if let Some((left_data, right_data, _mid)) = split_result {
+                            // Check if this is a degenerate split (one side empty)
+                            let is_degenerate_left = left_data.is_empty();
+                            let is_degenerate_right = right_data.is_empty();
 
-                            if let Some((left_data, right_data, _mid)) = split_result {
-                                // Check if this is a degenerate split (one side empty)
-                                let is_degenerate_left = left_data.is_empty();
-                                let is_degenerate_right = right_data.is_empty();
-
-                                if config.verbosity > 1 {
-                                    if is_degenerate_right {
-                                        eprintln!(
-                                            "SPLIT_DEGENERATE_RIGHT: ({},{}) -> left_only=({},{})",
-                                            key_front, key_back, left_key.kmer_front, left_key.kmer_back
-                                        );
-                                    } else if is_degenerate_left {
-                                        eprintln!(
-                                            "SPLIT_DEGENERATE_LEFT: ({},{}) -> right_only=({},{})",
-                                            key_front, key_back, right_key.kmer_front, right_key.kmer_back
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
-                                            key_front, key_back, left_key.kmer_front, left_key.kmer_back,
-                                            right_key.kmer_front, right_key.kmer_back
-                                        );
-                                    }
-                                }
-
-                                // Add left segment to its existing group (unless degenerate left)
-                                // (matches C++ AGC line 1507: add_known with actual segment data)
-                                if !is_degenerate_left {
-                                    if let Some(left_buffer) = groups.get_mut(&left_key) {
-                                        let left_buffered = BufferedSegment {
-                                            sample_name: task.sample_name.clone(),
-                                            contig_name: task.contig_name.clone(),
-                                            seg_part_no: place,
-                                            data: left_data,
-                                            is_rev_comp: should_reverse,
-                                        };
-                                        left_buffer.segments.push(left_buffered);
-
-                                        if left_buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                                            flush_pack(left_buffer, &collection, &archive, &config)
-                                                .context("Failed to flush left pack")?;
-                                        }
-                                    }
-                                }
-
-                                // Add right segment to its existing group (unless degenerate right)
-                                // (matches C++ AGC line 1510: add_known with actual segment data)
-                                if !is_degenerate_right {
-                                    if let Some(right_buffer) = groups.get_mut(&right_key) {
-                                        // Fix: Use place when LEFT is degenerate (prevents gap in segment indices)
-                                        let seg_part = if is_degenerate_left { place } else { place + 1 };
-                                        let right_buffered = BufferedSegment {
-                                            sample_name: task.sample_name.clone(),
-                                            contig_name: task.contig_name.clone(),
-                                            seg_part_no: seg_part,
-                                            data: right_data,
-                                            is_rev_comp: should_reverse,
-                                        };
-                                        right_buffer.segments.push(right_buffered);
-
-                                        if right_buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                                            flush_pack(right_buffer, &collection, &archive, &config)
-                                                .context("Failed to flush right pack")?;
-                                        }
-                                    }
-                                }
-
-                                // Record this split so subsequent segments from this contig get shifted
-                                // (matches C++ AGC lines 2033-2036: ++seg_part_no twice when split)
-                                // For degenerate splits, only increment once (no actual split)
-                                if !is_degenerate_left && !is_degenerate_right {
-                                    let mut offsets = split_offsets.lock().unwrap();
-                                    offsets.insert((task.sample_name.clone(), task.contig_name.clone(), original_place), 1);
-                                }
-
-                                // Skip adding original segment - we've added the split/reclassified segment
-                                continue;
-                            }
-                            // If split_result was None, fall through to normal path
-                        } else {
-                            // One or both split groups don't exist yet
-                            // Fall through to normal path to create group for unsplit segment
                             if config.verbosity > 1 {
-                                eprintln!(
-                                    "SPLIT_SKIPPED: original=({},{}) middle={} - split groups don't both exist yet",
-                                    key_front, key_back, middle_kmer
-                                );
+                                if is_degenerate_right {
+                                    eprintln!(
+                                        "SPLIT_DEGENERATE_RIGHT: ({},{}) -> left_only=({},{})",
+                                        key_front, key_back, left_key.kmer_front, left_key.kmer_back
+                                    );
+                                } else if is_degenerate_left {
+                                    eprintln!(
+                                        "SPLIT_DEGENERATE_LEFT: ({},{}) -> right_only=({},{})",
+                                        key_front, key_back, right_key.kmer_front, right_key.kmer_back
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
+                                        key_front, key_back, left_key.kmer_front, left_key.kmer_back,
+                                        right_key.kmer_front, right_key.kmer_back
+                                    );
+                                }
                             }
+
+                            // Add left segment to its existing group (unless degenerate left)
+                            // (matches C++ AGC line 1513: buffered_seg_part.add_known)
+                            if !is_degenerate_left {
+                                // CRITICAL FIX: Use .entry().or_insert_with() like Phase 3
+                                // The group exists in global map_segments, but may not exist in local buffer yet
+                                let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
+                                    let group_id = {
+                                        let mut seg_map = map_segments.lock().unwrap();
+                                        *seg_map.get(&left_key).expect("Split left group must exist in map_segments")
+                                    };
+
+                                    // Register streams for this existing group
+                                    let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+
+                                    let mut arch = archive.lock().unwrap();
+                                    let stream_id = arch.register_stream(&delta_stream_name);
+                                    let ref_stream_id = arch.register_stream(&ref_stream_name);
+                                    drop(arch);
+
+                                    SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+                                });
+
+                                let left_buffered = BufferedSegment {
+                                    sample_name: task.sample_name.clone(),
+                                    contig_name: task.contig_name.clone(),
+                                    seg_part_no: place,
+                                    data: left_data,
+                                    is_rev_comp: should_reverse,
+                                };
+                                left_buffer.segments.push(left_buffered);
+
+                                if left_buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                                    flush_pack(left_buffer, &collection, &archive, &config, &reference_segments)
+                                        .context("Failed to flush left pack")?;
+                                }
+                            }
+
+                            // Add right segment to its existing group (unless degenerate right)
+                            // (matches C++ AGC line 1516: buffered_seg_part.add_known)
+                            if !is_degenerate_right {
+                                // CRITICAL FIX: Use .entry().or_insert_with() like Phase 3
+                                // The group exists in global map_segments, but may not exist in local buffer yet
+                                let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
+                                    let group_id = {
+                                        let mut seg_map = map_segments.lock().unwrap();
+                                        *seg_map.get(&right_key).expect("Split right group must exist in map_segments")
+                                    };
+
+                                    // Register streams for this existing group
+                                    let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+
+                                    let mut arch = archive.lock().unwrap();
+                                    let stream_id = arch.register_stream(&delta_stream_name);
+                                    let ref_stream_id = arch.register_stream(&ref_stream_name);
+                                    drop(arch);
+
+                                    SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+                                });
+
+                                // Fix: Use place when LEFT is degenerate (prevents gap in segment indices)
+                                let seg_part = if is_degenerate_left { place } else { place + 1 };
+                                let right_buffered = BufferedSegment {
+                                    sample_name: task.sample_name.clone(),
+                                    contig_name: task.contig_name.clone(),
+                                    seg_part_no: seg_part,
+                                    data: right_data,
+                                    is_rev_comp: should_reverse,
+                                };
+                                right_buffer.segments.push(right_buffered);
+
+                                if right_buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                                    flush_pack(right_buffer, &collection, &archive, &config, &reference_segments)
+                                        .context("Failed to flush right pack")?;
+                                }
+                            }
+
+                            // Record this split so subsequent segments from this contig get shifted
+                            // (matches C++ AGC lines 2033-2036: ++seg_part_no twice when split)
+                            // For degenerate splits, only increment once (no actual split)
+                            if !is_degenerate_left && !is_degenerate_right {
+                                let mut offsets = split_offsets.lock().unwrap();
+                                offsets.insert((task.sample_name.clone(), task.contig_name.clone(), original_place), 1);
+                            }
+
+                            // Skip adding original segment - we've added the split/reclassified segment
+                            continue;
                         }
+                        // If split_result was None, fall through to normal path
                     }
                 }
 
@@ -1615,7 +1644,7 @@ fn worker_thread(
 
                 // Flush pack if buffer is full
                 if buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                    flush_pack(buffer, &collection, &archive, &config)
+                    flush_pack(buffer, &collection, &archive, &config, &reference_segments)
                         .context("Failed to flush pack")?;
                 }
             }
@@ -1782,78 +1811,94 @@ fn try_split_segment_with_cost(
         let map_segments_locked = map_segments.lock().unwrap();
         let ref_segments_locked = reference_segments.lock().unwrap();
 
-        if let Some(&segment_id) = map_segments_locked.get(key) {
-            if let Some(ref_data) = ref_segments_locked.get(&segment_id) {
-                // Reference exists! Prepare LZDiff on-demand
-                if config.verbosity > 0 {
-                    eprintln!(
-                        "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} ref_size={}",
-                        label, key.kmer_front, key.kmer_back, segment_id, ref_data.len()
-                    );
-                }
+        // C++ AGC uses map_segments[key] which returns 0 (default) if key doesn't exist
+        // This matches C++ AGC behavior: agc_compressor.cpp:1553-1554
+        let segment_id = map_segments_locked.get(key).copied().unwrap_or(0);
 
-                let mut lz = LZDiff::new(config.min_match_len as u32);
-                lz.prepare(ref_data);
-                return Some(lz);
-            } else {
-                // Segment ID exists but no reference data
-                if config.verbosity > 0 {
-                    eprintln!(
-                        "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} BUT NO REFERENCE DATA!",
-                        label, key.kmer_front, key.kmer_back, segment_id
-                    );
-                }
-            }
-        } else {
-            // Group doesn't exist in map_segments (should not happen if both_groups_exist passed)
+        if let Some(ref_data) = ref_segments_locked.get(&segment_id) {
+            // Reference exists! Prepare LZDiff on-demand
             if config.verbosity > 0 {
                 eprintln!(
-                    "DEBUG_LZDIFF: {}_key=({},{}) NOT IN MAP_SEGMENTS!",
-                    label, key.kmer_front, key.kmer_back
+                    "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} ref_size={}",
+                    label, key.kmer_front, key.kmer_back, segment_id, ref_data.len()
+                );
+            }
+
+            let mut lz = LZDiff::new(config.min_match_len as u32);
+            lz.prepare(ref_data);
+            return Some(lz);
+        } else {
+            // Segment ID exists but no reference data
+            // This can happen when groups don't exist yet (segment_id=0 may not have reference)
+            if config.verbosity > 0 {
+                eprintln!(
+                    "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} NO REFERENCE DATA (group may not exist yet)",
+                    label, key.kmer_front, key.kmer_back, segment_id
                 );
             }
         }
         None
     };
 
-    // Calculate compression costs for both split groups
-    // Matches C++ AGC agc_compressor.cpp:1598-1635
-    // ALWAYS prepare on-demand from global reference_segments (like C++ v_segments)
-    let mut v_costs1 = if let Some(lz) = prepare_on_demand(left_key, "left") {
-        lz.get_coding_cost_vector(segment_data, true)
+    // Build segment in both orientations once
+    let segment_dir = segment_data; // &Vec<u8>
+    // Reverse-complement once
+    let segment_rc_vec: Vec<u8> = reverse_complement_sequence(segment_data);
+
+    // Calculate compression costs for both split groups with orientation logic
+    // Matches C++ AGC agc_compressor.cpp:1598-1635 and orientation branches
+    let mut v_costs1 = if let Some(mut lz_left) = prepare_on_demand(left_key, "left") {
+        if front_kmer < middle_kmer {
+            // seg1->get_coding_cost(segment_dir, v_costs1, true)
+            lz_left.get_coding_cost_vector(segment_dir, true)
+        } else {
+            // seg1->get_coding_cost(segment_rc, v_costs1, false); reverse(v_costs1)
+            let mut v = lz_left.get_coding_cost_vector(&segment_rc_vec, false);
+            v.reverse();
+            v
+        }
     } else {
-        // No reference available - group hasn't written reference yet
         if config.verbosity > 1 {
             eprintln!("SPLIT_SKIP: left group has no reference yet");
         }
         return None;
     };
 
-    let mut v_costs2 = if let Some(lz) = prepare_on_demand(right_key, "right") {
-        lz.get_coding_cost_vector(segment_data, false)
-    } else {
-        // No reference available - group hasn't written reference yet
-        if config.verbosity > 1 {
-            eprintln!("SPLIT_SKIP: right group has no reference yet");
-        }
-        return None;
-    };
-
-    // CRITICAL: Compute cumulative sums (C++ AGC lines 1568, 1587/1592)
-    // v_costs1: cumulative sum from left (position i = cost of [0..i])
-    // v_costs2: cumulative sum from right (position i = cost of [i..end])
+    // Cumulative sum forward for v_costs1
     let mut sum = 0u32;
     for cost in v_costs1.iter_mut() {
         sum = sum.saturating_add(*cost);
         *cost = sum;
     }
 
-    // v_costs2 needs reverse cumulative sum (right to left)
-    sum = 0u32;
-    for cost in v_costs2.iter_mut().rev() {
-        sum = sum.saturating_add(*cost);
-        *cost = sum;
-    }
+    let mut v_costs2 = if let Some(mut lz_right) = prepare_on_demand(right_key, "right") {
+        if middle_kmer < back_kmer {
+            // seg2->get_coding_cost(segment_dir, v_costs2, false); partial_sum from right
+            let mut v = lz_right.get_coding_cost_vector(segment_dir, false);
+            // Reverse cumulative sum (right to left)
+            let mut acc = 0u32;
+            for cost in v.iter_mut().rev() {
+                acc = acc.saturating_add(*cost);
+                *cost = acc;
+            }
+            v
+        } else {
+            // seg2->get_coding_cost(segment_rc, v_costs2, true); partial_sum forward; reverse(v_costs2)
+            let mut v = lz_right.get_coding_cost_vector(&segment_rc_vec, true);
+            let mut acc = 0u32;
+            for cost in v.iter_mut() {
+                acc = acc.saturating_add(*cost);
+                *cost = acc;
+            }
+            v.reverse();
+            v
+        }
+    } else {
+        if config.verbosity > 1 {
+            eprintln!("SPLIT_SKIP: right group has no reference yet");
+        }
+        return None;
+    };
 
     if v_costs1.is_empty() || v_costs2.is_empty() {
         if config.verbosity > 1 {

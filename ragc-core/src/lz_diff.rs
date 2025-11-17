@@ -17,7 +17,11 @@ const HASHING_STEP: usize = 4; // USE_SPARSE_HT mode
 pub struct LZDiff {
     reference: Vec<u8>,
     reference_len: usize,       // Original length before padding
-    ht: HashMap<u64, Vec<u32>>, // Hash table: kmer_hash -> list of positions
+    // Legacy map used by encode/decode paths (OK if not bit-identical)
+    ht: HashMap<u64, Vec<u32>>, // Hash table: kmer_hash -> list of positions (legacy)
+    // Linear-probing table for exact coding-cost matching with C++
+    ht_lp: Vec<u32>,            // stores (i / HASHING_STEP) or u32::MAX for empty
+    ht_mask: u64,
     min_match_len: u32,
     key_len: u32,
     key_mask: u64,
@@ -37,6 +41,8 @@ impl LZDiff {
             reference: Vec::new(),
             reference_len: 0,
             ht: HashMap::new(),
+            ht_lp: Vec::new(),
+            ht_mask: 0,
             min_match_len,
             key_len,
             key_mask,
@@ -60,6 +66,7 @@ impl LZDiff {
         }
 
         self.build_index();
+        self.build_index_lp();
     }
 
     /// Build hash table index for k-mers in reference
@@ -77,6 +84,50 @@ impl LZDiff {
                     .entry(hash)
                     .or_insert_with(|| Vec::with_capacity(4))
                     .push((i / HASHING_STEP) as u32);
+            }
+            i += HASHING_STEP;
+        }
+    }
+
+    /// Build linear-probing hash table (exactly like C++ CLZDiffBase::make_index32)
+    fn build_index_lp(&mut self) {
+        // Count valid k-mer positions as in C++ prepare_index (sparse mode)
+        let mut ht_size: u64 = 0;
+        let mut no_prev_valid: u32 = 0;
+        let mut cnt_mod: u32 = 0;
+        let key_len_mod: u32 = self.key_len % (HASHING_STEP as u32);
+        for &c in &self.reference {
+            if c < 4 { no_prev_valid += 1; } else { no_prev_valid = 0; }
+            cnt_mod += 1;
+            if cnt_mod == HASHING_STEP as u32 { cnt_mod = 0; }
+            if cnt_mod == key_len_mod && no_prev_valid >= self.key_len {
+                ht_size += 1;
+            }
+        }
+
+        // Adjust size by load factor (0.7) and round to power of two then double
+        let mut ht_size = (ht_size as f64 / 0.7) as u64;
+        while ht_size & (ht_size - 1) != 0 { ht_size &= ht_size - 1; }
+        ht_size <<= 1;
+        if ht_size < 8 { ht_size = 8; }
+
+        self.ht_mask = ht_size - 1;
+        self.ht_lp.clear();
+        self.ht_lp.resize(ht_size as usize, u32::MAX);
+
+        // Insert positions with linear probing (sparse step)
+        let ref_len = self.reference.len();
+        let mut i = 0usize;
+        while i + (self.key_len as usize) < ref_len {
+            if let Some(code) = self.get_code(&self.reference[i..]) {
+                let base = (MurMur64Hash::hash(code) & self.ht_mask) as usize;
+                for j in 0..MAX_NO_TRIES {
+                    let idx = (base + j) & (self.ht_mask as usize);
+                    if self.ht_lp[idx] == u32::MAX {
+                        self.ht_lp[idx] = (i / HASHING_STEP) as u32;
+                        break;
+                    }
+                }
             }
             i += HASHING_STEP;
         }
@@ -166,7 +217,7 @@ impl LZDiff {
         text[start_pos..].reverse();
     }
 
-    /// Find best match in reference for the given position
+    /// Find best match using legacy map (used by encode)
     fn find_best_match(
         &self,
         hash: u64,
@@ -209,6 +260,60 @@ impl LZDiff {
                     b_len += 1;
                 }
 
+                if b_len + f_len > min_to_update {
+                    best_len_bck = b_len as u32;
+                    best_len_fwd = f_len as u32;
+                    best_ref_pos = h_pos as u32;
+                    min_to_update = b_len + f_len;
+                }
+            }
+        }
+
+        if (best_len_bck + best_len_fwd) as usize >= self.min_match_len as usize {
+            Some((best_ref_pos, best_len_bck, best_len_fwd))
+        } else {
+            None
+        }
+    }
+
+    /// Find best match using linear-probing table (exactly like C++ for cost vectors)
+    fn find_best_match_lp(
+        &self,
+        hash: u64,
+        target: &[u8],
+        text_pos: usize,
+        max_len: usize,
+        no_prev_literals: usize,
+    ) -> Option<(u32, u32, u32)> {
+        if self.ht_lp.is_empty() { return None; }
+
+        let mut best_ref_pos = 0u32;
+        let mut best_len_bck = 0u32;
+        let mut best_len_fwd = 0u32;
+        let mut min_to_update = self.min_match_len as usize;
+
+        let mut ht_pos = (hash & self.ht_mask) as usize;
+
+        for j in 0..MAX_NO_TRIES {
+            let idx = (ht_pos + j) & (self.ht_mask as usize);
+            let slot = self.ht_lp[idx];
+            if slot == u32::MAX { break; }
+
+            let h_pos = (slot as usize) * HASHING_STEP;
+            if h_pos >= self.reference.len() { continue; }
+
+            let ref_ptr = &self.reference[h_pos..];
+            let text_ptr = &target[text_pos..];
+            let f_len = Self::matching_length(text_ptr, ref_ptr, max_len);
+            if f_len >= self.key_len as usize {
+                let mut b_len = 0usize;
+                let max_back = no_prev_literals.min(h_pos).min(text_pos);
+                while b_len < max_back {
+                    if target[text_pos - b_len - 1] != self.reference[h_pos - b_len - 1] {
+                        break;
+                    }
+                    b_len += 1;
+                }
                 if b_len + f_len > min_to_update {
                     best_len_bck = b_len as u32;
                     best_len_fwd = f_len as u32;
@@ -294,7 +399,7 @@ impl LZDiff {
             let max_len = text_size - i;
 
             if let Some((match_pos, len_bck, len_fwd)) =
-                self.find_best_match(hash, target, i, max_len, no_prev_literals)
+                self.find_best_match_lp(hash, target, i, max_len, no_prev_literals)
             {
                 // Handle backward extension
                 if len_bck > 0 {
@@ -557,36 +662,40 @@ impl LZDiff {
         v_costs
     }
 
-    /// Compute coding cost for N-run
-    fn coding_cost_nrun(&self, len: u32) -> u32 {
-        // Cost: N_RUN_STARTER_CODE + decimal digits + N_CODE suffix
-        let delta = len - MIN_NRUN_LEN;
-        let digits = if delta == 0 {
-            1
-        } else {
-            ((delta as f64).log10().floor() as u32) + 1
-        };
-        1 + digits + 1 // starter + digits + suffix
+    /// Compute decimal digit length like C++ int_len()
+    fn int_len(x: u32) -> u32 {
+        if x < 10 { 1 }
+        else if x < 100 { 2 }
+        else if x < 1_000 { 3 }
+        else if x < 10_000 { 4 }
+        else if x < 100_000 { 5 }
+        else if x < 1_000_000 { 6 }
+        else if x < 10_000_000 { 7 }
+        else if x < 100_000_000 { 8 }
+        else if x < 1_000_000_000 { 9 }
+        else { 10 }
     }
 
-    /// Compute coding cost for match
+    /// Compute coding cost for N-run (matches C++ coding_cost_Nrun)
+    fn coding_cost_nrun(&self, len: u32) -> u32 {
+        let delta = len - MIN_NRUN_LEN;
+        // starter + decimal digits + suffix
+        1 + Self::int_len(delta) + 1
+    }
+
+    /// Compute coding cost for match (matches C++ coding_cost_match)
     fn coding_cost_match(&self, match_pos: u32, len: u32, pred_pos: u32) -> u32 {
-        // Cost: position_diff digits + ',' + length digits + '.'
         let dif_pos = (match_pos as i32) - (pred_pos as i32);
-        let pos_digits = if dif_pos == 0 {
-            1
+        let pos_digits = if dif_pos >= 0 {
+            Self::int_len(dif_pos as u32)
         } else {
-            ((dif_pos.abs() as f64).log10().floor() as u32) + 1 + if dif_pos < 0 { 1 } else { 0 }
+            Self::int_len((-dif_pos) as u32) + 1 // sign
         };
 
         let delta = len - self.min_match_len;
-        let len_digits = if delta == 0 {
-            1
-        } else {
-            ((delta as f64).log10().floor() as u32) + 1
-        };
+        let len_digits = Self::int_len(delta);
 
-        pos_digits + 1 + len_digits + 1 // pos + ',' + len + '.'
+        pos_digits + len_digits + 2 // pos + ',' + len + '.'
     }
 }
 

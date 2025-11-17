@@ -172,6 +172,36 @@ enum Commands {
         #[arg(short = 'v', long, default_value_t = 0)]
         verbosity: u32,
     },
+
+    /// Debug: extract a segment and two group references for cost verification
+    DebugCost {
+        /// Input archive file path
+        archive: PathBuf,
+        /// Sample name
+        #[arg(long)]
+        sample: String,
+        /// Contig name
+        #[arg(long)]
+        contig: String,
+        /// Segment index within contig
+        #[arg(long)]
+        index: usize,
+        /// Left group_id (k1, k_mid)
+        #[arg(long)]
+        left_group: u32,
+        /// Right group_id (k_mid, k2)
+        #[arg(long)]
+        right_group: u32,
+        /// Left costs placed at prefix (true) or suffix (false)
+        #[arg(long, default_value_t = true)]
+        left_prefix: bool,
+        /// Right costs placed at prefix (true) or suffix (false)
+        #[arg(long, default_value_t = false)]
+        right_prefix: bool,
+        /// Verbosity
+        #[arg(short = 'v', long, default_value_t = 0)]
+        verbosity: u32,
+    },
 }
 
 /// Parse capacity string with suffixes (K, M, G) into bytes
@@ -302,6 +332,10 @@ fn main() -> Result<()> {
                 show_segment_layout: segment_layout,
             };
             inspect::inspect_archive(archive, config)?
+        }
+
+        Commands::DebugCost { archive, sample, contig, index, left_group, right_group, left_prefix, right_prefix, verbosity } => {
+            debug_cost_command(archive, sample, contig, index, left_group, right_group, left_prefix, right_prefix, verbosity)?;
         }
     }
 
@@ -463,6 +497,128 @@ fn create_archive(
         return Ok(());
     }
 
+    Ok(())
+}
+
+fn write_bin<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
+    std::fs::create_dir_all(path.as_ref().parent().unwrap_or(Path::new(".")))?;
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+fn debug_cost_command(
+    archive: PathBuf,
+    sample: String,
+    contig: String,
+    index: usize,
+    left_group: u32,
+    right_group: u32,
+    left_prefix: bool,
+    right_prefix: bool,
+    verbosity: u32,
+) -> Result<()> {
+    let archive_str = archive.to_str().ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
+    let mut dec = Decompressor::open(archive_str, DecompressorConfig { verbosity })?;
+
+    // Load contig descriptors
+    let segments = dec.get_contig_segments_desc(&sample, &contig)?;
+    if index >= segments.len() {
+        anyhow::bail!("Index {} out of range (contig has {} segments)", index, segments.len());
+    }
+
+    let seg_desc = &segments[index];
+    let seg_data = dec.get_segment_data_by_desc(seg_desc)?;
+
+    let left_ref = dec.get_reference_segment(left_group)?;
+    let right_ref = dec.get_reference_segment(right_group)?;
+
+    // Write to tmp folder
+    let out_dir = PathBuf::from(format!("./tmp/cost_debug_{}_{}_{}", sample.replace('#', "_"), contig.replace('#', "_"), index));
+    std::fs::create_dir_all(&out_dir)?;
+    let seg_path = out_dir.join("segment.bin");
+    let left_path = out_dir.join("left_ref.bin");
+    let right_path = out_dir.join("right_ref.bin");
+    write_bin(&seg_path, &seg_data)?;
+    write_bin(&left_path, &left_ref)?;
+    write_bin(&right_path, &right_ref)?;
+
+    println!("Wrote files:");
+    println!("  segment:   {} (len={})", seg_path.display(), seg_data.len());
+    println!("  left_ref:  {} (group_id={} len={})", left_path.display(), left_group, left_ref.len());
+    println!("  right_ref: {} (group_id={} len={})", right_path.display(), right_group, right_ref.len());
+
+    // Try run cost verifier if built
+    let verifier = PathBuf::from("./target/cost_verifier");
+    if !verifier.exists() {
+        println!("\nCost verifier not found at {}. To build it:", verifier.display());
+        println!("  scripts/build_cost_verifier.sh");
+    } else {
+        println!("\nRunning C++ verifier (left, prefix={})…", left_prefix);
+        let out = std::process::Command::new(&verifier)
+            .args([
+                if left_prefix {"1"} else {"0"},
+                left_path.to_str().unwrap(),
+                seg_path.to_str().unwrap(),
+            ])
+            .output()?;
+        std::io::stdout().write_all(&out.stdout)?;
+
+        println!("\nRunning C++ verifier (right, prefix={})…", right_prefix);
+        let out2 = std::process::Command::new(&verifier)
+            .args([
+                if right_prefix {"1"} else {"0"},
+                right_path.to_str().unwrap(),
+                seg_path.to_str().unwrap(),
+            ])
+            .output()?;
+        std::io::stdout().write_all(&out2.stdout)?;
+    }
+
+    // Compute Rust cost vectors for comparison
+    use ragc_core::LZDiff;
+    let mut lz_left = LZDiff::new(dec.min_match_len);
+    lz_left.prepare(&left_ref);
+    let mut lz_right = LZDiff::new(dec.min_match_len);
+    lz_right.prepare(&right_ref);
+
+    let mut v_left_raw = lz_left.get_coding_cost_vector(&seg_data, left_prefix);
+    let mut v_right_raw = lz_right.get_coding_cost_vector(&seg_data, right_prefix);
+    let mut v_left = v_left_raw.clone();
+    let mut v_right = v_right_raw.clone();
+
+    // Apply cumulative sums as streaming splitter does
+    // Left: always forward cumulative sum
+    let mut sum = 0u32;
+    for c in v_left.iter_mut() { sum = sum.saturating_add(*c); *c = sum; }
+
+    // Right: if suffix costs (prefix=false), we need reverse cumulative sum (right to left)
+    // Otherwise (prefix=true), forward cumulative then reverse the vector
+    if !right_prefix {
+        let mut acc = 0u32; for c in v_right.iter_mut().rev() { acc = acc.saturating_add(*c); *c = acc; }
+    } else {
+        let mut acc = 0u32; for c in v_right.iter_mut() { acc = acc.saturating_add(*c); *c = acc; }
+        v_right.reverse();
+    }
+
+    // Find best split pos by minimizing left[i] + right[i]
+    let mut best_sum = u64::MAX; let mut best_pos = 0usize;
+    for i in 0..v_left.len().min(v_right.len()) {
+        let s = (v_left[i] as u64) + (v_right[i] as u64);
+        if s < best_sum { best_sum = s; best_pos = i; }
+    }
+
+    println!("\n[RUST] RAW left len={} head20={:?}", v_left_raw.len(), &v_left_raw.iter().take(20).cloned().collect::<Vec<_>>());
+    println!("[RUST] RAW left tail20={:?}", &v_left_raw.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
+    println!("[RUST] RAW right len={} head20={:?}", v_right_raw.len(), &v_right_raw.iter().take(20).cloned().collect::<Vec<_>>());
+    println!("[RUST] RAW right tail20={:?}", &v_right_raw.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
+
+    println!("[RUST] CUM left head20={:?}", &v_left.iter().take(20).cloned().collect::<Vec<_>>());
+    println!("[RUST] CUM left tail20={:?}", &v_left.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
+    println!("[RUST] CUM right head20={:?}", &v_right.iter().take(20).cloned().collect::<Vec<_>>());
+    println!("[RUST] CUM right tail20={:?}", &v_right.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
+    println!("[RUST] best_pos={} best_sum={}", best_pos, best_sum);
+
+    println!("\nTo tweak inputs: change left/right groups to neighbor segment group_ids or adjust prefix flags to match orientation.");
     Ok(())
 }
 
