@@ -1372,20 +1372,10 @@ fn worker_thread(
                                 key_front, key_back, task.sample_name);
                         }
 
-                        // CRITICAL: Pass k-mers matching segment orientation
-                        // When should_reverse=true, segment_data is RC, so pass original k-mers
-                        let (split_front, split_back) = if should_reverse {
-                            // Segment was reversed: pass original front/back (before normalization)
-                            (segment.front_kmer, segment.back_kmer)
-                        } else {
-                            // Segment in original orientation: use normalized keys
-                            (key_front, key_back)
-                        };
-
                         let split_result = try_split_segment_with_cost(
                             &segment_data,
-                            split_front,
-                            split_back,
+                            key_front,
+                            key_back,
                             middle_kmer,
                             &left_key,
                             &right_key,
@@ -1419,84 +1409,73 @@ fn worker_thread(
                                 }
                             }
 
-                            // Add left segment to its existing group (unless degenerate left)
-                            // (matches C++ AGC line 1513: buffered_seg_part.add_known)
-                            if !is_degenerate_left {
-                                // CRITICAL FIX: Use .entry().or_insert_with() like Phase 3
-                                // The group exists in global map_segments, but may not exist in local buffer yet
-                                let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
+                            // Prepare buffers for left/right groups (only if needed)
+                            let mut ensure_buffer = |key: &SegmentGroupKey| -> &mut SegmentGroupBuffer {
+                                groups.entry(key.clone()).or_insert_with(|| {
                                     let group_id = {
                                         let mut seg_map = map_segments.lock().unwrap();
-                                        *seg_map.get(&left_key).expect("Split left group must exist in map_segments")
+                                        *seg_map.get(key).expect("Split group must exist in map_segments")
                                     };
-
-                                    // Register streams for this existing group
                                     let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
                                     let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
                                     let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-
                                     let mut arch = archive.lock().unwrap();
                                     let stream_id = arch.register_stream(&delta_stream_name);
                                     let ref_stream_id = arch.register_stream(&ref_stream_name);
                                     drop(arch);
-
                                     SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
-                                });
+                                })
+                            };
 
-                                let left_buffered = BufferedSegment {
+                            // Emit order: if the original segment was reverse-complemented for orientation,
+                            // the "right" part in oriented space comes first in original contig order.
+                            let emit_left_first = !should_reverse;
+
+                            // Helper to push a part into its buffer with a given seg_part_no
+                            let mut push_part = |buf: &mut SegmentGroupBuffer, seg_part_no: usize, data: Vec<u8>| -> Result<()> {
+                                let bs = BufferedSegment {
                                     sample_name: task.sample_name.clone(),
                                     contig_name: task.contig_name.clone(),
-                                    seg_part_no: place,
-                                    data: left_data,
+                                    seg_part_no,
+                                    data,
                                     is_rev_comp: should_reverse,
                                 };
-                                left_buffer.segments.push(left_buffered);
-
-                                if left_buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                                    flush_pack(left_buffer, &collection, &archive, &config, &reference_segments)
-                                        .context("Failed to flush left pack")?;
+                                buf.segments.push(bs);
+                                if buf.segments.len() >= PACK_CARDINALITY + 1 {
+                                    flush_pack(buf, &collection, &archive, &config, &reference_segments)
+                                        .context("Failed to flush pack")?;
                                 }
+                                Ok(())
+                            };
+
+                            // Compute placement indices in contig order
+                            let (first_key, first_data, second_key, second_data, second_part_no) = if emit_left_first {
+                                // left at 'place', right at 'place+1' (unless degenerate)
+                                let first_key = &left_key;
+                                let first_data = if is_degenerate_left { None } else { Some(left_data) };
+                                let second_key = &right_key;
+                                let second_data = if is_degenerate_right { None } else { Some(right_data) };
+                                let second_part_no = if is_degenerate_left { place } else { place + 1 };
+                                (first_key, first_data, second_key, second_data, second_part_no)
+                            } else {
+                                // reversed: right comes first at 'place', left follows at 'place+1' (unless degenerate)
+                                let first_key = &right_key;
+                                let first_data = if is_degenerate_right { None } else { Some(right_data) };
+                                let second_key = &left_key;
+                                let second_data = if is_degenerate_left { None } else { Some(left_data) };
+                                let second_part_no = if is_degenerate_right { place } else { place + 1 };
+                                (first_key, first_data, second_key, second_data, second_part_no)
+                            };
+
+                            // Emit first part
+                            if let Some(data) = first_data {
+                                let buf = ensure_buffer(first_key);
+                                push_part(buf, place, data)?;
                             }
-
-                            // Add right segment to its existing group (unless degenerate right)
-                            // (matches C++ AGC line 1516: buffered_seg_part.add_known)
-                            if !is_degenerate_right {
-                                // CRITICAL FIX: Use .entry().or_insert_with() like Phase 3
-                                // The group exists in global map_segments, but may not exist in local buffer yet
-                                let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
-                                    let group_id = {
-                                        let mut seg_map = map_segments.lock().unwrap();
-                                        *seg_map.get(&right_key).expect("Split right group must exist in map_segments")
-                                    };
-
-                                    // Register streams for this existing group
-                                    let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
-                                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-
-                                    let mut arch = archive.lock().unwrap();
-                                    let stream_id = arch.register_stream(&delta_stream_name);
-                                    let ref_stream_id = arch.register_stream(&ref_stream_name);
-                                    drop(arch);
-
-                                    SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
-                                });
-
-                                // Fix: Use place when LEFT is degenerate (prevents gap in segment indices)
-                                let seg_part = if is_degenerate_left { place } else { place + 1 };
-                                let right_buffered = BufferedSegment {
-                                    sample_name: task.sample_name.clone(),
-                                    contig_name: task.contig_name.clone(),
-                                    seg_part_no: seg_part,
-                                    data: right_data,
-                                    is_rev_comp: should_reverse,
-                                };
-                                right_buffer.segments.push(right_buffered);
-
-                                if right_buffer.segments.len() >= PACK_CARDINALITY + 1 {
-                                    flush_pack(right_buffer, &collection, &archive, &config, &reference_segments)
-                                        .context("Failed to flush right pack")?;
-                                }
+                            // Emit second part, if exists
+                            if let Some(data) = second_data {
+                                let buf = ensure_buffer(second_key);
+                                push_part(buf, second_part_no, data)?;
                             }
 
                             // Record this split so subsequent segments from this contig get shifted

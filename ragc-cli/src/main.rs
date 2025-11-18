@@ -186,12 +186,12 @@ enum Commands {
         /// Segment index within contig
         #[arg(long)]
         index: usize,
-        /// Left group_id (k1, k_mid)
+        /// Left group_id (k1, k_mid). If omitted, uses prev segment's group_id.
         #[arg(long)]
-        left_group: u32,
-        /// Right group_id (k_mid, k2)
+        left_group: Option<u32>,
+        /// Right group_id (k_mid, k2). If omitted, uses current segment's group_id.
         #[arg(long)]
-        right_group: u32,
+        right_group: Option<u32>,
         /// Left costs placed at prefix (true) or suffix (false)
         #[arg(long, default_value_t = true)]
         left_prefix: bool,
@@ -511,8 +511,8 @@ fn debug_cost_command(
     sample: String,
     contig: String,
     index: usize,
-    left_group: u32,
-    right_group: u32,
+    left_group: Option<u32>,
+    right_group: Option<u32>,
     left_prefix: bool,
     right_prefix: bool,
     verbosity: u32,
@@ -529,8 +529,15 @@ fn debug_cost_command(
     let seg_desc = &segments[index];
     let seg_data = dec.get_segment_data_by_desc(seg_desc)?;
 
-    let left_ref = dec.get_reference_segment(left_group)?;
-    let right_ref = dec.get_reference_segment(right_group)?;
+    // Auto-pick neighbor groups if not provided
+    let left_gid = if let Some(g) = left_group { g } else {
+        if index == 0 { anyhow::bail!("No left group for index 0; provide --left-group explicitly"); }
+        segments[index - 1].group_id
+    };
+    let right_gid = if let Some(g) = right_group { g } else { segments[index].group_id };
+
+    let left_ref = dec.get_reference_segment(left_gid)?;
+    let right_ref = dec.get_reference_segment(right_gid)?;
 
     // Write to tmp folder
     let out_dir = PathBuf::from(format!("./tmp/cost_debug_{}_{}_{}", sample.replace('#', "_"), contig.replace('#', "_"), index));
@@ -544,8 +551,8 @@ fn debug_cost_command(
 
     println!("Wrote files:");
     println!("  segment:   {} (len={})", seg_path.display(), seg_data.len());
-    println!("  left_ref:  {} (group_id={} len={})", left_path.display(), left_group, left_ref.len());
-    println!("  right_ref: {} (group_id={} len={})", right_path.display(), right_group, right_ref.len());
+    println!("  left_ref:  {} (group_id={} len={})", left_path.display(), left_gid, left_ref.len());
+    println!("  right_ref: {} (group_id={} len={})", right_path.display(), right_gid, right_ref.len());
 
     // Try run cost verifier if built
     let verifier = PathBuf::from("./target/cost_verifier");
