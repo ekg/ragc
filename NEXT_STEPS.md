@@ -198,6 +198,12 @@ if only_ragc:
 
 ---
 
+## Mapping and Cost Parity Updates (in this branch)
+
+- Split mapping: use `split_pos = best_pos` to align with C++ midpoint mapping and eliminate paired ±1 segment length drift.
+- Cost index: guard linear-probing table sizing from `ht_size=0` to avoid debug underflow during tests; no behavioral change for real references.
+- Action: after pulling these changes, rebuild (`cargo build --release`) and re-run layout comparisons with your C++ baseline.
+
 ## Success Criteria
 
 1. ✅ RAGC group count matches C++ AGC (±5 groups acceptable)

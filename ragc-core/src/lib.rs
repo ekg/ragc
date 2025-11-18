@@ -137,6 +137,71 @@ pub mod tuple_packing;
 pub mod worker;
 pub mod zstd_pool;
 
+#[cfg(feature = "ffi_cost")]
+pub mod ragc_ffi {
+    extern "C" {
+        pub fn agc_cost_vector(
+            prefix: i32,
+            ref_ptr: *const u8,
+            ref_len: usize,
+            text_ptr: *const u8,
+            text_len: usize,
+            min_match_len: u32,
+            out_costs: *mut u32,
+        ) -> usize;
+
+        pub fn agc_best_split(
+            left_ref: *const u8,
+            left_len: usize,
+            right_ref: *const u8,
+            right_len: usize,
+            text_ptr: *const u8,
+            text_len: usize,
+            min_match_len: u32,
+            k: u32,
+            front_lt_mid: i32,
+            mid_lt_back: i32,
+            out_best_pos: *mut u32,
+            out_seg2_start: *mut u32,
+        ) -> i32;
+    }
+
+    pub fn cost_vector(prefix: bool, reference: &[u8], text: &[u8], min_match_len: u32) -> Vec<u32> {
+        unsafe {
+            let mut out = vec![0u32; text.len()];
+            let _ = agc_cost_vector(
+                if prefix { 1 } else { 0 },
+                reference.as_ptr(),
+                reference.len(),
+                text.as_ptr(),
+                text.len(),
+                min_match_len,
+                out.as_mut_ptr(),
+            );
+            out
+        }
+    }
+
+    pub fn best_split(left_ref: &[u8], right_ref: &[u8], text: &[u8], min_match_len: u32, k: u32, front_lt_mid: bool, mid_lt_back: bool) -> Option<(usize, usize)> {
+        unsafe {
+            let mut best: u32 = 0;
+            let mut seg2: u32 = 0;
+            let ok = agc_best_split(
+                left_ref.as_ptr(), left_ref.len(),
+                right_ref.as_ptr(), right_ref.len(),
+                text.as_ptr(), text.len(),
+                min_match_len,
+                k,
+                if front_lt_mid {1} else {0},
+                if mid_lt_back {1} else {0},
+                &mut best as *mut u32,
+                &mut seg2 as *mut u32,
+            );
+            if ok != 0 { Some((best as usize, seg2 as usize)) } else { None }
+        }
+    }
+}
+
 // Re-export commonly used types
 pub use contig_iterator::{MultiFileIterator, PansnFileIterator};
 pub use decompressor::{Decompressor, DecompressorConfig};

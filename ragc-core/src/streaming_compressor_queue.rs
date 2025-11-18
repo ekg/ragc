@@ -1409,73 +1409,91 @@ fn worker_thread(
                                 }
                             }
 
-                            // Prepare buffers for left/right groups (only if needed)
-                            let mut ensure_buffer = |key: &SegmentGroupKey| -> &mut SegmentGroupBuffer {
-                                groups.entry(key.clone()).or_insert_with(|| {
-                                    let group_id = {
-                                        let mut seg_map = map_segments.lock().unwrap();
-                                        *seg_map.get(key).expect("Split group must exist in map_segments")
-                                    };
-                                    let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
-                                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-                                    let mut arch = archive.lock().unwrap();
-                                    let stream_id = arch.register_stream(&delta_stream_name);
-                                    let ref_stream_id = arch.register_stream(&ref_stream_name);
-                                    drop(arch);
-                                    SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
-                                })
-                            };
-
-                            // Emit order: if the original segment was reverse-complemented for orientation,
-                            // the "right" part in oriented space comes first in original contig order.
                             let emit_left_first = !should_reverse;
 
-                            // Helper to push a part into its buffer with a given seg_part_no
-                            let mut push_part = |buf: &mut SegmentGroupBuffer, seg_part_no: usize, data: Vec<u8>| -> Result<()> {
-                                let bs = BufferedSegment {
-                                    sample_name: task.sample_name.clone(),
-                                    contig_name: task.contig_name.clone(),
-                                    seg_part_no,
-                                    data,
-                                    is_rev_comp: should_reverse,
-                                };
-                                buf.segments.push(bs);
-                                if buf.segments.len() >= PACK_CARDINALITY + 1 {
-                                    flush_pack(buf, &collection, &archive, &config, &reference_segments)
-                                        .context("Failed to flush pack")?;
+                            // Emit in correct contig order
+                            if emit_left_first {
+                                // left first
+                                if !is_degenerate_left {
+                                    let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
+                                        let group_id = {
+                                            let mut seg_map = map_segments.lock().unwrap();
+                                            *seg_map.get(&left_key).expect("Split left group must exist in map_segments")
+                                        };
+                                        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                                        let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                                        let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+                                        let mut arch = archive.lock().unwrap();
+                                        let stream_id = arch.register_stream(&delta_stream_name);
+                                        let ref_stream_id = arch.register_stream(&ref_stream_name);
+                                        drop(arch);
+                                        SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+                                    });
+                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: left_data, is_rev_comp: should_reverse };
+                                    left_buffer.segments.push(left_buffered);
+                                    if left_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(left_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush left pack")?; }
                                 }
-                                Ok(())
-                            };
-
-                            // Compute placement indices in contig order
-                            let (first_key, first_data, second_key, second_data, second_part_no) = if emit_left_first {
-                                // left at 'place', right at 'place+1' (unless degenerate)
-                                let first_key = &left_key;
-                                let first_data = if is_degenerate_left { None } else { Some(left_data) };
-                                let second_key = &right_key;
-                                let second_data = if is_degenerate_right { None } else { Some(right_data) };
-                                let second_part_no = if is_degenerate_left { place } else { place + 1 };
-                                (first_key, first_data, second_key, second_data, second_part_no)
+                                if !is_degenerate_right {
+                                    let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
+                                        let group_id = {
+                                            let mut seg_map = map_segments.lock().unwrap();
+                                            *seg_map.get(&right_key).expect("Split right group must exist in map_segments")
+                                        };
+                                        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                                        let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                                        let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+                                        let mut arch = archive.lock().unwrap();
+                                        let stream_id = arch.register_stream(&delta_stream_name);
+                                        let ref_stream_id = arch.register_stream(&ref_stream_name);
+                                        drop(arch);
+                                        SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+                                    });
+                                    let seg_part = if is_degenerate_left { place } else { place + 1 };
+                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: right_data, is_rev_comp: should_reverse };
+                                    right_buffer.segments.push(right_buffered);
+                                    if right_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(right_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush right pack")?; }
+                                }
                             } else {
-                                // reversed: right comes first at 'place', left follows at 'place+1' (unless degenerate)
-                                let first_key = &right_key;
-                                let first_data = if is_degenerate_right { None } else { Some(right_data) };
-                                let second_key = &left_key;
-                                let second_data = if is_degenerate_left { None } else { Some(left_data) };
-                                let second_part_no = if is_degenerate_right { place } else { place + 1 };
-                                (first_key, first_data, second_key, second_data, second_part_no)
-                            };
-
-                            // Emit first part
-                            if let Some(data) = first_data {
-                                let buf = ensure_buffer(first_key);
-                                push_part(buf, place, data)?;
-                            }
-                            // Emit second part, if exists
-                            if let Some(data) = second_data {
-                                let buf = ensure_buffer(second_key);
-                                push_part(buf, second_part_no, data)?;
+                                // reversed: right first
+                                if !is_degenerate_right {
+                                    let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
+                                        let group_id = {
+                                            let mut seg_map = map_segments.lock().unwrap();
+                                            *seg_map.get(&right_key).expect("Split right group must exist in map_segments")
+                                        };
+                                        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                                        let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                                        let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+                                        let mut arch = archive.lock().unwrap();
+                                        let stream_id = arch.register_stream(&delta_stream_name);
+                                        let ref_stream_id = arch.register_stream(&ref_stream_name);
+                                        drop(arch);
+                                        SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+                                    });
+                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: right_data, is_rev_comp: should_reverse };
+                                    right_buffer.segments.push(right_buffered);
+                                    if right_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(right_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush right pack")?; }
+                                }
+                                if !is_degenerate_left {
+                                    let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
+                                        let group_id = {
+                                            let mut seg_map = map_segments.lock().unwrap();
+                                            *seg_map.get(&left_key).expect("Split left group must exist in map_segments")
+                                        };
+                                        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                                        let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                                        let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+                                        let mut arch = archive.lock().unwrap();
+                                        let stream_id = arch.register_stream(&delta_stream_name);
+                                        let ref_stream_id = arch.register_stream(&ref_stream_name);
+                                        drop(arch);
+                                        SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+                                    });
+                                    let seg_part = if is_degenerate_right { place } else { place + 1 };
+                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: left_data, is_rev_comp: should_reverse };
+                                    left_buffer.segments.push(left_buffered);
+                                    if left_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(left_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush left pack")?; }
+                                }
                             }
 
                             // Record this split so subsequent segments from this contig get shifted
@@ -1758,6 +1776,15 @@ fn split_segment_at_position(
     (left, right)
 }
 
+/// Split using seg2_start byte index (start of right segment) matching C++ layout
+fn split_segment_from_start(segment_data: &[u8], seg2_start: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    let seg2_start_pos = seg2_start.min(segment_data.len());
+    let right = segment_data[seg2_start_pos..].to_vec();
+    let left_end = seg2_start_pos.saturating_add(k).min(segment_data.len());
+    let left = segment_data[..left_end].to_vec();
+    (left, right)
+}
+
 /// Phase 6: Attempt to split using compression cost heuristic (EXACT C++ AGC algorithm)
 /// Matches agc_compressor.cpp lines 1387-1503 and 1531-1663
 /// Returns Some((left_data, right_data, middle_kmer)) if split is beneficial
@@ -1824,24 +1851,71 @@ fn try_split_segment_with_cost(
     // Reverse-complement once
     let segment_rc_vec: Vec<u8> = reverse_complement_sequence(segment_data);
 
-    // Calculate compression costs for both split groups with orientation logic
-    // Matches C++ AGC agc_compressor.cpp:1598-1635 and orientation branches
-    let mut v_costs1 = if let Some(mut lz_left) = prepare_on_demand(left_key, "left") {
-        if front_kmer < middle_kmer {
-            // seg1->get_coding_cost(segment_dir, v_costs1, true)
-            lz_left.get_coding_cost_vector(segment_dir, true)
+    // Calculate compression costs and best split position using C++ FFI if enabled
+    // Falls back to Rust implementation otherwise
+    let mut maybe_best: Option<(usize, usize)> = None; // (best_pos, seg2_start)
+    #[cfg(feature = "ffi_cost")]
+    {
+        let left_ref_opt = {
+            let map_segments_locked = map_segments.lock().unwrap();
+            let ref_segments_locked = reference_segments.lock().unwrap();
+            let seg_id = map_segments_locked.get(left_key).copied().unwrap_or(0);
+            ref_segments_locked.get(&seg_id).cloned()
+        };
+        let right_ref_opt = {
+            let map_segments_locked = map_segments.lock().unwrap();
+            let ref_segments_locked = reference_segments.lock().unwrap();
+            let seg_id = map_segments_locked.get(right_key).copied().unwrap_or(0);
+            ref_segments_locked.get(&seg_id).cloned()
+        };
+        if let (Some(ref_left), Some(ref_right)) = (left_ref_opt, right_ref_opt) {
+            let flm = front_kmer < middle_kmer;
+            let mlb = middle_kmer < back_kmer;
+            maybe_best = crate::ragc_ffi::best_split(&ref_left, &ref_right, segment_dir, config.min_match_len as u32, config.k as u32, flm, mlb);
         } else {
-            // seg1->get_coding_cost(segment_rc, v_costs1, false); reverse(v_costs1)
-            let mut v = lz_left.get_coding_cost_vector(&segment_rc_vec, false);
-            v.reverse();
-            v
+            if config.verbosity > 1 { eprintln!("SPLIT_SKIP: missing left/right reference for FFI best split"); }
+            return None;
         }
-    } else {
-        if config.verbosity > 1 {
-            eprintln!("SPLIT_SKIP: left group has no reference yet");
+    }
+
+    // If FFI provided best position, use it; otherwise compute costs in Rust
+    let mut v_costs1 = if maybe_best.is_none() {
+        if let Some(mut lz_left) = prepare_on_demand(left_key, "left") {
+        #[cfg(feature = "ffi_cost")]
+        {
+            // Unused path when FFI returns best split; kept for completeness
+            let ref_left = {
+                let map_segments_locked = map_segments.lock().unwrap();
+                let ref_segments_locked = reference_segments.lock().unwrap();
+                let seg_id = map_segments_locked.get(left_key).copied().unwrap_or(0);
+                ref_segments_locked.get(&seg_id).cloned()
+            };
+            if let Some(ref_data) = ref_left {
+                if front_kmer < middle_kmer {
+                    crate::ragc_ffi::cost_vector(true, &ref_data, segment_dir, config.min_match_len as u32)
+                } else {
+                    let mut v = crate::ragc_ffi::cost_vector(false, &ref_data, &segment_rc_vec, config.min_match_len as u32);
+                    v.reverse(); v
+                }
+            } else {
+                if config.verbosity > 1 { eprintln!("SPLIT_SKIP: left group has no reference yet"); }
+                return None;
+            }
         }
+        #[cfg(not(feature = "ffi_cost"))]
+        {
+            if front_kmer < middle_kmer {
+                lz_left.get_coding_cost_vector(segment_dir, true)
+            } else {
+                let mut v = lz_left.get_coding_cost_vector(&segment_rc_vec, false);
+                v.reverse(); v
+            }
+        }
+        } else {
+        if config.verbosity > 1 { eprintln!("SPLIT_SKIP: left group has no reference yet"); }
         return None;
-    };
+        }
+    } else { Vec::new() };
 
     // Cumulative sum forward for v_costs1
     let mut sum = 0u32;
@@ -1850,43 +1924,71 @@ fn try_split_segment_with_cost(
         *cost = sum;
     }
 
-    let mut v_costs2 = if let Some(mut lz_right) = prepare_on_demand(right_key, "right") {
-        if middle_kmer < back_kmer {
-            // seg2->get_coding_cost(segment_dir, v_costs2, false); partial_sum from right
-            let mut v = lz_right.get_coding_cost_vector(segment_dir, false);
-            // Reverse cumulative sum (right to left)
-            let mut acc = 0u32;
-            for cost in v.iter_mut().rev() {
-                acc = acc.saturating_add(*cost);
-                *cost = acc;
+    let mut v_costs2 = if maybe_best.is_none() {
+        if let Some(mut lz_right) = prepare_on_demand(right_key, "right") {
+        #[cfg(feature = "ffi_cost")]
+        {
+            let ref_right = {
+                let map_segments_locked = map_segments.lock().unwrap();
+                let ref_segments_locked = reference_segments.lock().unwrap();
+                let seg_id = map_segments_locked.get(right_key).copied().unwrap_or(0);
+                ref_segments_locked.get(&seg_id).cloned()
+            };
+            if let Some(ref_data) = ref_right {
+                let mut v = if middle_kmer < back_kmer {
+                    // Suffix placement, cumulative sum right-to-left
+                    crate::ragc_ffi::cost_vector(false, &ref_data, segment_dir, config.min_match_len as u32)
+                } else {
+                    // RC + prefix placement; cumulative sum left-to-right then reverse
+                    crate::ragc_ffi::cost_vector(true, &ref_data, &segment_rc_vec, config.min_match_len as u32)
+                };
+                if middle_kmer < back_kmer {
+                    // Reverse cumulative sum
+                    let mut acc = 0u32;
+                    for cost in v.iter_mut().rev() {
+                        acc = acc.saturating_add(*cost);
+                        *cost = acc;
+                    }
+                    v
+                } else {
+                    // Forward cumulative then reverse
+                    let mut acc = 0u32;
+                    for cost in v.iter_mut() {
+                        acc = acc.saturating_add(*cost);
+                        *cost = acc;
+                    }
+                    v.reverse();
+                    v
+                }
+            } else {
+                if config.verbosity > 1 { eprintln!("SPLIT_SKIP: right group has no reference yet"); }
+                return None;
             }
-            v
+        }
+        #[cfg(not(feature = "ffi_cost"))]
+        {
+            if middle_kmer < back_kmer {
+                let mut v = lz_right.get_coding_cost_vector(segment_dir, false);
+                let mut acc = 0u32; for cost in v.iter_mut().rev() { acc = acc.saturating_add(*cost); *cost = acc; } v
+            } else {
+                let mut v = lz_right.get_coding_cost_vector(&segment_rc_vec, true);
+                let mut acc = 0u32; for cost in v.iter_mut() { acc = acc.saturating_add(*cost); *cost = acc; } v.reverse(); v
+            }
+        }
         } else {
-            // seg2->get_coding_cost(segment_rc, v_costs2, true); partial_sum forward; reverse(v_costs2)
-            let mut v = lz_right.get_coding_cost_vector(&segment_rc_vec, true);
-            let mut acc = 0u32;
-            for cost in v.iter_mut() {
-                acc = acc.saturating_add(*cost);
-                *cost = acc;
-            }
-            v.reverse();
-            v
-        }
-    } else {
-        if config.verbosity > 1 {
-            eprintln!("SPLIT_SKIP: right group has no reference yet");
-        }
+        if config.verbosity > 1 { eprintln!("SPLIT_SKIP: right group has no reference yet"); }
         return None;
-    };
+        }
+    } else { Vec::new() };
 
-    if v_costs1.is_empty() || v_costs2.is_empty() {
+    if maybe_best.is_none() && (v_costs1.is_empty() || v_costs2.is_empty()) {
         if config.verbosity > 1 {
             eprintln!("SPLIT_SKIP: cost vectors empty");
         }
         return None;
     }
 
-    if v_costs1.len() != v_costs2.len() {
+    if maybe_best.is_none() && v_costs1.len() != v_costs2.len() {
         if config.verbosity > 1 {
             eprintln!("SPLIT_SKIP: cost vector length mismatch");
         }
@@ -1895,41 +1997,62 @@ fn try_split_segment_with_cost(
 
     // Find position with minimum combined cost
     // Matches C++ AGC agc_compressor.cpp:1663-1674
-    let mut best_sum = u32::MAX;
-    let mut best_pos = 0usize;
+    let mut best_pos = if let Some((p, _)) = maybe_best { p } else {
+        let mut best_sum = u32::MAX;
+        let mut pos = 0usize;
+        for i in 0..v_costs1.len() {
+            let cs = v_costs1[i].saturating_add(v_costs2[i]);
+            if cs < best_sum {
+                best_sum = cs;
+                pos = i;
+            }
+        }
+        pos
+    };
 
-    for i in 0..v_costs1.len() {
-        let cs = v_costs1[i].saturating_add(v_costs2[i]);
-        if cs < best_sum {
-            best_sum = cs;
-            best_pos = i;
+    if std::env::var("RAGC_DEBUG_SPLIT_MAP").is_ok() && maybe_best.is_none() {
+        let start = best_pos.saturating_sub(3);
+        let end = (best_pos + 4).min(v_costs1.len());
+        eprintln!("RAGC_COST_WINDOW: len={} best_pos={}", v_costs1.len(), best_pos);
+        for i in start..end {
+            eprintln!(
+                "  i={} Lcum={} Rcum={} Sum={}{}",
+                i,
+                v_costs1[i],
+                v_costs2[i],
+                v_costs1[i].saturating_add(v_costs2[i]),
+                if i == best_pos { "  <--" } else { "" }
+            );
         }
     }
 
-    // Apply degenerate position rules (C++ AGC agc_compressor.cpp:1676-1679)
-    // If split would create segments too small, force to 0 or full size
-    let k = config.k;
-    let original_best_pos = best_pos;  // Save for logging
-    if best_pos < k + 1 {
-        best_pos = 0; // Too close to start
-    }
-    if best_pos + k + 1 > v_costs1.len() {
-        best_pos = v_costs1.len(); // Too close to end
-    }
+    // Apply degenerate position rules only when computing best_pos locally.
+    // When FFI is used, these rules have already been applied in C++.
+    if maybe_best.is_none() {
+        let k = config.k;
+        let original_best_pos = best_pos;  // Save for logging
+        if best_pos < k + 1 {
+            best_pos = 0; // Too close to start
+        }
+        if best_pos + k + 1 > v_costs1.len() {
+            best_pos = v_costs1.len(); // Too close to end
+        }
 
-    if config.verbosity > 1 && original_best_pos != best_pos {
-        eprintln!(
-            "COST_CALC: original_best_pos={} forced_to={} (len={}, k+1={})",
-            original_best_pos, best_pos, v_costs1.len(), k + 1
-        );
+        if config.verbosity > 1 && original_best_pos != best_pos {
+            eprintln!(
+                "COST_CALC: original_best_pos={} forced_to={} (len={}, k+1={})",
+                original_best_pos, best_pos, v_costs1.len(), k + 1
+            );
+        }
     }
 
     // Check if split is degenerate (C++ AGC agc_compressor.cpp:1400-1415)
     // C++ AGC ACCEPTS degenerate splits and assigns whole segment to one group
-    let left_size = best_pos;
-    let right_size = segment_data.len().saturating_sub(best_pos);
+    // First compute sizes with exact best_pos; map to bytes afterward.
+    let left_size_pre = best_pos;
+    let right_size_pre = segment_data.len().saturating_sub(best_pos);
 
-    if left_size == 0 {
+    if left_size_pre == 0 {
         // Degenerate: whole segment matches RIGHT group
         // Return empty left, full segment as right (C++ AGC line 1400-1407)
         if config.verbosity > 1 {
@@ -1940,7 +2063,7 @@ fn try_split_segment_with_cost(
         return Some((Vec::new(), segment_data.to_vec(), middle_kmer));
     }
 
-    if right_size == 0 {
+    if right_size_pre == 0 {
         // Degenerate: whole segment matches LEFT group
         // Return full segment as left, empty right (C++ AGC line 1408-1415)
         if config.verbosity > 1 {
@@ -1951,16 +2074,19 @@ fn try_split_segment_with_cost(
         return Some((segment_data.to_vec(), Vec::new(), middle_kmer));
     }
 
-    // Non-degenerate split: proceed directly (matches C++ AGC line 1434-1438)
-    // C++ AGC does NOT validate sizes after degenerate position rules
-    // Split at best position
-    let (left_data, right_data) = split_segment_at_position(segment_data.as_slice(), best_pos, k);
+    // Non-degenerate split: use C++ seg2_start if available, otherwise use local mapping
+    let (left_data, right_data) = if let Some((_, seg2_start)) = maybe_best {
+        split_segment_from_start(segment_data.as_slice(), seg2_start, config.k)
+    } else {
+        let split_pos = best_pos;
+        split_segment_at_position(segment_data.as_slice(), split_pos, config.k)
+    };
 
     if config.verbosity > 1 {
         eprintln!(
             "SPLIT_SUCCESS: best_pos={} cost={} left_len={} right_len={}",
             best_pos,
-            best_sum,
+            0u32, // best_sum not available under FFI path; placeholder
             left_data.len(),
             right_data.len()
         );

@@ -107,7 +107,8 @@ impl LZDiff {
 
         // Adjust size by load factor (0.7) and round to power of two then double
         let mut ht_size = (ht_size as f64 / 0.7) as u64;
-        while ht_size & (ht_size - 1) != 0 { ht_size &= ht_size - 1; }
+        if ht_size == 0 { ht_size = 1; }
+        while (ht_size & (ht_size - 1)) != 0 { ht_size &= ht_size - 1; }
         ht_size <<= 1;
         if ht_size < 8 { ht_size = 8; }
 

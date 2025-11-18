@@ -10,6 +10,7 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Core compression and decompression algorithms for the AGC genome compression format"
+build = "build.rs"
 
 [dependencies]
 # Local dependencies
@@ -37,3 +38,10 @@ num_cpus = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 tempfile = "3.8"
+
+[features]
+default = ["ffi_cost"]
+ffi_cost = []
+
+[build-dependencies]
+cc = "1"
