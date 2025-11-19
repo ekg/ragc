@@ -159,6 +159,9 @@ pub mod splitter_check_ffi;
 #[path = "ffi/segment_boundary.rs"]
 pub mod segment_boundary_ffi;
 
+#[path = "ffi/base_validation.rs"]
+pub mod base_validation_ffi;
+
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {
     extern "C" {
