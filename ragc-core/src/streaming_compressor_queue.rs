@@ -1498,6 +1498,12 @@ fn worker_thread(
                                                 group_counter.fetch_add(1, Ordering::SeqCst)
                                             })
                                         };
+                                        // Register with FFI engine
+                                        #[cfg(feature = "ffi_cost")]
+                                        if left_key.kmer_front != MISSING_KMER && left_key.kmer_back != MISSING_KMER {
+                                            let mut eng = grouping_engine.lock().unwrap();
+                                            eng.register_group(left_key.kmer_front, left_key.kmer_back, group_id);
+                                        }
                                         // Update terminators map for new group edge
                                         if left_key.kmer_front != MISSING_KMER && left_key.kmer_back != MISSING_KMER {
                                             let mut term_map = map_segments_terminators.lock().unwrap();
@@ -1533,6 +1539,12 @@ fn worker_thread(
                                                 group_counter.fetch_add(1, Ordering::SeqCst)
                                             })
                                         };
+                                        // Register with FFI engine
+                                        #[cfg(feature = "ffi_cost")]
+                                        if right_key.kmer_front != MISSING_KMER && right_key.kmer_back != MISSING_KMER {
+                                            let mut eng = grouping_engine.lock().unwrap();
+                                            eng.register_group(right_key.kmer_front, right_key.kmer_back, group_id);
+                                        }
                                         // Update terminators map for new group edge
                                         if right_key.kmer_front != MISSING_KMER && right_key.kmer_back != MISSING_KMER {
                                             let mut term_map = map_segments_terminators.lock().unwrap();
@@ -1698,6 +1710,13 @@ fn worker_thread(
                             }
                         })
                     };
+
+                    // Register with FFI engine
+                    #[cfg(feature = "ffi_cost")]
+                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                        let mut eng = grouping_engine.lock().unwrap();
+                        eng.register_group(key.kmer_front, key.kmer_back, group_id);
+                    }
 
                     // Update terminators map (matches C++ AGC agc_compressor.cpp:1017-1023)
                     // This is CRITICAL for split functionality - without this, find_middle_splitter() returns None!
