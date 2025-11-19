@@ -8,6 +8,7 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=src/ffi/agc_compress.cpp");
         println!("cargo:rerun-if-changed=src/ffi/agc_index.cpp");
+        println!("cargo:rerun-if-changed=src/ffi/splitters.cpp");
         println!("cargo:rerun-if-changed={}/agc_compressor.cpp", agc_core);
 
         let mut build = cc::Build::new();
@@ -25,6 +26,7 @@ fn main() {
             // FFI wrappers
             .file("src/ffi/agc_compress.cpp")
             .file("src/ffi/agc_index.cpp")
+            .file("src/ffi/splitters.cpp")
             // C++ AGC core compression
             .file(format!("{}/agc_compressor.cpp", agc_core))
             .file(format!("{}/agc_decompressor.cpp", agc_core))

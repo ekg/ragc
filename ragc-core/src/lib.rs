@@ -144,6 +144,9 @@ pub mod agc_index_ffi;
 #[path = "ffi/agc_compress.rs"]
 pub mod agc_compress_ffi;
 
+#[path = "ffi/splitters.rs"]
+pub mod splitters_ffi;
+
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {
     extern "C" {
