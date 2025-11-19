@@ -624,10 +624,11 @@ protected:
 	vector<uint64_t> v_duplicated_kmers;
 	uint64_t v_candidate_kmers_offset = 0;
 
-private:
-
+	// RAGC FORK: Made protected for Rust FFI integration
 	hash_set_t hs_splitters{ ~0ull, 16ull, 0.4, equal_to<uint64_t>{}, MurMur64Hash{} };			// only reads after init - no need to lock
 	bloom_set_t bloom_splitters;
+
+private:
 
 	unordered_map<pair<uint64_t, uint64_t>, int32_t, MurMurPair64Hash> map_segments;			// shared_mutex (seg_map_mtx)
 	unordered_map<uint64_t, vector<uint64_t>, MurMur64Hash> map_segments_terminators;			// shared_mutex (seg_map_mtx)

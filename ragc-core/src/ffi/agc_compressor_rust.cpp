@@ -11,19 +11,31 @@ void CAGCCompressorRust::SetPrecomputedSplitters(
     const std::vector<uint64_t>& singletons,
     const std::vector<uint64_t>& duplicates
 ) {
-    // Clear existing splitters
+    // Clear existing data
     v_candidate_kmers.clear();
     v_duplicated_kmers.clear();
     v_candidate_kmers_offset = 0;
+    hs_splitters.clear();
 
-    // Set new splitters (these are the singleton k-mers)
-    v_candidate_kmers = singletons;  // All singletons
-    v_duplicated_kmers = duplicates; // Duplicates for adaptive mode
+    // Set singletons (for adaptive mode and splitter finding if needed)
+    v_candidate_kmers = singletons;
+    v_duplicated_kmers = duplicates;
+
+    // Populate hs_splitters with actual splitters
+    for (const auto& splitter : splitters) {
+        hs_splitters.insert(splitter);
+    }
+
+    // Populate bloom filter for fast splitter lookup
+    // Using same sizing as C++ AGC (line 554 of agc_compressor.cpp)
+    bloom_splitters.resize((uint64_t)(hs_splitters.size() / 0.25));
+    bloom_splitters.insert(hs_splitters.begin(), hs_splitters.end());
 
     splitters_precomputed = true;
 
     cerr << "[RAGC FORK] Loaded " << singletons.size() << " singletons, "
-         << duplicates.size() << " duplicates" << endl;
+         << duplicates.size() << " duplicates, "
+         << splitters.size() << " splitters" << endl;
 }
 
 bool CAGCCompressorRust::CreateWithRustSplitters(
