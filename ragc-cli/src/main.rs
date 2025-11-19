@@ -625,6 +625,30 @@ fn debug_cost_command(
     println!("[RUST] CUM right tail20={:?}", &v_right.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
     println!("[RUST] best_pos={} best_sum={}", best_pos, best_sum);
 
+    // If FFI is available, compute C++ best split and show seg2_start
+    #[cfg(feature = "ffi_cost")]
+    {
+        let flm = {
+            // left group is usually (k1, k_mid), so flm indicates if k1 < k_mid
+            // We don't have k-mers here; assume forward orientation for display only
+            true
+        };
+        let mlb = true;
+        if let Some((ffi_best_pos, ffi_seg2_start)) = ragc_core::ragc_ffi::best_split(
+            &left_ref,
+            &right_ref,
+            &seg_data,
+            dec.min_match_len as u32,
+            dec.kmer_length as u32,
+            flm,
+            mlb,
+        ) {
+            println!("[FFI] best_pos={} seg2_start={}", ffi_best_pos, ffi_seg2_start);
+        } else {
+            println!("[FFI] best split unavailable (missing refs?)");
+        }
+    }
+
     println!("\nTo tweak inputs: change left/right groups to neighbor segment group_ids or adjust prefix flags to match orientation.");
     Ok(())
 }

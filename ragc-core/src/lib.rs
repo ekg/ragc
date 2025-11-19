@@ -161,8 +161,41 @@ pub mod ragc_ffi {
             k: u32,
             front_lt_mid: i32,
             mid_lt_back: i32,
+            should_reverse: i32,
             out_best_pos: *mut u32,
             out_seg2_start: *mut u32,
+            out_should_split: *mut i32,
+        ) -> i32;
+
+        pub fn agc_find_middle(
+            front_list: *const u64,
+            n_front: usize,
+            back_list: *const u64,
+            n_back: usize,
+            out_middle: *mut u64,
+        ) -> i32;
+
+        pub fn agc_decide_split(
+            front_list: *const u64,
+            n_front: usize,
+            back_list: *const u64,
+            n_back: usize,
+            left_ref: *const u8,
+            left_len: usize,
+            right_ref: *const u8,
+            right_len: usize,
+            text_ptr: *const u8,
+            text_len: usize,
+            front_kmer: u64,
+            back_kmer: u64,
+            min_match_len: u32,
+            k: u32,
+            should_reverse: i32,
+            out_has_middle: *mut i32,
+            out_middle: *mut u64,
+            out_best_pos: *mut u32,
+            out_seg2_start: *mut u32,
+            out_should_split: *mut i32,
         ) -> i32;
     }
 
@@ -182,10 +215,11 @@ pub mod ragc_ffi {
         }
     }
 
-    pub fn best_split(left_ref: &[u8], right_ref: &[u8], text: &[u8], min_match_len: u32, k: u32, front_lt_mid: bool, mid_lt_back: bool) -> Option<(usize, usize)> {
+    pub fn best_split(left_ref: &[u8], right_ref: &[u8], text: &[u8], min_match_len: u32, k: u32, front_lt_mid: bool, mid_lt_back: bool, should_reverse: bool) -> Option<(usize, usize, bool)> {
         unsafe {
             let mut best: u32 = 0;
             let mut seg2: u32 = 0;
+            let mut should: i32 = 0;
             let ok = agc_best_split(
                 left_ref.as_ptr(), left_ref.len(),
                 right_ref.as_ptr(), right_ref.len(),
@@ -194,10 +228,63 @@ pub mod ragc_ffi {
                 k,
                 if front_lt_mid {1} else {0},
                 if mid_lt_back {1} else {0},
+                if should_reverse {1} else {0},
                 &mut best as *mut u32,
                 &mut seg2 as *mut u32,
+                &mut should as *mut i32,
             );
-            if ok != 0 { Some((best as usize, seg2 as usize)) } else { None }
+            if ok != 0 { Some((best as usize, seg2 as usize, should != 0)) } else { None }
+        }
+    }
+
+    pub fn find_middle(front_neighbors: &[u64], back_neighbors: &[u64]) -> Option<u64> {
+        unsafe {
+            let mut out: u64 = 0;
+            let ok = agc_find_middle(
+                front_neighbors.as_ptr(), front_neighbors.len(),
+                back_neighbors.as_ptr(), back_neighbors.len(),
+                &mut out as *mut u64,
+            );
+            if ok != 0 { Some(out) } else { None }
+        }
+    }
+
+    pub fn decide_split(
+        front_neighbors: &[u64],
+        back_neighbors: &[u64],
+        left_ref: &[u8],
+        right_ref: &[u8],
+        text: &[u8],
+        front_kmer: u64,
+        back_kmer: u64,
+        min_match_len: u32,
+        k: u32,
+        should_reverse: bool,
+    ) -> Option<(bool, u64, usize, usize, bool)> {
+        unsafe {
+            let mut has_mid: i32 = 0;
+            let mut middle: u64 = 0;
+            let mut best: u32 = 0;
+            let mut seg2: u32 = 0;
+            let mut should: i32 = 0;
+            let ok = agc_decide_split(
+                front_neighbors.as_ptr(), front_neighbors.len(),
+                back_neighbors.as_ptr(), back_neighbors.len(),
+                left_ref.as_ptr(), left_ref.len(),
+                right_ref.as_ptr(), right_ref.len(),
+                text.as_ptr(), text.len(),
+                front_kmer, back_kmer,
+                min_match_len, k,
+                if should_reverse {1} else {0},
+                &mut has_mid as *mut i32,
+                &mut middle as *mut u64,
+                &mut best as *mut u32,
+                &mut seg2 as *mut u32,
+                &mut should as *mut i32,
+            );
+            if ok != 0 {
+                Some((has_mid != 0, middle, best as usize, seg2 as usize, should != 0))
+            } else { None }
         }
     }
 }

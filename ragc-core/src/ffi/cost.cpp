@@ -116,10 +116,12 @@ extern "C" int agc_best_split(
     const uint8_t* text, size_t text_len,
     uint32_t min_match_len, uint32_t k,
     int front_lt_mid, int mid_lt_back,
+    int should_reverse,
     uint32_t* out_best_pos,
-    uint32_t* out_seg2_start
+    uint32_t* out_seg2_start,
+    int* out_should_split
 ) {
-    if (!left_ref || !right_ref || !text || !out_best_pos || !out_seg2_start) return 0;
+    if (!left_ref || !right_ref || !text || !out_best_pos || !out_seg2_start || !out_should_split) return 0;
 
     CostEngine left_eng(min_match_len); left_eng.prepare(left_ref, left_len);
     CostEngine right_eng(min_match_len); right_eng.prepare(right_ref, right_len);
@@ -155,12 +157,18 @@ extern "C" int agc_best_split(
 
     if (v1.size() != v2.size() || v1.empty()) return 0;
 
-    // Argmin (prefer leftmost minimal)
+    // Argmin (prefer leftmost minimal) and compute total costs for no-split options
     uint32_t best_pos = 0; uint64_t best_sum = (uint64_t)UINT32_MAX + 1;
     for (size_t i=0;i<v1.size();++i) {
         uint64_t s = (uint64_t)v1[i] + (uint64_t)v2[i];
         if (s < best_sum) { best_sum = s; best_pos = (uint32_t)i; }
     }
+
+    // Total cost to encode entire text to left group is the last cumulative left value
+    uint64_t total_left = v1.back();
+    // Total cost to encode entire text to right group is first cumulative right value
+    uint64_t total_right = v2.front();
+    uint64_t nosplit_best = total_left < total_right ? total_left : total_right;
 
     // Degenerate position rules
     if (best_pos < k + 1u) best_pos = 0;
@@ -168,11 +176,149 @@ extern "C" int agc_best_split(
 
     *out_best_pos = best_pos;
     // Compute byte start for second segment with k-byte overlap: [seg2_start .. end], left ends at seg2_start + k
-    // C++ uses k-byte overlap centered around the k-mer; for odd k, midpoint rounds up
-    // Use half = (k+1)/2 so that seg2_start advances by one compared to plain k/2 for odd k.
-    uint32_t half = (k + 1u) >> 1; // integer ceil(k/2)
+    // C++ uses k-byte overlap centered around the k-mer; midpoint uses ceil(k/2) for seg2_start mapping
+    // Example: k=21 -> half=11, seg2_start = best_pos - 11
+    // seg2_start mapping depends on orientation used for emitting
+    // If sequence was reverse-complemented for normalization (should_reverse!=0), use ceil(k/2)
+    // Otherwise, use floor(k/2)
+    uint32_t half = should_reverse ? ((k + 1u) >> 1) : (k >> 1);
     uint32_t seg2_start = 0;
     if (best_pos > half) seg2_start = best_pos - half;
     *out_seg2_start = seg2_start;
+    // Determine if split is beneficial vs no split
+    *out_should_split = (best_sum < nosplit_best) ? 1 : 0;
+    return 1;
+}
+
+// Find a middle k-mer present in both neighbor lists (sorted, deduped).
+// Filters out UINT64_MAX as an invalid/missing k-mer.
+// Returns 1 and writes to out_middle if found; otherwise returns 0.
+extern "C" int agc_find_middle(
+    const uint64_t* front_list, size_t n_front,
+    const uint64_t* back_list, size_t n_back,
+    uint64_t* out_middle
+) {
+    if (!front_list || !back_list || !out_middle) return 0;
+    size_t i = 0, j = 0;
+    while (i < n_front && j < n_back) {
+        uint64_t a = front_list[i];
+        uint64_t b = back_list[j];
+        if (a == b) {
+            if (a != UINT64_MAX) { *out_middle = a; return 1; }
+            ++i; ++j; // skip invalid marker
+        } else if (a < b) {
+            ++i;
+        } else {
+            ++j;
+        }
+    }
+    return 0;
+}
+
+// One-shot split decision matching C++ path:
+// - Find middle k-mer via neighbor list intersection
+// - Compute cumulative costs for left/right with orientation
+// - Argmin with leftmost tie-break
+// - Degenerate forcing near ends
+// - seg2_start mapping based on should_reverse
+extern "C" int agc_decide_split(
+    const uint64_t* front_list, size_t n_front,
+    const uint64_t* back_list, size_t n_back,
+    const uint8_t* left_ref, size_t left_len,
+    const uint8_t* right_ref, size_t right_len,
+    const uint8_t* text, size_t text_len,
+    uint64_t front_kmer, uint64_t back_kmer,
+    uint32_t min_match_len, uint32_t k,
+    int should_reverse,
+    int* out_has_middle,
+    uint64_t* out_middle,
+    uint32_t* out_best_pos,
+    uint32_t* out_seg2_start,
+    int* out_should_split
+) {
+    if (!front_list || !back_list || !text ||
+        !out_has_middle || !out_middle || !out_best_pos || !out_seg2_start || !out_should_split) {
+        return 0;
+    }
+
+    // 1) Find middle via intersection
+    size_t i = 0, j = 0; uint64_t middle = UINT64_MAX; int has_m = 0;
+    while (i < n_front && j < n_back) {
+        uint64_t a = front_list[i];
+        uint64_t b = back_list[j];
+        if (a == b) { if (a != UINT64_MAX) { middle = a; has_m = 1; break; } ++i; ++j; }
+        else if (a < b) ++i; else ++j;
+    }
+    *out_has_middle = has_m;
+    if (!has_m) {
+        *out_middle = UINT64_MAX; *out_best_pos = 0; *out_seg2_start = 0; *out_should_split = 0; return 1;
+    }
+    *out_middle = middle;
+
+    // If references are unavailable, behave like C++ would: cannot evaluate split cost => no split.
+    if (left_len == 0 || right_len == 0) {
+        *out_best_pos = 0;
+        *out_seg2_start = 0;
+        *out_should_split = 0;
+        return 1;
+    }
+
+    // 2) Cost engines for refs
+    CostEngine left_eng(min_match_len); left_eng.prepare(left_ref, left_len);
+    CostEngine right_eng(min_match_len); right_eng.prepare(right_ref, right_len);
+
+    // Reverse-complement of text
+    std::vector<uint8_t> text_rc; reverse_complement(text, text_len, text_rc);
+
+    // Orientation flags
+    int front_lt_mid = front_kmer < middle ? 1 : 0;
+    int mid_lt_back = middle < back_kmer ? 1 : 0;
+
+    // Left cumulative
+    std::vector<uint32_t> v1;
+    if (front_lt_mid) {
+        v1 = left_eng.get_costs(text, text_len, /*prefix*/true);
+        uint32_t acc=0; for (auto &c: v1) { acc += c; c = acc; }
+    } else {
+        v1 = left_eng.get_costs(text_rc.data(), text_len, /*prefix*/false);
+        std::reverse(v1.begin(), v1.end());
+        uint32_t acc=0; for (auto &c: v1) { acc += c; c = acc; }
+    }
+
+    // Right cumulative
+    std::vector<uint32_t> v2;
+    if (mid_lt_back) {
+        v2 = right_eng.get_costs(text, text_len, /*prefix*/false);
+        uint32_t acc=0; for (auto it=v2.rbegin(); it!=v2.rend(); ++it) { acc += *it; *it = acc; }
+    } else {
+        v2 = right_eng.get_costs(text_rc.data(), text_len, /*prefix*/true);
+        uint32_t acc=0; for (auto &c: v2) { acc += c; c = acc; }
+        std::reverse(v2.begin(), v2.end());
+    }
+
+    if (v1.size() != v2.size() || v1.empty()) { *out_should_split = 0; *out_best_pos = 0; *out_seg2_start = 0; return 1; }
+
+    // Argmin (leftmost)
+    uint32_t best_pos = 0; uint64_t best_sum = (uint64_t)UINT32_MAX + 1;
+    for (size_t idx=0; idx<v1.size(); ++idx) {
+        uint64_t s = (uint64_t)v1[idx] + (uint64_t)v2[idx];
+        if (s < best_sum) { best_sum = s; best_pos = (uint32_t)idx; }
+    }
+
+    // No-split cost
+    uint64_t total_left = v1.back();
+    uint64_t total_right = v2.front();
+    uint64_t nosplit_best = total_left < total_right ? total_left : total_right;
+
+    // Degenerate forcing
+    if (best_pos < k + 1u) best_pos = 0;
+    if ((size_t)best_pos + k + 1u > v1.size()) best_pos = (uint32_t)v1.size();
+    *out_best_pos = best_pos;
+
+    // seg2_start mapping by orientation used for emission
+    uint32_t half = should_reverse ? ((k + 1u) >> 1) : (k >> 1);
+    uint32_t seg2_start = 0; if (best_pos > half) seg2_start = best_pos - half; *out_seg2_start = seg2_start;
+
+    *out_should_split = (best_sum < nosplit_best) ? 1 : 0;
     return 1;
 }
