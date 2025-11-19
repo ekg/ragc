@@ -2301,11 +2301,22 @@ bool CAGCCompressor::Create(const string& _file_name, const uint32_t _pack_cardi
     verbosity = _verbosity;
     fallback_frac = _fallback_frac;
     fallback_filter.reset(fallback_frac);
-    
-    if (!determine_splitters(reference_file_name, _segment_size, no_threads))
+
+    // RAGC FORK: Check if splitters were pre-computed (e.g., by Rust FFI)
+    if (v_candidate_kmers.empty())
     {
-        working_mode = working_mode_t::none;
-        return false;
+        // Normal path: determine splitters from reference file
+        if (!determine_splitters(reference_file_name, _segment_size, no_threads))
+        {
+            working_mode = working_mode_t::none;
+            return false;
+        }
+    }
+    else
+    {
+        // Rust FFI path: splitters already set, skip detection
+        if (verbosity > 0 && is_app_mode)
+            cerr << "[RAGC FORK] Using pre-computed splitters (" << v_candidate_kmers.size() << " singletons)" << endl;
     }
 
     out_archive = make_shared<CArchive>(false, 32 << 20);

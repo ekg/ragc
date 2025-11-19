@@ -75,12 +75,31 @@ bool CAGCCompressorRust::CreateWithRustSplitters(
     cerr << "[RAGC FORK] Rust found: " << singletons.size() << " singletons, "
          << splitters.size() << " splitters" << endl;
 
-    // Set the splitters
+    // Set the splitters BEFORE calling Create()
     SetPrecomputedSplitters(splitters, singletons, duplicates);
 
-    // Now call normal Create, which will use the pre-set splitters
-    // TODO: Need to modify CAGCCompressor::Create to skip determine_splitters if already set
-    cerr << "[RAGC FORK] TODO: Need to implement rest of Create() logic" << endl;
+    // Now call normal Create(), which will detect pre-set splitters and skip determine_splitters()
+    cerr << "[RAGC FORK] Calling Create() with pre-computed splitters..." << endl;
 
-    return false;  // Not fully implemented yet
+    bool result = CAGCCompressor::Create(
+        _file_name,
+        _pack_cardinality,
+        _kmer_length,
+        reference_file_name,  // Still needed for file path but won't be read
+        _segment_size,
+        _min_match_len,
+        _concatenated_genomes,
+        _adaptive_compression,
+        _verbosity,
+        _no_threads,
+        _fallback_frac
+    );
+
+    if (result) {
+        cerr << "[RAGC FORK] Create() succeeded with Rust splitters!" << endl;
+    } else {
+        cerr << "[RAGC FORK] Create() failed" << endl;
+    }
+
+    return result;
 }

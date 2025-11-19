@@ -9,6 +9,7 @@
 
 // C++ AGC headers
 #include "../../../agc/src/core/agc_compressor.h"
+#include "agc_compressor_rust.h"
 
 extern "C" {
 
@@ -94,6 +95,71 @@ bool agc_compress_create(
     } catch (...) {
         if (params->verbosity > 0) {
             fprintf(stderr, "C++ AGC compression error: unknown exception\n");
+        }
+        return false;
+    }
+}
+
+// Compression function using Rust splitter detection
+bool agc_compress_create_with_rust_splitters(
+    const AgcCompressParams* params,
+    const AgcSampleFile* samples,
+    size_t n_samples
+) {
+    if (!params || !samples || n_samples == 0) {
+        return false;
+    }
+
+    try {
+        CAGCCompressorRust compressor;
+
+        // Step 1: Create compressor using Rust splitter detection
+        bool ok = compressor.CreateWithRustSplitters(
+            std::string(params->out_archive_name),
+            params->pack_cardinality,
+            params->kmer_length,
+            std::string(params->reference_file),
+            params->segment_size,
+            params->min_match_length,
+            params->concatenated_genomes,
+            params->adaptive_compression,
+            params->verbosity,
+            params->no_threads,
+            params->fallback_frac
+        );
+
+        if (!ok) {
+            return false;
+        }
+
+        // Step 2: Add all sample files
+        std::vector<std::pair<std::string, std::string>> v_sample_files;
+        v_sample_files.reserve(n_samples);
+
+        for (size_t i = 0; i < n_samples; ++i) {
+            v_sample_files.emplace_back(
+                std::string(samples[i].sample_name),
+                std::string(samples[i].file_path)
+            );
+        }
+
+        ok = compressor.AddSampleFiles(v_sample_files, params->no_threads);
+        if (!ok) {
+            return false;
+        }
+
+        // Step 3: Finalize and write archive
+        ok = compressor.Close(params->no_threads);
+        return ok;
+
+    } catch (const std::exception& e) {
+        if (params->verbosity > 0) {
+            fprintf(stderr, "[RAGC FORK] C++ AGC compression error: %s\n", e.what());
+        }
+        return false;
+    } catch (...) {
+        if (params->verbosity > 0) {
+            fprintf(stderr, "[RAGC FORK] C++ AGC compression error: unknown exception\n");
         }
         return false;
     }
