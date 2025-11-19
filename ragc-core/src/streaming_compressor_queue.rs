@@ -1350,8 +1350,17 @@ fn worker_thread(
                 if split_allowed && key_front != MISSING_KMER && key_back != MISSING_KMER {
                     // CRITICAL: First attempt to find middle splitter
                     let middle_kmer_opt = {
-                        let terminators = map_segments_terminators.lock().unwrap();
-                        find_middle_splitter(key_front, key_back, &terminators)
+                        #[cfg(feature = "ffi_cost")]
+                        {
+                            // Use C++ AGC grouping engine for perfect parity
+                            let eng = grouping_engine.lock().unwrap();
+                            eng.find_middle(key_front, key_back)
+                        }
+                        #[cfg(not(feature = "ffi_cost"))]
+                        {
+                            let terminators = map_segments_terminators.lock().unwrap();
+                            find_middle_splitter(key_front, key_back, &terminators)
+                        }
                     };
 
                     if config.verbosity > 0 {
