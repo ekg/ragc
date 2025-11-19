@@ -1,14 +1,18 @@
 fn main() {
-    // Path to C++ AGC source directories (absolute paths for build)
+    // Path to C++ AGC source directories (local fork in ragc repo)
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let agc_common = format!("{}/../agc/src/common", manifest_dir);
+    let agc_core = format!("{}/../agc/src/core", manifest_dir);
+
+    // Also need HOME for 3rd party dependencies
     let home = std::env::var("HOME").expect("HOME not set");
-    let agc_common = format!("{}/agc/src/common", home);
-    let agc_core = format!("{}/agc/src/core", home);
 
     // Compile C++ AGC complete compression FFI (for byte-identical archives)
     {
         println!("cargo:rerun-if-changed=src/ffi/agc_compress.cpp");
         println!("cargo:rerun-if-changed=src/ffi/agc_index.cpp");
         println!("cargo:rerun-if-changed=src/ffi/splitters.cpp");
+        println!("cargo:rerun-if-changed=src/ffi/agc_compressor_rust.cpp");
         println!("cargo:rerun-if-changed={}/agc_compressor.cpp", agc_core);
 
         let mut build = cc::Build::new();
@@ -27,6 +31,7 @@ fn main() {
             .file("src/ffi/agc_compress.cpp")
             .file("src/ffi/agc_index.cpp")
             .file("src/ffi/splitters.cpp")
+            .file("src/ffi/agc_compressor_rust.cpp")
             // C++ AGC core compression
             .file(format!("{}/agc_compressor.cpp", agc_core))
             .file(format!("{}/agc_decompressor.cpp", agc_core))
