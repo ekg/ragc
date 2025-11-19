@@ -168,6 +168,9 @@ pub mod reverse_complement_ffi;
 #[path = "ffi/segment_split.rs"]
 pub mod segment_split_ffi;
 
+#[path = "ffi/kmer_pair.rs"]
+pub mod kmer_pair_ffi;
+
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {
     extern "C" {
