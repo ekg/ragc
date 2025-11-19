@@ -126,6 +126,7 @@ pub mod kmer_extract;
 pub mod lz_diff;
 pub mod lz_matcher;
 pub mod memory_bounded_queue;
+pub mod preprocessing;
 pub mod priority_queue;
 pub mod segment;
 pub mod segment_buffer;
@@ -170,6 +171,9 @@ pub mod segment_split_ffi;
 
 #[path = "ffi/kmer_pair.rs"]
 pub mod kmer_pair_ffi;
+
+#[path = "ffi/preprocessing.rs"]
+pub mod preprocessing_ffi;
 
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {

@@ -94,6 +94,9 @@ bool ragc_is_empty_kmer(uint64_t kmer);
 bool ragc_is_valid_kmer_pair(uint64_t first, uint64_t second);
 KmerPair ragc_create_empty_kmer_pair();
 
+// 9. Preprocessing operations
+size_t ragc_preprocess_raw_contig(uint8_t* contig_ptr, size_t contig_len, size_t contig_capacity);
+
 } // extern "C"
 
 #endif // RAGC_MICRO_FFI_H
