@@ -2,6 +2,7 @@
 // Tests that Rust k-mer canonicalization matches C++ CKmer exactly
 
 use crate::kmer::{Kmer, KmerMode};
+use crate::kmer_extract::remove_non_singletons;
 use std::slice;
 
 /// Extract all canonical k-mer values from a contig
@@ -113,6 +114,42 @@ pub extern "C" fn ragc_extract_kmer_at_position(
         }
 
         kmer.data()
+    }
+}
+
+/// Remove non-singleton k-mers from a sorted vector
+///
+/// Modifies the vector in place to keep only k-mers that appear exactly once.
+/// K-mers before `virtual_begin` are not checked and remain in the output.
+///
+/// Returns the new length of the vector.
+///
+/// # Safety
+/// - vec_ptr must point to a valid vector allocation of at least vec_capacity elements
+/// - The vector must be sorted (for correct singleton detection)
+/// - The caller must resize the vector to the returned length
+/// - Caller maintains ownership of the allocation
+#[no_mangle]
+pub extern "C" fn ragc_remove_non_singletons(
+    vec_ptr: *mut u64,
+    vec_len: usize,
+    vec_capacity: usize,
+    virtual_begin: usize,
+) -> usize {
+    unsafe {
+        // Reconstruct the Vec from raw parts (temporarily borrow ownership)
+        let mut vec = Vec::from_raw_parts(vec_ptr, vec_len, vec_capacity);
+
+        // Call the Rust implementation
+        remove_non_singletons(&mut vec, virtual_begin);
+
+        // Get the new length after modification
+        let new_len = vec.len();
+
+        // Prevent Rust from freeing the allocation (C++ owns it)
+        std::mem::forget(vec);
+
+        new_len
     }
 }
 

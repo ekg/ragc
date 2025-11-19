@@ -25,6 +25,7 @@ struct KmerArray {
 KmerArray ragc_extract_canonical_kmers(const uint8_t* contig_data, size_t contig_len, uint32_t k);
 uint64_t ragc_extract_kmer_at_position(const uint8_t* contig_data, size_t contig_len, uint32_t k, size_t position);
 void ragc_free_kmer_array(KmerArray array);
+size_t ragc_remove_non_singletons(uint64_t* vec_ptr, size_t vec_len, size_t vec_capacity, size_t virtual_begin);
 
 // 3. Splitter checking
 bool ragc_is_splitter(uint64_t kmer_value, const uint64_t* splitters_ptr, size_t splitters_len);

@@ -1,5 +1,35 @@
 # RAGC Development Activity Log
 
+## 🚨 CRITICAL: SHIP OF THESEUS REQUIREMENT 🚨
+
+**When replacing C++ AGC functions with Rust equivalents, archives MUST be byte-for-byte IDENTICAL.**
+
+**NOT "works correctly" - IDENTICAL archives.**
+**NOT "extracts the same data" - IDENTICAL archives.**
+**NOT "compatible format" - IDENTICAL archives.**
+
+### Verification Protocol:
+
+```bash
+# 1. Create archive with ORIGINAL C++ version
+/home/erik/agc/bin/agc create -o cpp_baseline.agc -k 21 -s 10000 -l 20 -t 1 test.fa
+sha256sum cpp_baseline.agc > cpp.sha
+
+# 2. Create archive with RUST-enhanced version
+/home/erik/agc/bin/agc create -o rust_test.agc -k 21 -s 10000 -l 20 -t 1 test.fa
+sha256sum rust_test.agc > rust.sha
+
+# 3. MUST be identical
+diff cpp.sha rust.sha          # MUST show no difference
+cmp cpp_baseline.agc rust_test.agc  # MUST show no difference
+```
+
+**If archives differ by even ONE BYTE → the Rust replacement is WRONG.**
+
+This is like reimplementing zlib - not approximately correct, not "close enough", but **EXACT**.
+
+---
+
 ## 🔬 HOW TO VERIFY ARCHIVES ARE THE SAME 🔬
 
 **THE FUNDAMENTAL METHOD: SEGMENT LAYOUT COMPARISON**
