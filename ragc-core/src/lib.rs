@@ -150,6 +150,9 @@ pub mod splitters_ffi;
 #[path = "ffi/segment_helpers.rs"]
 pub mod segment_helpers_ffi;
 
+#[path = "ffi/kmer_helpers.rs"]
+pub mod kmer_helpers_ffi;
+
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {
     extern "C" {
