@@ -137,6 +137,13 @@ pub mod tuple_packing;
 pub mod worker;
 pub mod zstd_pool;
 
+// C++ AGC FFI (always available for byte-identical archives)
+#[path = "ffi/agc_index.rs"]
+pub mod agc_index_ffi;
+
+#[path = "ffi/agc_compress.rs"]
+pub mod agc_compress_ffi;
+
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {
     extern "C" {
