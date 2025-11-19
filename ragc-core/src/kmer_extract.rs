@@ -83,6 +83,53 @@ pub fn remove_non_singletons(vec: &mut Vec<u64>, virtual_begin: usize) {
     vec.truncate(curr_end);
 }
 
+/// Remove non-singleton k-mers from a vector, collecting duplicates
+///
+/// Like `remove_non_singletons`, but also collects the duplicated k-mers
+/// into a separate vector.
+///
+/// # Arguments
+/// * `vec` - Mutable vector of k-mers to filter (modified in place)
+/// * `duplicated` - Vector to collect duplicated k-mers (cleared and filled)
+/// * `virtual_begin` - Starting index for processing
+///
+/// # Behavior
+/// - Assumes the input vector is sorted
+/// - K-mers before `virtual_begin` are not checked and remain in the output
+/// - Modifies `vec` in place, resizing it to contain only singletons
+/// - Fills `duplicated` with k-mers appearing more than once
+pub fn remove_non_singletons_with_duplicates(
+    vec: &mut Vec<u64>,
+    duplicated: &mut Vec<u64>,
+    virtual_begin: usize,
+) {
+    duplicated.clear();
+
+    let mut curr_end = virtual_begin;
+    let mut i = virtual_begin;
+
+    while i < vec.len() {
+        // Find the end of the run of equal values
+        let mut j = i + 1;
+        while j < vec.len() && vec[i] == vec[j] {
+            j += 1;
+        }
+
+        // If this k-mer appears exactly once (singleton), keep it
+        if i + 1 == j {
+            vec[curr_end] = vec[i];
+            curr_end += 1;
+        } else {
+            // K-mer appears more than once - collect as duplicate
+            duplicated.push(vec[i]);
+        }
+
+        i = j;
+    }
+
+    vec.truncate(curr_end);
+}
+
 /// Find candidate k-mers (singletons) from a contig
 ///
 /// This is a convenience function that combines k-mer enumeration,

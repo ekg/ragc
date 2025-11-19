@@ -2,7 +2,7 @@
 // Tests that Rust k-mer canonicalization matches C++ CKmer exactly
 
 use crate::kmer::{Kmer, KmerMode};
-use crate::kmer_extract::remove_non_singletons;
+use crate::kmer_extract::{remove_non_singletons, remove_non_singletons_with_duplicates};
 use std::slice;
 
 /// Extract all canonical k-mer values from a contig
@@ -150,6 +150,63 @@ pub extern "C" fn ragc_remove_non_singletons(
         std::mem::forget(vec);
 
         new_len
+    }
+}
+
+/// Result of remove_non_singletons_with_duplicates containing both new lengths
+#[repr(C)]
+pub struct RemoveSingletonsResult {
+    /// New length of the main vector (singletons only)
+    pub vec_new_len: usize,
+    /// New length of the duplicates vector
+    pub dup_new_len: usize,
+}
+
+/// Remove non-singleton k-mers from a sorted vector, collecting duplicates
+///
+/// Modifies the vector in place to keep only k-mers that appear exactly once,
+/// and collects k-mers appearing more than once into a separate vector.
+/// K-mers before `virtual_begin` are not checked and remain in the output.
+///
+/// Returns a struct containing the new lengths of both vectors.
+///
+/// # Safety
+/// - vec_ptr must point to a valid vector allocation of at least vec_capacity elements
+/// - dup_ptr must point to a valid vector allocation
+/// - The main vector must be sorted (for correct singleton detection)
+/// - The caller must resize both vectors to the returned lengths
+/// - Caller maintains ownership of both allocations
+/// - The duplicates vector will be cleared and filled with new values
+#[no_mangle]
+pub extern "C" fn ragc_remove_non_singletons_with_duplicates(
+    vec_ptr: *mut u64,
+    vec_len: usize,
+    vec_capacity: usize,
+    dup_ptr: *mut u64,
+    dup_len: usize,
+    dup_capacity: usize,
+    virtual_begin: usize,
+) -> RemoveSingletonsResult {
+    unsafe {
+        // Reconstruct both Vecs from raw parts (temporarily borrow ownership)
+        let mut vec = Vec::from_raw_parts(vec_ptr, vec_len, vec_capacity);
+        let mut duplicated = Vec::from_raw_parts(dup_ptr, dup_len, dup_capacity);
+
+        // Call the Rust implementation
+        remove_non_singletons_with_duplicates(&mut vec, &mut duplicated, virtual_begin);
+
+        // Get the new lengths after modification
+        let new_vec_len = vec.len();
+        let new_dup_len = duplicated.len();
+
+        // Prevent Rust from freeing the allocations (C++ owns them)
+        std::mem::forget(vec);
+        std::mem::forget(duplicated);
+
+        RemoveSingletonsResult {
+            vec_new_len: new_vec_len,
+            dup_new_len: new_dup_len,
+        }
     }
 }
 
