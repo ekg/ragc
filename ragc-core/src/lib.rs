@@ -156,6 +156,9 @@ pub mod kmer_helpers_ffi;
 #[path = "ffi/splitter_check.rs"]
 pub mod splitter_check_ffi;
 
+#[path = "ffi/segment_boundary.rs"]
+pub mod segment_boundary_ffi;
+
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {
     extern "C" {
