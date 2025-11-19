@@ -12,6 +12,9 @@ categories.workspace = true
 description = "Core compression and decompression algorithms for the AGC genome compression format"
 build = "build.rs"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 # Local dependencies
 ragc-common = { path = "../ragc-common", version = "0.1.0" }

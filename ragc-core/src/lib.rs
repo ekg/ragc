@@ -147,6 +147,9 @@ pub mod agc_compress_ffi;
 #[path = "ffi/splitters.rs"]
 pub mod splitters_ffi;
 
+#[path = "ffi/segment_helpers.rs"]
+pub mod segment_helpers_ffi;
+
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {
     extern "C" {
