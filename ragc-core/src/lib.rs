@@ -197,6 +197,15 @@ pub mod ragc_ffi {
             out_seg2_start: *mut u32,
             out_should_split: *mut i32,
         ) -> i32;
+
+        // Grouping Engine FFI
+        pub fn agc_grouping_engine_create(k: u32, start_group_id: u32) -> *mut std::ffi::c_void;
+        pub fn agc_grouping_engine_destroy(engine: *mut std::ffi::c_void);
+        pub fn agc_grouping_engine_register(engine: *mut std::ffi::c_void, kmer_front: u64, kmer_back: u64, group_id: u32);
+        pub fn agc_grouping_engine_find_middle(engine: *mut std::ffi::c_void, front: u64, back: u64, out_middle: *mut u64) -> i32;
+        pub fn agc_grouping_engine_group_exists(engine: *mut std::ffi::c_void, kmer_front: u64, kmer_back: u64) -> i32;
+        pub fn agc_grouping_engine_get_group_id(engine: *mut std::ffi::c_void, kmer_front: u64, kmer_back: u64) -> u32;
+        pub fn agc_grouping_engine_alloc_id(engine: *mut std::ffi::c_void) -> u32;
     }
 
     pub fn cost_vector(prefix: bool, reference: &[u8], text: &[u8], min_match_len: u32) -> Vec<u32> {
@@ -287,6 +296,66 @@ pub mod ragc_ffi {
             } else { None }
         }
     }
+
+    /// Safe Rust wrapper for C++ GroupingEngine
+    pub struct GroupingEngine {
+        ptr: *mut std::ffi::c_void,
+    }
+
+    impl GroupingEngine {
+        pub fn new(k: u32, start_group_id: u32) -> Self {
+            unsafe {
+                Self {
+                    ptr: agc_grouping_engine_create(k, start_group_id),
+                }
+            }
+        }
+
+        pub fn register_group(&mut self, kmer_front: u64, kmer_back: u64, group_id: u32) {
+            unsafe {
+                agc_grouping_engine_register(self.ptr, kmer_front, kmer_back, group_id);
+            }
+        }
+
+        pub fn find_middle(&self, front: u64, back: u64) -> Option<u64> {
+            unsafe {
+                let mut out: u64 = 0;
+                let ok = agc_grouping_engine_find_middle(self.ptr, front, back, &mut out as *mut u64);
+                if ok != 0 { Some(out) } else { None }
+            }
+        }
+
+        pub fn group_exists(&self, kmer_front: u64, kmer_back: u64) -> bool {
+            unsafe {
+                agc_grouping_engine_group_exists(self.ptr, kmer_front, kmer_back) != 0
+            }
+        }
+
+        pub fn get_group_id(&self, kmer_front: u64, kmer_back: u64) -> Option<u32> {
+            unsafe {
+                let gid = agc_grouping_engine_get_group_id(self.ptr, kmer_front, kmer_back);
+                if gid == u32::MAX { None } else { Some(gid) }
+            }
+        }
+
+        pub fn alloc_group_id(&mut self) -> u32 {
+            unsafe {
+                agc_grouping_engine_alloc_id(self.ptr)
+            }
+        }
+    }
+
+    impl Drop for GroupingEngine {
+        fn drop(&mut self) {
+            unsafe {
+                agc_grouping_engine_destroy(self.ptr);
+            }
+        }
+    }
+
+    // GroupingEngine is Send + Sync because C++ implementation is thread-safe
+    unsafe impl Send for GroupingEngine {}
+    unsafe impl Sync for GroupingEngine {}
 }
 
 // Re-export commonly used types

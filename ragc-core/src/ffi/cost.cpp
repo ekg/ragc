@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <vector>
 #include <algorithm>
+#include <unordered_map>
+#include <utility>
 
 namespace {
 static inline uint64_t murmur64(uint64_t h) {
@@ -188,6 +190,138 @@ extern "C" int agc_best_split(
     // Determine if split is beneficial vs no split
     *out_should_split = (best_sum < nosplit_best) ? 1 : 0;
     return 1;
+}
+
+// ============================================================================
+// Stateful Grouping Engine - Maintains complete terminator map
+// ============================================================================
+
+namespace {
+struct pair_hash {
+    std::size_t operator()(const std::pair<uint64_t, uint64_t>& p) const {
+        return std::hash<uint64_t>()(p.first) ^ (std::hash<uint64_t>()(p.second) << 1);
+    }
+};
+
+struct GroupingEngine {
+    // Group tracking (matches C++ AGC map_segments)
+    std::unordered_map<std::pair<uint64_t, uint64_t>, uint32_t, pair_hash> map_segments;
+
+    // Terminator tracking (matches C++ AGC map_segments_terminators)
+    std::unordered_map<uint64_t, std::vector<uint64_t>> map_segments_terminators;
+
+    uint32_t next_group_id;
+    uint32_t k;
+
+    GroupingEngine(uint32_t k_len, uint32_t start_group_id) : next_group_id(start_group_id), k(k_len) {
+        map_segments.max_load_factor(1.0f);
+        map_segments_terminators.max_load_factor(1.0f);
+    }
+
+    // Register a new group with its k-mer pair
+    void register_group(uint64_t kmer_front, uint64_t kmer_back, uint32_t group_id) {
+        if (kmer_front == UINT64_MAX || kmer_back == UINT64_MAX) return;
+
+        auto key = std::make_pair(kmer_front, kmer_back);
+        map_segments[key] = group_id;
+
+        // Add to terminators (both directions)
+        map_segments_terminators[kmer_front].push_back(kmer_back);
+        if (kmer_front != kmer_back) {
+            map_segments_terminators[kmer_back].push_back(kmer_front);
+        }
+
+        // Sort and deduplicate
+        auto& front_vec = map_segments_terminators[kmer_front];
+        std::sort(front_vec.begin(), front_vec.end());
+        front_vec.erase(std::unique(front_vec.begin(), front_vec.end()), front_vec.end());
+
+        if (kmer_front != kmer_back) {
+            auto& back_vec = map_segments_terminators[kmer_back];
+            std::sort(back_vec.begin(), back_vec.end());
+            back_vec.erase(std::unique(back_vec.begin(), back_vec.end()), back_vec.end());
+        }
+    }
+
+    // Find middle k-mer via terminator intersection
+    bool find_middle(uint64_t front, uint64_t back, uint64_t* out_middle) const {
+        if (front == UINT64_MAX || back == UINT64_MAX) return false;
+
+        auto it_front = map_segments_terminators.find(front);
+        auto it_back = map_segments_terminators.find(back);
+
+        if (it_front == map_segments_terminators.end() || it_back == map_segments_terminators.end()) {
+            return false;
+        }
+
+        const auto& front_list = it_front->second;
+        const auto& back_list = it_back->second;
+
+        // Find intersection (both lists are sorted)
+        size_t i = 0, j = 0;
+        while (i < front_list.size() && j < back_list.size()) {
+            if (front_list[i] == back_list[j]) {
+                if (front_list[i] != UINT64_MAX) {
+                    *out_middle = front_list[i];
+                    return true;
+                }
+                ++i; ++j;
+            } else if (front_list[i] < back_list[j]) {
+                ++i;
+            } else {
+                ++j;
+            }
+        }
+        return false;
+    }
+
+    // Check if a group exists
+    bool group_exists(uint64_t kmer_front, uint64_t kmer_back) const {
+        auto key = std::make_pair(kmer_front, kmer_back);
+        return map_segments.find(key) != map_segments.end();
+    }
+
+    // Get group ID for k-mer pair
+    uint32_t get_group_id(uint64_t kmer_front, uint64_t kmer_back) const {
+        auto key = std::make_pair(kmer_front, kmer_back);
+        auto it = map_segments.find(key);
+        return (it != map_segments.end()) ? it->second : UINT32_MAX;
+    }
+
+    // Allocate next group ID
+    uint32_t alloc_group_id() {
+        return next_group_id++;
+    }
+};
+} // namespace
+
+// C API for GroupingEngine
+extern "C" void* agc_grouping_engine_create(uint32_t k, uint32_t start_group_id) {
+    return new GroupingEngine(k, start_group_id);
+}
+
+extern "C" void agc_grouping_engine_destroy(void* engine) {
+    delete static_cast<GroupingEngine*>(engine);
+}
+
+extern "C" void agc_grouping_engine_register(void* engine, uint64_t kmer_front, uint64_t kmer_back, uint32_t group_id) {
+    static_cast<GroupingEngine*>(engine)->register_group(kmer_front, kmer_back, group_id);
+}
+
+extern "C" int agc_grouping_engine_find_middle(void* engine, uint64_t front, uint64_t back, uint64_t* out_middle) {
+    return static_cast<GroupingEngine*>(engine)->find_middle(front, back, out_middle) ? 1 : 0;
+}
+
+extern "C" int agc_grouping_engine_group_exists(void* engine, uint64_t kmer_front, uint64_t kmer_back) {
+    return static_cast<GroupingEngine*>(engine)->group_exists(kmer_front, kmer_back) ? 1 : 0;
+}
+
+extern "C" uint32_t agc_grouping_engine_get_group_id(void* engine, uint64_t kmer_front, uint64_t kmer_back) {
+    return static_cast<GroupingEngine*>(engine)->get_group_id(kmer_front, kmer_back);
+}
+
+extern "C" uint32_t agc_grouping_engine_alloc_id(void* engine) {
+    return static_cast<GroupingEngine*>(engine)->alloc_group_id();
 }
 
 // Find a middle k-mer present in both neighbor lists (sorted, deduped).

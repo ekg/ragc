@@ -221,6 +221,10 @@ pub struct StreamingQueueCompressor {
     map_segments: Arc<Mutex<std::collections::HashMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id
     map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>, // kmer -> [connected kmers]
 
+    // FFI Grouping Engine - C++ AGC-compatible group assignment
+    #[cfg(feature = "ffi_cost")]
+    grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
+
     // Persistent reference segment storage (matches C++ AGC v_segments)
     // Stores reference segment data even after groups are flushed, enabling LZ cost estimation
     // for subsequent samples (fixes multi-sample group fragmentation bug)
@@ -356,6 +360,13 @@ impl StreamingQueueCompressor {
         // Persistent reference segment storage (matches C++ AGC v_segments)
         let reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 
+        // FFI Grouping Engine - C++ AGC-compatible group assignment
+        #[cfg(feature = "ffi_cost")]
+        let grouping_engine = Arc::new(Mutex::new(crate::ragc_ffi::GroupingEngine::new(
+            config.k as u32,
+            NO_RAW_GROUPS,  // Start group IDs at 16 (raw groups 0-15 handled separately)
+        )));
+
         // Priority tracking for interleaved processing (matches C++ AGC)
         let sample_priorities: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
@@ -375,6 +386,8 @@ impl StreamingQueueCompressor {
             let map_segments_terminators = Arc::clone(&map_segments_terminators);
             let reference_segments = Arc::clone(&reference_segments);
             let split_offsets = Arc::clone(&split_offsets);
+            #[cfg(feature = "ffi_cost")]
+            let grouping_engine = Arc::clone(&grouping_engine);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
@@ -392,6 +405,8 @@ impl StreamingQueueCompressor {
                     map_segments_terminators,
                     reference_segments,
                     split_offsets,
+                    #[cfg(feature = "ffi_cost")]
+                    grouping_engine,
                     config,
                 )
             });
@@ -416,6 +431,8 @@ impl StreamingQueueCompressor {
             reference_sample_name,
             map_segments,
             map_segments_terminators,
+            #[cfg(feature = "ffi_cost")]
+            grouping_engine,
             reference_segments,
             split_offsets,
             sample_priorities,
@@ -480,6 +497,8 @@ impl StreamingQueueCompressor {
                 let map_segments_terminators = Arc::clone(&self.map_segments_terminators);
                 let reference_segments = Arc::clone(&self.reference_segments);
                 let split_offsets = Arc::clone(&self.split_offsets);
+                #[cfg(feature = "ffi_cost")]
+                let grouping_engine = Arc::clone(&self.grouping_engine);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
@@ -497,6 +516,8 @@ impl StreamingQueueCompressor {
                         map_segments_terminators,
                         reference_segments,
                         split_offsets,
+                        #[cfg(feature = "ffi_cost")]
+                        grouping_engine,
                         config,
                     )
                 });
@@ -1175,6 +1196,8 @@ fn worker_thread(
     map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>>,
+    #[cfg(feature = "ffi_cost")]
+    grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
