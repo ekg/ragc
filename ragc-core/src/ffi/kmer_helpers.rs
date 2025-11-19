@@ -2,7 +2,7 @@
 // Tests that Rust k-mer canonicalization matches C++ CKmer exactly
 
 use crate::kmer::{Kmer, KmerMode};
-use crate::kmer_extract::{remove_non_singletons, remove_non_singletons_with_duplicates};
+use crate::kmer_extract::{remove_non_singletons, remove_non_singletons_with_duplicates, find_new_splitters_kmers};
 use std::slice;
 
 /// Extract all canonical k-mer values from a contig
@@ -207,6 +207,63 @@ pub extern "C" fn ragc_remove_non_singletons_with_duplicates(
             vec_new_len: new_vec_len,
             dup_new_len: new_dup_len,
         }
+    }
+}
+
+/// Find new splitter k-mers from a contig by excluding reference k-mers
+///
+/// Implements the k-mer filtering workflow from C++ AGC's find_new_splitters():
+/// 1. Extract canonical k-mers from contig
+/// 2. Filter to singletons only
+/// 3. Exclude k-mers that appear in reference singletons
+/// 4. Exclude k-mers that appear in reference duplicates
+///
+/// # Parameters
+/// - contig_data: Pointer to contig sequence data (numeric encoding: A=0, C=1, G=2, T=3)
+/// - contig_len: Length of contig
+/// - k: K-mer length
+/// - candidate_kmers_ptr: Pointer to sorted reference singleton k-mers
+/// - candidate_kmers_len: Length of reference singleton array
+/// - candidate_kmers_offset: Offset to start reading from candidate k-mers
+/// - duplicated_kmers_ptr: Pointer to sorted reference duplicate k-mers
+/// - duplicated_kmers_len: Length of reference duplicate array
+///
+/// # Returns
+/// KmerArray containing novel k-mer values (must be freed with ragc_free_kmer_array)
+///
+/// # Safety
+/// - Caller must ensure all pointers point to valid memory
+/// - All k-mer arrays must be sorted
+/// - Returned array must be freed with ragc_free_kmer_array()
+#[no_mangle]
+pub extern "C" fn ragc_find_new_splitters_kmers(
+    contig_data: *const u8,
+    contig_len: usize,
+    k: u32,
+    candidate_kmers_ptr: *const u64,
+    candidate_kmers_len: usize,
+    candidate_kmers_offset: usize,
+    duplicated_kmers_ptr: *const u64,
+    duplicated_kmers_len: usize,
+) -> KmerArray {
+    unsafe {
+        let contig = slice::from_raw_parts(contig_data, contig_len);
+        let candidate_kmers = slice::from_raw_parts(candidate_kmers_ptr, candidate_kmers_len);
+        let duplicated_kmers = slice::from_raw_parts(duplicated_kmers_ptr, duplicated_kmers_len);
+
+        let mut result = find_new_splitters_kmers(
+            contig,
+            k,
+            candidate_kmers,
+            candidate_kmers_offset,
+            duplicated_kmers,
+        );
+
+        let len = result.len();
+        let ptr = result.as_mut_ptr();
+        std::mem::forget(result);
+
+        KmerArray { data: ptr, len }
     }
 }
 
