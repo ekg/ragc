@@ -175,6 +175,9 @@ pub mod kmer_pair_ffi;
 #[path = "ffi/preprocessing.rs"]
 pub mod preprocessing_ffi;
 
+#[path = "ffi/find_splitters_in_contig.rs"]
+pub mod find_splitters_in_contig_ffi;
+
 #[cfg(feature = "ffi_cost")]
 pub mod ragc_ffi {
     extern "C" {

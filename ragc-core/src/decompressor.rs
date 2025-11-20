@@ -627,12 +627,45 @@ impl Decompressor {
 
             Ok(decoded)
         } else {
-            // Raw-only group (0-15): all segments in delta stream
-            let pack_id = desc.in_group_id as usize / PACK_CARDINALITY;
-            let position_in_pack = desc.in_group_id as usize % PACK_CARDINALITY;
+            // Raw group (0-15): uses two-stream architecture like LZ groups
+            // - Reference (in_group_id=0) in ref stream
+            // - Deltas (in_group_id=1+) in delta stream at position (in_group_id - 1)
+
+            // If this IS the reference (in_group_id == 0), load from ref stream
+            if desc.in_group_id == 0 {
+                let ref_stream_name = stream_ref_name(archive_version, desc.group_id);
+                let ref_stream_id = self
+                    .archive
+                    .get_stream_id(&ref_stream_name)
+                    .ok_or_else(|| anyhow!("Reference stream not found: {ref_stream_name}"))?;
+
+                let (mut ref_data, ref_metadata) = self.archive.get_part_by_id(ref_stream_id, 0)?;
+
+                // Decompress if needed
+                let decompressed_ref = if ref_metadata == 0 {
+                    ref_data
+                } else {
+                    if ref_data.is_empty() {
+                        anyhow::bail!("Empty compressed reference data");
+                    }
+                    let marker = ref_data.pop().unwrap();
+                    decompress_segment_with_marker(&ref_data, marker)?
+                };
+
+                if self.config.verbosity > 1 {
+                    eprintln!("Loaded raw reference for group {}: length={}", desc.group_id, decompressed_ref.len());
+                }
+
+                return Ok(decompressed_ref);
+            }
+
+            // Otherwise, load delta from delta stream at position (in_group_id - 1)
+            let delta_position = (desc.in_group_id - 1) as usize;
+            let pack_id = delta_position / PACK_CARDINALITY;
+            let position_in_pack = delta_position % PACK_CARDINALITY;
 
             if self.config.verbosity > 1 {
-                eprintln!("  Raw group: pack_id={pack_id}, position_in_pack={position_in_pack}");
+                eprintln!("  Raw group: delta_position={delta_position}, pack_id={pack_id}, position_in_pack={position_in_pack}");
             }
 
             let stream_name = stream_delta_name(archive_version, desc.group_id);

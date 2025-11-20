@@ -103,6 +103,20 @@ KmerArray ragc_find_new_splitters_kmers(
     const uint64_t* candidate_kmers_ptr, size_t candidate_kmers_len, size_t candidate_kmers_offset,
     const uint64_t* duplicated_kmers_ptr, size_t duplicated_kmers_len);
 
+// 11. Find splitters in contig workflow
+struct FindSplittersResult {
+    uint64_t* splitters_data;
+    size_t splitters_len;
+    uint64_t* fallbacks_data;
+    size_t fallbacks_len;
+};
+FindSplittersResult ragc_find_splitters_in_contig(
+    const uint8_t* contig_data, size_t contig_len, uint32_t k,
+    uint64_t segment_size,
+    const uint64_t* candidate_kmers_ptr, size_t candidate_kmers_len,
+    uint64_t fallback_threshold);
+void ragc_free_find_splitters_result(FindSplittersResult result);
+
 } // extern "C"
 
 #endif // RAGC_MICRO_FFI_H

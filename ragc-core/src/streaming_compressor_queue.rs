@@ -822,7 +822,23 @@ fn flush_pack(
     let mut segment_delta_indices: Vec<u32> = Vec::new(); // Which unique delta each segment uses
 
     // First pass: encode segments and deduplicate deltas
-    for seg in buffer.segments.iter() {
+
+    // Get reference data for comparison (if it exists)
+    let reference_data = buffer.reference_segment.as_ref().map(|ref_seg| &ref_seg.data);
+    if let Some(ref_data) = reference_data {
+        // Pre-populate unique_deltas[0] with the reference-matching delta
+        // For raw groups: this is the raw reference data
+        // For LZ groups: this is an empty delta (matching reference exactly)
+        if !use_lz_encoding {
+            // Raw groups: store raw reference data at position 0
+            unique_deltas.push(ref_data.clone());
+        } else {
+            // LZ groups: store empty delta at position 0 (represents "identical to reference")
+            unique_deltas.push(Vec::new());
+        }
+    }
+
+    for (i, seg) in buffer.segments.iter().enumerate() {
         let contig_data = if !use_lz_encoding || buffer.reference_segment.is_none() {
             // Raw segment: groups 0-15 OR groups without reference
             seg.data.clone()
@@ -834,7 +850,8 @@ fn flush_pack(
                 .encode(&seg.data)
         };
 
-        // Check if this delta already exists (matching C++ AGC segment.cpp line 66)
+        // Check if this delta already exists (includes reference delta at position 0)
+        // (matching C++ AGC segment.cpp line 66)
         if let Some(existing_idx) = unique_deltas.iter().position(|d| d == &contig_data) {
             // Reuse existing delta (matching C++ AGC segment.cpp line 69)
             segment_delta_indices.push(existing_idx as u32);
@@ -855,9 +872,8 @@ fn flush_pack(
     // Register segments in collection with their delta indices
     for (seg, &delta_idx) in buffer.segments.iter().zip(segment_delta_indices.iter()) {
         // in_group_id represents which delta this segment uses
-        // 0 = reference, 1+ = delta index (offset by buffer.segments_written and +1 for reference)
-        // NOTE: Raw groups (0-15) don't have references, but still use 1+ indexing to match C++ AGC
-        let in_group_id = buffer.segments_written + delta_idx + 1;
+        // 0 = reference, 1+ = delta index (1-based, not offset by segments_written)
+        let in_group_id = delta_idx + 1;
 
         let mut coll = collection.lock().unwrap();
         coll.add_segment_placed(
@@ -878,17 +894,23 @@ fn flush_pack(
 
     // Compress and write the packed data (if we have any delta segments)
     if !packed_data.is_empty() {
-        // The metadata field stores the uncompressed size (including separators)
-        let total_raw_size = packed_data.len() as u64;
+        let total_raw_size = packed_data.len();
 
         let mut compressed = compress_segment_configured(&packed_data, config.compression_level)
             .context("Failed to compress pack")?;
         compressed.push(0); // Marker 0 = plain ZSTD
 
-        {
-            let mut arch = archive.lock().unwrap();
-            arch.add_part(buffer.stream_id, &compressed, total_raw_size)
-                .context("Failed to write pack")?;
+        // CRITICAL: Check if compression helped (matching C++ AGC segment.h line 179)
+        // C++ AGC: if(packed_size + 1u < (uint32_t) data.size())
+        let mut arch = archive.lock().unwrap();
+        if compressed.len() < total_raw_size {
+            // Compression helped - write compressed data with metadata=original_size
+            arch.add_part(buffer.stream_id, &compressed, total_raw_size as u64)
+                .context("Failed to write compressed pack")?;
+        } else {
+            // Compression didn't help - write UNCOMPRESSED data with metadata=0
+            arch.add_part(buffer.stream_id, &packed_data, 0)
+                .context("Failed to write uncompressed pack")?;
         }
     }
 
@@ -924,14 +946,21 @@ fn write_reference_immediately(
         .context("Failed to compress reference")?;
     compressed.push(marker);
 
-    // Metadata stores the uncompressed size
-    let ref_size = segment.data.len() as u64;
+    let ref_size = segment.data.len();
 
     // 2. Write to archive immediately (matching C++ AGC segment.cpp line 43: store_in_archive)
+    // CRITICAL: Check if compression helped (matching C++ AGC segment.h line 179)
     {
         let mut arch = archive.lock().unwrap();
-        arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
-            .context("Failed to write immediate reference")?;
+        if compressed.len() < ref_size {
+            // Compression helped - write compressed data with metadata=original_size
+            arch.add_part(buffer.ref_stream_id, &compressed, ref_size as u64)
+                .context("Failed to write compressed reference")?;
+        } else {
+            // Compression didn't help - write UNCOMPRESSED data with metadata=0
+            arch.add_part(buffer.ref_stream_id, &segment.data, 0)
+                .context("Failed to write uncompressed reference")?;
+        }
     }
 
     // 3. Register reference in collection with in_group_id = 0 (matching flush_pack lines 650-661)
