@@ -1049,13 +1049,14 @@ fn reverse_complement_sequence(seq: &[u8]) -> Vec<u8> {
 
 /// Find best existing group for a segment with only one k-mer present
 /// (Implements C++ AGC's find_cand_segment_with_one_splitter logic from lines 1659-1745)
+/// CRITICAL: Must use batch-local groups only (not global map) to match C++ AGC's m_kmers
 fn find_group_with_one_kmer(
     kmer: u64,
     kmer_is_dir: bool,
     segment_data: &[u8],      // Segment data in forward orientation
     segment_data_rc: &[u8],   // Segment data in reverse complement
     map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
-    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    batch_local_groups: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,  // BATCH-LOCAL, not global!
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
@@ -1099,7 +1100,7 @@ fn find_group_with_one_kmer(
 
     {
         let groups = segment_groups.lock().unwrap();
-        let seg_map = map_segments.lock().unwrap();
+        let batch_map = batch_local_groups.lock().unwrap();  // BATCH-LOCAL only!
         let ref_segs = reference_segments.lock().unwrap();
 
         for &cand_kmer in &connected_kmers {
@@ -1120,9 +1121,9 @@ fn find_group_with_one_kmer(
                 kmer_back: key_back,
             };
 
-            // Check if this group exists in global registry (matching C++ AGC line 1711)
-            // CRITICAL FIX: Use seg_map to check ALL groups, not just buffered ones
-            if let Some(&group_id) = seg_map.get(&cand_key) {
+            // Check if this group exists in BATCH-LOCAL registry (matching C++ AGC's local m_kmers)
+            // CRITICAL: Only check batch-local groups, NOT global (C++ AGC m_kmers is per-batch)
+            if let Some(&group_id) = batch_map.get(&cand_key) {
                 // Get reference segment size from buffer OR persistent storage
                 let ref_size = if let Some(group_buffer) = groups.get(&cand_key) {
                     // Group in buffer - get size from buffer
@@ -1186,7 +1187,7 @@ fn find_group_with_one_kmer(
 
     {
         let groups = segment_groups.lock().unwrap();
-        let seg_map = map_segments.lock().unwrap();
+        let batch_map = batch_local_groups.lock().unwrap();  // BATCH-LOCAL only!
         let ref_segs = reference_segments.lock().unwrap();
 
         for &(key_front, key_back, needs_rc, ref_size) in &candidates {
@@ -1198,7 +1199,7 @@ fn find_group_with_one_kmer(
             // Get the reference segment for this candidate from buffer OR persistent storage
             let ref_data_opt: Option<&[u8]> = if let Some(group_buffer) = groups.get(&cand_key) {
                 group_buffer.reference_segment.as_ref().map(|seg| seg.data.as_slice())
-            } else if let Some(&group_id) = seg_map.get(&cand_key) {
+            } else if let Some(&group_id) = batch_map.get(&cand_key) {
                 ref_segs.get(&group_id).map(|data| data.as_slice())
             } else {
                 None
@@ -1492,7 +1493,7 @@ fn worker_thread(
                         &segment.data,
                         &segment_data_rc,
                         &map_segments_terminators,
-                        &map_segments,
+                        &batch_local_groups,  // Use batch-local, not global!
                         &segment_groups,
                         &reference_segments,
                         &config,
@@ -1512,7 +1513,7 @@ fn worker_thread(
                         &segment.data,
                         &segment_data_rc,
                         &map_segments_terminators,
-                        &map_segments,
+                        &batch_local_groups,  // Use batch-local, not global!
                         &segment_groups,
                         &reference_segments,
                         &config,
@@ -1725,19 +1726,12 @@ fn worker_thread(
                                 // left first
                                 if !is_degenerate_left {
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
-                                        // BATCH-LOCAL: Check global first, then batch-local
+                                        // BATCH-LOCAL: Only use batch-local map (no global check)
                                         let group_id = {
-                                            let global_map = map_segments.lock().unwrap();
-                                            if let Some(&existing_id) = global_map.get(&left_key) {
-                                                drop(global_map);
-                                                existing_id
-                                            } else {
-                                                drop(global_map);
-                                                let mut batch_map = batch_local_groups.lock().unwrap();
-                                                *batch_map.entry(left_key.clone()).or_insert_with(|| {
-                                                    group_counter.fetch_add(1, Ordering::SeqCst)
-                                                })
-                                            }
+                                            let mut batch_map = batch_local_groups.lock().unwrap();
+                                            *batch_map.entry(left_key.clone()).or_insert_with(|| {
+                                                group_counter.fetch_add(1, Ordering::SeqCst)
+                                            })
                                         };
                                         // Register with FFI engine
                                         #[cfg(feature = "ffi_cost")]
@@ -1773,19 +1767,12 @@ fn worker_thread(
                                 }
                                 if !is_degenerate_right {
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
-                                        // BATCH-LOCAL: Check global first, then batch-local
+                                        // BATCH-LOCAL: Only use batch-local map (no global check)
                                         let group_id = {
-                                            let global_map = map_segments.lock().unwrap();
-                                            if let Some(&existing_id) = global_map.get(&right_key) {
-                                                drop(global_map);
-                                                existing_id
-                                            } else {
-                                                drop(global_map);
-                                                let mut batch_map = batch_local_groups.lock().unwrap();
-                                                *batch_map.entry(right_key.clone()).or_insert_with(|| {
-                                                    group_counter.fetch_add(1, Ordering::SeqCst)
-                                                })
-                                            }
+                                            let mut batch_map = batch_local_groups.lock().unwrap();
+                                            *batch_map.entry(right_key.clone()).or_insert_with(|| {
+                                                group_counter.fetch_add(1, Ordering::SeqCst)
+                                            })
                                         };
                                         // Register with FFI engine
                                         #[cfg(feature = "ffi_cost")]
@@ -1824,16 +1811,10 @@ fn worker_thread(
                                 // reversed: right first
                                 if !is_degenerate_right {
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
-                                        // BATCH-LOCAL: Check global first, then batch-local (group must exist from earlier)
+                                        // BATCH-LOCAL: Group must exist in batch-local map (created earlier in this batch)
                                         let group_id = {
-                                            let global_map = map_segments.lock().unwrap();
-                                            if let Some(&id) = global_map.get(&right_key) {
-                                                id
-                                            } else {
-                                                drop(global_map);
-                                                let batch_map = batch_local_groups.lock().unwrap();
-                                                *batch_map.get(&right_key).expect("Split right group must exist in batch_local_groups or map_segments")
-                                            }
+                                            let batch_map = batch_local_groups.lock().unwrap();
+                                            *batch_map.get(&right_key).expect("Split right group must exist in batch_local_groups")
                                         };
                                         let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
                                         let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
@@ -1850,16 +1831,10 @@ fn worker_thread(
                                 }
                                 if !is_degenerate_left {
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
-                                        // BATCH-LOCAL: Check global first, then batch-local (group must exist from earlier)
+                                        // BATCH-LOCAL: Group must exist in batch-local map (created earlier in this batch)
                                         let group_id = {
-                                            let global_map = map_segments.lock().unwrap();
-                                            if let Some(&id) = global_map.get(&left_key) {
-                                                id
-                                            } else {
-                                                drop(global_map);
-                                                let batch_map = batch_local_groups.lock().unwrap();
-                                                *batch_map.get(&left_key).expect("Split left group must exist in batch_local_groups or map_segments")
-                                            }
+                                            let batch_map = batch_local_groups.lock().unwrap();
+                                            *batch_map.get(&left_key).expect("Split left group must exist in batch_local_groups")
                                         };
                                         let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
                                         let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
@@ -1961,27 +1936,19 @@ fn worker_thread(
                 // If group doesn't exist yet, allocate group_id using BATCH-LOCAL logic
                 let buffer = groups.entry(key.clone()).or_insert_with(|| {
                     // BATCH-LOCAL GROUP ASSIGNMENT (matches C++ AGC m_kmers per-batch behavior)
-                    // 1. Check GLOBAL registry first (for groups from previous batches)
-                    // 2. If not found globally, check/create in BATCH-LOCAL map
+                    // C++ AGC uses a LOCAL m_kmers map that starts EMPTY for each batch
+                    // DO NOT check global registry - groups from previous batches CANNOT be referenced
+                    // Only use batch-local map for current batch
                     let group_id = {
-                        let global_map = map_segments.lock().unwrap();
-                        if let Some(&existing_id) = global_map.get(&key) {
-                            // Group exists from previous batch - reuse it
-                            drop(global_map);
-                            existing_id
-                        } else {
-                            // Not in global registry - check batch-local map
-                            drop(global_map);
-                            let mut batch_map = batch_local_groups.lock().unwrap();
-                            *batch_map.entry(key.clone()).or_insert_with(|| {
-                                // New group for this batch - allocate ID
-                                if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
-                                    key.kmer_front as u32  // Raw groups use ID from key
-                                } else {
-                                    group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
-                                }
-                            })
-                        }
+                        let mut batch_map = batch_local_groups.lock().unwrap();
+                        *batch_map.entry(key.clone()).or_insert_with(|| {
+                            // New group for this batch - allocate ID
+                            if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
+                                key.kmer_front as u32  // Raw groups use ID from key
+                            } else {
+                                group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
+                            }
+                        })
                     };
 
                     // Register with FFI engine
