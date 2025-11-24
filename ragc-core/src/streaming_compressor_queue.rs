@@ -110,6 +110,17 @@ struct SegmentGroupKey {
     kmer_back: u64,
 }
 
+/// Pending segment for batch-local processing (before group assignment)
+#[derive(Debug, Clone)]
+struct PendingSegment {
+    key: SegmentGroupKey,
+    segment_data: Vec<u8>,
+    should_reverse: bool,
+    sample_name: String,
+    contig_name: String,
+    place: usize,
+}
+
 /// Buffered segment waiting to be packed
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferedSegment {
@@ -237,6 +248,12 @@ pub struct StreamingQueueCompressor {
     // Priority assignment for interleaved processing (matches C++ AGC)
     // Higher priority = processed first (sample1 > sample2 > sample3...)
     sample_priorities: Arc<Mutex<std::collections::HashMap<String, i32>>>, // sample_name -> priority
+
+    // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
+    // When sample changes, we flush pending segments and clear batch-local state
+    current_batch_sample: Arc<Mutex<Option<String>>>, // Current sample being processed
+    batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>, // Batch-local m_kmers equivalent
+    pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>, // Buffer segments until batch boundary
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
 }
 
@@ -371,6 +388,11 @@ impl StreamingQueueCompressor {
         let sample_priorities: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
 
+        // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
+        let current_batch_sample: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
+
         // Spawn worker threads
         let mut workers = Vec::new();
         for worker_id in 0..config.num_threads {
@@ -388,6 +410,9 @@ impl StreamingQueueCompressor {
             let split_offsets = Arc::clone(&split_offsets);
             #[cfg(feature = "ffi_cost")]
             let grouping_engine = Arc::clone(&grouping_engine);
+            let current_batch_sample = Arc::clone(&current_batch_sample);
+            let batch_local_groups = Arc::clone(&batch_local_groups);
+            let pending_batch_segments = Arc::clone(&pending_batch_segments);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
@@ -407,6 +432,9 @@ impl StreamingQueueCompressor {
                     split_offsets,
                     #[cfg(feature = "ffi_cost")]
                     grouping_engine,
+                    current_batch_sample,
+                    batch_local_groups,
+                    pending_batch_segments,
                     config,
                 )
             });
@@ -437,6 +465,9 @@ impl StreamingQueueCompressor {
             split_offsets,
             sample_priorities,
             next_priority,
+            current_batch_sample,
+            batch_local_groups,
+            pending_batch_segments,
         })
     }
 
@@ -499,6 +530,9 @@ impl StreamingQueueCompressor {
                 let split_offsets = Arc::clone(&self.split_offsets);
                 #[cfg(feature = "ffi_cost")]
                 let grouping_engine = Arc::clone(&self.grouping_engine);
+                let current_batch_sample = Arc::clone(&self.current_batch_sample);
+                let batch_local_groups = Arc::clone(&self.batch_local_groups);
+                let pending_batch_segments = Arc::clone(&self.pending_batch_segments);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
@@ -518,6 +552,9 @@ impl StreamingQueueCompressor {
                         split_offsets,
                         #[cfg(feature = "ffi_cost")]
                         grouping_engine,
+                        current_batch_sample,
+                        batch_local_groups,
+                        pending_batch_segments,
                         config,
                     )
                 });
@@ -1234,6 +1271,57 @@ fn find_group_with_one_kmer(
     (best_key_front, best_key_back, best_needs_rc)
 }
 
+/// Flush batch-local groups to global state (matches C++ AGC batch boundary)
+/// This updates the global map_segments registry with batch-local groups,
+/// then clears the batch-local state (like C++ AGC destroying m_kmers at batch end)
+fn flush_batch(
+    _segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    _pending_batch_segments: &Arc<Mutex<Vec<PendingSegment>>>,
+    batch_local_groups: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    _group_counter: &Arc<AtomicU32>,
+    _map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    _archive: &Arc<Mutex<Archive>>,
+    _collection: &Arc<Mutex<CollectionV3>>,
+    _reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    #[cfg(feature = "ffi_cost")]
+    _grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
+    config: &StreamingQueueConfig,
+) -> Result<()> {
+    // Get batch-local groups
+    let batch_map = batch_local_groups.lock().unwrap();
+
+    if batch_map.is_empty() {
+        if config.verbosity > 0 {
+            eprintln!("FLUSH_BATCH: No pending groups to flush");
+        }
+        return Ok(());
+    }
+
+    if config.verbosity > 0 {
+        eprintln!("FLUSH_BATCH: Updating global registry with {} batch-local groups", batch_map.len());
+    }
+
+    // Update global registry with this batch's new groups
+    {
+        let mut global_map = map_segments.lock().unwrap();
+        for (key, group_id) in batch_map.iter() {
+            // Only insert if not already present (shouldn't happen, but defensive)
+            global_map.entry(key.clone()).or_insert(*group_id);
+        }
+    }
+
+    // Clear batch-local state (like C++ AGC destroying m_kmers)
+    drop(batch_map);
+    batch_local_groups.lock().unwrap().clear();
+
+    if config.verbosity > 0 {
+        eprintln!("FLUSH_BATCH: Batch flush complete, batch-local state cleared");
+    }
+
+    Ok(())
+}
+
 /// Worker thread that pulls from queue and compresses
 fn worker_thread(
     worker_id: usize,
@@ -1251,6 +1339,9 @@ fn worker_thread(
     split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>>,
     #[cfg(feature = "ffi_cost")]
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
+    current_batch_sample: Arc<Mutex<Option<String>>>,
+    batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
@@ -1258,7 +1349,25 @@ fn worker_thread(
     loop {
         // Pull from queue (blocks if empty, returns None when closed)
         let Some(task) = queue.pull() else {
-            // Queue is closed and empty - we're done!
+            // Queue is closed and empty - flush any pending batch before exiting
+            if config.verbosity > 0 {
+                eprintln!("Worker {} flushing final batch before exit", worker_id);
+            }
+            flush_batch(
+                &segment_groups,
+                &pending_batch_segments,
+                &batch_local_groups,
+                &map_segments,
+                &group_counter,
+                &map_segments_terminators,
+                &archive,
+                &collection,
+                &reference_segments,
+                #[cfg(feature = "ffi_cost")]
+                &grouping_engine,
+                &config,
+            ).ok(); // Ignore errors on final flush
+
             if config.verbosity > 1 {
                 eprintln!(
                     "Worker {} finished ({} contigs processed)",
@@ -1267,6 +1376,37 @@ fn worker_thread(
             }
             break;
         };
+
+        // Check if we're starting a new sample (batch boundary)
+        {
+            let mut current = current_batch_sample.lock().unwrap();
+            if current.as_ref() != Some(&task.sample_name) {
+                if current.is_some() {
+                    // Batch boundary detected - flush previous batch
+                    if config.verbosity > 0 {
+                        eprintln!("BATCH_BOUNDARY: Flushing batch for sample {:?}, starting new batch for {}",
+                            current, task.sample_name);
+                    }
+                    drop(current); // Release lock before flush
+                    flush_batch(
+                        &segment_groups,
+                        &pending_batch_segments,
+                        &batch_local_groups,
+                        &map_segments,
+                        &group_counter,
+                        &map_segments_terminators,
+                        &archive,
+                        &collection,
+                        &reference_segments,
+                        #[cfg(feature = "ffi_cost")]
+                        &grouping_engine,
+                        &config,
+                    )?;
+                    current = current_batch_sample.lock().unwrap();
+                }
+                *current = Some(task.sample_name.clone());
+            }
+        }
 
         // Split into segments
         let segments =
@@ -1585,12 +1725,19 @@ fn worker_thread(
                                 // left first
                                 if !is_degenerate_left {
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
-                                        // Ensure group exists in map_segments (create if missing)
+                                        // BATCH-LOCAL: Check global first, then batch-local
                                         let group_id = {
-                                            let mut seg_map = map_segments.lock().unwrap();
-                                            *seg_map.entry(left_key.clone()).or_insert_with(|| {
-                                                group_counter.fetch_add(1, Ordering::SeqCst)
-                                            })
+                                            let global_map = map_segments.lock().unwrap();
+                                            if let Some(&existing_id) = global_map.get(&left_key) {
+                                                drop(global_map);
+                                                existing_id
+                                            } else {
+                                                drop(global_map);
+                                                let mut batch_map = batch_local_groups.lock().unwrap();
+                                                *batch_map.entry(left_key.clone()).or_insert_with(|| {
+                                                    group_counter.fetch_add(1, Ordering::SeqCst)
+                                                })
+                                            }
                                         };
                                         // Register with FFI engine
                                         #[cfg(feature = "ffi_cost")]
@@ -1626,12 +1773,19 @@ fn worker_thread(
                                 }
                                 if !is_degenerate_right {
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
-                                        // Ensure group exists in map_segments (create if missing)
+                                        // BATCH-LOCAL: Check global first, then batch-local
                                         let group_id = {
-                                            let mut seg_map = map_segments.lock().unwrap();
-                                            *seg_map.entry(right_key.clone()).or_insert_with(|| {
-                                                group_counter.fetch_add(1, Ordering::SeqCst)
-                                            })
+                                            let global_map = map_segments.lock().unwrap();
+                                            if let Some(&existing_id) = global_map.get(&right_key) {
+                                                drop(global_map);
+                                                existing_id
+                                            } else {
+                                                drop(global_map);
+                                                let mut batch_map = batch_local_groups.lock().unwrap();
+                                                *batch_map.entry(right_key.clone()).or_insert_with(|| {
+                                                    group_counter.fetch_add(1, Ordering::SeqCst)
+                                                })
+                                            }
                                         };
                                         // Register with FFI engine
                                         #[cfg(feature = "ffi_cost")]
@@ -1670,9 +1824,16 @@ fn worker_thread(
                                 // reversed: right first
                                 if !is_degenerate_right {
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
+                                        // BATCH-LOCAL: Check global first, then batch-local (group must exist from earlier)
                                         let group_id = {
-                                            let mut seg_map = map_segments.lock().unwrap();
-                                            *seg_map.get(&right_key).expect("Split right group must exist in map_segments")
+                                            let global_map = map_segments.lock().unwrap();
+                                            if let Some(&id) = global_map.get(&right_key) {
+                                                id
+                                            } else {
+                                                drop(global_map);
+                                                let batch_map = batch_local_groups.lock().unwrap();
+                                                *batch_map.get(&right_key).expect("Split right group must exist in batch_local_groups or map_segments")
+                                            }
                                         };
                                         let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
                                         let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
@@ -1689,9 +1850,16 @@ fn worker_thread(
                                 }
                                 if !is_degenerate_left {
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
+                                        // BATCH-LOCAL: Check global first, then batch-local (group must exist from earlier)
                                         let group_id = {
-                                            let mut seg_map = map_segments.lock().unwrap();
-                                            *seg_map.get(&left_key).expect("Split left group must exist in map_segments")
+                                            let global_map = map_segments.lock().unwrap();
+                                            if let Some(&id) = global_map.get(&left_key) {
+                                                id
+                                            } else {
+                                                drop(global_map);
+                                                let batch_map = batch_local_groups.lock().unwrap();
+                                                *batch_map.get(&left_key).expect("Split left group must exist in batch_local_groups or map_segments")
+                                            }
                                         };
                                         let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
                                         let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
@@ -1790,19 +1958,30 @@ fn worker_thread(
                 };
 
                 // Get or create buffer for this group
-                // If group doesn't exist yet, allocate group_id and insert into map_segments NOW
+                // If group doesn't exist yet, allocate group_id using BATCH-LOCAL logic
                 let buffer = groups.entry(key.clone()).or_insert_with(|| {
-                    // Allocate new group_id and atomically insert into map_segments
-                    // (This happens ONLY when split failed or wasn't possible)
+                    // BATCH-LOCAL GROUP ASSIGNMENT (matches C++ AGC m_kmers per-batch behavior)
+                    // 1. Check GLOBAL registry first (for groups from previous batches)
+                    // 2. If not found globally, check/create in BATCH-LOCAL map
                     let group_id = {
-                        let mut seg_map = map_segments.lock().unwrap();
-                        *seg_map.entry(key.clone()).or_insert_with(|| {
-                            if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
-                                key.kmer_front as u32  // Raw groups use ID from key
-                            } else {
-                                group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
-                            }
-                        })
+                        let global_map = map_segments.lock().unwrap();
+                        if let Some(&existing_id) = global_map.get(&key) {
+                            // Group exists from previous batch - reuse it
+                            drop(global_map);
+                            existing_id
+                        } else {
+                            // Not in global registry - check batch-local map
+                            drop(global_map);
+                            let mut batch_map = batch_local_groups.lock().unwrap();
+                            *batch_map.entry(key.clone()).or_insert_with(|| {
+                                // New group for this batch - allocate ID
+                                if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
+                                    key.kmer_front as u32  // Raw groups use ID from key
+                                } else {
+                                    group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
+                                }
+                            })
+                        }
                     };
 
                     // Register with FFI engine
