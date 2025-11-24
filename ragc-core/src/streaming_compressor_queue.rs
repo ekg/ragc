@@ -1128,46 +1128,50 @@ fn find_group_with_one_kmer(
         }
     });
 
-    // Test compression for each candidate (C++ AGC lines 1732-1745)
-    // Pick candidate with smallest LZ-encoded size
-    let mut best_key_front = candidates[0].0;
-    let mut best_key_back = candidates[0].1;
-    let mut best_needs_rc = candidates[0].2;
+    // Test compression for each candidate (C++ AGC lines 1726-1788)
+    // Match C++ AGC's TWO-PASS approach:
+    //   Pass 1: Compute all estimates, track minimum (lines 1726-1732)
+    //   Pass 2: Pick candidate with minimum estimate (lines 1775-1787)
+    //
+    // CRITICAL: Initialize best_pk to (~0ull, ~0ull) like C++ AGC (line 1628)
+    let mut best_key_front = u64::MAX;  // ~0ull in C++
+    let mut best_key_back = u64::MAX;   // ~0ull in C++
+    let mut best_needs_rc = false;
     let mut best_estim_size = if segment_len < 16 {
         segment_len
     } else {
         segment_len - 16
     };
 
+    // Pass 1: Compute estimates and find minimum
+    // Store estimates alongside candidates: Vec<(front, back, needs_rc, ref_size, estim_size)>
+    let mut candidate_estimates: Vec<(u64, u64, bool, usize, usize)> = Vec::new();
+
     {
         let groups = segment_groups.lock().unwrap();
         let seg_map = map_segments.lock().unwrap();
         let ref_segs = reference_segments.lock().unwrap();
 
-        for &(key_front, key_back, needs_rc, _ref_size) in &candidates {
+        for &(key_front, key_back, needs_rc, ref_size) in &candidates {
             let cand_key = SegmentGroupKey {
                 kmer_front: key_front,
                 kmer_back: key_back,
             };
 
             // Get the reference segment for this candidate from buffer OR persistent storage
-            // CRITICAL FIX: Check persistent storage for flushed groups (matching C++ AGC v_segments)
             let ref_data_opt: Option<&[u8]> = if let Some(group_buffer) = groups.get(&cand_key) {
-                // Group in buffer - get reference from buffer
                 group_buffer.reference_segment.as_ref().map(|seg| seg.data.as_slice())
             } else if let Some(&group_id) = seg_map.get(&cand_key) {
-                // Group flushed - get reference from persistent storage
                 ref_segs.get(&group_id).map(|data| data.as_slice())
             } else {
                 None
             };
 
             if let Some(ref_data) = ref_data_opt {
-                // Test LZ encoding against this reference (C++ AGC line 1734: estimate())
+                // Test LZ encoding against this reference (C++ AGC line 1728: estimate())
                 let mut lz = LZDiff::new(config.min_match_len as u32);
                 lz.prepare(&ref_data.to_vec());
 
-                // Choose segment orientation based on needs_rc
                 let target_data = if needs_rc {
                     segment_data_rc.to_vec()
                 } else {
@@ -1184,21 +1188,41 @@ fn find_group_with_one_kmer(
                     );
                 }
 
-                // Update best if this candidate compresses better
-                // (C++ AGC lines 1737-1743)
-                let cand_pk = (key_front, key_back);
-                let best_pk = (best_key_front, best_key_back);
-
-                if estim_size < best_estim_size
-                    || (estim_size == best_estim_size && cand_pk < best_pk)
-                    || (estim_size == best_estim_size && cand_pk == best_pk && !needs_rc)
-                {
+                // Track minimum estim_size (C++ AGC lines 1730-1732)
+                if estim_size < best_estim_size {
                     best_estim_size = estim_size;
-                    best_key_front = key_front;
-                    best_key_back = key_back;
-                    best_needs_rc = needs_rc;
                 }
+
+                candidate_estimates.push((key_front, key_back, needs_rc, ref_size, estim_size));
             }
+        }
+    }
+
+    // Pass 2: Pick candidate with minimum estimate among ALL candidates, using tie-breakers
+    // (C++ AGC lines 1775-1788)
+    // CRITICAL: Compare against ACTUAL candidate estimates, not against initial threshold!
+    // C++ AGC's condition (line 1780): v_estim_size[i] < best_estim_size
+    // This means: pick candidate if its estimate is better than ANY previous candidate
+    let mut first_candidate = true;
+    for &(key_front, key_back, needs_rc, _ref_size, estim_size) in &candidate_estimates {
+        let cand_pk = (key_front, key_back);
+        let best_pk = (best_key_front, best_key_back);
+
+        // Match C++ AGC's selection logic exactly (lines 1780-1787):
+        // Pick first candidate unconditionally, then pick better ones via:
+        // - Smaller estimate, OR
+        // - Same estimate with lexicographically smaller pk, OR
+        // - Same estimate+pk with better RC (prefers forward orientation)
+        if first_candidate
+            || estim_size < best_estim_size
+            || (estim_size == best_estim_size && cand_pk < best_pk)
+            || (estim_size == best_estim_size && cand_pk == best_pk && !needs_rc)
+        {
+            best_estim_size = estim_size;
+            best_key_front = key_front;
+            best_key_back = key_back;
+            best_needs_rc = needs_rc;
+            first_candidate = false;
         }
     }
 
@@ -1282,6 +1306,18 @@ fn worker_thread(
             // (agc_compressor.cpp lines 1306-1327)
             use crate::segment::MISSING_KMER;
 
+            // Precompute reverse complement for all cases that might need it
+            // Segment data uses numeric encoding: 0=A, 1=C, 2=G, 3=T
+            let segment_data_rc: Vec<u8> = segment.data.iter().rev().map(|&base| {
+                match base {
+                    0 => 3, // A -> T
+                    1 => 2, // C -> G
+                    2 => 1, // G -> C
+                    3 => 0, // T -> A
+                    _ => base, // N or other non-ACGT
+                }
+            }).collect();
+
             let (key_front, key_back, should_reverse) =
                 if segment.front_kmer != MISSING_KMER && segment.back_kmer != MISSING_KMER {
                     // Both k-mers present - normalize by ensuring front <= back
@@ -1307,20 +1343,40 @@ fn worker_thread(
                     }
                 } else if segment.front_kmer != MISSING_KMER {
                     // Case 3a: Only front k-mer present, back is MISSING (terminator)
-                    // This means the segment ends at a contig boundary
-                    // C++ AGC doesn't add terminator pairs to map_segments (lines 1020-1030)
-                    // So we should create a new group directly, not look up connections
-                    eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} back=MISSING -> key=({},{}) store_rc=false",
-                        task.sample_name, segment.front_kmer, segment.front_kmer, MISSING_KMER);
-                    (segment.front_kmer, segment.back_kmer, false)
+                    // Match C++ AGC lines 1315-1336: reverse complement and find candidate with one splitter
+                    eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} back=MISSING -> finding best group",
+                        task.sample_name, segment.front_kmer);
+                    find_group_with_one_kmer(
+                        segment.front_kmer,
+                        true, // kmer_is_dir = true for front k-mer
+                        &segment.data,
+                        &segment_data_rc,
+                        &map_segments_terminators,
+                        &map_segments,
+                        &segment_groups,
+                        &reference_segments,
+                        &config,
+                    )
                 } else if segment.back_kmer != MISSING_KMER {
                     // Case 3b: Only back k-mer present, front is MISSING (terminator)
-                    // This means the segment starts at a contig boundary
-                    // C++ AGC doesn't add terminator pairs to map_segments (lines 1020-1030)
-                    // So we should create a new group directly, not look up connections
-                    eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} -> key=({},{}) store_rc=false",
-                        task.sample_name, segment.back_kmer, MISSING_KMER, segment.back_kmer);
-                    (segment.front_kmer, segment.back_kmer, false)
+                    // Match C++ AGC lines 1337-1360: swap_dir_rc() just swaps orientation, not the k-mer value
+                    eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} -> finding best group",
+                        task.sample_name, segment.back_kmer);
+
+                    // C++ AGC calls kmer.swap_dir_rc() which swaps the orientation fields
+                    // but uses the ORIGINAL k-mer value for lookup
+                    // kmer_is_dir = false because we swapped from RC to DIR (swap_dir_rc)
+                    find_group_with_one_kmer(
+                        segment.back_kmer, // Use original k-mer value, not RC'd
+                        false, // kmer_is_dir = false (after swap_dir_rc, RC becomes DIR)
+                        &segment.data,
+                        &segment_data_rc,
+                        &map_segments_terminators,
+                        &map_segments,
+                        &segment_groups,
+                        &reference_segments,
+                        &config,
+                    )
                 } else {
                     // Case 1 or 4: Both MISSING - use as-is
                     (segment.front_kmer, segment.back_kmer, false)
