@@ -9,6 +9,7 @@
 
 // C++ AGC headers
 #include "../../../agc/src/core/agc_compressor.h"
+#include "../../../agc/src/common/lz_diff.h"
 #include "agc_compressor_rust.h"
 
 extern "C" {
@@ -163,6 +164,39 @@ bool agc_compress_create_with_rust_splitters(
         }
         return false;
     }
+}
+
+// Compute encoding cost estimate using actual CLZDiff_V2::Estimate
+// This uses the EXACT same algorithm as C++ AGC's find_cand_segment_with_one_splitter
+uint32_t agc_lzdiff_v2_estimate(
+    const uint8_t* ref, size_t ref_len,
+    const uint8_t* text, size_t text_len,
+    uint32_t min_match_len,
+    uint32_t bound
+) {
+    if (!ref || !text || ref_len == 0 || text_len == 0) {
+        return UINT32_MAX;
+    }
+
+    // Create CLZDiff_V2 with min_match_len
+    CLZDiff_V2 lz(min_match_len);
+
+    // Build reference contig
+    contig_t reference_contig(ref, ref + ref_len);
+
+    // Prepare() sets reference and prepares for encoding
+    lz.Prepare(reference_contig);
+
+    // AssureIndex() ensures the hash index is built (called before Estimate)
+    lz.AssureIndex();
+
+    // Build text contig
+    contig_t text_contig(text, text + text_len);
+
+    // Call the actual Estimate function
+    size_t result = lz.Estimate(text_contig, bound);
+
+    return (uint32_t)result;
 }
 
 } // extern "C"

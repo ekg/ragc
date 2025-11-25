@@ -83,6 +83,13 @@ enum Commands {
         #[arg(long, default_value = "2G")]
         queue_capacity: String,
 
+        /// Fallback minimizers fraction for grouping terminator segments (0.0-1.0)
+        /// When > 0, enables fallback k-mer indexing for segments with missing terminators.
+        /// Higher values (e.g., 0.1) index more k-mers for better grouping at memory cost.
+        /// Default 0.0 disables fallback minimizers (matches C++ AGC default).
+        #[arg(long, default_value_t = 0.0)]
+        fallback_frac: f64,
+
         /// Use C++ AGC compression via FFI for byte-identical archives
         /// This delegates the entire compression to the original C++ AGC implementation.
         /// Use this to verify RAGC produces compatible output, then pare back.
@@ -279,6 +286,7 @@ fn main() -> Result<()> {
             threads,
             batch,
             queue_capacity,
+            fallback_frac,
             cpp_agc,
         } => create_archive(
             output,
@@ -293,6 +301,7 @@ fn main() -> Result<()> {
             threads,
             batch,
             &queue_capacity,
+            fallback_frac,
             cpp_agc,
         )?,
 
@@ -364,6 +373,7 @@ fn create_archive(
     threads: Option<usize>,
     batch: bool,
     queue_capacity_str: &str,
+    fallback_frac: f64,
     cpp_agc: bool,
 ) -> Result<()> {
     // Determine thread count (use provided or auto-detect)
@@ -466,6 +476,7 @@ fn create_archive(
             num_threads,
             verbosity: verbosity as usize,
             adaptive_mode: adaptive,
+            fallback_frac,
             ..StreamingQueueConfig::default()
         };
 

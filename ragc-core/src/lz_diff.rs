@@ -698,6 +698,148 @@ impl LZDiff {
 
         pos_digits + len_digits + 2 // pos + ',' + len + '.'
     }
+
+    /// Compute uint_len like C++ CLZDiff_V2::uint_len (caps at 8 digits)
+    fn uint_len_v2(x: u32) -> u32 {
+        if x < 10 { 1 }
+        else if x < 100 { 2 }
+        else if x < 1_000 { 3 }
+        else if x < 10_000 { 4 }
+        else if x < 100_000 { 5 }
+        else if x < 1_000_000 { 6 }
+        else if x < 10_000_000 { 7 }
+        else { 8 }
+    }
+
+    /// Compute int_len like C++ CLZDiff_V2::int_len
+    fn int_len_v2(x: i32) -> u32 {
+        if x >= 0 {
+            Self::uint_len_v2(x as u32)
+        } else {
+            1 + Self::uint_len_v2((-x) as u32)
+        }
+    }
+
+    /// Compute cost_match like C++ CLZDiff_V2::cost_match
+    /// Note: len == u32::MAX means "match to end of sequence" (no length encoding)
+    fn cost_match_v2(&self, ref_pos: u32, len: u32, pred_pos: u32) -> u32 {
+        let dif_pos = (ref_pos as i32) - (pred_pos as i32);
+        let mut r = Self::int_len_v2(dif_pos);
+
+        if len != u32::MAX {
+            r += 1 + Self::uint_len_v2(len - self.min_match_len);
+        }
+
+        r + 1 // +1 for '.' terminator
+    }
+
+    /// Compute cost_Nrun like C++ CLZDiff_V2::cost_Nrun
+    fn cost_nrun_v2(len: u32) -> u32 {
+        2 + Self::uint_len_v2(len - MIN_NRUN_LEN)
+    }
+
+    /// Estimate encoding cost without actually encoding (matches C++ CLZDiff_V2::Estimate)
+    /// This is faster than full encode and used for terminator grouping decisions.
+    ///
+    /// # Arguments
+    /// * `target` - Target sequence to estimate encoding cost for
+    /// * `bound` - Early termination bound (return early if cost exceeds this)
+    ///
+    /// # Returns
+    /// Estimated encoding cost in bytes
+    pub fn estimate(&self, target: &Contig, bound: u32) -> u32 {
+        if self.ht_lp.is_empty() {
+            return target.len() as u32; // No index, cost is all literals
+        }
+
+        let text_size = target.len() as u32;
+
+        // Quick check for equal sequences
+        if text_size == self.reference_len as u32 {
+            if target.iter().zip(self.reference.iter()).all(|(a, b)| a == b) {
+                return 0; // Equal sequences
+            }
+        }
+
+        let mut est_cost = 0u32;
+        let mut i = 0u32;
+        let mut pred_pos = 0u32;
+        let mut no_prev_literals = 0u32;
+        let mut x_prev: Option<u64> = None;
+        let text_ptr = target.as_slice();
+
+        while (i + self.key_len) < text_size {
+            // Early termination
+            if est_cost > bound {
+                return est_cost;
+            }
+
+            // Get k-mer code
+            let x = if x_prev.is_some() && no_prev_literals > 0 {
+                self.get_code_skip1(x_prev.unwrap(), &text_ptr[i as usize..])
+            } else {
+                self.get_code(&text_ptr[i as usize..])
+            };
+            x_prev = x;
+
+            if x.is_none() {
+                // Check for N-run
+                let nrun_len = self.get_nrun_len(&text_ptr[i as usize..], (text_size - i) as usize);
+
+                if nrun_len >= MIN_NRUN_LEN {
+                    est_cost += Self::cost_nrun_v2(nrun_len);
+                    i += nrun_len;
+                    no_prev_literals = 0;
+                } else {
+                    // Single literal
+                    est_cost += 1;
+                    i += 1;
+                    pred_pos += 1;
+                    no_prev_literals += 1;
+                }
+                continue;
+            }
+
+            // Look up k-mer in linear-probing hash table
+            let hash = MurMur64Hash::hash(x.unwrap());
+            let max_len = (text_size - i) as usize;
+
+            if let Some((match_pos, len_bck, len_fwd)) =
+                self.find_best_match_lp(hash, target, i as usize, max_len, no_prev_literals as usize)
+            {
+                let total_len = len_bck + len_fwd;
+                // CRITICAL: C++ AGC's Estimate uses match_pos directly (NOT adjusted by len_bck)
+                // This differs from the actual encode which does adjust for backward extension
+
+                // Check if this is a match to end of sequence
+                // C++ AGC: i + len_bck + len_fwd == text_size && match_pos + len_bck + len_fwd == reference.size() - key_len
+                let is_end_match = (i + total_len) == text_size
+                    && (match_pos + total_len) as usize == self.reference_len;
+
+                if is_end_match {
+                    est_cost += self.cost_match_v2(match_pos, u32::MAX, pred_pos);
+                } else {
+                    est_cost += self.cost_match_v2(match_pos, total_len, pred_pos);
+                }
+
+                // C++ AGC: pred_pos = match_pos + len_bck + len_fwd (NOT adjusted)
+                pred_pos = match_pos + total_len;
+                i += total_len;
+                no_prev_literals = 0;
+            } else {
+                // No match, literal cost is 1
+                est_cost += 1;
+                i += 1;
+                pred_pos += 1;
+                no_prev_literals += 1;
+            }
+        }
+
+        // Remaining bases are literals
+        est_cost += text_size - i;
+
+        est_cost
+    }
 }
 
 #[cfg(test)]

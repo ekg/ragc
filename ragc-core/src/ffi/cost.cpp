@@ -455,3 +455,29 @@ extern "C" int agc_decide_split(
     *out_should_split = 1;
     return 1;
 }
+
+// Compute estimate (total encoding cost) for comparing with RAGC's estimate()
+// Returns the sum of all per-position costs from get_costs()
+extern "C" uint32_t agc_estimate(
+    const uint8_t* ref, size_t ref_len,
+    const uint8_t* text, size_t text_len,
+    uint32_t min_match_len,
+    uint32_t bound
+) {
+    if (!ref || !text) return UINT32_MAX;
+
+    CostEngine eng(min_match_len);
+    eng.prepare(ref, ref_len);
+
+    // Use prefix=true mode (forward order)
+    auto v = eng.get_costs(text, text_len, /*prefix*/true);
+
+    // Sum all costs to get total estimate
+    uint32_t total = 0;
+    for (auto c : v) {
+        total += c;
+        // Early termination like CLZDiff_V2::Estimate
+        if (total > bound) return total;
+    }
+    return total;
+}

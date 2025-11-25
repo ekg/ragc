@@ -247,6 +247,56 @@ pub mod ragc_ffi {
         pub fn agc_grouping_engine_group_exists(engine: *mut std::ffi::c_void, kmer_front: u64, kmer_back: u64) -> i32;
         pub fn agc_grouping_engine_get_group_id(engine: *mut std::ffi::c_void, kmer_front: u64, kmer_back: u64) -> u32;
         pub fn agc_grouping_engine_alloc_id(engine: *mut std::ffi::c_void) -> u32;
+
+        // Estimate function for comparing with RAGC's estimate()
+        pub fn agc_estimate(
+            ref_ptr: *const u8,
+            ref_len: usize,
+            text_ptr: *const u8,
+            text_len: usize,
+            min_match_len: u32,
+            bound: u32,
+        ) -> u32;
+
+        // REAL CLZDiff_V2::Estimate from agc_compress.cpp (always linked)
+        // This is the EXACT function used by C++ AGC's find_cand_segment_with_one_splitter
+        pub fn agc_lzdiff_v2_estimate(
+            ref_ptr: *const u8,
+            ref_len: usize,
+            text_ptr: *const u8,
+            text_len: usize,
+            min_match_len: u32,
+            bound: u32,
+        ) -> u32;
+    }
+
+    /// Compute estimate (total encoding cost) using C++ FFI for comparison
+    pub fn estimate(reference: &[u8], text: &[u8], min_match_len: u32, bound: u32) -> u32 {
+        unsafe {
+            agc_estimate(
+                reference.as_ptr(),
+                reference.len(),
+                text.as_ptr(),
+                text.len(),
+                min_match_len,
+                bound,
+            )
+        }
+    }
+
+    /// Compute estimate using the REAL CLZDiff_V2::Estimate from C++ AGC
+    /// This is the EXACT algorithm used by find_cand_segment_with_one_splitter
+    pub fn lzdiff_v2_estimate(reference: &[u8], text: &[u8], min_match_len: u32, bound: u32) -> u32 {
+        unsafe {
+            agc_lzdiff_v2_estimate(
+                reference.as_ptr(),
+                reference.len(),
+                text.as_ptr(),
+                text.len(),
+                min_match_len,
+                bound,
+            )
+        }
     }
 
     pub fn cost_vector(prefix: bool, reference: &[u8], text: &[u8], min_match_len: u32) -> Vec<u32> {

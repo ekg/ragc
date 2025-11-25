@@ -40,6 +40,10 @@ pub struct StreamingQueueConfig {
     /// Adaptive mode: find new splitters for samples that can't be segmented well
     /// (matches C++ AGC -a flag)
     pub adaptive_mode: bool,
+
+    /// Fallback fraction: fraction of minimizers to use for fallback grouping
+    /// (matches C++ AGC --fallback-frac parameter, default 0.0)
+    pub fallback_frac: f64,
 }
 
 impl Default for StreamingQueueConfig {
@@ -53,6 +57,7 @@ impl Default for StreamingQueueConfig {
             queue_capacity: 2 * 1024 * 1024 * 1024, // 2 GB like C++ AGC
             verbosity: 1,
             adaptive_mode: false, // Default matches C++ AGC (adaptive mode off)
+            fallback_frac: 0.0,   // Default matches C++ AGC (fallback disabled)
         }
     }
 }
@@ -1273,21 +1278,27 @@ fn find_group_with_one_kmer(
 
     // Pass 2: Pick candidate with minimum estimate among ALL candidates, using tie-breakers
     // (C++ AGC lines 1775-1788)
-    // CRITICAL: Compare against ACTUAL candidate estimates, not against initial threshold!
-    // C++ AGC's condition (line 1780): v_estim_size[i] < best_estim_size
-    // This means: pick candidate if its estimate is better than ANY previous candidate
-    let mut first_candidate = true;
+    //
+    // CRITICAL FIX: C++ AGC only picks candidates that BEAT the initial threshold (segment_size - 16).
+    // If no candidate beats the threshold, best_pk stays at (~0ull, ~0ull) and fallback MISSING is used.
+    //
+    // The previous bug was unconditionally picking the first candidate (first_candidate = true).
+    // This caused RAGC to always pick the first candidate even when its estimate was worse than threshold,
+    // preventing fallback to existing MISSING groups.
+    //
+    // C++ AGC's selection logic (lines 1780-1787):
+    //   if (v_estim_size[i] < best_estim_size || ...)
+    // This only updates best_pk if estimate is BETTER than current best (initially threshold).
     for &(key_front, key_back, needs_rc, _ref_size, estim_size) in &candidate_estimates {
         let cand_pk = (key_front, key_back);
         let best_pk = (best_key_front, best_key_back);
 
         // Match C++ AGC's selection logic exactly (lines 1780-1787):
-        // Pick first candidate unconditionally, then pick better ones via:
-        // - Smaller estimate, OR
+        // Only pick candidate if:
+        // - Smaller estimate than current best (initially threshold), OR
         // - Same estimate with lexicographically smaller pk, OR
         // - Same estimate+pk with better RC (prefers forward orientation)
-        if first_candidate
-            || estim_size < best_estim_size
+        if estim_size < best_estim_size
             || (estim_size == best_estim_size && cand_pk < best_pk)
             || (estim_size == best_estim_size && cand_pk == best_pk && !needs_rc)
         {
@@ -1295,7 +1306,24 @@ fn find_group_with_one_kmer(
             best_key_front = key_front;
             best_key_back = key_back;
             best_needs_rc = needs_rc;
-            first_candidate = false;
+        }
+    }
+
+    // If no candidate was selected (best_pk is still (~0ull, ~0ull)), create MISSING key
+    // This matches C++ AGC lines 1791-1799: fallback to (kmer, MISSING) or (MISSING, kmer)
+    if best_key_front == u64::MAX && best_key_back == u64::MAX {
+        if kmer_is_dir {
+            // Dir-oriented: (kmer, MISSING) with rc=false
+            if config.verbosity > 1 {
+                eprintln!("RAGC_CASE3_NO_WINNER: kmer={} is_dir=true -> ({}, MISSING) rc=false", kmer, kmer);
+            }
+            return (kmer, MISSING_KMER, false);
+        } else {
+            // NOT dir-oriented: (MISSING, kmer) with rc=true
+            if config.verbosity > 1 {
+                eprintln!("RAGC_CASE3_NO_WINNER: kmer={} is_dir=false -> (MISSING, {}) rc=true", kmer, kmer);
+            }
+            return (MISSING_KMER, kmer, true);
         }
     }
 
@@ -1540,11 +1568,12 @@ fn worker_thread(
                 } else if segment.front_kmer != MISSING_KMER {
                     // Case 3a: Only front k-mer present, back is MISSING (terminator)
                     // Match C++ AGC lines 1315-1336: reverse complement and find candidate with one splitter
-                    eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} back=MISSING -> finding best group",
-                        task.sample_name, segment.front_kmer);
+                    // Use the actual is_dir_oriented value from segment detection
+                    eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} front_is_dir={} back=MISSING -> finding best group",
+                        task.sample_name, segment.front_kmer, segment.front_kmer_is_dir);
                     find_group_with_one_kmer(
                         segment.front_kmer,
-                        true, // kmer_is_dir = true for front k-mer
+                        segment.front_kmer_is_dir, // Use actual orientation from segment detection
                         &segment.data,
                         &segment_data_rc,
                         &map_segments_terminators,
@@ -1555,16 +1584,18 @@ fn worker_thread(
                     )
                 } else if segment.back_kmer != MISSING_KMER {
                     // Case 3b: Only back k-mer present, front is MISSING (terminator)
-                    // Match C++ AGC lines 1337-1360: swap_dir_rc() just swaps orientation, not the k-mer value
-                    eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} -> finding best group",
-                        task.sample_name, segment.back_kmer);
+                    // Match C++ AGC lines 1337-1360: swap_dir_rc() inverts is_dir_oriented()
+                    //
+                    // C++ AGC calls kmer.swap_dir_rc() which swaps kmer_dir and kmer_rc fields,
+                    // effectively inverting is_dir_oriented() (which checks kmer_dir <= kmer_rc).
+                    // So if back_kmer was originally dir-oriented, after swap it becomes NOT dir-oriented.
+                    let kmer_is_dir_after_swap = !segment.back_kmer_is_dir;
+                    eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} back_is_dir={} -> kmer_is_dir_after_swap={}",
+                        task.sample_name, segment.back_kmer, segment.back_kmer_is_dir, kmer_is_dir_after_swap);
 
-                    // C++ AGC calls kmer.swap_dir_rc() which swaps the orientation fields
-                    // but uses the ORIGINAL k-mer value for lookup
-                    // kmer_is_dir = false because we swapped from RC to DIR (swap_dir_rc)
                     find_group_with_one_kmer(
-                        segment.back_kmer, // Use original k-mer value, not RC'd
-                        false, // kmer_is_dir = false (after swap_dir_rc, RC becomes DIR)
+                        segment.back_kmer, // Use original k-mer value
+                        kmer_is_dir_after_swap, // Inverted due to swap_dir_rc()
                         &segment.data,
                         &segment_data_rc,
                         &map_segments_terminators,
