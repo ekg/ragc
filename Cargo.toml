@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "ragc-core",
-    "ragc-common",
+    "ragc-reader",
+    "ragc-writer",
     "ragc-cli",
 ]
 resolver = "2"

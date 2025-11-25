@@ -8,9 +8,11 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ragc_core::{
-    contig_iterator::ContigIterator, Decompressor, DecompressorConfig, MultiFileIterator,
+use ragc_reader::{Decompressor, DecompressorConfig};
+use ragc_writer::{
+    contig_iterator::ContigIterator, MultiFileIterator,
     StreamingCompressor, StreamingCompressorConfig, StreamingQueueCompressor, StreamingQueueConfig,
+    determine_splitters_streaming,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -331,7 +333,7 @@ fn create_archive(
             eprintln!("Detecting splitters from first input file: {:?}", inputs[0]);
         }
 
-        let splitters = ragc_core::determine_splitters_streaming(
+        let splitters = determine_splitters_streaming(
             &inputs[0],
             kmer_length as usize,
             segment_size as usize,
@@ -403,7 +405,7 @@ fn create_archive(
             }
 
             // Use buffered in-memory reordering
-            use ragc_core::contig_iterator::BufferedPansnFileIterator;
+            use ragc_writer::contig_iterator::BufferedPansnFileIterator;
             if verbosity > 0 {
                 eprintln!("Using buffered in-memory reordering");
                 eprintln!();

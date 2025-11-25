@@ -1,0 +1,12 @@
+[package]
+name = "ragc-reader"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AGC archive reader/decompressor"
+
+[dependencies]
+ragc-core = { path = "../ragc-core", version = "0.1.0" }
+anyhow = { workspace = true }
+zstd = { workspace = true }
