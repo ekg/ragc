@@ -28,7 +28,6 @@ use ragc_core::{
     AGC_FILE_MINOR, CONTIG_SEPARATOR,
 };
 use rayon::prelude::*;
-use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};

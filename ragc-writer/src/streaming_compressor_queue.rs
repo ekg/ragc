@@ -198,7 +198,6 @@ impl StreamingQueueCompressor {
         splitters: HashSet<u64>,
     ) -> Result<Self> {
         let output_path = output_path.as_ref();
-        let archive_path = output_path.to_string_lossy().to_string();
 
         if config.verbosity > 0 {
             eprintln!("Initializing streaming compressor...");
@@ -762,7 +761,7 @@ fn worker_thread(
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>,
-    reference_sample_name: Arc<Mutex<Option<String>>>,
+    _reference_sample_name: Arc<Mutex<Option<String>>>,
     map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     config: StreamingQueueConfig,

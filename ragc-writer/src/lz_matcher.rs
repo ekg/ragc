@@ -50,9 +50,6 @@ pub fn get_coding_cost_vector(reference: &[u8], text: &[u8], prefix_costs: bool)
             }
         }
 
-        // Compute hash of k-mer at position i
-        let key = compute_kmer_hash(&text[i..], KEY_LEN);
-
         // Look up in hash table
         if let Some(match_result) = find_best_match(&ht, reference, &text[i..], no_prev_literals) {
             // Found a match - encode as (pos, len) pair

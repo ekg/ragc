@@ -171,7 +171,7 @@ pub struct SharedCompressorState {
     /// Segment groups indexed by group_id
     /// Matches C++ AGC's v_segments (vector<CSegment*>)
     /// Lazily created when first segment arrives for that group
-    pub v_segments: Arc<Mutex<Vec<Option<SegmentGroup>>>>,
+    v_segments: Arc<Mutex<Vec<Option<SegmentGroup>>>>,
 
     /// Collection metadata for samples/contigs/segments
     /// Matches C++ AGC's collection_desc
