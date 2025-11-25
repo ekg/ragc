@@ -37,3 +37,5 @@ tikv-jemallocator = { version = "0.5", optional = true }
 [features]
 default = []
 jemalloc = ["tikv-jemallocator"]
+# Enable C++ AGC FFI for byte-identical archives (--cpp-agc flag)
+cpp_agc = ["ragc-core/cpp_agc"]

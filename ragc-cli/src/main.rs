@@ -92,8 +92,9 @@ enum Commands {
 
         /// Use C++ AGC compression via FFI for byte-identical archives
         /// This delegates the entire compression to the original C++ AGC implementation.
-        /// Use this to verify RAGC produces compatible output, then pare back.
-        #[arg(long)]
+        /// Requires: cargo build --features cpp_agc
+        #[cfg_attr(not(feature = "cpp_agc"), arg(hide = true))]
+        #[arg(long, default_value_t = false)]
         cpp_agc: bool,
     },
 
@@ -412,6 +413,7 @@ fn create_archive(
         if concatenated {
             eprintln!("  concatenated mode: enabled (all contigs as one sample)");
         }
+        #[cfg(feature = "cpp_agc")]
         if cpp_agc {
             eprintln!("  C++ AGC FFI mode: enabled (byte-identical archives)");
         }
@@ -419,6 +421,7 @@ fn create_archive(
     }
 
     // C++ AGC FFI mode: delegate entire compression to C++ AGC for byte-identical archives
+    #[cfg(feature = "cpp_agc")]
     if cpp_agc {
         if verbosity > 0 {
             eprintln!("Using C++ AGC compression via FFI...");
@@ -452,6 +455,12 @@ fn create_archive(
             eprintln!("\nArchive created successfully: {output:?}");
         }
         return Ok(());
+    }
+
+    // Error if cpp_agc requested but feature not enabled
+    #[cfg(not(feature = "cpp_agc"))]
+    if cpp_agc {
+        anyhow::bail!("--cpp-agc requires building with: cargo build --features cpp_agc");
     }
 
     // Branch: Streaming queue mode (default) vs. batch mode (legacy)

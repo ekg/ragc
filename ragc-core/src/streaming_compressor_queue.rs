@@ -13,6 +13,65 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+/// MurmurHash64A implementation matching C++ AGC's MurMur64Hash
+/// This is the same hash function used by C++ AGC for fallback filtering
+fn murmur_hash_64a(key: u64) -> u64 {
+    const M: u64 = 0xc6a4a7935bd1e995;
+    const R: u32 = 47;
+
+    let mut h: u64 = 0xc70f6907u64.wrapping_mul(M);
+    let mut k = key;
+
+    k = k.wrapping_mul(M);
+    k ^= k >> R;
+    k = k.wrapping_mul(M);
+    h ^= k;
+    h = h.wrapping_mul(M);
+
+    h ^= h >> R;
+    h = h.wrapping_mul(M);
+    h ^= h >> R;
+
+    h
+}
+
+/// Fallback k-mer filter matching C++ AGC's kmer_filter_t
+/// Used to select a fraction of k-mers for fallback grouping
+#[derive(Debug, Clone)]
+struct FallbackFilter {
+    /// Threshold for hash comparison (0 = disabled, u64::MAX = all pass)
+    threshold: u64,
+    /// Random seed for hash mixing (matches C++ AGC's rnd constant)
+    rnd: u64,
+}
+
+impl FallbackFilter {
+    /// Create a new fallback filter with the given fraction
+    /// Matches C++ AGC's kmer_filter_t constructor
+    fn new(fraction: f64) -> Self {
+        let threshold = if fraction == 0.0 {
+            0
+        } else {
+            (u64::MAX as f64 * fraction) as u64
+        };
+        Self {
+            threshold,
+            rnd: 0xD73F8BF11046C40E, // Matches C++ AGC constant
+        }
+    }
+
+    /// Check if the filter is enabled (fraction > 0)
+    fn is_enabled(&self) -> bool {
+        self.threshold != 0
+    }
+
+    /// Check if a k-mer passes the filter
+    /// Matches C++ AGC's kmer_filter_t::operator()
+    fn passes(&self, kmer: u64) -> bool {
+        (murmur_hash_64a(kmer) ^ self.rnd) < self.threshold
+    }
+}
+
 /// Configuration for the streaming queue-based compressor
 #[derive(Debug, Clone)]
 pub struct StreamingQueueConfig {
@@ -246,7 +305,7 @@ pub struct StreamingQueueCompressor {
     map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>, // kmer -> [connected kmers]
 
     // FFI Grouping Engine - C++ AGC-compatible group assignment
-    #[cfg(feature = "ffi_cost")]
+    #[cfg(feature = "cpp_agc")]
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
 
     // Persistent reference segment storage (matches C++ AGC v_segments)
@@ -268,6 +327,8 @@ pub struct StreamingQueueCompressor {
     batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>, // Batch-local m_kmers equivalent
     batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>, // Batch-local terminators - only merged to global at batch end
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>, // Buffer segments until batch boundary
+    // Fallback minimizers map for segments with no terminator match (matches C++ AGC map_fallback_minimizers)
+    map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>, // kmer -> [(front, back)] candidate group keys
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
     next_sequence: Arc<std::sync::atomic::AtomicU64>, // Increases for each contig (FASTA order)
 }
@@ -393,7 +454,7 @@ impl StreamingQueueCompressor {
         let reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // FFI Grouping Engine - C++ AGC-compatible group assignment
-        #[cfg(feature = "ffi_cost")]
+        #[cfg(feature = "cpp_agc")]
         let grouping_engine = Arc::new(Mutex::new(crate::ragc_ffi::GroupingEngine::new(
             config.k as u32,
             NO_RAW_GROUPS,  // Start group IDs at 16 (raw groups 0-15 handled separately)
@@ -409,6 +470,7 @@ impl StreamingQueueCompressor {
         let batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
         let batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
         let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
+        let map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -425,12 +487,13 @@ impl StreamingQueueCompressor {
             let map_segments_terminators = Arc::clone(&map_segments_terminators);
             let reference_segments = Arc::clone(&reference_segments);
             let split_offsets = Arc::clone(&split_offsets);
-            #[cfg(feature = "ffi_cost")]
+            #[cfg(feature = "cpp_agc")]
             let grouping_engine = Arc::clone(&grouping_engine);
             let current_batch_sample = Arc::clone(&current_batch_sample);
             let batch_local_groups = Arc::clone(&batch_local_groups);
             let batch_local_terminators = Arc::clone(&batch_local_terminators);
             let pending_batch_segments = Arc::clone(&pending_batch_segments);
+            let map_fallback_minimizers = Arc::clone(&map_fallback_minimizers);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
@@ -448,12 +511,13 @@ impl StreamingQueueCompressor {
                     map_segments_terminators,
                     reference_segments,
                     split_offsets,
-                    #[cfg(feature = "ffi_cost")]
+                    #[cfg(feature = "cpp_agc")]
                     grouping_engine,
                     current_batch_sample,
                     batch_local_groups,
                     batch_local_terminators,
                     pending_batch_segments,
+                    map_fallback_minimizers,
                     config,
                 )
             });
@@ -478,7 +542,7 @@ impl StreamingQueueCompressor {
             reference_sample_name,
             map_segments,
             map_segments_terminators,
-            #[cfg(feature = "ffi_cost")]
+            #[cfg(feature = "cpp_agc")]
             grouping_engine,
             reference_segments,
             split_offsets,
@@ -488,6 +552,7 @@ impl StreamingQueueCompressor {
             batch_local_groups,
             batch_local_terminators,
             pending_batch_segments,
+            map_fallback_minimizers,
             next_sequence,
         })
     }
@@ -549,12 +614,13 @@ impl StreamingQueueCompressor {
                 let map_segments_terminators = Arc::clone(&self.map_segments_terminators);
                 let reference_segments = Arc::clone(&self.reference_segments);
                 let split_offsets = Arc::clone(&self.split_offsets);
-                #[cfg(feature = "ffi_cost")]
+                #[cfg(feature = "cpp_agc")]
                 let grouping_engine = Arc::clone(&self.grouping_engine);
                 let current_batch_sample = Arc::clone(&self.current_batch_sample);
                 let batch_local_groups = Arc::clone(&self.batch_local_groups);
                 let batch_local_terminators = Arc::clone(&self.batch_local_terminators);
                 let pending_batch_segments = Arc::clone(&self.pending_batch_segments);
+                let map_fallback_minimizers = Arc::clone(&self.map_fallback_minimizers);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
@@ -572,12 +638,13 @@ impl StreamingQueueCompressor {
                         map_segments_terminators,
                         reference_segments,
                         split_offsets,
-                        #[cfg(feature = "ffi_cost")]
+                        #[cfg(feature = "cpp_agc")]
                         grouping_engine,
                         current_batch_sample,
                         batch_local_groups,
                         batch_local_terminators,
                         pending_batch_segments,
+                        map_fallback_minimizers,
                         config,
                     )
                 });
@@ -1206,6 +1273,21 @@ fn find_group_with_one_kmer(
         }
     });
 
+    // Debug: Print sorted candidates before evaluation
+    if config.verbosity > 2 {
+        eprintln!(
+            "RAGC_CASE3_SORTED_CANDIDATES: kmer={} segment_len={} n_candidates={}",
+            kmer, segment_len, candidates.len()
+        );
+        for (i, &(kf, kb, rc, rs)) in candidates.iter().enumerate() {
+            let size_diff = (rs as i64 - segment_len as i64).abs();
+            eprintln!(
+                "  CAND[{}]: ({},{}) rc={} ref_size={} size_diff={}",
+                i, kf, kb, rc, rs, size_diff
+            );
+        }
+    }
+
     // Test compression for each candidate (C++ AGC lines 1726-1788)
     // Match C++ AGC's TWO-PASS approach:
     //   Pass 1: Compute all estimates, track minimum (lines 1726-1732)
@@ -1247,21 +1329,33 @@ fn find_group_with_one_kmer(
 
             if let Some(ref_data) = ref_data_opt {
                 // Test LZ encoding against this reference (C++ AGC line 1728: estimate())
-                let mut lz = LZDiff::new(config.min_match_len as u32);
-                lz.prepare(&ref_data.to_vec());
-
                 let target_data = if needs_rc {
-                    segment_data_rc.to_vec()
+                    segment_data_rc
                 } else {
-                    segment_data.to_vec()
+                    segment_data
                 };
 
-                let encoded = lz.encode(&target_data);
-                let estim_size = encoded.len();
+                // Use C++ AGC's EXACT CLZDiff_V2::Estimate algorithm via FFI
+                // This matches find_cand_segment_with_one_splitter's cost estimation
+                #[cfg(feature = "cpp_agc")]
+                let estim_size = crate::ragc_ffi::lzdiff_v2_estimate(
+                    ref_data,
+                    target_data,
+                    config.min_match_len as u32,
+                    best_estim_size as u32,  // bound = current threshold
+                ) as usize;
+
+                #[cfg(not(feature = "cpp_agc"))]
+                let estim_size = {
+                    let mut lz = LZDiff::new(config.min_match_len as u32);
+                    lz.prepare(&ref_data.to_vec());
+                    let encoded = lz.encode(&target_data.to_vec());
+                    encoded.len()
+                };
 
                 if config.verbosity > 2 {
                     eprintln!(
-                        "RAGC_CASE3_ESTIMATE: kmer={} cand=({},{}) rc={} ref_len={} target_len={} encoded={}",
+                        "RAGC_CASE3_ESTIMATE: kmer={} cand=({},{}) rc={} ref_len={} target_len={} estim={}",
                         kmer, key_front, key_back, needs_rc, ref_data.len(), target_data.len(), estim_size
                     );
                 }
@@ -1309,6 +1403,23 @@ fn find_group_with_one_kmer(
         }
     }
 
+    // Debug: Print Pass 2 results
+    if config.verbosity > 2 && !candidate_estimates.is_empty() {
+        let threshold = if segment_len < 16 { segment_len } else { segment_len - 16 };
+        eprintln!(
+            "RAGC_CASE3_PASS2_RESULTS: threshold={} best=({},{}) best_estim={}",
+            threshold, best_key_front, best_key_back, best_estim_size
+        );
+        for (i, &(kf, kb, rc, rs, es)) in candidate_estimates.iter().enumerate() {
+            let is_winner = kf == best_key_front && kb == best_key_back;
+            let marker = if is_winner { "*WINNER*" } else { "" };
+            eprintln!(
+                "  RESULT[{}]: ({},{}) rc={} ref_size={} estimate={} {}",
+                i, kf, kb, rc, rs, es, marker
+            );
+        }
+    }
+
     // If no candidate was selected (best_pk is still (~0ull, ~0ull)), create MISSING key
     // This matches C++ AGC lines 1791-1799: fallback to (kmer, MISSING) or (MISSING, kmer)
     if best_key_front == u64::MAX && best_key_back == u64::MAX {
@@ -1335,6 +1446,329 @@ fn find_group_with_one_kmer(
     (best_key_front, best_key_back, best_needs_rc)
 }
 
+/// Find candidate segment using fallback minimizers
+/// Matches C++ AGC's find_cand_segment_using_fallback_minimizers (lines 1807-1958)
+///
+/// This function is called when Case 3 (one k-mer present) fails to find a good match.
+/// It scans the segment for k-mers that pass the fallback filter, looks them up in
+/// the fallback minimizers map, and finds candidate groups with shared k-mers.
+///
+/// # Arguments
+/// * `segment_data` - The segment data to search
+/// * `k` - K-mer length
+/// * `min_shared_kmers` - Minimum number of shared k-mers to consider a candidate
+/// * `fallback_filter` - Filter to select which k-mers to check
+/// * `map_fallback_minimizers` - Map from k-mer to candidate group keys
+/// * `map_segments` - Map from group key to group ID
+/// * `segment_groups` - Buffer of segment groups
+/// * `reference_segments` - Stored reference segments
+/// * `config` - Compression configuration
+///
+/// # Returns
+/// (key_front, key_back, should_reverse) if a candidate is found, or (MISSING, MISSING, false) if none
+#[allow(clippy::too_many_arguments)]
+fn find_cand_segment_using_fallback_minimizers(
+    segment_data: &[u8],
+    segment_data_rc: &[u8],
+    k: usize,
+    min_shared_kmers: u64,
+    fallback_filter: &FallbackFilter,
+    map_fallback_minimizers: &Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>,
+    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    config: &StreamingQueueConfig,
+) -> (u64, u64, bool) {
+    use crate::segment::MISSING_KMER;
+
+    const MAX_NUM_TO_ESTIMATE: usize = 10;
+    let short_segments = config.segment_size <= 10000;
+    let segment_len = segment_data.len();
+
+    if !fallback_filter.is_enabled() {
+        return (MISSING_KMER, MISSING_KMER, false);
+    }
+
+    // Scan segment for k-mers and count candidates
+    // Map from candidate group key to list of shared k-mers
+    let mut cand_seg_counts: HashMap<(u64, u64), Vec<u64>> = HashMap::new();
+
+    // K-mer scanning state (matches C++ AGC CKmer behavior)
+    let mut kmer_data: u64 = 0;
+    let mut kmer_rc: u64 = 0;
+    let mut kmer_len: usize = 0;
+    let mask: u64 = (1u64 << (2 * k)) - 1;
+
+    // Scan segment for k-mers
+    for &base in segment_data {
+        if base > 3 {
+            // Non-ACGT character - reset k-mer
+            kmer_data = 0;
+            kmer_rc = 0;
+            kmer_len = 0;
+            continue;
+        }
+
+        // Add base to forward k-mer (shift left, add at LSB)
+        kmer_data = ((kmer_data << 2) | (base as u64)) & mask;
+
+        // Add complement to reverse k-mer (shift right, add at MSB)
+        let comp = 3 - base; // A<->T, C<->G
+        kmer_rc = (kmer_rc >> 2) | ((comp as u64) << (2 * (k - 1)));
+
+        kmer_len += 1;
+
+        if kmer_len >= k {
+            // Use canonical k-mer (smaller of forward and reverse)
+            let canonical = kmer_data.min(kmer_rc);
+            let is_dir_oriented = kmer_data <= kmer_rc;
+
+            // Check if k-mer passes fallback filter and is not symmetric
+            if fallback_filter.passes(canonical) && kmer_data != kmer_rc {
+                // Look up in fallback minimizers map
+                let fb_map = map_fallback_minimizers.lock().unwrap();
+                if let Some(candidates) = fb_map.get(&canonical) {
+                    for &(key1, key2) in candidates {
+                        // Skip MISSING keys
+                        if key1 == MISSING_KMER || key2 == MISSING_KMER {
+                            continue;
+                        }
+
+                        // Normalize based on orientation
+                        let cand_key = if !is_dir_oriented {
+                            (key2, key1)
+                        } else {
+                            (key1, key2)
+                        };
+
+                        cand_seg_counts.entry(cand_key)
+                            .or_insert_with(Vec::new)
+                            .push(canonical);
+                    }
+                }
+            }
+        }
+    }
+
+    // Prune candidates to those with >= min_shared_kmers unique k-mers
+    let mut pruned_candidates: Vec<(u64, (u64, u64))> = Vec::new();
+    for (key, mut kmers) in cand_seg_counts {
+        kmers.sort_unstable();
+        kmers.dedup();
+        let unique_count = kmers.len() as u64;
+        if unique_count >= min_shared_kmers {
+            pruned_candidates.push((unique_count, key));
+        }
+    }
+
+    if pruned_candidates.is_empty() {
+        if config.verbosity > 1 {
+            eprintln!("RAGC_FALLBACK_NO_CANDIDATES: min_shared={}", min_shared_kmers);
+        }
+        return (MISSING_KMER, MISSING_KMER, false);
+    }
+
+    // Sort by count (descending) and take top MAX_NUM_TO_ESTIMATE
+    pruned_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    if pruned_candidates.len() > MAX_NUM_TO_ESTIMATE {
+        pruned_candidates.truncate(MAX_NUM_TO_ESTIMATE);
+    }
+
+    // Avoid trying poor candidates (less than half the best count)
+    let best_count = pruned_candidates[0].0;
+    pruned_candidates.retain(|c| c.0 * 2 >= best_count);
+
+    if config.verbosity > 1 {
+        eprintln!("RAGC_FALLBACK_CANDIDATES: count={} best_shared={} min_shared={}",
+            pruned_candidates.len(), best_count, min_shared_kmers);
+    }
+
+    // For short segments, use fast decision based on shared k-mer count
+    if short_segments {
+        let (count, (key_front, key_back)) = pruned_candidates[0];
+        if config.verbosity > 1 {
+            eprintln!("RAGC_FALLBACK_SHORT_SEGMENT: key=({},{}) shared_kmers={}", key_front, key_back, count);
+        }
+        // Normalize: ensure front <= back
+        if key_front <= key_back {
+            return (key_front, key_back, false);
+        } else {
+            return (key_back, key_front, true);
+        }
+    }
+
+    // For longer segments, estimate compression cost for each candidate
+    let mut best_key: Option<(u64, u64)> = None;
+    let mut best_estimate: usize = segment_len;
+    let mut _best_is_rc = false;
+
+    {
+        let groups = segment_groups.lock().unwrap();
+        let seg_map = map_segments.lock().unwrap();
+        let ref_segs = reference_segments.lock().unwrap();
+
+        for &(_count, (key_front, key_back)) in &pruned_candidates {
+            // Normalize key
+            let (norm_front, norm_back, is_seg_rc) = if key_front <= key_back {
+                (key_front, key_back, false)
+            } else {
+                (key_back, key_front, true)
+            };
+
+            let cand_key = SegmentGroupKey {
+                kmer_front: norm_front,
+                kmer_back: norm_back,
+            };
+
+            // Get reference segment for this candidate
+            let ref_data_opt: Option<&[u8]> = if let Some(group_buffer) = groups.get(&cand_key) {
+                group_buffer.reference_segment.as_ref().map(|seg| seg.data.as_slice())
+            } else if let Some(&group_id) = seg_map.get(&cand_key) {
+                ref_segs.get(&group_id).map(|data| data.as_slice())
+            } else {
+                None
+            };
+
+            if let Some(ref_data) = ref_data_opt {
+                let target_data = if is_seg_rc { segment_data_rc } else { segment_data };
+
+                // Estimate compression cost
+                #[cfg(feature = "cpp_agc")]
+                let estimate = crate::ragc_ffi::lzdiff_v2_estimate(
+                    ref_data,
+                    target_data,
+                    config.min_match_len as u32,
+                    best_estimate as u32,
+                ) as usize;
+
+                #[cfg(not(feature = "cpp_agc"))]
+                let estimate = {
+                    let mut lz = LZDiff::new(config.min_match_len as u32);
+                    lz.prepare(&ref_data.to_vec());
+                    let encoded = lz.encode(&target_data.to_vec());
+                    encoded.len()
+                };
+
+                if config.verbosity > 2 {
+                    eprintln!("RAGC_FALLBACK_ESTIMATE: key=({},{}) rc={} estimate={}",
+                        norm_front, norm_back, is_seg_rc, estimate);
+                }
+
+                // Track best (lowest estimate)
+                if estimate > 0 && estimate < best_estimate {
+                    best_estimate = estimate;
+                    best_key = Some((norm_front, norm_back));
+                    _best_is_rc = is_seg_rc;
+                }
+            }
+        }
+    }
+
+    // In adaptive mode, check if result is worth using
+    if config.adaptive_mode {
+        let threshold = if short_segments {
+            (segment_len as f64 * 0.9) as usize
+        } else {
+            (segment_len as f64 * 0.2) as usize
+        };
+
+        if best_estimate >= threshold {
+            if config.verbosity > 1 {
+                eprintln!("RAGC_FALLBACK_ADAPTIVE_REJECT: estimate={} threshold={}", best_estimate, threshold);
+            }
+            return (MISSING_KMER, MISSING_KMER, false);
+        }
+    }
+
+    match best_key {
+        Some((front, back)) => {
+            // Normalize: ensure front <= back
+            if front <= back {
+                if config.verbosity > 1 {
+                    eprintln!("RAGC_FALLBACK_PICKED: key=({},{}) rc=false estimate={}", front, back, best_estimate);
+                }
+                (front, back, false)
+            } else {
+                if config.verbosity > 1 {
+                    eprintln!("RAGC_FALLBACK_PICKED: key=({},{}) rc=true estimate={}", back, front, best_estimate);
+                }
+                (back, front, true)
+            }
+        }
+        None => {
+            if config.verbosity > 1 {
+                eprintln!("RAGC_FALLBACK_NO_WINNER: no candidate beat threshold");
+            }
+            (MISSING_KMER, MISSING_KMER, false)
+        }
+    }
+}
+
+/// Add fallback mapping for a segment's k-mers
+/// Matches C++ AGC's add_fallback_mapping (lines 1961-1989)
+///
+/// Called when a segment is assigned to a group to populate the fallback minimizers map.
+fn add_fallback_mapping(
+    segment_data: &[u8],
+    k: usize,
+    splitter1: u64,
+    splitter2: u64,
+    fallback_filter: &FallbackFilter,
+    map_fallback_minimizers: &Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>,
+) {
+    use crate::segment::MISSING_KMER;
+
+    if !fallback_filter.is_enabled() {
+        return;
+    }
+
+    // Skip if splitters are MISSING
+    if splitter1 == MISSING_KMER || splitter2 == MISSING_KMER {
+        return;
+    }
+
+    let splitter_dir = (splitter1, splitter2);
+    let splitter_rev = (splitter2, splitter1);
+    let mask: u64 = (1u64 << (2 * k)) - 1;
+
+    // K-mer scanning state
+    let mut kmer_data: u64 = 0;
+    let mut kmer_rc: u64 = 0;
+    let mut kmer_len: usize = 0;
+
+    let mut fb_map = map_fallback_minimizers.lock().unwrap();
+
+    for &base in segment_data {
+        if base > 3 {
+            kmer_data = 0;
+            kmer_rc = 0;
+            kmer_len = 0;
+            continue;
+        }
+
+        kmer_data = ((kmer_data << 2) | (base as u64)) & mask;
+        let comp = 3 - base;
+        kmer_rc = (kmer_rc >> 2) | ((comp as u64) << (2 * (k - 1)));
+        kmer_len += 1;
+
+        if kmer_len >= k {
+            let canonical = kmer_data.min(kmer_rc);
+            let is_dir_oriented = kmer_data <= kmer_rc;
+
+            // Check filter and skip symmetric k-mers
+            if fallback_filter.passes(canonical) && kmer_data != kmer_rc {
+                let to_add = if is_dir_oriented { splitter_dir } else { splitter_rev };
+                let entry = fb_map.entry(canonical).or_insert_with(Vec::new);
+
+                // Only add if not already present
+                if !entry.contains(&to_add) {
+                    entry.push(to_add);
+                }
+            }
+        }
+    }
+}
+
 /// Flush batch-local groups to global state (matches C++ AGC batch boundary)
 /// This updates the global map_segments registry with batch-local groups,
 /// then clears the batch-local state (like C++ AGC destroying m_kmers at batch end)
@@ -1349,7 +1783,7 @@ fn flush_batch(
     _archive: &Arc<Mutex<Archive>>,
     _collection: &Arc<Mutex<CollectionV3>>,
     _reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
-    #[cfg(feature = "ffi_cost")]
+    #[cfg(feature = "cpp_agc")]
     _grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     config: &StreamingQueueConfig,
 ) -> Result<()> {
@@ -1418,15 +1852,19 @@ fn worker_thread(
     map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>>,
-    #[cfg(feature = "ffi_cost")]
+    #[cfg(feature = "cpp_agc")]
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     current_batch_sample: Arc<Mutex<Option<String>>>,
     batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
+    map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
+
+    // Create fallback filter from config
+    let fallback_filter = FallbackFilter::new(config.fallback_frac);
 
     loop {
         // Pull from queue (blocks if empty, returns None when closed)
@@ -1446,7 +1884,7 @@ fn worker_thread(
                 &archive,
                 &collection,
                 &reference_segments,
-                #[cfg(feature = "ffi_cost")]
+                #[cfg(feature = "cpp_agc")]
                 &grouping_engine,
                 &config,
             ).ok(); // Ignore errors on final flush
@@ -1482,7 +1920,7 @@ fn worker_thread(
                         &archive,
                         &collection,
                         &reference_segments,
-                        #[cfg(feature = "ffi_cost")]
+                        #[cfg(feature = "cpp_agc")]
                         &grouping_engine,
                         &config,
                     )?;
@@ -1571,7 +2009,7 @@ fn worker_thread(
                     // Use the actual is_dir_oriented value from segment detection
                     eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} front_is_dir={} back=MISSING -> finding best group",
                         task.sample_name, segment.front_kmer, segment.front_kmer_is_dir);
-                    find_group_with_one_kmer(
+                    let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
                         segment.front_kmer,
                         segment.front_kmer_is_dir, // Use actual orientation from segment detection
                         &segment.data,
@@ -1581,7 +2019,32 @@ fn worker_thread(
                         &segment_groups,
                         &reference_segments,
                         &config,
-                    )
+                    );
+
+                    // Fallback: If Case 3a returned MISSING, try fallback minimizers (C++ AGC lines 1322-1334)
+                    if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
+                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                            &segment.data,
+                            &segment_data_rc,
+                            config.k,
+                            5, // min_shared_kmers = 5 for Case 3 (matches C++ AGC)
+                            &fallback_filter,
+                            &map_fallback_minimizers,
+                            &map_segments,
+                            &segment_groups,
+                            &reference_segments,
+                            &config,
+                        );
+                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                            if config.verbosity > 1 {
+                                eprintln!("RAGC_CASE3A_FALLBACK: found ({},{}) rc={}", fb_kf, fb_kb, fb_sr);
+                            }
+                            kf = fb_kf;
+                            kb = fb_kb;
+                            sr = fb_sr;
+                        }
+                    }
+                    (kf, kb, sr)
                 } else if segment.back_kmer != MISSING_KMER {
                     // Case 3b: Only back k-mer present, front is MISSING (terminator)
                     // Match C++ AGC lines 1337-1360: swap_dir_rc() inverts is_dir_oriented()
@@ -1593,7 +2056,7 @@ fn worker_thread(
                     eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} back_is_dir={} -> kmer_is_dir_after_swap={}",
                         task.sample_name, segment.back_kmer, segment.back_kmer_is_dir, kmer_is_dir_after_swap);
 
-                    find_group_with_one_kmer(
+                    let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
                         segment.back_kmer, // Use original k-mer value
                         kmer_is_dir_after_swap, // Inverted due to swap_dir_rc()
                         &segment.data,
@@ -1603,7 +2066,33 @@ fn worker_thread(
                         &segment_groups,
                         &reference_segments,
                         &config,
-                    )
+                    );
+
+                    // Fallback: If Case 3b returned MISSING, try fallback minimizers (C++ AGC lines 1347-1359)
+                    // Note: C++ AGC uses segment_rc for fallback in Case 3b
+                    if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
+                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                            &segment_data_rc, // Use RC for Case 3b (matches C++ AGC)
+                            &segment.data,
+                            config.k,
+                            5, // min_shared_kmers = 5 for Case 3 (matches C++ AGC)
+                            &fallback_filter,
+                            &map_fallback_minimizers,
+                            &map_segments,
+                            &segment_groups,
+                            &reference_segments,
+                            &config,
+                        );
+                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                            if config.verbosity > 1 {
+                                eprintln!("RAGC_CASE3B_FALLBACK: found ({},{}) rc={}", fb_kf, fb_kb, !fb_sr);
+                            }
+                            kf = fb_kf;
+                            kb = fb_kb;
+                            sr = !fb_sr; // C++ AGC: store_rc = !store_dir_alt
+                        }
+                    }
+                    (kf, kb, sr)
                 } else {
                     // Case 1 or 4: Both MISSING - use as-is
                     (segment.front_kmer, segment.back_kmer, false)
@@ -1820,7 +2309,7 @@ fn worker_thread(
                                             }
                                         };
                                         // Register with FFI engine
-                                        #[cfg(feature = "ffi_cost")]
+                                        #[cfg(feature = "cpp_agc")]
                                         if left_key.kmer_front != MISSING_KMER && left_key.kmer_back != MISSING_KMER {
                                             let mut eng = grouping_engine.lock().unwrap();
                                             eng.register_group(left_key.kmer_front, left_key.kmer_back, group_id);
@@ -1869,7 +2358,7 @@ fn worker_thread(
                                             }
                                         };
                                         // Register with FFI engine
-                                        #[cfg(feature = "ffi_cost")]
+                                        #[cfg(feature = "cpp_agc")]
                                         if right_key.kmer_front != MISSING_KMER && right_key.kmer_back != MISSING_KMER {
                                             let mut eng = grouping_engine.lock().unwrap();
                                             eng.register_group(right_key.kmer_front, right_key.kmer_back, group_id);
@@ -2067,7 +2556,7 @@ fn worker_thread(
                     };
 
                     // Register with FFI engine
-                    #[cfg(feature = "ffi_cost")]
+                    #[cfg(feature = "cpp_agc")]
                     if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
                         let mut eng = grouping_engine.lock().unwrap();
                         eng.register_group(key.kmer_front, key.kmer_back, group_id);
@@ -2136,6 +2625,17 @@ fn worker_thread(
                         key.kmer_front, key.kmer_back, should_reverse, source, buffer.group_id);
                 }
 
+                // Add fallback mapping for this segment (matches C++ AGC add_fallback_mapping)
+                // This populates the fallback minimizers map for use by find_cand_segment_using_fallback_minimizers
+                add_fallback_mapping(
+                    &buffered.data,
+                    config.k,
+                    key.kmer_front,
+                    key.kmer_back,
+                    &fallback_filter,
+                    &map_fallback_minimizers,
+                );
+
                 if key_exists && config.verbosity > 1 {
                     eprintln!("REUSE_GROUP: group_id={} front={} back={} sample={}",
                         buffer.group_id, key_front, key_back, task.sample_name);
@@ -2186,7 +2686,7 @@ fn find_middle_splitter(
     let front_connections = terminators.get(&front_kmer)?;
     let back_connections = terminators.get(&back_kmer)?;
 
-    #[cfg(feature = "ffi_cost")]
+    #[cfg(feature = "cpp_agc")]
     {
         if let Some(m) = crate::ragc_ffi::find_middle(front_connections, back_connections) {
             return Some(m);
@@ -2200,7 +2700,7 @@ fn find_middle_splitter(
         None
     }
 
-    #[cfg(not(feature = "ffi_cost"))]
+    #[cfg(not(feature = "cpp_agc"))]
     {
         // Fallback: local set_intersection
         let mut i = 0;
@@ -2372,7 +2872,7 @@ fn try_split_segment_with_cost(
     // Calculate compression costs and best split position using C++ FFI if enabled
     // Falls back to Rust implementation otherwise
     let mut maybe_best: Option<(usize, usize)> = None; // (best_pos, seg2_start)
-    #[cfg(feature = "ffi_cost")]
+    #[cfg(feature = "cpp_agc")]
     {
         // Inspect availability of left/right references and log keys
         let (left_seg_id_opt, right_seg_id_opt) = {
@@ -2433,7 +2933,7 @@ fn try_split_segment_with_cost(
     // If FFI provided best position, use it; otherwise compute costs in Rust
     let mut v_costs1 = if maybe_best.is_none() {
         if let Some(mut lz_left) = prepare_on_demand(left_key, "left") {
-        #[cfg(feature = "ffi_cost")]
+        #[cfg(feature = "cpp_agc")]
         {
             // Unused path when FFI returns best split; kept for completeness
             let ref_left = {
@@ -2454,7 +2954,7 @@ fn try_split_segment_with_cost(
                 return None;
             }
         }
-        #[cfg(not(feature = "ffi_cost"))]
+        #[cfg(not(feature = "cpp_agc"))]
         {
             if front_kmer < middle_kmer {
                 lz_left.get_coding_cost_vector(segment_dir, true)
@@ -2478,7 +2978,7 @@ fn try_split_segment_with_cost(
 
     let mut v_costs2 = if maybe_best.is_none() {
         if let Some(mut lz_right) = prepare_on_demand(right_key, "right") {
-        #[cfg(feature = "ffi_cost")]
+        #[cfg(feature = "cpp_agc")]
         {
             let ref_right = {
                 let map_segments_locked = map_segments.lock().unwrap();
@@ -2517,7 +3017,7 @@ fn try_split_segment_with_cost(
                 return None;
             }
         }
-        #[cfg(not(feature = "ffi_cost"))]
+        #[cfg(not(feature = "cpp_agc"))]
         {
             if middle_kmer < back_kmer {
                 let mut v = lz_right.get_coding_cost_vector(segment_dir, false);

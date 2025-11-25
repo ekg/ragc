@@ -178,7 +178,7 @@ pub mod preprocessing_ffi;
 #[path = "ffi/find_splitters_in_contig.rs"]
 pub mod find_splitters_in_contig_ffi;
 
-#[cfg(feature = "ffi_cost")]
+#[cfg(feature = "cpp_agc")]
 pub mod ragc_ffi {
     extern "C" {
         pub fn agc_cost_vector(
