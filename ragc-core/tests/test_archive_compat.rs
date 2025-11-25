@@ -1,7 +1,7 @@
 // Archive compatibility tests
 // Read archives created by C++ implementation to validate format compatibility
 //
-// NOTE: These tests require pre-generated C++ archive files in ../test-data/
+// NOTE: These tests require pre-generated C++ archive files in ../fixtures/
 // They are ignored by default. See ragc-core/tests/cpp_compat.rs for active C++ compatibility tests.
 
 use ragc_core::Archive;
@@ -11,7 +11,7 @@ use ragc_core::Archive;
 fn test_read_cpp_simple_archive() {
     let mut archive = Archive::new_reader();
     archive
-        .open("../test-data/archive_test1.agc")
+        .open("../fixtures/archive_test1.agc")
         .expect("Failed to open C++ generated archive");
 
     let stream_id = archive
@@ -37,7 +37,7 @@ fn test_read_cpp_simple_archive() {
 fn test_read_cpp_multiple_streams() {
     let mut archive = Archive::new_reader();
     archive
-        .open("../test-data/archive_test2.agc")
+        .open("../fixtures/archive_test2.agc")
         .expect("Failed to open C++ generated archive");
 
     assert_eq!(archive.get_num_streams(), 2);
@@ -66,7 +66,7 @@ fn test_read_cpp_multiple_streams() {
 fn test_read_cpp_large_metadata() {
     let mut archive = Archive::new_reader();
     archive
-        .open("../test-data/archive_test3.agc")
+        .open("../fixtures/archive_test3.agc")
         .expect("Failed to open C++ generated archive");
 
     let stream_id = archive

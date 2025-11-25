@@ -1,7 +1,7 @@
 // Collection compatibility tests
 // Read collections created by C++ implementation to validate format compatibility
 //
-// NOTE: These tests require pre-generated C++ collection files in ../test-data/
+// NOTE: These tests require pre-generated C++ collection files in ../fixtures/
 // They are ignored by default. See ragc-core/tests/cpp_compat.rs for active C++ compatibility tests.
 
 use ragc_core::{Archive, CollectionV3};
@@ -11,7 +11,7 @@ use ragc_core::{Archive, CollectionV3};
 fn test_read_cpp_simple_collection() {
     let mut archive = Archive::new_reader();
     archive
-        .open("../test-data/collection_test1.agc")
+        .open("../fixtures/collection_test1.agc")
         .expect("Failed to open C++ generated collection");
 
     let mut collection = CollectionV3::new();
@@ -87,7 +87,7 @@ fn test_read_cpp_simple_collection() {
 fn test_read_cpp_collection_segments() {
     let mut archive = Archive::new_reader();
     archive
-        .open("../test-data/collection_test2.agc")
+        .open("../fixtures/collection_test2.agc")
         .expect("Failed to open C++ generated collection");
 
     let mut collection = CollectionV3::new();

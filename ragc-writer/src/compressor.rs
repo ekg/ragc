@@ -499,7 +499,7 @@ mod tests {
         let mut compressor = Compressor::new(archive_path, config).unwrap();
 
         // Use the test FASTA file
-        let fasta_path = Path::new("../test-data/test_simple.fasta");
+        let fasta_path = Path::new("../tests/data/test_simple.fasta");
 
         if fasta_path.exists() {
             compressor
