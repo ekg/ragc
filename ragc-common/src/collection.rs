@@ -460,6 +460,23 @@ impl CollectionV3 {
         self.batch_sample_counts.contains_key(&batch_id)
     }
 
+    /// Get batch ID for a given sample
+    /// Returns the batch that contains contig names/details for this sample
+    pub fn get_sample_batch_id(&self, sample_name: &str) -> Option<usize> {
+        self.sample_ids
+            .get(sample_name)
+            .map(|&sample_id| sample_id / self.batch_size)
+    }
+
+    /// Check if contigs are loaded for a sample
+    /// Returns true if the sample's batch has been loaded
+    pub fn is_sample_contigs_loaded(&self, sample_name: &str) -> bool {
+        self.sample_ids.get(sample_name).map_or(false, |&sample_id| {
+            let batch_id = sample_id / self.batch_size;
+            self.batch_sample_counts.contains_key(&batch_id)
+        })
+    }
+
     /// Get number of contigs in a sample
     pub fn get_no_contigs(&self, sample_name: &str) -> Option<usize> {
         self.sample_ids

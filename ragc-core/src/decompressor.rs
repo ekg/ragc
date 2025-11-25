@@ -79,15 +79,18 @@ impl Decompressor {
 
         let mut collection = CollectionV3::new();
 
-        // Load segment_size, kmer_length, and min_match_len from params stream
-        let (segment_size, kmer_length, min_match_len) = Self::load_params(&mut archive)?;
+        // Load segment_size, kmer_length, min_match_len, and pack_cardinality from params stream
+        let (segment_size, kmer_length, min_match_len, pack_cardinality) =
+            Self::load_params(&mut archive)?;
 
         if config.verbosity > 1 {
-            eprintln!("Loaded params: segment_size={segment_size}, kmer_length={kmer_length}");
+            eprintln!(
+                "Loaded params: segment_size={segment_size}, kmer_length={kmer_length}, batch_size={pack_cardinality}"
+            );
         }
 
-        // Configure collection
-        collection.set_config(segment_size, kmer_length, None);
+        // Configure collection with batch_size from archive (pack_cardinality)
+        collection.set_config(segment_size, kmer_length, Some(pack_cardinality as usize));
 
         // Load collection metadata
         collection.prepare_for_decompression(&archive)?;
@@ -120,7 +123,9 @@ impl Decompressor {
     /// - 12 bytes: kmer_length, min_match_len, pack_cardinality (older C++ AGC)
     /// - 16 bytes: kmer_length, min_match_len, pack_cardinality, segment_size (newer C++ AGC)
     /// - 20 bytes: kmer_length, min_match_len, pack_cardinality, segment_size, no_raw_groups (ragc)
-    fn load_params(archive: &mut Archive) -> Result<(u32, u32, u32)> {
+    ///
+    /// Returns: (segment_size, kmer_length, min_match_len, pack_cardinality)
+    fn load_params(archive: &mut Archive) -> Result<(u32, u32, u32, u32)> {
         // Get params stream
         let stream_id = archive
             .get_stream_id("params")
@@ -145,7 +150,7 @@ impl Decompressor {
 
         let kmer_length = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let min_match_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let _pack_cardinality = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let pack_cardinality = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
 
         // segment_size is optional (not present in older C++ AGC archives)
         let segment_size = if data.len() >= 16 {
@@ -157,7 +162,7 @@ impl Decompressor {
 
         // no_raw_groups is optional (only in ragc archives) - ignored if present
 
-        Ok((segment_size, kmer_length, min_match_len))
+        Ok((segment_size, kmer_length, min_match_len, pack_cardinality))
     }
 
     /// Get list of samples in the archive
@@ -165,28 +170,49 @@ impl Decompressor {
         self.collection.get_samples_list(false)
     }
 
-    /// Load all contig batches if not already loaded
-    fn ensure_contig_batches_loaded(&mut self) -> Result<()> {
+    /// Load all contig batches if not already loaded (eager loading)
+    /// Use this when you need to iterate over all contigs in the archive
+    #[allow(dead_code)]
+    fn ensure_all_contig_batches_loaded(&mut self) -> Result<()> {
         let num_batches = self.collection.get_contig_stream_num_batches(&self.archive)?;
 
         for batch_id in 0..num_batches {
             if !self.collection.is_contig_batch_loaded(batch_id) {
-                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+                self.collection
+                    .load_contig_batch(&mut self.archive, batch_id)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Load contig batch for a specific sample if not already loaded (lazy loading)
+    /// This is much faster than loading all batches when only accessing a few samples
+    fn ensure_sample_batch_loaded(&mut self, sample_name: &str) -> Result<()> {
+        // Get batch ID for this sample
+        let batch_id = self
+            .collection
+            .get_sample_batch_id(sample_name)
+            .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))?;
+
+        // Load batch if not already loaded
+        if !self.collection.is_contig_batch_loaded(batch_id) {
+            self.collection
+                .load_contig_batch(&mut self.archive, batch_id)?;
         }
         Ok(())
     }
 
     /// Get list of contigs for a specific sample
     pub fn list_contigs(&mut self, sample_name: &str) -> Result<Vec<String>> {
-        self.ensure_contig_batches_loaded()?;
-        self.collection.get_contig_list(sample_name)
+        self.ensure_sample_batch_loaded(sample_name)?;
+        self.collection
+            .get_contig_list(sample_name)
             .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))
     }
 
     /// Extract a specific contig from a sample
     pub fn get_contig(&mut self, sample_name: &str, contig_name: &str) -> Result<Contig> {
-        self.ensure_contig_batches_loaded()?;
+        self.ensure_sample_batch_loaded(sample_name)?;
 
         // Get contig segment descriptors
         let segments = self
@@ -215,7 +241,7 @@ impl Decompressor {
 
     /// Extract all contigs from a sample
     pub fn get_sample(&mut self, sample_name: &str) -> Result<Vec<(String, Contig)>> {
-        self.ensure_contig_batches_loaded()?;
+        self.ensure_sample_batch_loaded(sample_name)?;
 
         let sample_desc = self
             .collection
@@ -741,7 +767,7 @@ impl Decompressor {
             );
         }
 
-        self.ensure_contig_batches_loaded()?;
+        self.ensure_sample_batch_loaded(sample_name)?;
 
         // Get contig segment descriptors
         let segments = self
@@ -848,7 +874,7 @@ impl Decompressor {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn get_contig_length(&mut self, sample_name: &str, contig_name: &str) -> Result<usize> {
-        self.ensure_contig_batches_loaded()?;
+        self.ensure_sample_batch_loaded(sample_name)?;
 
         // Get contig segment descriptors
         let segments = self
