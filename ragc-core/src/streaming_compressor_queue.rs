@@ -1349,14 +1349,33 @@ fn find_group_with_one_kmer(
                 let estim_size = {
                     let mut lz = LZDiff::new(config.min_match_len as u32);
                     lz.prepare(&ref_data.to_vec());
-                    let encoded = lz.encode(&target_data.to_vec());
-                    encoded.len()
+                    // Use estimate() which matches C++ CLZDiff_V2::Estimate exactly
+                    lz.estimate(&target_data.to_vec(), best_estim_size as u32) as usize
                 };
 
+                // DEBUG: Also compute estimate with initial threshold to check if tie would occur
+                #[cfg(not(feature = "cpp_agc"))]
+                let estim_no_bound = if config.verbosity > 2 {
+                    let mut lz2 = LZDiff::new(config.min_match_len as u32);
+                    lz2.prepare(&ref_data.to_vec());
+                    lz2.estimate(&target_data.to_vec(), (segment_len - 16) as u32) as usize
+                } else { 0 };
+
                 if config.verbosity > 2 {
+                    // Print detailed debug info including bound and first/last bytes
+                    let ref_first: Vec<u8> = ref_data.iter().take(5).cloned().collect();
+                    let ref_last: Vec<u8> = ref_data.iter().rev().take(5).cloned().collect();
+                    let tgt_first: Vec<u8> = target_data.iter().take(5).cloned().collect();
+                    let tgt_last: Vec<u8> = target_data.iter().rev().take(5).cloned().collect();
+                    #[cfg(not(feature = "cpp_agc"))]
                     eprintln!(
-                        "RAGC_CASE3_ESTIMATE: kmer={} cand=({},{}) rc={} ref_len={} target_len={} estim={}",
-                        kmer, key_front, key_back, needs_rc, ref_data.len(), target_data.len(), estim_size
+                        "RAGC_CASE3_ESTIMATE: kmer={} cand=({},{}) rc={} ref_len={} target_len={} bound={} estim={} estim_nobound={} ref[0..5]={:?} ref[-5..]={:?} tgt[0..5]={:?} tgt[-5..]={:?}",
+                        kmer, key_front, key_back, needs_rc, ref_data.len(), target_data.len(), best_estim_size, estim_size, estim_no_bound, ref_first, ref_last, tgt_first, tgt_last
+                    );
+                    #[cfg(feature = "cpp_agc")]
+                    eprintln!(
+                        "RAGC_CASE3_ESTIMATE: kmer={} cand=({},{}) rc={} ref_len={} target_len={} bound={} estim={} ref[0..5]={:?} ref[-5..]={:?} tgt[0..5]={:?} tgt[-5..]={:?}",
+                        kmer, key_front, key_back, needs_rc, ref_data.len(), target_data.len(), best_estim_size, estim_size, ref_first, ref_last, tgt_first, tgt_last
                     );
                 }
 
@@ -1645,8 +1664,8 @@ fn find_cand_segment_using_fallback_minimizers(
                 let estimate = {
                     let mut lz = LZDiff::new(config.min_match_len as u32);
                     lz.prepare(&ref_data.to_vec());
-                    let encoded = lz.encode(&target_data.to_vec());
-                    encoded.len()
+                    // Use estimate() which matches C++ CLZDiff_V2::Estimate exactly
+                    lz.estimate(&target_data.to_vec(), best_estimate as u32) as usize
                 };
 
                 if config.verbosity > 2 {
@@ -2056,17 +2075,22 @@ fn worker_thread(
                     eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} back_is_dir={} -> kmer_is_dir_after_swap={}",
                         task.sample_name, segment.back_kmer, segment.back_kmer_is_dir, kmer_is_dir_after_swap);
 
+                    // C++ AGC line 1344 passes (segment_rc, segment) to find_cand_segment_with_one_splitter
+                    // and then inverts the result: store_rc = !store_dir
+                    // So we swap the segment parameters here AND invert sr below
                     let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
                         segment.back_kmer, // Use original k-mer value
                         kmer_is_dir_after_swap, // Inverted due to swap_dir_rc()
-                        &segment.data,
-                        &segment_data_rc,
+                        &segment_data_rc,  // SWAPPED: RC first (matches C++ AGC segment_rc param)
+                        &segment.data,     // SWAPPED: Original second (matches C++ AGC segment param)
                         &map_segments_terminators,
                         &map_segments,
                         &segment_groups,
                         &reference_segments,
                         &config,
                     );
+                    // Invert sr to match C++ AGC's store_rc = !store_dir
+                    sr = !sr;
 
                     // Fallback: If Case 3b returned MISSING, try fallback minimizers (C++ AGC lines 1347-1359)
                     // Note: C++ AGC uses segment_rc for fallback in Case 3b
