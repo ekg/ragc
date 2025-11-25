@@ -855,27 +855,23 @@ fn flush_pack(
 
     // Pack segments together with delta deduplication (matching C++ AGC segment.cpp lines 66-74)
     // Note: segments do NOT include the reference - it's stored separately
+    // Track unique deltas and their in_group_ids (matching C++ AGC segment.cpp)
+    // In C++ AGC:
+    // - Reference: in_group_id = 0
+    // - Empty delta (same as reference): in_group_id = 0 (IMPROVED_LZ_ENCODING)
+    // - New unique delta: in_group_id = no_seqs, then no_seqs++
+    // - Duplicate delta: reuse existing in_group_id
     let mut unique_deltas: Vec<Vec<u8>> = Vec::new(); // v_lzp in C++ AGC
-    let mut segment_delta_indices: Vec<u32> = Vec::new(); // Which unique delta each segment uses
+    let mut delta_in_group_ids: Vec<u32> = Vec::new(); // in_group_id for each unique delta
+    let mut segment_in_group_ids: Vec<u32> = Vec::new(); // in_group_id for each segment
 
-    // First pass: encode segments and deduplicate deltas
+    // Continue from where previous pack left off for this group
+    // Both LZ and raw groups start at in_group_id=1 (slot 0 is reference position)
+    // In LZ groups, slot 0 has actual reference data
+    // In raw groups, slot 0 is conceptually skipped (matches C++ AGC behavior)
+    let mut no_seqs: u32 = buffer.segments_written.max(1);
 
-    // Get reference data for comparison (if it exists)
-    let reference_data = buffer.reference_segment.as_ref().map(|ref_seg| &ref_seg.data);
-    if let Some(ref_data) = reference_data {
-        // Pre-populate unique_deltas[0] with the reference-matching delta
-        // For raw groups: this is the raw reference data
-        // For LZ groups: this is an empty delta (matching reference exactly)
-        if !use_lz_encoding {
-            // Raw groups: store raw reference data at position 0
-            unique_deltas.push(ref_data.clone());
-        } else {
-            // LZ groups: store empty delta at position 0 (represents "identical to reference")
-            unique_deltas.push(Vec::new());
-        }
-    }
-
-    for (i, seg) in buffer.segments.iter().enumerate() {
+    for seg in buffer.segments.iter() {
         let contig_data = if !use_lz_encoding || buffer.reference_segment.is_none() {
             // Raw segment: groups 0-15 OR groups without reference
             seg.data.clone()
@@ -887,31 +883,49 @@ fn flush_pack(
                 .encode(&seg.data)
         };
 
-        // Check if this delta already exists (includes reference delta at position 0)
-        // (matching C++ AGC segment.cpp line 66)
+        // Handle LZ groups with IMPROVED_LZ_ENCODING: empty delta means same as reference
+        // (matching C++ AGC segment.cpp lines 62-63)
+        if use_lz_encoding && contig_data.is_empty() {
+            // Same as reference - use in_group_id = 0
+            segment_in_group_ids.push(0);
+            continue;
+        }
+
+        // Check if this delta already exists (matching C++ AGC segment.cpp line 66)
         if let Some(existing_idx) = unique_deltas.iter().position(|d| d == &contig_data) {
-            // Reuse existing delta (matching C++ AGC segment.cpp line 69)
-            segment_delta_indices.push(existing_idx as u32);
+            // Reuse existing delta's in_group_id (matching C++ AGC segment.cpp line 69)
+            let reused_id = delta_in_group_ids[existing_idx];
+            segment_in_group_ids.push(reused_id);
         } else {
-            // New unique delta - add it (matching C++ AGC segment.cpp line 74)
-            segment_delta_indices.push(unique_deltas.len() as u32);
+            // New unique delta - assign next in_group_id (matching C++ AGC segment.cpp lines 74, 77)
+            let in_group_id = no_seqs;
+            no_seqs += 1;
+            delta_in_group_ids.push(in_group_id);
+            segment_in_group_ids.push(in_group_id);
             unique_deltas.push(contig_data);
         }
     }
 
     // Second pass: pack unique deltas and register segments
     let mut packed_data = Vec::new();
+
+    // CRITICAL: Raw groups need a placeholder segment at position 0
+    // (C++ AGC agc_compressor.cpp line 2315: v_segments[no_segments]->add_raw(empty_ctg, nullptr, nullptr))
+    // The placeholder {0x7f} is added once when the group is created, taking slot 0
+    // This is only needed for the FIRST pack of each raw group (segments_written was 0 before max(1))
+    if !use_lz_encoding && buffer.segments_written == 0 {
+        // Add placeholder for raw groups: {0x7f} followed by separator
+        packed_data.push(0x7f);
+        packed_data.push(CONTIG_SEPARATOR);
+    }
+
     for delta in unique_deltas.iter() {
         packed_data.extend_from_slice(delta);
         packed_data.push(CONTIG_SEPARATOR);
     }
 
-    // Register segments in collection with their delta indices
-    for (seg, &delta_idx) in buffer.segments.iter().zip(segment_delta_indices.iter()) {
-        // in_group_id represents which delta this segment uses
-        // 0 = reference, 1+ = delta index (1-based, not offset by segments_written)
-        let in_group_id = delta_idx + 1;
-
+    // Register segments in collection with their in_group_ids
+    for (seg, &in_group_id) in buffer.segments.iter().zip(segment_in_group_ids.iter()) {
         let mut coll = collection.lock().unwrap();
         coll.add_segment_placed(
             &seg.sample_name,
@@ -925,9 +939,8 @@ fn flush_pack(
         .context("Failed to register segment")?;
     }
 
-    // Update counter (counts UNIQUE deltas only, not reference or duplicates)
-    // This matches C++ AGC which increments no_seqs only when adding new deltas (segment.cpp line 77)
-    buffer.segments_written += unique_deltas.len() as u32;
+    // Update counter to track no_seqs (counts reference + unique deltas)
+    buffer.segments_written = no_seqs;
 
     // Compress and write the packed data (if we have any delta segments)
     if !packed_data.is_empty() {
@@ -1018,6 +1031,8 @@ fn write_reference_immediately(
     // 4. Mark reference as written and store for LZ encoding (matching flush_pack lines 663-664)
     buffer.ref_written = true;
     buffer.reference_segment = Some(segment.clone());
+    // CRITICAL: Mark that in_group_id=0 is taken, so subsequent segments start from 1
+    buffer.segments_written = 1;
 
     // 4b. Store reference data persistently (matching C++ AGC v_segments)
     // This enables LZ cost estimation for subsequent samples even after flush
@@ -2078,10 +2093,12 @@ fn worker_thread(
                         buffer.group_id, key_front, key_back, task.sample_name);
                 }
 
-                // CRITICAL: Match C++ AGC behavior - write reference IMMEDIATELY
+                // CRITICAL: Match C++ AGC behavior - write reference IMMEDIATELY for LZ groups
                 // (C++ AGC segment.cpp lines 41-48: if (no_seqs == 0) writes reference right away)
-                if buffer.reference_segment.is_none() && buffer.segments.is_empty() {
-                    // This is the FIRST segment in this group - make it the reference NOW
+                // BUT: Raw groups (0-15) don't have references - they skip position 0
+                let is_raw_group = buffer.group_id < NO_RAW_GROUPS;
+                if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
+                    // This is the FIRST segment in an LZ group - make it the reference NOW
                     // (matches C++ AGC: lz_diff->Prepare(s); store_in_archive(s, zstd_cctx);)
                     if let Err(e) = write_reference_immediately(&buffered, buffer, &collection, &archive, &reference_segments, &config) {
                         eprintln!("ERROR: Failed to write immediate reference: {}", e);
@@ -2089,7 +2106,7 @@ fn worker_thread(
                         buffer.segments.push(buffered);
                     }
                 } else {
-                    // Subsequent segments - buffer them
+                    // Buffer segment: either raw group, or subsequent LZ segment
                     buffer.segments.push(buffered);
                 }
 
