@@ -704,6 +704,214 @@ impl Decompressor {
         Ok(())
     }
 
+    /// Compute the length of a contig from its segment descriptors without decompression.
+    ///
+    /// The total length is: sum of (raw_length - kmer_length) for each segment after the first,
+    /// plus the full raw_length of the first segment.
+    fn compute_contig_length_from_segments(&self, segments: &[SegmentDesc]) -> usize {
+        if segments.is_empty() {
+            return 0;
+        }
+
+        let mut total_len = segments[0].raw_length as usize;
+        for seg in &segments[1..] {
+            // Each subsequent segment contributes (raw_length - kmer_length) bases
+            // because the first kmer_length bases overlap with the previous segment
+            total_len += seg.raw_length as usize - self.kmer_length as usize;
+        }
+        total_len
+    }
+
+    /// Compute segment boundaries (start positions) for a contig.
+    /// Returns a vector of (segment_start, segment_end) positions in contig coordinates.
+    fn compute_segment_boundaries(&self, segments: &[SegmentDesc]) -> Vec<(usize, usize)> {
+        let mut boundaries = Vec::with_capacity(segments.len());
+        let mut pos = 0usize;
+
+        for (i, seg) in segments.iter().enumerate() {
+            let seg_len = if i == 0 {
+                seg.raw_length as usize
+            } else {
+                seg.raw_length as usize - self.kmer_length as usize
+            };
+            boundaries.push((pos, pos + seg_len));
+            pos += seg_len;
+        }
+
+        boundaries
+    }
+
+    /// Extract a subsequence from a specific contig.
+    ///
+    /// This method only decompresses the segments that overlap with the requested range,
+    /// which can be significantly faster than extracting the full contig for small queries.
+    ///
+    /// # Arguments
+    /// * `sample_name` - The sample name
+    /// * `contig_name` - The contig name
+    /// * `start` - Start position (0-based, inclusive)
+    /// * `end` - End position (0-based, exclusive)
+    ///
+    /// # Returns
+    /// The subsequence as a Vec<u8> with numeric encoding (A=0, C=1, G=2, T=3)
+    ///
+    /// # Example
+    /// ```no_run
+    /// use ragc_core::{Decompressor, DecompressorConfig};
+    ///
+    /// let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+    /// // Extract bases 100-200 from chr1
+    /// let subseq = dec.get_contig_range("sample1", "chr1", 100, 200)?;
+    /// assert_eq!(subseq.len(), 100);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn get_contig_range(
+        &mut self,
+        sample_name: &str,
+        contig_name: &str,
+        start: usize,
+        end: usize,
+    ) -> Result<Contig> {
+        if start > end {
+            anyhow::bail!(
+                "Start position {} exceeds end position {}",
+                start,
+                end
+            );
+        }
+
+        // Load contig batch if needed
+        if self
+            .collection
+            .get_no_contigs(sample_name)
+            .is_none_or(|count| count == 0)
+        {
+            self.collection.load_contig_batch(&mut self.archive, 0)?;
+        }
+
+        // Get contig segment descriptors
+        let segments = self
+            .collection
+            .get_contig_desc(sample_name, contig_name)
+            .ok_or_else(|| anyhow!("Contig not found: {sample_name}/{contig_name}"))?;
+
+        // Compute total contig length and validate range
+        let contig_len = self.compute_contig_length_from_segments(&segments);
+        if end > contig_len {
+            anyhow::bail!(
+                "End position {} exceeds contig length {}",
+                end,
+                contig_len
+            );
+        }
+
+        // For small contigs or when requesting most of the contig, just decompress everything
+        // The overhead of partial decompression isn't worth it for small data
+        if contig_len < 100_000 || (end - start) > contig_len / 2 {
+            let contig = self.get_contig(sample_name, contig_name)?;
+            return Ok(contig[start..end].to_vec());
+        }
+
+        // Compute segment boundaries
+        let boundaries = self.compute_segment_boundaries(&segments);
+
+        // Find which segments overlap with [start, end)
+        let mut first_seg_idx = None;
+        let mut last_seg_idx = None;
+
+        for (i, &(seg_start, seg_end)) in boundaries.iter().enumerate() {
+            if seg_end > start && first_seg_idx.is_none() {
+                first_seg_idx = Some(i);
+            }
+            if seg_start < end {
+                last_seg_idx = Some(i);
+            }
+        }
+
+        let first_seg_idx = first_seg_idx.ok_or_else(|| anyhow!("No segments found for range"))?;
+        let last_seg_idx = last_seg_idx.ok_or_else(|| anyhow!("No segments found for range"))?;
+
+        // Decompress only the overlapping segments
+        let mut result = Contig::new();
+
+        for seg_idx in first_seg_idx..=last_seg_idx {
+            let segment_desc = &segments[seg_idx];
+            let mut segment_data = self.get_segment(segment_desc)?;
+
+            // Apply reverse complement if needed
+            if segment_desc.is_rev_comp {
+                segment_data = Self::reverse_complement_segment(&segment_data);
+            }
+
+            let (seg_start, _seg_end) = boundaries[seg_idx];
+
+            if seg_idx == first_seg_idx && seg_idx == last_seg_idx {
+                // Single segment case
+                let local_start = start - seg_start;
+                let local_end = end - seg_start;
+                if seg_idx == 0 {
+                    result.extend_from_slice(&segment_data[local_start..local_end]);
+                } else {
+                    // Skip kmer_length overlap
+                    let adjusted_start = local_start + self.kmer_length as usize;
+                    let adjusted_end = local_end + self.kmer_length as usize;
+                    result.extend_from_slice(&segment_data[adjusted_start..adjusted_end]);
+                }
+            } else if seg_idx == first_seg_idx {
+                // First segment of range
+                let local_start = start - seg_start;
+                if seg_idx == 0 {
+                    result.extend_from_slice(&segment_data[local_start..]);
+                } else {
+                    let adjusted_start = local_start + self.kmer_length as usize;
+                    result.extend_from_slice(&segment_data[adjusted_start..]);
+                }
+            } else if seg_idx == last_seg_idx {
+                // Last segment of range
+                let local_end = end - seg_start + self.kmer_length as usize;
+                result.extend_from_slice(&segment_data[self.kmer_length as usize..local_end]);
+            } else {
+                // Middle segment - take everything except the kmer overlap
+                result.extend_from_slice(&segment_data[self.kmer_length as usize..]);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Get the length of a contig without full decompression.
+    ///
+    /// This method computes the length from segment metadata, which is much faster
+    /// than decompressing the entire contig.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use ragc_core::{Decompressor, DecompressorConfig};
+    ///
+    /// let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+    /// let len = dec.get_contig_length("sample1", "chr1")?;
+    /// println!("Contig length: {} bp", len);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn get_contig_length(&mut self, sample_name: &str, contig_name: &str) -> Result<usize> {
+        // Load contig batch if needed
+        if self
+            .collection
+            .get_no_contigs(sample_name)
+            .is_none_or(|count| count == 0)
+        {
+            self.collection.load_contig_batch(&mut self.archive, 0)?;
+        }
+
+        // Get contig segment descriptors
+        let segments = self
+            .collection
+            .get_contig_desc(sample_name, contig_name)
+            .ok_or_else(|| anyhow!("Contig not found: {sample_name}/{contig_name}"))?;
+
+        Ok(self.compute_contig_length_from_segments(&segments))
+    }
+
     /// Close the archive
     pub fn close(mut self) -> Result<()> {
         self.archive.close()
@@ -801,6 +1009,135 @@ mod tests {
 
             assert_eq!(sample_contigs[1].0, "chr2");
             assert_eq!(sample_contigs[1].1, vec![3, 2, 1, 0, 3, 2, 1, 0]);
+
+            decompressor.close().unwrap();
+        }
+
+        fs::remove_file(archive_path).unwrap();
+    }
+
+    #[test]
+    fn test_get_contig_range() {
+        let archive_path = "/tmp/test_range.agc";
+        let _ = fs::remove_file(archive_path);
+
+        // Create archive with a known sequence
+        {
+            let config = CompressorConfig::default();
+            let mut compressor = Compressor::new(archive_path, config).unwrap();
+
+            // Create a sequence: ACGTACGTACGT (12 bases)
+            let seq1 = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
+            compressor
+                .add_contig("sample1", "chr1", seq1.clone())
+                .unwrap();
+
+            compressor.finalize().unwrap();
+        }
+
+        // Test range extraction
+        {
+            let config = DecompressorConfig { verbosity: 0 };
+            let mut decompressor = Decompressor::open(archive_path, config).unwrap();
+
+            // Test various ranges
+            let range1 = decompressor.get_contig_range("sample1", "chr1", 0, 4).unwrap();
+            assert_eq!(range1, vec![0, 1, 2, 3]); // ACGT
+
+            let range2 = decompressor.get_contig_range("sample1", "chr1", 4, 8).unwrap();
+            assert_eq!(range2, vec![0, 1, 2, 3]); // ACGT
+
+            let range3 = decompressor.get_contig_range("sample1", "chr1", 2, 10).unwrap();
+            assert_eq!(range3, vec![2, 3, 0, 1, 2, 3, 0, 1]); // GTACGTAC
+
+            // Test full range
+            let full = decompressor.get_contig_range("sample1", "chr1", 0, 12).unwrap();
+            assert_eq!(full, vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]);
+
+            // Test single base
+            let single = decompressor.get_contig_range("sample1", "chr1", 5, 6).unwrap();
+            assert_eq!(single, vec![1]); // C
+
+            decompressor.close().unwrap();
+        }
+
+        fs::remove_file(archive_path).unwrap();
+    }
+
+    #[test]
+    fn test_get_contig_length() {
+        let archive_path = "/tmp/test_length.agc";
+        let _ = fs::remove_file(archive_path);
+
+        // Create archive
+        {
+            let config = CompressorConfig::default();
+            let mut compressor = Compressor::new(archive_path, config).unwrap();
+
+            let seq1 = vec![0, 1, 2, 3, 0, 1, 2, 3]; // 8 bases
+            let seq2 = vec![0; 100]; // 100 bases
+
+            compressor
+                .add_contig("sample1", "chr1", seq1.clone())
+                .unwrap();
+            compressor
+                .add_contig("sample1", "chr2", seq2.clone())
+                .unwrap();
+
+            compressor.finalize().unwrap();
+        }
+
+        // Test length computation
+        {
+            let config = DecompressorConfig { verbosity: 0 };
+            let mut decompressor = Decompressor::open(archive_path, config).unwrap();
+
+            let len1 = decompressor.get_contig_length("sample1", "chr1").unwrap();
+            assert_eq!(len1, 8);
+
+            let len2 = decompressor.get_contig_length("sample1", "chr2").unwrap();
+            assert_eq!(len2, 100);
+
+            decompressor.close().unwrap();
+        }
+
+        fs::remove_file(archive_path).unwrap();
+    }
+
+    #[test]
+    fn test_get_contig_range_errors() {
+        let archive_path = "/tmp/test_range_errors.agc";
+        let _ = fs::remove_file(archive_path);
+
+        // Create archive
+        {
+            let config = CompressorConfig::default();
+            let mut compressor = Compressor::new(archive_path, config).unwrap();
+
+            let seq1 = vec![0, 1, 2, 3, 0, 1, 2, 3]; // 8 bases
+            compressor
+                .add_contig("sample1", "chr1", seq1.clone())
+                .unwrap();
+
+            compressor.finalize().unwrap();
+        }
+
+        // Test error cases
+        {
+            let config = DecompressorConfig { verbosity: 0 };
+            let mut decompressor = Decompressor::open(archive_path, config).unwrap();
+
+            // Start > end
+            let result = decompressor.get_contig_range("sample1", "chr1", 5, 3);
+            assert!(result.is_err());
+
+            // End > length
+            let result = decompressor.get_contig_range("sample1", "chr1", 0, 100);
+            assert!(result.is_err());
+
+            // Non-existent contig
+            let result = decompressor.get_contig_range("sample1", "chrX", 0, 5);
+            assert!(result.is_err());
 
             decompressor.close().unwrap();
         }
