@@ -284,6 +284,9 @@ pub struct CollectionV3 {
 
     // For in_group_id delta encoding
     in_group_ids: Vec<i32>,
+
+    // Track sample count for each loaded batch (batch_id -> sample_count_in_that_batch)
+    batch_sample_counts: HashMap<usize, usize>,
 }
 
 impl Default for CollectionV3 {
@@ -308,6 +311,7 @@ impl CollectionV3 {
             placing_sample_id: 0,
             no_samples_in_last_batch: 0,
             in_group_ids: Vec::new(),
+            batch_sample_counts: HashMap::new(),
         }
     }
 
@@ -436,6 +440,19 @@ impl CollectionV3 {
     /// Get number of samples
     pub fn get_no_samples(&self) -> usize {
         self.sample_desc.len()
+    }
+
+    /// Get the batch size (number of samples per batch)
+    pub fn get_batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Get number of contig batches in the archive
+    pub fn get_contig_stream_num_batches(&self, archive: &Archive) -> Result<usize> {
+        let stream_id = self
+            .collection_contigs_id
+            .context("collection-contigs stream not found")?;
+        Ok(archive.get_num_parts(stream_id))
     }
 
     /// Get number of contigs in a sample
@@ -1063,8 +1080,28 @@ impl CollectionV3 {
     }
 
     /// Load a batch of contigs (names + details)
+    ///
+    /// Note: Batches MUST be loaded in sequential order (0, 1, 2, ...) because
+    /// the starting sample index for each batch depends on the sample counts
+    /// from all previous batches.
     #[allow(clippy::needless_range_loop)]
     pub fn load_contig_batch(&mut self, archive: &mut Archive, id_batch: usize) -> Result<()> {
+        // Compute the starting sample index for this batch by summing samples from all previous batches.
+        // This requires batches to be loaded in sequential order (0, 1, 2, ...).
+        let start_sample_idx: usize = (0..id_batch)
+            .map(|b| {
+                self.batch_sample_counts
+                    .get(&b)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Batch {b} must be loaded before batch {id_batch}. \
+                             Batches must be loaded in sequential order."
+                        )
+                    })
+            })
+            .sum();
+
         // Load contig names
         let contig_stream_id = self
             .collection_contigs_id
@@ -1082,7 +1119,11 @@ impl CollectionV3 {
             );
         }
 
-        self.deserialize_contig_names(&v_data_names, id_batch * self.batch_size)?;
+        self.deserialize_contig_names(&v_data_names, start_sample_idx)?;
+
+        // Record the sample count for this batch (set by deserialize_contig_names in no_samples_in_last_batch)
+        self.batch_sample_counts
+            .insert(id_batch, self.no_samples_in_last_batch);
 
         // Load contig details
         let details_stream_id = self
@@ -1122,7 +1163,7 @@ impl CollectionV3 {
             }
         }
 
-        self.deserialize_contig_details(&v_data_details, id_batch * self.batch_size)?;
+        self.deserialize_contig_details(&v_data_details, start_sample_idx)?;
 
         Ok(())
     }

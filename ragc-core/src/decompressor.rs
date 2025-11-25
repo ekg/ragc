@@ -60,6 +60,9 @@ pub struct Decompressor {
     // Cached segment data (group_id -> reference segment)
     segment_cache: HashMap<u32, Contig>,
 
+    // Track which contig batches have been loaded
+    loaded_contig_batches: std::collections::HashSet<usize>,
+
     // Archive parameters
     _segment_size: u32,
     kmer_length: u32,
@@ -107,6 +110,7 @@ impl Decompressor {
             archive,
             collection,
             segment_cache: HashMap::new(),
+            loaded_contig_batches: std::collections::HashSet::new(),
             _segment_size: segment_size,
             kmer_length,
             min_match_len,
@@ -165,59 +169,29 @@ impl Decompressor {
         self.collection.get_samples_list(false)
     }
 
+    /// Load all contig batches if not already loaded
+    fn ensure_contig_batches_loaded(&mut self) -> Result<()> {
+        let num_batches = self.collection.get_contig_stream_num_batches(&self.archive)?;
+
+        for batch_id in 0..num_batches {
+            if !self.loaded_contig_batches.contains(&batch_id) {
+                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+                self.loaded_contig_batches.insert(batch_id);
+            }
+        }
+        Ok(())
+    }
+
     /// Get list of contigs for a specific sample
     pub fn list_contigs(&mut self, sample_name: &str) -> Result<Vec<String>> {
-        if self.config.verbosity > 1 {
-            eprintln!("list_contigs called for: {sample_name}");
-            eprintln!(
-                "get_no_contigs before load: {:?}",
-                self.collection.get_no_contigs(sample_name)
-            );
-        }
-
-        // Load contig batch if not already loaded (either None or Some(0))
-        if self
-            .collection
-            .get_no_contigs(sample_name)
-            .is_none_or(|count| count == 0)
-        {
-            if self.config.verbosity > 1 {
-                eprintln!("Loading contig batch for sample: {sample_name}");
-            }
-            self.collection.load_contig_batch(&mut self.archive, 0)?;
-
-            if self.config.verbosity > 1 {
-                eprintln!(
-                    "After load: get_no_contigs = {:?}",
-                    self.collection.get_no_contigs(sample_name)
-                );
-            }
-        } else if self.config.verbosity > 1 {
-            eprintln!(
-                "Contig batch already loaded, get_no_contigs = {:?}",
-                self.collection.get_no_contigs(sample_name)
-            );
-        }
-
-        let result = self.collection.get_contig_list(sample_name);
-        if self.config.verbosity > 1 {
-            eprintln!("get_contig_list result: {result:?}");
-        }
-
-        result.ok_or_else(|| anyhow!("Sample not found: {sample_name}"))
+        self.ensure_contig_batches_loaded()?;
+        self.collection.get_contig_list(sample_name)
+            .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))
     }
 
     /// Extract a specific contig from a sample
     pub fn get_contig(&mut self, sample_name: &str, contig_name: &str) -> Result<Contig> {
-        // Load contig batch if needed (either None or Some(0))
-        if self
-            .collection
-            .get_no_contigs(sample_name)
-            .is_none_or(|count| count == 0)
-        {
-            let _num_samples = self.collection.get_no_samples();
-            self.collection.load_contig_batch(&mut self.archive, 0)?;
-        }
+        self.ensure_contig_batches_loaded()?;
 
         // Get contig segment descriptors
         let segments = self
@@ -246,15 +220,7 @@ impl Decompressor {
 
     /// Extract all contigs from a sample
     pub fn get_sample(&mut self, sample_name: &str) -> Result<Vec<(String, Contig)>> {
-        // Load contig batch if needed (either None or Some(0))
-        if self
-            .collection
-            .get_no_contigs(sample_name)
-            .is_none_or(|count| count == 0)
-        {
-            let _num_samples = self.collection.get_no_samples();
-            self.collection.load_contig_batch(&mut self.archive, 0)?;
-        }
+        self.ensure_contig_batches_loaded()?;
 
         let sample_desc = self
             .collection
@@ -780,14 +746,7 @@ impl Decompressor {
             );
         }
 
-        // Load contig batch if needed
-        if self
-            .collection
-            .get_no_contigs(sample_name)
-            .is_none_or(|count| count == 0)
-        {
-            self.collection.load_contig_batch(&mut self.archive, 0)?;
-        }
+        self.ensure_contig_batches_loaded()?;
 
         // Get contig segment descriptors
         let segments = self
@@ -894,14 +853,7 @@ impl Decompressor {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn get_contig_length(&mut self, sample_name: &str, contig_name: &str) -> Result<usize> {
-        // Load contig batch if needed
-        if self
-            .collection
-            .get_no_contigs(sample_name)
-            .is_none_or(|count| count == 0)
-        {
-            self.collection.load_contig_batch(&mut self.archive, 0)?;
-        }
+        self.ensure_contig_batches_loaded()?;
 
         // Get contig segment descriptors
         let segments = self
