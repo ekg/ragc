@@ -82,6 +82,12 @@ enum Commands {
         /// Accepts suffixes: K, M, G (e.g., "512M", "2G")
         #[arg(long, default_value = "2G")]
         queue_capacity: String,
+
+        /// Use C++ AGC compression via FFI for byte-identical archives
+        /// This delegates the entire compression to the original C++ AGC implementation.
+        /// Use this to verify RAGC produces compatible output, then pare back.
+        #[arg(long)]
+        cpp_agc: bool,
     },
 
     /// Display information about an AGC archive
@@ -273,6 +279,7 @@ fn main() -> Result<()> {
             threads,
             batch,
             queue_capacity,
+            cpp_agc,
         } => create_archive(
             output,
             inputs,
@@ -286,6 +293,7 @@ fn main() -> Result<()> {
             threads,
             batch,
             &queue_capacity,
+            cpp_agc,
         )?,
 
         Commands::Info { archive } => {
@@ -356,6 +364,7 @@ fn create_archive(
     threads: Option<usize>,
     batch: bool,
     queue_capacity_str: &str,
+    cpp_agc: bool,
 ) -> Result<()> {
     // Determine thread count (use provided or auto-detect)
     let num_threads = threads.unwrap_or_else(|| {
@@ -393,7 +402,46 @@ fn create_archive(
         if concatenated {
             eprintln!("  concatenated mode: enabled (all contigs as one sample)");
         }
+        if cpp_agc {
+            eprintln!("  C++ AGC FFI mode: enabled (byte-identical archives)");
+        }
         eprintln!();
+    }
+
+    // C++ AGC FFI mode: delegate entire compression to C++ AGC for byte-identical archives
+    if cpp_agc {
+        if verbosity > 0 {
+            eprintln!("Using C++ AGC compression via FFI...");
+        }
+
+        // Build sample_files list: (sample_name, file_path)
+        let sample_files: Vec<(String, String)> = inputs
+            .iter()
+            .map(|p| {
+                let sample_name = extract_sample_name(p);
+                let file_path = p.to_string_lossy().to_string();
+                (sample_name, file_path)
+            })
+            .collect();
+
+        ragc_core::agc_compress_ffi::compress_with_cpp_agc(
+            &output,
+            &sample_files,
+            kmer_length,
+            segment_size,
+            min_match_len,
+            50, // pack_cardinality (default)
+            concatenated,
+            adaptive,
+            verbosity,
+            num_threads as u32,
+            0.0, // fallback_frac
+        )?;
+
+        if verbosity > 0 {
+            eprintln!("\nArchive created successfully: {output:?}");
+        }
+        return Ok(());
     }
 
     // Branch: Streaming queue mode (default) vs. batch mode (legacy)
