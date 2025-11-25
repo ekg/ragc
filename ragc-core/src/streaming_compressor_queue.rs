@@ -62,24 +62,29 @@ impl Default for StreamingQueueConfig {
 ///
 /// Priority ordering matches C++ AGC:
 /// - Higher sample_priority first (sample1 > sample2 > sample3...)
-/// - Within same sample, lexicographic contig_name order (chrI before chrII)
+/// - Within same sample, FASTA order (lower sequence first)
+///
+/// NOTE: C++ AGC processes contigs in FASTA order (insertion order) with single thread,
+/// not by size. The priority queue only affects ordering when multiple items are queued.
 #[derive(Clone)]
 struct ContigTask {
     sample_name: String,
     contig_name: String,
     data: Contig, // Vec<u8>
     sample_priority: i32, // Higher = process first (decreases for each sample)
-    #[allow(dead_code)]
-    cost: usize,  // Contig size in bytes (kept for future use)
+    sequence: u64, // Insertion order within sample - lower = processed first (FASTA order)
 }
 
 // Implement priority ordering for BinaryHeap (max-heap)
 // BinaryHeap pops the "greatest" element, so we want:
-// - Higher sample_priority = greater
-// - REVERSE lexicographic contig_name = greater (so chrI comes out before chrII)
+// - Higher sample_priority = greater (first sample processed first)
+// - LOWER sequence = greater (FASTA order - earlier contigs processed first)
+//
+// NOTE: C++ AGC with single thread processes in FASTA order because items are
+// consumed as fast as they're pushed. We match this by using sequence ordering.
 impl PartialEq for ContigTask {
     fn eq(&self, other: &Self) -> bool {
-        self.sample_priority == other.sample_priority && self.contig_name == other.contig_name
+        self.sample_priority == other.sample_priority && self.sequence == other.sequence
     }
 }
 
@@ -96,9 +101,10 @@ impl Ord for ContigTask {
         // First compare by sample_priority (higher priority first)
         match self.sample_priority.cmp(&other.sample_priority) {
             std::cmp::Ordering::Equal => {
-                // Then by contig_name (REVERSE lexicographic so smaller names pop first)
-                // C++ AGC processes contigs in FASTA order, which is lexicographic
-                other.contig_name.cmp(&self.contig_name)
+                // Then by sequence (FASTA order - lower sequence = higher priority)
+                // REVERSE comparison: other.sequence vs self.sequence
+                // This makes lower sequence values "greater" so they're popped first
+                other.sequence.cmp(&self.sequence)
             }
             other_ord => other_ord,
         }
@@ -258,6 +264,7 @@ pub struct StreamingQueueCompressor {
     batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>, // Batch-local terminators - only merged to global at batch end
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>, // Buffer segments until batch boundary
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
+    next_sequence: Arc<std::sync::atomic::AtomicU64>, // Increases for each contig (FASTA order)
 }
 
 impl StreamingQueueCompressor {
@@ -390,6 +397,7 @@ impl StreamingQueueCompressor {
         // Priority tracking for interleaved processing (matches C++ AGC)
         let sample_priorities: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
+        let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Increases for each contig (FASTA order)
 
         // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
         let current_batch_sample: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -475,6 +483,7 @@ impl StreamingQueueCompressor {
             batch_local_groups,
             batch_local_terminators,
             pending_batch_segments,
+            next_sequence,
         })
     }
 
@@ -595,9 +604,11 @@ impl StreamingQueueCompressor {
             }
         }
 
-        // Calculate task size and cost
+        // Calculate task size
         let task_size = data.len();
-        let cost = data.len(); // Matches C++ AGC: cost = contig size
+
+        // Get sequence number for FASTA ordering (lower = earlier = higher priority)
+        let sequence = self.next_sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Get or assign priority for this sample (matches C++ AGC priority queue)
         // Higher priority = processed first (decreases for each new sample)
@@ -613,12 +624,13 @@ impl StreamingQueueCompressor {
         };
 
         // Create task with priority information
+        // NOTE: sequence is used for FASTA ordering (lower = processed first)
         let task = ContigTask {
             sample_name,
             contig_name,
             data,
             sample_priority,
-            cost,
+            sequence,
         };
 
         // Push to queue (BLOCKS if queue is full!)
@@ -1612,10 +1624,10 @@ fn worker_thread(
                 };
 
                 // Phase 2: Try to split
-                // C++ AGC splits BEFORE checking if key exists (agc_compressor.cpp:1453)
-                // Default: attempt splits for all segments (matches C++ AGC)
-                // Set RAGC_SPLIT_ALL=0 to use old behavior (only split when key is new)
-                let split_allowed = if std::env::var("RAGC_SPLIT_ALL").as_deref() == Ok("0") { !key_exists } else { true };
+                // C++ AGC only attempts splits when key doesn't exist (agc_compressor.cpp:1367)
+                // This is the condition: p == map_segments.end() && both k-mers valid && both in terminators
+                // Set RAGC_SPLIT_ALL=1 to try splitting even when key exists (experimental)
+                let split_allowed = if std::env::var("RAGC_SPLIT_ALL").as_deref() == Ok("1") { true } else { !key_exists };
                 if split_allowed && key_front != MISSING_KMER && key_back != MISSING_KMER {
                     // CRITICAL: First attempt to find middle splitter
                     // Use ONLY global terminators (not batch-local) to match C++ AGC behavior
