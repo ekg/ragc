@@ -33,6 +33,7 @@ struct SegmentPlacement {
 /// - Buffers subsequent delta segments
 /// - Writes to archive streams
 struct SegmentGroup {
+    #[allow(dead_code)]
     group_id: u32,
     stream_id: usize,          // Delta stream for packed segments
     ref_stream_id: usize,      // Reference stream for first segment
@@ -1176,6 +1177,7 @@ fn compress_samples_streaming_with_archive(
     // Step 5: Main processing loop (agc_compressor.cpp:2163-2242)
     let mut sample_priority = usize::MAX;
     let mut _cnt_contigs_in_sample = 0;
+    #[allow(dead_code)]
     const PACK_CARDINALITY: usize = 50; // TODO: Get from config
 
     for (sample_name, file_path) in sample_files {

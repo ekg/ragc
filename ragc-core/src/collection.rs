@@ -276,10 +276,6 @@ pub struct CollectionV3 {
 
     // State tracking
     prev_sample_name: String,
-    #[allow(dead_code)]
-    placing_sample_name: String,
-    #[allow(dead_code)]
-    placing_sample_id: usize,
     no_samples_in_last_batch: usize,
 
     // For in_group_id delta encoding
@@ -307,8 +303,6 @@ impl CollectionV3 {
             segment_size: 0,
             kmer_length: 0,
             prev_sample_name: String::new(),
-            placing_sample_name: String::new(),
-            placing_sample_id: 0,
             no_samples_in_last_batch: 0,
             in_group_ids: Vec::new(),
             batch_sample_counts: HashMap::new(),

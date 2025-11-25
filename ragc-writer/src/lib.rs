@@ -1,12 +1,8 @@
-#![allow(clippy::all)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-#![allow(private_interfaces)]
 //! AGC archive writer/compressor
 //!
 //! This crate provides compression functionality for creating AGC genome archives.
 
+#[allow(dead_code, unused_variables)]
 pub mod _compressor_streaming_old;
 pub mod bloom_filter;
 pub mod compressor;

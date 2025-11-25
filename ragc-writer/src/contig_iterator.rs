@@ -30,8 +30,10 @@ pub trait ContigIterator {
 #[derive(Debug)]
 struct SampleOrderInfo {
     /// Map of sample -> list of (contig_name, file_byte_offset)
+    #[allow(dead_code)]
     sample_contigs: HashMap<String, Vec<String>>,
     /// Samples in the order they should be processed
+    #[allow(dead_code)]
     sample_order: Vec<String>,
     /// Whether samples appear in contiguous blocks (all of sample A, then all of sample B)
     is_contiguous: bool,

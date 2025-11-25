@@ -13,7 +13,7 @@
 //! ## Creating and reading an archive
 //!
 //! ```no_run
-//! use ragc_common::Archive;
+//! use ragc_core::Archive;
 //!
 //! // Create a new archive for writing
 //! let mut archive = Archive::new_writer();
@@ -39,7 +39,7 @@
 //! ## Variable-length integer encoding
 //!
 //! ```
-//! use ragc_common::{write_varint, read_varint};
+//! use ragc_core::{write_varint, read_varint};
 //! use std::io::Cursor;
 //!
 //! let mut buffer = Vec::new();
@@ -54,7 +54,7 @@
 //! ## Using hash functions
 //!
 //! ```
-//! use ragc_common::MurMur64Hash;
+//! use ragc_core::MurMur64Hash;
 //!
 //! let kmer_value = 0x12345678u64;
 //! let hash = MurMur64Hash::hash(kmer_value);

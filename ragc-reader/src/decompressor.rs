@@ -39,7 +39,7 @@ impl Default for DecompressorConfig {
 ///
 /// # Example
 /// ```no_run
-/// use ragc_core::{Decompressor, DecompressorConfig};
+/// use ragc_reader::{Decompressor, DecompressorConfig};
 /// use std::thread;
 ///
 /// let dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
@@ -171,21 +171,6 @@ impl Decompressor {
     /// Get list of samples in the archive
     pub fn list_samples(&self) -> Vec<String> {
         self.collection.get_samples_list(false)
-    }
-
-    /// Load all contig batches if not already loaded (eager loading)
-    /// Use this when you need to iterate over all contigs in the archive
-    #[allow(dead_code)]
-    fn ensure_all_contig_batches_loaded(&mut self) -> Result<()> {
-        let num_batches = self.collection.get_contig_stream_num_batches(&self.archive)?;
-
-        for batch_id in 0..num_batches {
-            if !self.collection.is_contig_batch_loaded(batch_id) {
-                self.collection
-                    .load_contig_batch(&mut self.archive, batch_id)?;
-            }
-        }
-        Ok(())
     }
 
     /// Load contig batch for a specific sample if not already loaded (lazy loading)
@@ -611,7 +596,7 @@ impl Decompressor {
     ///
     /// # Example
     /// ```no_run
-    /// use ragc_core::{Decompressor, DecompressorConfig};
+    /// use ragc_reader::{Decompressor, DecompressorConfig};
     ///
     /// let dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
     ///
@@ -637,7 +622,7 @@ impl Decompressor {
     ///
     /// # Example
     /// ```no_run
-    /// use ragc_core::{Decompressor, DecompressorConfig};
+    /// use ragc_reader::{Decompressor, DecompressorConfig};
     ///
     /// let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
     ///
@@ -678,7 +663,7 @@ impl Decompressor {
     ///
     /// # Example
     /// ```no_run
-    /// use ragc_core::{Decompressor, DecompressorConfig};
+    /// use ragc_reader::{Decompressor, DecompressorConfig};
     /// use std::thread;
     ///
     /// let dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
@@ -758,7 +743,7 @@ impl Decompressor {
     ///
     /// # Example
     /// ```no_run
-    /// use ragc_core::{Decompressor, DecompressorConfig};
+    /// use ragc_reader::{Decompressor, DecompressorConfig};
     ///
     /// let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
     /// // Extract bases 100-200 from chr1
@@ -880,7 +865,7 @@ impl Decompressor {
     ///
     /// # Example
     /// ```no_run
-    /// use ragc_core::{Decompressor, DecompressorConfig};
+    /// use ragc_reader::{Decompressor, DecompressorConfig};
     ///
     /// let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
     /// let len = dec.get_contig_length("sample1", "chr1")?;
