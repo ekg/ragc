@@ -402,42 +402,14 @@ fn create_archive(
                 eprintln!();
             }
 
-            // Try indexed iterator first (fast random access if .fai exists)
-            // Fall back to buffered in-memory reordering if no index
-            #[cfg(feature = "indexed-fasta")]
-            {
-                use ragc_core::contig_iterator::IndexedPansnFileIterator;
-                match IndexedPansnFileIterator::new(input_path) {
-                    Ok(indexed_iter) => {
-                        if verbosity > 0 {
-                            eprintln!("Using indexed random access (.fai index found)");
-                            eprintln!();
-                        }
-                        compressor.add_contigs_with_splitters(Box::new(indexed_iter))?;
-                    }
-                    Err(_) => {
-                        // No index, use buffered approach
-                        use ragc_core::contig_iterator::BufferedPansnFileIterator;
-                        if verbosity > 0 {
-                            eprintln!("Using buffered in-memory reordering (no .fai index)");
-                            eprintln!();
-                        }
-                        let iterator = BufferedPansnFileIterator::new(input_path)?;
-                        compressor.add_contigs_with_splitters(Box::new(iterator))?;
-                    }
-                }
+            // Use buffered in-memory reordering
+            use ragc_core::contig_iterator::BufferedPansnFileIterator;
+            if verbosity > 0 {
+                eprintln!("Using buffered in-memory reordering");
+                eprintln!();
             }
-
-            #[cfg(not(feature = "indexed-fasta"))]
-            {
-                use ragc_core::contig_iterator::BufferedPansnFileIterator;
-                if verbosity > 0 {
-                    eprintln!("Using buffered in-memory reordering");
-                    eprintln!();
-                }
-                let iterator = BufferedPansnFileIterator::new(input_path)?;
-                compressor.add_contigs_with_splitters(Box::new(iterator))?;
-            }
+            let iterator = BufferedPansnFileIterator::new(input_path)?;
+            compressor.add_contigs_with_splitters(Box::new(iterator))?;
         } else {
             // Single-sample file: use filename as sample name, with splitter-based segmentation
             if verbosity > 0 {
@@ -496,7 +468,10 @@ fn getset_command(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
 
-    let config = DecompressorConfig { verbosity };
+    let config = DecompressorConfig {
+        verbosity,
+        ..Default::default()
+    };
     let mut decompressor = Decompressor::open(archive_str, config)?;
 
     // Determine which samples to extract
@@ -555,8 +530,7 @@ fn listset_command(archive: PathBuf, output: Option<PathBuf>) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
 
-    let config = DecompressorConfig { verbosity: 0 };
-    let decompressor = Decompressor::open(archive_str, config)?;
+    let decompressor = Decompressor::open(archive_str, DecompressorConfig::default())?;
 
     let samples = decompressor.list_samples();
 
@@ -579,8 +553,7 @@ fn listctg_command(archive: PathBuf, samples: Vec<String>, output: Option<PathBu
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
 
-    let config = DecompressorConfig { verbosity: 0 };
-    let mut decompressor = Decompressor::open(archive_str, config)?;
+    let mut decompressor = Decompressor::open(archive_str, DecompressorConfig::default())?;
 
     let mut output_lines = Vec::new();
 

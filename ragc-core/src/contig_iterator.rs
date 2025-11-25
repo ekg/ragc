@@ -16,9 +16,6 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "indexed-fasta")]
-use faigz_rs::{FastaFormat, FastaIndex, FastaReader};
-
 /// Trait for iterating over contigs from various input sources
 pub trait ContigIterator {
     /// Get the next contig. Returns None when no more contigs.
@@ -194,22 +191,7 @@ impl PansnFileIterator {
             let index_path = format!("{}.fai", file_path.display());
             let has_index = std::path::Path::new(&index_path).exists();
 
-            #[cfg(feature = "indexed-fasta")]
-            {
-                if has_index {
-                    return Err(anyhow!(
-                        "Samples are not contiguously ordered in file: {}\n\
-                        \n\
-                        For C++ AGC compatibility, samples must appear in contiguous blocks.\n\
-                        \n\
-                        This file has an index, so you can use random access.\n\
-                        Use IndexedPansnFileIterator::new() instead of PansnFileIterator::new()\n\
-                        Or enable automatic detection in your code.",
-                        file_path.display()
-                    ));
-                }
-            }
-
+            let _ = has_index; // suppress unused warning
             return Err(anyhow!(
                 "Samples are not contiguously ordered in file: {}\n\
                 \n\
@@ -388,116 +370,6 @@ impl ContigIterator for BufferedPansnFileIterator {
             contig_name.clone(),
             contig.clone(),
         )))
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        self.current_sample_idx = 0;
-        self.current_contig_idx = 0;
-        Ok(())
-    }
-}
-
-/// Iterator for indexed PanSN FASTA files with random access
-/// Uses faigz-rs to read contigs in sample-grouped order even if file is out-of-order
-#[cfg(feature = "indexed-fasta")]
-pub struct IndexedPansnFileIterator {
-    // Field is intentionally kept to prevent dangling pointer in reader
-    #[allow(dead_code)]
-    index: FastaIndex, // Must keep index alive for reader
-    reader: FastaReader,
-    order_info: SampleOrderInfo,
-    current_sample_idx: usize,
-    current_contig_idx: usize,
-}
-
-#[cfg(feature = "indexed-fasta")]
-impl IndexedPansnFileIterator {
-    /// Create a new indexed iterator for a PanSN FASTA file
-    /// Requires the file to be bgzip-compressed with a .fai index
-    pub fn new(file_path: &Path) -> Result<Self> {
-        // Check for index file
-        let index_path = format!("{}.fai", file_path.display());
-        if !std::path::Path::new(&index_path).exists() {
-            return Err(anyhow!(
-                "Index file not found: {}\n\
-                To use indexed random access, create an index with:\n  \
-                samtools faidx {}",
-                index_path,
-                file_path.display()
-            ));
-        }
-
-        // Analyze sample ordering FIRST (reads .fai file header-only, fast)
-        let order_info = SampleOrderInfo::analyze_file(file_path)?;
-
-        // Load the index
-        let index = FastaIndex::new(
-            file_path.to_str().ok_or_else(|| anyhow!("Invalid path"))?,
-            FastaFormat::Fasta,
-        )
-        .with_context(|| format!("Failed to load FASTA index for {}", file_path.display()))?;
-
-        // Create the reader once and reuse it for all fetches
-        let reader = FastaReader::new(&index).with_context(|| "Failed to create FASTA reader")?;
-
-        Ok(IndexedPansnFileIterator {
-            index, // Store index to keep it alive
-            reader,
-            order_info,
-            current_sample_idx: 0,
-            current_contig_idx: 0,
-        })
-    }
-}
-
-#[cfg(feature = "indexed-fasta")]
-impl ContigIterator for IndexedPansnFileIterator {
-    fn next_contig(&mut self) -> Result<Option<(String, String, Contig)>> {
-        // Loop to find next sample with contigs (handles empty samples)
-        loop {
-            // Check if we've exhausted all samples
-            if self.current_sample_idx >= self.order_info.sample_order.len() {
-                return Ok(None);
-            }
-
-            let sample_name = &self.order_info.sample_order[self.current_sample_idx];
-            let contigs = self
-                .order_info
-                .sample_contigs
-                .get(sample_name)
-                .ok_or_else(|| anyhow!("Sample not found: {sample_name}"))?;
-
-            // Check if we've exhausted contigs for this sample
-            if self.current_contig_idx >= contigs.len() {
-                // Move to next sample
-                self.current_sample_idx += 1;
-                self.current_contig_idx = 0;
-                continue; // Loop to next sample instead of recursion
-            }
-
-            // Fetch the contig using random access
-            let full_header = &contigs[self.current_contig_idx];
-            self.current_contig_idx += 1;
-
-            // Use faigz-rs to fetch the sequence (reusing the reader)
-            let sequence = self
-                .reader
-                .fetch_seq_all(full_header)
-                .with_context(|| format!("Failed to fetch sequence for {full_header}"))?;
-
-            // Convert ASCII nucleotides to 0-3 encoding
-            use crate::genome_io::CNV_NUM;
-            let mut contig = Contig::with_capacity(sequence.len());
-            for byte in sequence.as_bytes() {
-                if (*byte as usize) < CNV_NUM.len() {
-                    contig.push(CNV_NUM[*byte as usize]);
-                } else {
-                    contig.push(4); // N for invalid characters
-                }
-            }
-
-            return Ok(Some((sample_name.clone(), full_header.clone(), contig)));
-        }
     }
 
     fn reset(&mut self) -> Result<()> {

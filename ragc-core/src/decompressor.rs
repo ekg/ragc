@@ -10,7 +10,7 @@ use ragc_common::{
     stream_delta_name, stream_ref_name, Archive, CollectionV3, Contig, SegmentDesc, AGC_FILE_MAJOR,
     AGC_FILE_MINOR, CONTIG_SEPARATOR,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::Path;
 
@@ -18,11 +18,16 @@ use std::path::Path;
 #[derive(Debug, Clone)]
 pub struct DecompressorConfig {
     pub verbosity: u32,
+    /// Maximum number of cached reference segments (0 = unlimited)
+    pub max_segment_cache_entries: usize,
 }
 
 impl Default for DecompressorConfig {
     fn default() -> Self {
-        DecompressorConfig { verbosity: 1 }
+        DecompressorConfig {
+            verbosity: 1,
+            max_segment_cache_entries: 0, // Unlimited by default
+        }
     }
 }
 
@@ -57,8 +62,9 @@ pub struct Decompressor {
     archive: Archive,
     collection: CollectionV3,
 
-    // Cached segment data (group_id -> reference segment)
+    // Cached segment data (group_id -> reference segment) with LRU tracking
     segment_cache: HashMap<u32, Contig>,
+    cache_order: VecDeque<u32>, // LRU order: front = oldest, back = newest
 
     // Archive parameters
     _segment_size: u32,
@@ -110,6 +116,7 @@ impl Decompressor {
             archive,
             collection,
             segment_cache: HashMap::new(),
+            cache_order: VecDeque::new(),
             _segment_size: segment_size,
             kmer_length,
             min_match_len,
@@ -295,6 +302,34 @@ impl Decompressor {
             .collect()
     }
 
+    /// Insert a segment into the cache with LRU eviction
+    fn cache_insert(&mut self, group_id: u32, segment: Contig) {
+        let max = self.config.max_segment_cache_entries;
+        if max > 0 {
+            // Evict oldest entries if at capacity
+            while self.segment_cache.len() >= max {
+                if let Some(oldest) = self.cache_order.pop_front() {
+                    self.segment_cache.remove(&oldest);
+                }
+            }
+        }
+        if !self.segment_cache.contains_key(&group_id) {
+            self.cache_order.push_back(group_id);
+        }
+        self.segment_cache.insert(group_id, segment);
+    }
+
+    /// Get a segment from the cache
+    fn cache_get(&self, group_id: u32) -> Option<Contig> {
+        self.segment_cache.get(&group_id).cloned()
+    }
+
+    /// Clear the segment cache to free memory
+    pub fn clear_segment_cache(&mut self) {
+        self.segment_cache.clear();
+        self.cache_order.clear();
+    }
+
     /// Reconstruct a contig from its segment descriptors
     fn reconstruct_contig(&mut self, segments: &[SegmentDesc]) -> Result<Contig> {
         let mut contig = Contig::new();
@@ -442,13 +477,13 @@ impl Decompressor {
                     );
                 }
 
-                // Cache the reference
-                self.segment_cache.insert(desc.group_id, decompressed_ref);
+                // Cache the reference with LRU eviction
+                self.cache_insert(desc.group_id, decompressed_ref);
             }
 
             // If this IS the reference (in_group_id == 0), return it directly
             if desc.in_group_id == 0 {
-                return Ok(self.segment_cache.get(&desc.group_id).unwrap().clone());
+                return Ok(self.cache_get(desc.group_id).unwrap());
             }
 
             // Otherwise, load LZ-encoded segment from delta stream
