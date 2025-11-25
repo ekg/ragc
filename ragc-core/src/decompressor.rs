@@ -60,9 +60,6 @@ pub struct Decompressor {
     // Cached segment data (group_id -> reference segment)
     segment_cache: HashMap<u32, Contig>,
 
-    // Track which contig batches have been loaded
-    loaded_contig_batches: std::collections::HashSet<usize>,
-
     // Archive parameters
     _segment_size: u32,
     kmer_length: u32,
@@ -110,7 +107,6 @@ impl Decompressor {
             archive,
             collection,
             segment_cache: HashMap::new(),
-            loaded_contig_batches: std::collections::HashSet::new(),
             _segment_size: segment_size,
             kmer_length,
             min_match_len,
@@ -174,9 +170,8 @@ impl Decompressor {
         let num_batches = self.collection.get_contig_stream_num_batches(&self.archive)?;
 
         for batch_id in 0..num_batches {
-            if !self.loaded_contig_batches.contains(&batch_id) {
+            if !self.collection.is_contig_batch_loaded(batch_id) {
                 self.collection.load_contig_batch(&mut self.archive, batch_id)?;
-                self.loaded_contig_batches.insert(batch_id);
             }
         }
         Ok(())

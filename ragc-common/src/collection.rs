@@ -455,6 +455,11 @@ impl CollectionV3 {
         Ok(archive.get_num_parts(stream_id))
     }
 
+    /// Check if a contig batch has been loaded
+    pub fn is_contig_batch_loaded(&self, batch_id: usize) -> bool {
+        self.batch_sample_counts.contains_key(&batch_id)
+    }
+
     /// Get number of contigs in a sample
     pub fn get_no_contigs(&self, sample_name: &str) -> Option<usize> {
         self.sample_ids
