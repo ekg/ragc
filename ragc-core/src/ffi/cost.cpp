@@ -439,12 +439,7 @@ extern "C" int agc_decide_split(
         if (s < best_sum) { best_sum = s; best_pos = (uint32_t)idx; }
     }
 
-    // No-split cost
-    uint64_t total_left = v1.back();
-    uint64_t total_right = v2.front();
-    uint64_t nosplit_best = total_left < total_right ? total_left : total_right;
-
-    // Degenerate forcing
+    // Degenerate forcing (matches C++ AGC agc_compressor.cpp:1616-1619)
     if (best_pos < k + 1u) best_pos = 0;
     if ((size_t)best_pos + k + 1u > v1.size()) best_pos = (uint32_t)v1.size();
     *out_best_pos = best_pos;
@@ -453,6 +448,10 @@ extern "C" int agc_decide_split(
     uint32_t half = should_reverse ? ((k + 1u) >> 1) : (k >> 1);
     uint32_t seg2_start = 0; if (best_pos > half) seg2_start = best_pos - half; *out_seg2_start = seg2_start;
 
-    *out_should_split = (best_sum < nosplit_best) ? 1 : 0;
+    // CRITICAL FIX: C++ AGC does NOT check compression efficiency!
+    // It always splits when a middle k-mer is found (agc_compressor.cpp:1395)
+    // The previous code incorrectly added: (best_sum < nosplit_best) ? 1 : 0
+    // which rejected splits that C++ AGC would accept.
+    *out_should_split = 1;
     return 1;
 }
