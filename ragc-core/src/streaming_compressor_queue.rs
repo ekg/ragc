@@ -62,23 +62,24 @@ impl Default for StreamingQueueConfig {
 ///
 /// Priority ordering matches C++ AGC:
 /// - Higher sample_priority first (sample1 > sample2 > sample3...)
-/// - Within same sample, larger cost (contig size) first
+/// - Within same sample, lexicographic contig_name order (chrI before chrII)
 #[derive(Clone)]
 struct ContigTask {
     sample_name: String,
     contig_name: String,
     data: Contig, // Vec<u8>
     sample_priority: i32, // Higher = process first (decreases for each sample)
-    cost: usize,  // Contig size in bytes
+    #[allow(dead_code)]
+    cost: usize,  // Contig size in bytes (kept for future use)
 }
 
 // Implement priority ordering for BinaryHeap (max-heap)
 // BinaryHeap pops the "greatest" element, so we want:
 // - Higher sample_priority = greater
-// - Larger cost = greater (within same sample_priority)
+// - REVERSE lexicographic contig_name = greater (so chrI comes out before chrII)
 impl PartialEq for ContigTask {
     fn eq(&self, other: &Self) -> bool {
-        self.sample_priority == other.sample_priority && self.cost == other.cost
+        self.sample_priority == other.sample_priority && self.contig_name == other.contig_name
     }
 }
 
@@ -95,8 +96,9 @@ impl Ord for ContigTask {
         // First compare by sample_priority (higher priority first)
         match self.sample_priority.cmp(&other.sample_priority) {
             std::cmp::Ordering::Equal => {
-                // Then by cost (larger cost first)
-                self.cost.cmp(&other.cost)
+                // Then by contig_name (REVERSE lexicographic so smaller names pop first)
+                // C++ AGC processes contigs in FASTA order, which is lexicographic
+                other.contig_name.cmp(&self.contig_name)
             }
             other_ord => other_ord,
         }
@@ -253,6 +255,7 @@ pub struct StreamingQueueCompressor {
     // When sample changes, we flush pending segments and clear batch-local state
     current_batch_sample: Arc<Mutex<Option<String>>>, // Current sample being processed
     batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>, // Batch-local m_kmers equivalent
+    batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>, // Batch-local terminators - only merged to global at batch end
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>, // Buffer segments until batch boundary
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
 }
@@ -391,6 +394,7 @@ impl StreamingQueueCompressor {
         // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
         let current_batch_sample: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
         let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Spawn worker threads
@@ -412,6 +416,7 @@ impl StreamingQueueCompressor {
             let grouping_engine = Arc::clone(&grouping_engine);
             let current_batch_sample = Arc::clone(&current_batch_sample);
             let batch_local_groups = Arc::clone(&batch_local_groups);
+            let batch_local_terminators = Arc::clone(&batch_local_terminators);
             let pending_batch_segments = Arc::clone(&pending_batch_segments);
             let config = config.clone();
 
@@ -434,6 +439,7 @@ impl StreamingQueueCompressor {
                     grouping_engine,
                     current_batch_sample,
                     batch_local_groups,
+                    batch_local_terminators,
                     pending_batch_segments,
                     config,
                 )
@@ -467,6 +473,7 @@ impl StreamingQueueCompressor {
             next_priority,
             current_batch_sample,
             batch_local_groups,
+            batch_local_terminators,
             pending_batch_segments,
         })
     }
@@ -532,6 +539,7 @@ impl StreamingQueueCompressor {
                 let grouping_engine = Arc::clone(&self.grouping_engine);
                 let current_batch_sample = Arc::clone(&self.current_batch_sample);
                 let batch_local_groups = Arc::clone(&self.batch_local_groups);
+                let batch_local_terminators = Arc::clone(&self.batch_local_terminators);
                 let pending_batch_segments = Arc::clone(&self.pending_batch_segments);
                 let config = self.config.clone();
 
@@ -554,6 +562,7 @@ impl StreamingQueueCompressor {
                         grouping_engine,
                         current_batch_sample,
                         batch_local_groups,
+                        batch_local_terminators,
                         pending_batch_segments,
                         config,
                     )
@@ -1293,9 +1302,10 @@ fn flush_batch(
     _segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     _pending_batch_segments: &Arc<Mutex<Vec<PendingSegment>>>,
     batch_local_groups: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    batch_local_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     _group_counter: &Arc<AtomicU32>,
-    _map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     _archive: &Arc<Mutex<Archive>>,
     _collection: &Arc<Mutex<CollectionV3>>,
     _reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
@@ -1305,8 +1315,9 @@ fn flush_batch(
 ) -> Result<()> {
     // Get batch-local groups
     let batch_map = batch_local_groups.lock().unwrap();
+    let batch_terms = batch_local_terminators.lock().unwrap();
 
-    if batch_map.is_empty() {
+    if batch_map.is_empty() && batch_terms.is_empty() {
         if config.verbosity > 0 {
             eprintln!("FLUSH_BATCH: No pending groups to flush");
         }
@@ -1314,7 +1325,8 @@ fn flush_batch(
     }
 
     if config.verbosity > 0 {
-        eprintln!("FLUSH_BATCH: Updating global registry with {} batch-local groups", batch_map.len());
+        eprintln!("FLUSH_BATCH: Updating global registry with {} batch-local groups, {} terminator keys",
+            batch_map.len(), batch_terms.len());
     }
 
     // Update global registry with this batch's new groups
@@ -1326,9 +1338,23 @@ fn flush_batch(
         }
     }
 
+    // CRITICAL: Merge batch-local terminators into global terminators
+    // This is where C++ AGC makes terminators visible for find_middle in subsequent samples
+    {
+        let mut global_terms = map_segments_terminators.lock().unwrap();
+        for (kmer, connections) in batch_terms.iter() {
+            let entry = global_terms.entry(*kmer).or_insert_with(Vec::new);
+            entry.extend(connections.iter().cloned());
+            entry.sort_unstable();
+            entry.dedup();
+        }
+    }
+
     // Clear batch-local state (like C++ AGC destroying m_kmers)
     drop(batch_map);
+    drop(batch_terms);
     batch_local_groups.lock().unwrap().clear();
+    batch_local_terminators.lock().unwrap().clear();
 
     if config.verbosity > 0 {
         eprintln!("FLUSH_BATCH: Batch flush complete, batch-local state cleared");
@@ -1356,6 +1382,7 @@ fn worker_thread(
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     current_batch_sample: Arc<Mutex<Option<String>>>,
     batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
@@ -1372,6 +1399,7 @@ fn worker_thread(
                 &segment_groups,
                 &pending_batch_segments,
                 &batch_local_groups,
+                &batch_local_terminators,
                 &map_segments,
                 &group_counter,
                 &map_segments_terminators,
@@ -1407,6 +1435,7 @@ fn worker_thread(
                         &segment_groups,
                         &pending_batch_segments,
                         &batch_local_groups,
+                        &batch_local_terminators,
                         &map_segments,
                         &group_counter,
                         &map_segments_terminators,
@@ -1589,18 +1618,11 @@ fn worker_thread(
                 let split_allowed = if std::env::var("RAGC_SPLIT_ALL").as_deref() == Ok("0") { !key_exists } else { true };
                 if split_allowed && key_front != MISSING_KMER && key_back != MISSING_KMER {
                     // CRITICAL: First attempt to find middle splitter
+                    // Use ONLY global terminators (not batch-local) to match C++ AGC behavior
+                    // C++ AGC only sees terminators from previous batches, not the current one
                     let middle_kmer_opt = {
-                        #[cfg(feature = "ffi_cost")]
-                        {
-                            // Use C++ AGC grouping engine for perfect parity
-                            let eng = grouping_engine.lock().unwrap();
-                            eng.find_middle(key_front, key_back)
-                        }
-                        #[cfg(not(feature = "ffi_cost"))]
-                        {
-                            let terminators = map_segments_terminators.lock().unwrap();
-                            find_middle_splitter(key_front, key_back, &terminators)
-                        }
+                        let terminators = map_segments_terminators.lock().unwrap();
+                        find_middle_splitter(key_front, key_back, &terminators)
                     };
 
                     if config.verbosity > 0 {
@@ -1760,9 +1782,10 @@ fn worker_thread(
                                             let mut eng = grouping_engine.lock().unwrap();
                                             eng.register_group(left_key.kmer_front, left_key.kmer_back, group_id);
                                         }
-                                        // Update terminators map for new group edge
+                                        // Update BATCH-LOCAL terminators map for new group edge
+                                        // These will be merged to global at batch end (matches C++ AGC behavior)
                                         if left_key.kmer_front != MISSING_KMER && left_key.kmer_back != MISSING_KMER {
-                                            let mut term_map = map_segments_terminators.lock().unwrap();
+                                            let mut term_map = batch_local_terminators.lock().unwrap();
                                             term_map.entry(left_key.kmer_front).or_insert_with(Vec::new).push(left_key.kmer_back);
                                             if left_key.kmer_front != left_key.kmer_back {
                                                 term_map.entry(left_key.kmer_back).or_insert_with(Vec::new).push(left_key.kmer_front);
@@ -1808,9 +1831,10 @@ fn worker_thread(
                                             let mut eng = grouping_engine.lock().unwrap();
                                             eng.register_group(right_key.kmer_front, right_key.kmer_back, group_id);
                                         }
-                                        // Update terminators map for new group edge
+                                        // Update BATCH-LOCAL terminators map for new group edge
+                                        // These will be merged to global at batch end (matches C++ AGC behavior)
                                         if right_key.kmer_front != MISSING_KMER && right_key.kmer_back != MISSING_KMER {
-                                            let mut term_map = map_segments_terminators.lock().unwrap();
+                                            let mut term_map = batch_local_terminators.lock().unwrap();
                                             term_map.entry(right_key.kmer_front).or_insert_with(Vec::new).push(right_key.kmer_back);
                                             if right_key.kmer_front != right_key.kmer_back {
                                                 term_map.entry(right_key.kmer_back).or_insert_with(Vec::new).push(right_key.kmer_front);
@@ -2006,10 +2030,11 @@ fn worker_thread(
                         eng.register_group(key.kmer_front, key.kmer_back, group_id);
                     }
 
-                    // Update terminators map (matches C++ AGC agc_compressor.cpp:1017-1023)
-                    // This is CRITICAL for split functionality - without this, find_middle_splitter() returns None!
+                    // Update BATCH-LOCAL terminators map for new group edge
+                    // These will be merged to global at batch end (matches C++ AGC behavior)
+                    // This is CRITICAL for split functionality - terminators enable find_middle_splitter()
                     if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                        let mut term_map = map_segments_terminators.lock().unwrap();
+                        let mut term_map = batch_local_terminators.lock().unwrap();
 
                         // Add bidirectional edge: front -> back
                         term_map.entry(key.kmer_front)
@@ -2024,15 +2049,14 @@ fn worker_thread(
                         }
 
                         // Sort to maintain sorted order for set_intersection
-                        // C++ AGC sorts immediately after each insertion (line 1018, 1023)
                         if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
                             front_vec.sort_unstable();
-                            front_vec.dedup();  // Remove duplicates
+                            front_vec.dedup();
                         }
                         if key.kmer_front != key.kmer_back {
                             if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
                                 back_vec.sort_unstable();
-                                back_vec.dedup();  // Remove duplicates
+                                back_vec.dedup();
                             }
                         }
                     }
@@ -2054,39 +2078,20 @@ fn worker_thread(
                     let ref_stream_id = arch.register_stream(&ref_stream_name);
                     drop(arch);
 
-                    // Phase 1: Track segment terminators for splitting
-                    // (matches C++ AGC agc_compressor.cpp lines 1319-1334)
-                    // NOTE: map_segments insert already done atomically above - skip duplicate insert
-                    {
-                        use crate::segment::MISSING_KMER;
-
-                        // Track k-mer connections (only if both are not MISSING)
-                        if key_front != MISSING_KMER && key_back != MISSING_KMER {
-                            let mut terminators = map_segments_terminators.lock().unwrap();
-
-                            // Add bidirectional connection
-                            terminators.entry(key_front).or_insert_with(Vec::new).push(key_back);
-                            if key_front != key_back {
-                                terminators.entry(key_back).or_insert_with(Vec::new).push(key_front);
-                            }
-
-                            // Keep vectors sorted and deduplicated for efficient set intersection
-                            // (C++ AGC uses sorted vectors for set_intersection in lines 1541-1543)
-                            if let Some(vec) = terminators.get_mut(&key_front) {
-                                vec.sort_unstable();
-                                vec.dedup();
-                            }
-                            if key_front != key_back {
-                                if let Some(vec) = terminators.get_mut(&key_back) {
-                                    vec.sort_unstable();
-                                    vec.dedup();
-                                }
-                            }
-                        }
-                    }
+                    // NOTE: Terminator updates already done in batch_local_terminators above
+                    // Removed redundant duplicate block here
 
                     SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                 });
+
+                // CSV logging for ALL segment grouping decisions (enabled via RAGC_GROUP_LOG=1)
+                // This logs every segment, including those joining existing batch-local groups
+                if std::env::var("RAGC_GROUP_LOG").as_deref() == Ok("1") {
+                    let source = if key_exists { "global" } else { "batch_or_new" };
+                    eprintln!("SEGMENT_GROUP,{},{},{},{},{},{},{},{}",
+                        task.sample_name, task.contig_name, place,
+                        key.kmer_front, key.kmer_back, should_reverse, source, buffer.group_id);
+                }
 
                 if key_exists && config.verbosity > 1 {
                     eprintln!("REUSE_GROUP: group_id={} front={} back={} sample={}",
