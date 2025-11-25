@@ -2171,8 +2171,11 @@ fn worker_thread(
                 // C++ AGC only attempts splits when key doesn't exist (agc_compressor.cpp:1367)
                 // This is the condition: p == map_segments.end() && both k-mers valid && both in terminators
                 // Set RAGC_SPLIT_ALL=1 to try splitting even when key exists (experimental)
+                // CRITICAL: C++ AGC lines 1374-1378 skip segment splitting when front == back!
+                // When front == back, it just sets store_rc based on orientation, does NOT call
+                // find_cand_segment_with_missing_middle_splitter. We must do the same.
                 let split_allowed = if std::env::var("RAGC_SPLIT_ALL").as_deref() == Ok("1") { true } else { !key_exists };
-                if split_allowed && key_front != MISSING_KMER && key_back != MISSING_KMER {
+                if split_allowed && key_front != MISSING_KMER && key_back != MISSING_KMER && key_front != key_back {
                     // CRITICAL: First attempt to find middle splitter
                     // Use ONLY global terminators (not batch-local) to match C++ AGC behavior
                     // C++ AGC only sees terminators from previous batches, not the current one
