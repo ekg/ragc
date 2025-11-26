@@ -421,9 +421,35 @@ impl LZDiff {
                     Some(total_len)
                 };
 
-                self.encode_match(match_pos - len_bck, len_to_encode, pred_pos, &mut encoded);
+                let adjusted_match_pos = match_pos - len_bck;
 
-                pred_pos = match_pos - len_bck + total_len;
+                // C++ AGC optimization (lz_diff.cpp lines 769-779): when match_pos == pred_pos,
+                // convert preceding literals that match the reference to '!' for better compression.
+                // IMPORTANT: This must be done BEFORE encode_match, so the last bytes in buffer are literals.
+                // The '!' character is decoded by looking up reference[pred_pos].
+                if adjusted_match_pos == pred_pos {
+                    let e_size = encoded.len();
+                    // C++: for (uint32_t i = 1; i < e_size && i < match_pos; ++i)
+                    let max_scan = e_size.min(adjusted_match_pos as usize);
+                    for scan_i in 1..max_scan {
+                        let enc_idx = e_size - scan_i;
+                        let c = encoded[enc_idx];
+                        // Stop if not a literal (A-Z range)
+                        if c < b'A' || c > b'Z' {
+                            break;
+                        }
+                        // Check if literal matches reference at corresponding position
+                        let base = c - b'A';
+                        let ref_idx = adjusted_match_pos as usize - scan_i;
+                        if base == self.reference[ref_idx] {
+                            encoded[enc_idx] = b'!';
+                        }
+                    }
+                }
+
+                self.encode_match(adjusted_match_pos, len_to_encode, pred_pos, &mut encoded);
+
+                pred_pos = adjusted_match_pos + total_len;
                 i += total_len as usize;
                 no_prev_literals = 0;
             } else {
