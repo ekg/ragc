@@ -25,7 +25,7 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 num_cpus = { workspace = true }
-flate2 = "1.1"
+flate2 = { workspace = true }
 
 # Optional: Alternative memory allocators
 tikv-jemallocator = { version = "0.6", optional = true }
