@@ -437,6 +437,7 @@ impl LZDiff {
 
         if debug_lz {
             eprintln!("RAGC_LZ_START: ref_len={} target_len={} min_match={}", self.reference_len, target.len(), self.min_match_len);
+            eprintln!("RAGC_LZ_ENCODING_TRACE: Starting LZ encoding");
         }
 
         let text_size = target.len();

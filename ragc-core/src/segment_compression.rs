@@ -82,14 +82,29 @@ pub fn compress_segment_configured(data: &Contig, level: i32) -> Result<PackedBl
 pub fn compress_reference_segment(data: &Contig) -> Result<(PackedBlock, u8)> {
     let repetitiveness = check_repetitiveness(data);
 
+    // Debug logging for reference compression decisions
+    let debug_ref = std::env::var("RAGC_DEBUG_REF").is_ok();
+    if debug_ref {
+        eprintln!("RAGC_REF_COMPRESS: len={} rep={:.4} threshold={:.4}",
+            data.len(), repetitiveness, REPETITIVENESS_THRESHOLD);
+    }
+
     if repetitiveness < REPETITIVENESS_THRESHOLD {
         // Low repetitiveness: use tuple packing
         let tuples = bytes_to_tuples(data);
         let compressed = zstd_pool::compress_segment_pooled(&tuples, REF_TUPLES_COMPRESSION_LEVEL)?;
+        if debug_ref {
+            eprintln!("RAGC_REF_DECISION: TUPLE_PACK marker=1 level={} tuple_len={} compressed_len={}",
+                REF_TUPLES_COMPRESSION_LEVEL, tuples.len(), compressed.len());
+        }
         Ok((compressed, 1)) // Marker 1 = tuple-packed
     } else {
         // High repetitiveness: use plain ZSTD
         let compressed = zstd_pool::compress_segment_pooled(data, REF_PLAIN_COMPRESSION_LEVEL)?;
+        if debug_ref {
+            eprintln!("RAGC_REF_DECISION: PLAIN marker=0 level={} compressed_len={}",
+                REF_PLAIN_COMPRESSION_LEVEL, compressed.len());
+        }
         Ok((compressed, 0)) // Marker 0 = plain
     }
 }
