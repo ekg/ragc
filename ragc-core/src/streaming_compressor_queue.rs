@@ -1413,13 +1413,28 @@ fn find_group_with_one_kmer(
             };
 
             // Get the reference segment for this candidate from buffer OR persistent storage
-            let ref_data_opt: Option<&[u8]> = if let Some(group_buffer) = groups.get(&cand_key) {
-                group_buffer.reference_segment.as_ref().map(|seg| seg.data.as_slice())
+            let (ref_data_opt, ref_source): (Option<&[u8]>, &str) = if let Some(group_buffer) = groups.get(&cand_key) {
+                if config.verbosity > 2 && key_front == 1244212049458757632 && key_back == 1244212049458757632 {
+                    let ref_seg = group_buffer.reference_segment.as_ref();
+                    let ref_len = ref_seg.map(|s| s.data.len()).unwrap_or(0);
+                    let ref_first5: Vec<u8> = ref_seg.map(|s| s.data.iter().take(5).cloned().collect()).unwrap_or_default();
+                    eprintln!("RAGC_REF_LOOKUP_BUFFER: degenerate key ({},{}) buffer ref_len={} ref[0..5]={:?}",
+                        key_front, key_back, ref_len, ref_first5);
+                }
+                (group_buffer.reference_segment.as_ref().map(|seg| seg.data.as_slice()), "buffer")
             } else if let Some(&group_id) = seg_map.get(&cand_key) {
-                ref_segs.get(&group_id).map(|data| data.as_slice())
+                if config.verbosity > 2 && key_front == 1244212049458757632 && key_back == 1244212049458757632 {
+                    let ref_data = ref_segs.get(&group_id);
+                    let ref_len = ref_data.map(|d| d.len()).unwrap_or(0);
+                    let ref_first5: Vec<u8> = ref_data.map(|d| d.iter().take(5).cloned().collect()).unwrap_or_default();
+                    eprintln!("RAGC_REF_LOOKUP_PERSISTENT: degenerate key ({},{}) -> group_id={} ref_len={} ref[0..5]={:?}",
+                        key_front, key_back, group_id, ref_len, ref_first5);
+                }
+                (ref_segs.get(&group_id).map(|data| data.as_slice()), "persistent")
             } else {
-                None
+                (None, "none")
             };
+            let ref_data_opt = ref_data_opt;
 
             if let Some(ref_data) = ref_data_opt {
                 // Test LZ encoding against this reference (C++ AGC line 1728: estimate())
@@ -2116,8 +2131,10 @@ fn worker_thread(
 
             let (key_front, key_back, should_reverse) =
                 if segment.front_kmer != MISSING_KMER && segment.back_kmer != MISSING_KMER {
-                    // Both k-mers present - normalize by ensuring front <= back
-                    if segment.front_kmer <= segment.back_kmer {
+                    // Both k-mers present
+                    // C++ AGC uses `<` not `<=`, which means degenerate k-mers (front == back)
+                    // go to the else branch and get store_rc=true (lines 1306-1313)
+                    if segment.front_kmer < segment.back_kmer {
                         // Already normalized - keep original orientation
                         if config.verbosity > 2 {
                             #[cfg(feature = "verbose_debug")]
@@ -2677,6 +2694,13 @@ fn worker_thread(
                     data: segment_data,
                     is_rev_comp: should_reverse,
                 };
+
+                // DEBUG: Print data for degenerate k-mer reference segments
+                if key_front == 1244212049458757632 && key_back == 1244212049458757632 && config.verbosity > 1 {
+                    let data_first5: Vec<u8> = buffered.data.iter().take(5).cloned().collect();
+                    eprintln!("RAGC_DEGENERATE_BUFFERED: sample={} contig={} part={} key=({},{}) should_reverse={} len={} data[0..5]={:?}",
+                        task.sample_name, task.contig_name, place, key_front, key_back, should_reverse, buffered.data.len(), data_first5);
+                }
 
                 // Get or create buffer for this group
                 // If group doesn't exist yet, allocate group_id using BATCH-LOCAL logic
