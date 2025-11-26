@@ -1272,12 +1272,14 @@ fn find_group_with_one_kmer(
                 if kmer_is_dir {
                     // Dir-oriented: (kmer, MISSING) with rc=false
                     if config.verbosity > 1 {
+                        #[cfg(feature = "verbose_debug")]
                         eprintln!("RAGC_CASE3_NO_CONNECTION: kmer={} is_dir=true -> ({}, MISSING) rc=false", kmer, kmer);
                     }
                     return (kmer, MISSING_KMER, false);
                 } else {
                     // NOT dir-oriented: (MISSING, kmer) with rc=true
                     if config.verbosity > 1 {
+                        #[cfg(feature = "verbose_debug")]
                         eprintln!("RAGC_CASE3_NO_CONNECTION: kmer={} is_dir=false -> (MISSING, {}) rc=true", kmer, kmer);
                     }
                     return (MISSING_KMER, kmer, true);
@@ -1287,6 +1289,7 @@ fn find_group_with_one_kmer(
     };
 
     if config.verbosity > 1 {
+        #[cfg(feature = "verbose_debug")]
         eprintln!("RAGC_CASE3_FOUND_CONNECTIONS: kmer={} connections={}",
             kmer, connected_kmers.len());
     }
@@ -1345,6 +1348,7 @@ fn find_group_with_one_kmer(
     if candidates.is_empty() {
         // No existing groups found - create new with MISSING
         if config.verbosity > 1 {
+            #[cfg(feature = "verbose_debug")]
             eprintln!("RAGC_CASE3_NO_CANDIDATES: kmer={} -> (kmer, MISSING)", kmer);
         }
         return (kmer, MISSING_KMER, false);
@@ -1540,12 +1544,14 @@ fn find_group_with_one_kmer(
         if kmer_is_dir {
             // Dir-oriented: (kmer, MISSING) with rc=false
             if config.verbosity > 1 {
+                #[cfg(feature = "verbose_debug")]
                 eprintln!("RAGC_CASE3_NO_WINNER: kmer={} is_dir=true -> ({}, MISSING) rc=false", kmer, kmer);
             }
             return (kmer, MISSING_KMER, false);
         } else {
             // NOT dir-oriented: (MISSING, kmer) with rc=true
             if config.verbosity > 1 {
+                #[cfg(feature = "verbose_debug")]
                 eprintln!("RAGC_CASE3_NO_WINNER: kmer={} is_dir=false -> (MISSING, {}) rc=true", kmer, kmer);
             }
             return (MISSING_KMER, kmer, true);
@@ -1553,6 +1559,7 @@ fn find_group_with_one_kmer(
     }
 
     if config.verbosity > 1 {
+        #[cfg(feature = "verbose_debug")]
         eprintln!("RAGC_CASE3_PICKED: kmer={} best=({},{}) rc={} estim_size={} segment_size={}",
             kmer, best_key_front, best_key_back, best_needs_rc, best_estim_size, segment_len);
     }
@@ -1677,6 +1684,7 @@ fn find_cand_segment_using_fallback_minimizers(
 
     if pruned_candidates.is_empty() {
         if config.verbosity > 1 {
+            #[cfg(feature = "verbose_debug")]
             eprintln!("RAGC_FALLBACK_NO_CANDIDATES: min_shared={}", min_shared_kmers);
         }
         return (MISSING_KMER, MISSING_KMER, false);
@@ -1693,6 +1701,7 @@ fn find_cand_segment_using_fallback_minimizers(
     pruned_candidates.retain(|c| c.0 * 2 >= best_count);
 
     if config.verbosity > 1 {
+        #[cfg(feature = "verbose_debug")]
         eprintln!("RAGC_FALLBACK_CANDIDATES: count={} best_shared={} min_shared={}",
             pruned_candidates.len(), best_count, min_shared_kmers);
     }
@@ -1701,6 +1710,7 @@ fn find_cand_segment_using_fallback_minimizers(
     if short_segments {
         let (count, (key_front, key_back)) = pruned_candidates[0];
         if config.verbosity > 1 {
+            #[cfg(feature = "verbose_debug")]
             eprintln!("RAGC_FALLBACK_SHORT_SEGMENT: key=({},{}) shared_kmers={}", key_front, key_back, count);
         }
         // Normalize: ensure front <= back
@@ -1764,6 +1774,7 @@ fn find_cand_segment_using_fallback_minimizers(
                 };
 
                 if config.verbosity > 2 {
+                    #[cfg(feature = "verbose_debug")]
                     eprintln!("RAGC_FALLBACK_ESTIMATE: key=({},{}) rc={} estimate={}",
                         norm_front, norm_back, is_seg_rc, estimate);
                 }
@@ -1788,6 +1799,7 @@ fn find_cand_segment_using_fallback_minimizers(
 
         if best_estimate >= threshold {
             if config.verbosity > 1 {
+                #[cfg(feature = "verbose_debug")]
                 eprintln!("RAGC_FALLBACK_ADAPTIVE_REJECT: estimate={} threshold={}", best_estimate, threshold);
             }
             return (MISSING_KMER, MISSING_KMER, false);
@@ -1799,11 +1811,13 @@ fn find_cand_segment_using_fallback_minimizers(
             // Normalize: ensure front <= back
             if front <= back {
                 if config.verbosity > 1 {
+                    #[cfg(feature = "verbose_debug")]
                     eprintln!("RAGC_FALLBACK_PICKED: key=({},{}) rc=false estimate={}", front, back, best_estimate);
                 }
                 (front, back, false)
             } else {
                 if config.verbosity > 1 {
+                    #[cfg(feature = "verbose_debug")]
                     eprintln!("RAGC_FALLBACK_PICKED: key=({},{}) rc=true estimate={}", back, front, best_estimate);
                 }
                 (back, front, true)
@@ -1811,6 +1825,7 @@ fn find_cand_segment_using_fallback_minimizers(
         }
         None => {
             if config.verbosity > 1 {
+                #[cfg(feature = "verbose_debug")]
                 eprintln!("RAGC_FALLBACK_NO_WINNER: no candidate beat threshold");
             }
             (MISSING_KMER, MISSING_KMER, false)
@@ -1906,12 +1921,14 @@ fn flush_batch(
     let batch_terms = batch_local_terminators.lock().unwrap();
 
     if batch_map.is_empty() && batch_terms.is_empty() {
+        #[cfg(feature = "verbose_debug")]
         if config.verbosity > 0 {
             eprintln!("FLUSH_BATCH: No pending groups to flush");
         }
         return Ok(());
     }
 
+    #[cfg(feature = "verbose_debug")]
     if config.verbosity > 0 {
         eprintln!("FLUSH_BATCH: Updating global registry with {} batch-local groups, {} terminator keys",
             batch_map.len(), batch_terms.len());
@@ -1944,6 +1961,7 @@ fn flush_batch(
     batch_local_groups.lock().unwrap().clear();
     batch_local_terminators.lock().unwrap().clear();
 
+    #[cfg(feature = "verbose_debug")]
     if config.verbosity > 0 {
         eprintln!("FLUSH_BATCH: Batch flush complete, batch-local state cleared");
     }
@@ -2018,6 +2036,7 @@ fn worker_thread(
             if current.as_ref() != Some(&task.sample_name) {
                 if current.is_some() {
                     // Batch boundary detected - flush previous batch
+                    #[cfg(feature = "verbose_debug")]
                     if config.verbosity > 0 {
                         eprintln!("BATCH_BOUNDARY: Flushing batch for sample {:?}, starting new batch for {}",
                             current, task.sample_name);
@@ -2074,6 +2093,7 @@ fn worker_thread(
             };
 
             // DEBUG: Output every segment for comparison with C++ AGC
+            #[cfg(feature = "verbose_debug")]
             eprintln!("RAGC_SEGMENT: sample={} contig={} part={} len={} front={} back={}",
                 task.sample_name, task.contig_name, place, segment.data.len(),
                 segment.front_kmer, segment.back_kmer);
@@ -2100,6 +2120,7 @@ fn worker_thread(
                     if segment.front_kmer <= segment.back_kmer {
                         // Already normalized - keep original orientation
                         if config.verbosity > 2 {
+                            #[cfg(feature = "verbose_debug")]
                             eprintln!(
                                 "RAGC_CASE2_KEEP: sample={} front={} back={} len={}",
                                 task.sample_name, segment.front_kmer, segment.back_kmer, segment.data.len()
@@ -2109,6 +2130,7 @@ fn worker_thread(
                     } else {
                         // Swap k-mers and reverse complement data
                         if config.verbosity > 2 {
+                            #[cfg(feature = "verbose_debug")]
                             eprintln!(
                                 "RAGC_CASE2_SWAP: sample={} front={} back={} -> key=({},{}) len={}",
                                 task.sample_name, segment.front_kmer, segment.back_kmer,
@@ -2121,6 +2143,7 @@ fn worker_thread(
                     // Case 3a: Only front k-mer present, back is MISSING (terminator)
                     // Match C++ AGC lines 1315-1336: reverse complement and find candidate with one splitter
                     // Use the actual is_dir_oriented value from segment detection
+                    #[cfg(feature = "verbose_debug")]
                     eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} front_is_dir={} back=MISSING -> finding best group",
                         task.sample_name, segment.front_kmer, segment.front_kmer_is_dir);
                     let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
@@ -2151,6 +2174,7 @@ fn worker_thread(
                         );
                         if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
                             if config.verbosity > 1 {
+                                #[cfg(feature = "verbose_debug")]
                                 eprintln!("RAGC_CASE3A_FALLBACK: found ({},{}) rc={}", fb_kf, fb_kb, fb_sr);
                             }
                             kf = fb_kf;
@@ -2167,6 +2191,7 @@ fn worker_thread(
                     // effectively inverting is_dir_oriented() (which checks kmer_dir <= kmer_rc).
                     // So if back_kmer was originally dir-oriented, after swap it becomes NOT dir-oriented.
                     let kmer_is_dir_after_swap = !segment.back_kmer_is_dir;
+                    #[cfg(feature = "verbose_debug")]
                     eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} back_is_dir={} -> kmer_is_dir_after_swap={}",
                         task.sample_name, segment.back_kmer, segment.back_kmer_is_dir, kmer_is_dir_after_swap);
 
@@ -2204,6 +2229,7 @@ fn worker_thread(
                         );
                         if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
                             if config.verbosity > 1 {
+                                #[cfg(feature = "verbose_debug")]
                                 eprintln!("RAGC_CASE3B_FALLBACK: found ({},{}) rc={}", fb_kf, fb_kb, !fb_sr);
                             }
                             kf = fb_kf;
@@ -2279,6 +2305,7 @@ fn worker_thread(
                         find_middle_splitter(key_front, key_back, &terminators)
                     };
 
+                    #[cfg(feature = "verbose_debug")]
                     if config.verbosity > 0 {
                         if middle_kmer_opt.is_some() {
                             eprintln!("DEBUG_SPLIT: Found middle k-mer for ({},{}) sample={}",
@@ -2322,6 +2349,7 @@ fn worker_thread(
                         // CRITICAL: C++ AGC only checks if k-mers exist as TERMINATORS (line 1379-1382)
                         // This is already validated by find_middle_splitter above!
                         // Do NOT check if groups exist - splits can create NEW groups
+                        #[cfg(feature = "verbose_debug")]
                         if config.verbosity > 0 {
                             eprintln!("DEBUG_SPLIT: Attempting cost-based split for ({},{}) sample={}",
                                 key_front, key_back, task.sample_name);
@@ -2963,6 +2991,7 @@ fn try_split_segment_with_cost(
 
         if let Some(ref_data) = ref_segments_locked.get(&segment_id) {
             // Reference exists! Prepare LZDiff on-demand
+            #[cfg(feature = "verbose_debug")]
             if config.verbosity > 0 {
                 eprintln!(
                     "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} ref_size={}",
@@ -2976,6 +3005,7 @@ fn try_split_segment_with_cost(
         } else {
             // Segment ID exists but no reference data
             // This can happen when groups don't exist yet (segment_id=0 may not have reference)
+            #[cfg(feature = "verbose_debug")]
             if config.verbosity > 0 {
                 eprintln!(
                     "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} NO REFERENCE DATA (group may not exist yet)",
@@ -3184,6 +3214,7 @@ fn try_split_segment_with_cost(
         pos
     };
 
+    #[cfg(feature = "verbose_debug")]
     if std::env::var("RAGC_DEBUG_SPLIT_MAP").is_ok() && maybe_best.is_none() {
         let start = best_pos.saturating_sub(3);
         let end = (best_pos + 4).min(v_costs1.len());

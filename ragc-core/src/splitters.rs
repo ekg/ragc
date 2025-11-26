@@ -131,6 +131,7 @@ pub fn determine_splitters_streaming(
     segment_size: usize,
 ) -> Result<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> {
     // Pass 1a: Stream through file to collect k-mers from ALL contigs (matching C++ AGC)
+    #[cfg(feature = "verbose_debug")]
     eprintln!("DEBUG: Pass 1 - Collecting k-mers from reference (streaming)...");
     let mut all_kmers = Vec::new();
     let mut reference_sample = String::new();
@@ -144,6 +145,7 @@ pub fn determine_splitters_streaming(
                 // Identify first sample#haplotype for logging
                 if reference_sample.is_empty() {
                     reference_sample = sample_name.clone();
+                    #[cfg(feature = "verbose_debug")]
                     eprintln!(
                         "DEBUG: Collecting k-mers from ALL contigs (first sample: {})",
                         reference_sample
@@ -158,16 +160,19 @@ pub fn determine_splitters_streaming(
         }
     }
 
+    #[cfg(feature = "verbose_debug")]
     eprintln!(
         "DEBUG: Collected {} k-mers (with duplicates)",
         all_kmers.len()
     );
+    #[cfg(feature = "verbose_debug")]
     eprintln!(
         "DEBUG: Vec memory usage: ~{} MB",
         all_kmers.len() * 8 / 1_000_000
     );
 
     // Pass 1b: Sort and identify duplicates/singletons
+    #[cfg(feature = "verbose_debug")]
     eprintln!("DEBUG: Sorting k-mers...");
     all_kmers.radix_sort_unstable();
 
@@ -191,17 +196,20 @@ pub fn determine_splitters_streaming(
         i = j;
     }
 
+    #[cfg(feature = "verbose_debug")]
     eprintln!("DEBUG: Found {} duplicate k-mers", duplicates.len());
 
     // Remove non-singletons
     remove_non_singletons(&mut all_kmers, 0);
     let candidates: HashSet<u64> = all_kmers.into_iter().collect();
+    #[cfg(feature = "verbose_debug")]
     eprintln!(
         "DEBUG: Found {} candidate singleton k-mers",
         candidates.len()
     );
 
     // Pass 2: Stream through file again to find actually-used splitters from ALL contigs
+    #[cfg(feature = "verbose_debug")]
     eprintln!("DEBUG: Pass 2 - Finding actually-used splitters (streaming)...");
     let mut splitters = HashSet::new();
 
@@ -219,6 +227,7 @@ pub fn determine_splitters_streaming(
         }
     }
 
+    #[cfg(feature = "verbose_debug")]
     eprintln!("DEBUG: {} actually-used splitters", splitters.len());
 
     Ok((splitters, candidates, duplicates))
@@ -253,6 +262,7 @@ fn find_actual_splitters_in_contig_named(
                 recent_kmers.push(kmer_value);
 
                 // DEBUG: Log specific k-mers we're investigating
+                #[cfg(feature = "verbose_debug")]
                 if kmer_value == 4991190226639519744 || kmer_value == 1518275220618608640 {
                     eprintln!("DEBUG_RAGC_FOUND_KMER: contig={} pos={} kmer={} current_len={} is_candidate={} will_mark={}",
                               contig_name, current_pos, kmer_value, current_len,
@@ -262,6 +272,7 @@ fn find_actual_splitters_in_contig_named(
 
                 if current_len >= segment_size && candidates.contains(&kmer_value) {
                     // This candidate is actually used!
+                    #[cfg(feature = "verbose_debug")]
                     eprintln!("DEBUG_RAGC_SPLITTER_USED: contig={} pos={} kmer={} current_len={}", contig_name, current_pos, kmer_value, current_len);
                     used_splitters.push(kmer_value);
                     current_len = 0;
@@ -278,6 +289,7 @@ fn find_actual_splitters_in_contig_named(
     // Try to add rightmost candidate k-mer
     for &kmer_value in recent_kmers.iter().rev() {
         if candidates.contains(&kmer_value) {
+            #[cfg(feature = "verbose_debug")]
             eprintln!("DEBUG_RAGC_SPLITTER_USED_RIGHTMOST: contig={} kmer={}", contig_name, kmer_value);
             used_splitters.push(kmer_value);
             break;
@@ -326,6 +338,7 @@ fn find_actual_splitters_in_contig(
 
                 if current_len >= segment_size && candidates.contains(&kmer_value) {
                     // This candidate is actually used!
+                    #[cfg(feature = "verbose_debug")]
                     eprintln!("DEBUG_RAGC_SPLITTER_USED: pos={} kmer={} current_len={}", current_pos, kmer_value, current_len);
                     used_splitters.push(kmer_value);
                     current_len = 0;
@@ -342,6 +355,7 @@ fn find_actual_splitters_in_contig(
     // Try to add rightmost candidate k-mer
     for &kmer_value in recent_kmers.iter().rev() {
         if candidates.contains(&kmer_value) {
+            #[cfg(feature = "verbose_debug")]
             eprintln!("DEBUG_RAGC_SPLITTER_USED_RIGHTMOST: kmer={}", kmer_value);
             used_splitters.push(kmer_value);
             break;

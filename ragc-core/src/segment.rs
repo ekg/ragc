@@ -140,6 +140,7 @@ pub fn split_at_splitters_with_size(
                         if debug {
                             eprintln!("  MAIN_LOOP_SPLIT: segment=[{}..{}) len={}", segment_start, segment_end, segment_data.len());
                         }
+                        #[cfg(feature = "verbose_debug")]
                         if std::env::var("RAGC_DEBUG_OVERLAP").is_ok() {
                             let first_5: Vec<u8> = segment_data.iter().take(5).copied().collect();
                             let last_5: Vec<u8> = segment_data.iter().rev().take(5).rev().copied().collect();
@@ -149,6 +150,7 @@ pub fn split_at_splitters_with_size(
                                 if seg_back == MISSING_KMER { "MISSING".to_string() } else { seg_back.to_string() },
                                 first_5, last_5);
                         } else {
+                            #[cfg(feature = "verbose_debug")]
                             eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={}",
                                 pos, kmer_value, segment_start, segment_end, segment_data.len(),
                                 if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
@@ -201,6 +203,7 @@ pub fn split_at_splitters_with_size(
             if debug {
                 eprintln!("  FINAL: segment=[{}..{}) len={}", segment_start, contig.len(), segment_data.len());
             }
+            #[cfg(feature = "verbose_debug")]
             eprintln!("RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back={}",
                 segment_start, contig.len(), segment_data.len(),
                 if final_front == MISSING_KMER { "MISSING".to_string() } else { final_front.to_string() },
@@ -215,6 +218,7 @@ pub fn split_at_splitters_with_size(
         if debug {
             eprintln!("  NO_SPLIT: Returning entire contig as single segment");
         }
+        #[cfg(feature = "verbose_debug")]
         eprintln!("RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING", contig.len());
         segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false));
     }
@@ -291,6 +295,7 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
                     let segment_data = contig[segment_start..segment_end].to_vec();
 
                     if !segment_data.is_empty() {
+                        #[cfg(feature = "verbose_debug")]
                         eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={}",
                             pos, kmer_value, segment_start, segment_end, segment_data.len(),
                             if front_kmer == MISSING_KMER { "MISSING".to_string() } else { front_kmer.to_string() },
@@ -311,6 +316,7 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
     if segment_start < contig.len() {
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
+            #[cfg(feature = "verbose_debug")]
             eprintln!("RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back=MISSING",
                 segment_start, contig.len(), segment_data.len(),
                 if front_kmer == MISSING_KMER { "MISSING".to_string() } else { front_kmer.to_string() });
@@ -320,6 +326,7 @@ pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -
 
     // If no segments were created (no splitters), return entire contig as one segment
     if segments.is_empty() {
+        #[cfg(feature = "verbose_debug")]
         eprintln!("RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING", contig.len());
         segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false));
     }

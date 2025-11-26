@@ -378,7 +378,10 @@ impl Decompressor {
     /// Reconstruct a contig from its segment descriptors
     fn reconstruct_contig(&mut self, segments: &[SegmentDesc]) -> Result<Contig> {
         let mut contig = Contig::new();
+        #[cfg(feature = "verbose_debug")]
         let should_debug = std::env::var("RAGC_DEBUG_RECONSTRUCT").is_ok() && segments.len() > 1;
+        #[cfg(not(feature = "verbose_debug"))]
+        let should_debug = false;
 
         if should_debug {
             eprintln!("DEBUG_RECONSTRUCT: {} segments, k={}", segments.len(), self.kmer_length);

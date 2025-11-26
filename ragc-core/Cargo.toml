@@ -47,6 +47,8 @@ default = []
 # Enable C++ AGC FFI for byte-identical archives and FFI cost estimation
 # This requires C++ AGC to be built and available at ../agc
 cpp_agc = []
+# Enable verbose debug output (off by default for clean output)
+verbose_debug = []
 
 [build-dependencies]
 cc = "1"
