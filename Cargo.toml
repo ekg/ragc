@@ -3,6 +3,7 @@ members = [
     "ragc-core",
     "ragc-common",
     "ragc-cli",
+    "compare_archives",
 ]
 resolver = "2"
 

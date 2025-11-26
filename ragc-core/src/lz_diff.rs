@@ -342,10 +342,16 @@ impl LZDiff {
             if let Some(ref_kmer_code) = self.get_code(&self.reference[h_pos..]) {
                 if ref_kmer_code != kmer_code {
                     // Hash collision - this position has a different k-mer
+                    if debug_lz && text_pos < 10 && probes < 3 {
+                        eprintln!("RAGC_LZ_COLLISION: text_pos={} probe={} h_pos={} kmer_mismatch", text_pos, j, h_pos);
+                    }
                     continue;
                 }
             } else {
                 // Invalid k-mer at this position (contains N)
+                if debug_lz && text_pos < 10 && probes < 3 {
+                    eprintln!("RAGC_LZ_INVALID_KMER: text_pos={} probe={} h_pos={} contains_N", text_pos, j, h_pos);
+                }
                 continue;
             }
 
@@ -384,7 +390,13 @@ impl LZDiff {
                     best_len_fwd = f_len as u32;
                     best_ref_pos = h_pos as u32;
                     min_to_update = b_len + f_len;
+                } else if debug_lz && text_pos < 10 && probes < 3 {
+                    eprintln!("RAGC_LZ_TOO_SHORT: text_pos={} probe={} h_pos={} total_len={} < min_to_update={}",
+                        text_pos, j, h_pos, b_len + f_len, min_to_update);
                 }
+            } else if debug_lz && text_pos < 10 && probes < 3 {
+                eprintln!("RAGC_LZ_FLEN_SHORT: text_pos={} probe={} h_pos={} f_len={} < key_len={}",
+                    text_pos, j, h_pos, f_len, self.key_len);
             }
         }
 
@@ -421,6 +433,8 @@ impl LZDiff {
         let mut match_count = 0u32;
         let mut literal_count = 0u32;
         let mut bang_count = 0u32;
+        let mut total_match_len = 0u64;
+        let mut nrun_count = 0u32;
 
         // Optimization: if target equals reference, return empty
         if target.len() == self.reference_len
@@ -436,7 +450,8 @@ impl LZDiff {
         }
 
         if debug_lz {
-            eprintln!("RAGC_LZ_START: ref_len={} target_len={} min_match={}", self.reference_len, target.len(), self.min_match_len);
+            eprintln!("RAGC_LZ_START: ref_len={} target_len={} min_match={} ht_lp_size={} ht_legacy_size={}",
+                self.reference_len, target.len(), self.min_match_len, self.ht_lp.len(), self.ht.len());
             eprintln!("RAGC_LZ_ENCODING_TRACE: Starting LZ encoding");
         }
 
@@ -465,6 +480,10 @@ impl LZDiff {
                 let nrun_len = self.get_nrun_len(&target[i..], text_size - i);
 
                 if nrun_len >= MIN_NRUN_LEN {
+                    if debug_lz && nrun_count < 5 {
+                        eprintln!("RAGC_LZ_NRUN: i={} len={}", i, nrun_len);
+                    }
+                    nrun_count += 1;
                     self.encode_nrun(nrun_len, &mut encoded);
                     i += nrun_len as usize;
                     no_prev_literals = 0;
@@ -538,12 +557,13 @@ impl LZDiff {
                     bang_count += bang_replacements;
                 }
 
-                if debug_lz {
+                if debug_lz && match_count < 10 {
                     eprintln!("RAGC_LZ_MATCH: i={} match_pos={} len_bck={} len_fwd={} total={} pred_pos={} bangs={}",
                         i, match_pos, len_bck, len_fwd, total_len, pred_pos, bang_replacements);
                 }
 
                 match_count += 1;
+                total_match_len += total_len as u64;
                 self.encode_match(adjusted_match_pos, len_to_encode, pred_pos, &mut encoded);
 
                 pred_pos = adjusted_match_pos + total_len;
@@ -573,8 +593,22 @@ impl LZDiff {
         }
 
         if debug_lz {
-            eprintln!("RAGC_LZ_END: matches={} literals={} bangs={} encoded_len={}",
-                match_count, literal_count, bang_count, encoded.len());
+            let avg_match_len = if match_count > 0 { total_match_len as f64 / match_count as f64 } else { 0.0 };
+            let compression_ratio = if target.len() > 0 { encoded.len() as f64 / target.len() as f64 } else { 0.0 };
+            let bases_covered_by_matches = total_match_len;
+            let bases_as_literals = literal_count as u64;
+            let coverage_pct = if target.len() > 0 { 100.0 * bases_covered_by_matches as f64 / target.len() as f64 } else { 0.0 };
+
+            eprintln!("RAGC_LZ_END: matches={} (avg_len={:.1}) literals={} nruns={} bangs={} encoded_len={}",
+                match_count, avg_match_len, literal_count, nrun_count, bang_count, encoded.len());
+            eprintln!("RAGC_LZ_SUMMARY: target_len={} match_coverage={}/{} ({:.1}%) ratio={:.3}",
+                target.len(), bases_covered_by_matches, target.len(), coverage_pct, compression_ratio);
+
+            // Warning if encoding is bloated
+            if encoded.len() > target.len() {
+                eprintln!("RAGC_LZ_WARNING: encoded LARGER than target! {} vs {} bytes (+{})",
+                    encoded.len(), target.len(), encoded.len() - target.len());
+            }
         }
 
         encoded

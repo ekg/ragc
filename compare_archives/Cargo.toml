@@ -1,0 +1,10 @@
+[package]
+name = "compare_archives"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ragc-common = { path = "../ragc-common" }
+ragc-core = { path = "../ragc-core" }
+anyhow = "1.0"
+sha2 = "0.10"
