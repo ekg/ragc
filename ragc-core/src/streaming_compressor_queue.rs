@@ -1024,6 +1024,14 @@ fn flush_pack(
             seg.data.clone()
         } else {
             // LZ-encoded segment (groups >= 16 with reference)
+            // DEBUG: Log sizes before encoding
+            if let Some(ref_seg) = &buffer.reference_segment {
+                if config.verbosity > 1 {
+                    eprintln!("  LZ encoding: group={} ref_len={} target_len={} sample={} contig={} part={}",
+                        buffer.group_id, ref_seg.data.len(), seg.data.len(),
+                        seg.sample_name, seg.contig_name, seg.seg_part_no);
+                }
+            }
             // Reuse prepared lz_diff (matching C++ AGC segment.cpp line 59: lz_diff->Encode(s, delta))
             let ragc_encoded = buffer.lz_diff.as_mut()
                 .expect("lz_diff should be prepared when reference is written")

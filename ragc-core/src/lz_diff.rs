@@ -69,6 +69,8 @@ impl LZDiff {
 
     /// Prepare the encoder with a reference sequence
     pub fn prepare(&mut self, reference: &Contig) {
+        let debug_lz = std::env::var("RAGC_DEBUG_LZ").unwrap_or_default() == "1";
+
         self.reference = reference.clone();
         self.reference_len = reference.len(); // Store original length before padding
                                               // Add padding for key_len
@@ -85,6 +87,15 @@ impl LZDiff {
 
         self.build_index();
         self.build_index_lp();
+
+        if debug_lz {
+            eprintln!("RAGC_LZ_PREPARE: ref_len={} key_len={} ht_lp_size={} ht_mask={:#x}",
+                self.reference_len, self.key_len, self.ht_lp.len(), self.ht_mask);
+            // Count non-empty slots
+            let filled = self.ht_lp.iter().filter(|&&x| x != u32::MAX).count();
+            eprintln!("RAGC_LZ_PREPARE: ht_lp filled={}/{} ({:.1}%)",
+                filled, self.ht_lp.len(), 100.0 * filled as f64 / self.ht_lp.len() as f64);
+        }
     }
 
     /// Build hash table index for k-mers in reference
@@ -298,12 +309,14 @@ impl LZDiff {
     /// Find best match using linear-probing table (exactly like C++ for cost vectors)
     fn find_best_match_lp(
         &self,
+        kmer_code: u64,
         hash: u64,
         target: &[u8],
         text_pos: usize,
         max_len: usize,
         no_prev_literals: usize,
     ) -> Option<(u32, u32, u32)> {
+        let debug_lz = std::env::var("RAGC_DEBUG_LZ").unwrap_or_default() == "1";
         if self.ht_lp.is_empty() { return None; }
 
         let mut best_ref_pos = 0u32;
@@ -312,18 +325,51 @@ impl LZDiff {
         let mut min_to_update = self.min_match_len as usize;
 
         let mut ht_pos = (hash & self.ht_mask) as usize;
+        let mut probes = 0usize;
+        let mut found_match = false;
 
         for j in 0..MAX_NO_TRIES {
             let idx = (ht_pos + j) & (self.ht_mask as usize);
             let slot = self.ht_lp[idx];
+            probes += 1;
             if slot == u32::MAX { break; }
+            found_match = true;
 
             let h_pos = (slot as usize) * HASHING_STEP;
             if h_pos >= self.reference.len() { continue; }
 
+            // CRITICAL: Verify the k-mer actually matches (not just hash collision)
+            if let Some(ref_kmer_code) = self.get_code(&self.reference[h_pos..]) {
+                if ref_kmer_code != kmer_code {
+                    // Hash collision - this position has a different k-mer
+                    continue;
+                }
+            } else {
+                // Invalid k-mer at this position (contains N)
+                continue;
+            }
+
             let ref_ptr = &self.reference[h_pos..];
             let text_ptr = &target[text_pos..];
             let f_len = Self::matching_length(text_ptr, ref_ptr, max_len);
+
+            if debug_lz && text_pos < 5 && j == 0 {
+                // Show the actual k-mer (key_len bytes) being compared
+                let kmer_len = self.key_len as usize;
+                let ref_kmer: String = ref_ptr.iter().take(kmer_len).map(|&b| {
+                    if b < 4 { (b'A' + b) as char } else { 'N' }
+                }).collect();
+                let tgt_kmer: String = text_ptr.iter().take(kmer_len).map(|&b| {
+                    if b < 4 { (b'A' + b) as char } else { 'N' }
+                }).collect();
+                let kmer_match = ref_ptr.iter().zip(text_ptr.iter()).take(kmer_len).all(|(a, b)| a == b);
+
+                eprintln!("RAGC_LZ_KMER: text_pos={} h_pos={} kmer_match={} f_len={}",
+                    text_pos, h_pos, kmer_match, f_len);
+                eprintln!("  ref_kmer[{}]: {}", kmer_len, ref_kmer);
+                eprintln!("  tgt_kmer[{}]: {}", kmer_len, tgt_kmer);
+            }
+
             if f_len >= self.key_len as usize {
                 let mut b_len = 0usize;
                 let max_back = no_prev_literals.min(h_pos).min(text_pos);
@@ -340,6 +386,11 @@ impl LZDiff {
                     min_to_update = b_len + f_len;
                 }
             }
+        }
+
+        if debug_lz && text_pos < 100 {
+            eprintln!("RAGC_LZ_LOOKUP: text_pos={} probes={} found_slot={} best_len={}",
+                text_pos, probes, found_match, best_len_bck + best_len_fwd);
         }
 
         if (best_len_bck + best_len_fwd) as usize >= self.min_match_len as usize {
@@ -365,6 +416,12 @@ impl LZDiff {
         // Typical LZ compression achieves 2-4:1, so estimate capacity as target_len / 2
         let mut encoded = Vec::with_capacity(target.len() / 2);
 
+        // Debug logging (only if RAGC_DEBUG_LZ=1)
+        let debug_lz = std::env::var("RAGC_DEBUG_LZ").unwrap_or_default() == "1";
+        let mut match_count = 0u32;
+        let mut literal_count = 0u32;
+        let mut bang_count = 0u32;
+
         // Optimization: if target equals reference, return empty
         if target.len() == self.reference_len
             && target
@@ -372,7 +429,14 @@ impl LZDiff {
                 .zip(self.reference.iter())
                 .all(|(a, b)| a == b)
         {
+            if debug_lz {
+                eprintln!("RAGC_LZ: target == reference, returning empty (len={})", target.len());
+            }
             return encoded;
+        }
+
+        if debug_lz {
+            eprintln!("RAGC_LZ_START: ref_len={} target_len={} min_match={}", self.reference_len, target.len(), self.min_match_len);
         }
 
         let text_size = target.len();
@@ -414,11 +478,12 @@ impl LZDiff {
             }
 
             // Try to find match
-            let hash = MurMur64Hash::hash(x.unwrap());
+            let kmer_code = x.unwrap();
+            let hash = MurMur64Hash::hash(kmer_code);
             let max_len = text_size - i;
 
             if let Some((match_pos, len_bck, len_fwd)) =
-                self.find_best_match_lp(hash, target, i, max_len, no_prev_literals)
+                self.find_best_match_lp(kmer_code, hash, target, i, max_len, no_prev_literals)
             {
                 // Handle backward extension
                 if len_bck > 0 {
@@ -449,6 +514,7 @@ impl LZDiff {
                 // convert preceding literals that match the reference to '!' for better compression.
                 // IMPORTANT: This must be done BEFORE encode_match, so the last bytes in buffer are literals.
                 // The '!' character is decoded by looking up reference[pred_pos].
+                let mut bang_replacements = 0u32;
                 if adjusted_match_pos == pred_pos {
                     let e_size = encoded.len();
                     // C++: for (uint32_t i = 1; i < e_size && i < match_pos; ++i)
@@ -465,10 +531,18 @@ impl LZDiff {
                         let ref_idx = adjusted_match_pos as usize - scan_i;
                         if base == self.reference[ref_idx] {
                             encoded[enc_idx] = b'!';
+                            bang_replacements += 1;
                         }
                     }
+                    bang_count += bang_replacements;
                 }
 
+                if debug_lz {
+                    eprintln!("RAGC_LZ_MATCH: i={} match_pos={} len_bck={} len_fwd={} total={} pred_pos={} bangs={}",
+                        i, match_pos, len_bck, len_fwd, total_len, pred_pos, bang_replacements);
+                }
+
+                match_count += 1;
                 self.encode_match(adjusted_match_pos, len_to_encode, pred_pos, &mut encoded);
 
                 pred_pos = adjusted_match_pos + total_len;
@@ -476,6 +550,10 @@ impl LZDiff {
                 no_prev_literals = 0;
             } else {
                 // No match, encode literal
+                if debug_lz && literal_count < 10 {
+                    eprintln!("RAGC_LZ_LITERAL: i={} base={}", i, target[i]);
+                }
+                literal_count += 1;
                 self.encode_literal(target[i], &mut encoded);
                 i += 1;
                 pred_pos += 1;
@@ -485,8 +563,17 @@ impl LZDiff {
 
         // Encode remaining bases as literals
         while i < text_size {
+            if debug_lz && literal_count < 10 {
+                eprintln!("RAGC_LZ_LITERAL_TAIL: i={} base={}", i, target[i]);
+            }
+            literal_count += 1;
             self.encode_literal(target[i], &mut encoded);
             i += 1;
+        }
+
+        if debug_lz {
+            eprintln!("RAGC_LZ_END: matches={} literals={} bangs={} encoded_len={}",
+                match_count, literal_count, bang_count, encoded.len());
         }
 
         encoded
@@ -849,11 +936,12 @@ impl LZDiff {
             }
 
             // Look up k-mer in linear-probing hash table
-            let hash = MurMur64Hash::hash(x.unwrap());
+            let kmer_code = x.unwrap();
+            let hash = MurMur64Hash::hash(kmer_code);
             let max_len = (text_size - i) as usize;
 
             if let Some((match_pos, len_bck, len_fwd)) =
-                self.find_best_match_lp(hash, target, i as usize, max_len, no_prev_literals as usize)
+                self.find_best_match_lp(kmer_code, hash, target, i as usize, max_len, no_prev_literals as usize)
             {
                 let total_len = len_bck + len_fwd;
                 // CRITICAL: C++ AGC's Estimate uses match_pos directly (NOT adjusted by len_bck)
