@@ -18,7 +18,3 @@ Thumbs.db
 # Test outputs
 *.agc
 test_output/
-
-# Local debug outputs
-tmp/
-agc/

@@ -4,51 +4,22 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
-homepage.workspace = true
-documentation.workspace = true
-keywords.workspace = true
-categories.workspace = true
-description = "Core compression and decompression algorithms for the AGC genome compression format"
+description = "Core types and archive I/O for AGC genome compression"
 build = "build.rs"
-
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[dependencies]
-# Local dependencies
-ragc-common = { path = "../ragc-common", version = "0.1.0" }
-
-# Workspace dependencies
-serde = { workspace = true }
-bincode = { workspace = true }
-zstd = { workspace = true }
-flate2 = { workspace = true }
-ahash = { workspace = true }
-hashbrown = { workspace = true }
-dashmap = { workspace = true }
-rayon = { workspace = true }
-crossbeam = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-sha2 = { workspace = true }
-
-# Direct dependencies
-byteorder = "1.5"
-rdst = "0.20"
-num_cpus = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-tempfile = "3.8"
 
 [features]
 default = []
-# Enable C++ AGC FFI for byte-identical archives and FFI cost estimation
-# This requires C++ AGC to be built and available at ../agc
+# Enable C++ AGC FFI for byte-identical archives
+# Requires C++ AGC to be built and available at ../agc
 cpp_agc = []
-# Enable verbose debug output (off by default for clean output)
-verbose_debug = []
+
+[dependencies]
+ahash = { workspace = true }
+anyhow = { workspace = true }
+zstd = { workspace = true }
 
 [build-dependencies]
+cc = { version = "1", optional = true }
+
+[target.'cfg(feature = "cpp_agc")'.build-dependencies]
 cc = "1"

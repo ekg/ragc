@@ -1,0 +1,27 @@
+[package]
+name = "ragc-writer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AGC archive compressor/writer"
+
+[dependencies]
+# Local dependencies
+ragc-core = { path = "../ragc-core", version = "0.1.0" }
+
+# Workspace dependencies
+zstd = { workspace = true }
+flate2 = { workspace = true }
+ahash = { workspace = true }
+dashmap = { workspace = true }
+rayon = { workspace = true }
+crossbeam = { workspace = true }
+anyhow = { workspace = true }
+num_cpus = { workspace = true }
+
+# Direct dependencies
+rdst = "0.20"
+
+[dev-dependencies]
+tempfile = "3.23"

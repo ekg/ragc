@@ -6,13 +6,13 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-mod inspect;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ragc_core::{
-    contig_iterator::ContigIterator, Decompressor, DecompressorConfig, MultiFileIterator,
-    StreamingQueueCompressor, StreamingQueueConfig,
+use ragc_reader::{Decompressor, DecompressorConfig};
+use ragc_writer::{
+    contig_iterator::ContigIterator, MultiFileIterator,
+    StreamingCompressor, StreamingCompressorConfig, StreamingQueueCompressor, StreamingQueueConfig,
+    determine_splitters_streaming,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -82,20 +82,6 @@ enum Commands {
         /// Accepts suffixes: K, M, G (e.g., "512M", "2G")
         #[arg(long, default_value = "2G")]
         queue_capacity: String,
-
-        /// Fallback minimizers fraction for grouping terminator segments (0.0-1.0)
-        /// When > 0, enables fallback k-mer indexing for segments with missing terminators.
-        /// Higher values (e.g., 0.1) index more k-mers for better grouping at memory cost.
-        /// Default 0.0 disables fallback minimizers (matches C++ AGC default).
-        #[arg(long, default_value_t = 0.0)]
-        fallback_frac: f64,
-
-        /// Use C++ AGC compression via FFI for byte-identical archives
-        /// This delegates the entire compression to the original C++ AGC implementation.
-        /// Requires: cargo build --features cpp_agc
-        #[cfg_attr(not(feature = "cpp_agc"), arg(hide = true))]
-        #[arg(long, default_value_t = false)]
-        cpp_agc: bool,
     },
 
     /// Display information about an AGC archive
@@ -147,74 +133,6 @@ enum Commands {
         /// Output file (default: stdout)
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
-    },
-
-    /// Inspect archive structure (groups, segments, compression details)
-    Inspect {
-        /// Input archive file path
-        archive: PathBuf,
-
-        /// Show detailed segment information
-        #[arg(short = 's', long)]
-        segments: bool,
-
-        /// Filter by specific group ID
-        #[arg(short = 'g', long)]
-        group_id: Option<u32>,
-
-        /// Show only single-segment groups (for debugging fragmentation)
-        #[arg(long)]
-        single_groups: bool,
-
-        /// Show segment layout in CSV format for comparison
-        #[arg(long)]
-        segment_layout: bool,
-
-        /// Look up segment by sample name
-        #[arg(long)]
-        sample: Option<String>,
-
-        /// Look up segment by contig name (requires --sample)
-        #[arg(long)]
-        contig: Option<String>,
-
-        /// Look up segment by index (requires --sample and --contig)
-        #[arg(long)]
-        index: Option<usize>,
-
-        /// Verbosity level (0=quiet, 1=normal, 2=verbose)
-        #[arg(short = 'v', long, default_value_t = 0)]
-        verbosity: u32,
-    },
-
-    /// Debug: extract a segment and two group references for cost verification
-    DebugCost {
-        /// Input archive file path
-        archive: PathBuf,
-        /// Sample name
-        #[arg(long)]
-        sample: String,
-        /// Contig name
-        #[arg(long)]
-        contig: String,
-        /// Segment index within contig
-        #[arg(long)]
-        index: usize,
-        /// Left group_id (k1, k_mid). If omitted, uses prev segment's group_id.
-        #[arg(long)]
-        left_group: Option<u32>,
-        /// Right group_id (k_mid, k2). If omitted, uses current segment's group_id.
-        #[arg(long)]
-        right_group: Option<u32>,
-        /// Left costs placed at prefix (true) or suffix (false)
-        #[arg(long, default_value_t = true)]
-        left_prefix: bool,
-        /// Right costs placed at prefix (true) or suffix (false)
-        #[arg(long, default_value_t = false)]
-        right_prefix: bool,
-        /// Verbosity
-        #[arg(short = 'v', long, default_value_t = 0)]
-        verbosity: u32,
     },
 }
 
@@ -287,8 +205,6 @@ fn main() -> Result<()> {
             threads,
             batch,
             queue_capacity,
-            fallback_frac,
-            cpp_agc,
         } => create_archive(
             output,
             inputs,
@@ -302,8 +218,6 @@ fn main() -> Result<()> {
             threads,
             batch,
             &queue_capacity,
-            fallback_frac,
-            cpp_agc,
         )?,
 
         Commands::Info { archive } => {
@@ -326,35 +240,6 @@ fn main() -> Result<()> {
             samples,
             output,
         } => listctg_command(archive, samples, output)?,
-
-        Commands::Inspect {
-            archive,
-            segments,
-            group_id,
-            single_groups,
-            segment_layout,
-            sample,
-            contig,
-            index,
-            verbosity,
-        } => {
-            let config = inspect::InspectConfig {
-                verbosity,
-                show_groups: true,
-                show_segments: segments,
-                group_id_filter: group_id,
-                sample_filter: sample,
-                contig_filter: contig,
-                segment_index: index,
-                show_single_segment_groups: single_groups,
-                show_segment_layout: segment_layout,
-            };
-            inspect::inspect_archive(archive, config)?
-        }
-
-        Commands::DebugCost { archive, sample, contig, index, left_group, right_group, left_prefix, right_prefix, verbosity } => {
-            debug_cost_command(archive, sample, contig, index, left_group, right_group, left_prefix, right_prefix, verbosity)?;
-        }
     }
 
     Ok(())
@@ -374,8 +259,6 @@ fn create_archive(
     threads: Option<usize>,
     batch: bool,
     queue_capacity_str: &str,
-    fallback_frac: f64,
-    cpp_agc: bool,
 ) -> Result<()> {
     // Determine thread count (use provided or auto-detect)
     let num_threads = threads.unwrap_or_else(|| {
@@ -413,54 +296,7 @@ fn create_archive(
         if concatenated {
             eprintln!("  concatenated mode: enabled (all contigs as one sample)");
         }
-        #[cfg(feature = "cpp_agc")]
-        if cpp_agc {
-            eprintln!("  C++ AGC FFI mode: enabled (byte-identical archives)");
-        }
         eprintln!();
-    }
-
-    // C++ AGC FFI mode: delegate entire compression to C++ AGC for byte-identical archives
-    #[cfg(feature = "cpp_agc")]
-    if cpp_agc {
-        if verbosity > 0 {
-            eprintln!("Using C++ AGC compression via FFI...");
-        }
-
-        // Build sample_files list: (sample_name, file_path)
-        let sample_files: Vec<(String, String)> = inputs
-            .iter()
-            .map(|p| {
-                let sample_name = extract_sample_name(p);
-                let file_path = p.to_string_lossy().to_string();
-                (sample_name, file_path)
-            })
-            .collect();
-
-        ragc_core::agc_compress_ffi::compress_with_cpp_agc(
-            &output,
-            &sample_files,
-            kmer_length,
-            segment_size,
-            min_match_len,
-            50, // pack_cardinality (default)
-            concatenated,
-            adaptive,
-            verbosity,
-            num_threads as u32,
-            0.0, // fallback_frac
-        )?;
-
-        if verbosity > 0 {
-            eprintln!("\nArchive created successfully: {output:?}");
-        }
-        return Ok(());
-    }
-
-    // Error if cpp_agc requested but feature not enabled
-    #[cfg(not(feature = "cpp_agc"))]
-    if cpp_agc {
-        anyhow::bail!("--cpp-agc requires building with: cargo build --features cpp_agc");
     }
 
     // Branch: Streaming queue mode (default) vs. batch mode (legacy)
@@ -485,7 +321,6 @@ fn create_archive(
             num_threads,
             verbosity: verbosity as usize,
             adaptive_mode: adaptive,
-            fallback_frac,
             ..StreamingQueueConfig::default()
         };
 
@@ -498,7 +333,7 @@ fn create_archive(
             eprintln!("Detecting splitters from first input file: {:?}", inputs[0]);
         }
 
-        let splitters = ragc_core::determine_splitters_streaming(
+        let splitters = determine_splitters_streaming(
             &inputs[0],
             kmer_length as usize,
             segment_size as usize,
@@ -514,45 +349,11 @@ fn create_archive(
         let mut compressor =
             StreamingQueueCompressor::with_splitters(output_str, config, splitters)?;
 
-        // CRITICAL: Process reference sample (first file) completely BEFORE other samples
-        // This matches C++ AGC architecture and ensures splits work correctly.
-        // C++ AGC loads the entire reference sample first, creating all its segment groups
-        // and terminators, then processes remaining samples. This allows splits to find
-        // target groups that already exist in map_segments.
-
-        if verbosity > 0 {
-            eprintln!("Processing reference sample (first input): {:?}", inputs[0]);
-        }
-
-        // Process ONLY the first file (reference sample)
-        let mut ref_iterator = MultiFileIterator::new(vec![inputs[0].clone()])?;
-        while let Some((sample_name, contig_name, sequence)) = ref_iterator.next_contig()? {
+        // Process all input files
+        let mut iterator = MultiFileIterator::new(inputs.clone())?;
+        while let Some((sample_name, contig_name, sequence)) = iterator.next_contig()? {
             if !sequence.is_empty() {
                 compressor.push(sample_name, contig_name, sequence)?;
-            }
-        }
-
-        // Wait for reference sample to be completely processed
-        // This ensures all reference groups and terminators are created before
-        // we start processing other samples
-        if verbosity > 0 {
-            eprintln!("Reference sample queued - waiting for processing to complete...");
-        }
-        compressor.drain()?;
-
-        if verbosity > 0 {
-            eprintln!("Reference sample complete! Processing remaining {} samples...", inputs.len() - 1);
-            eprintln!();
-        }
-
-        // Now process remaining samples
-        // At this point, all reference groups exist, so splits can happen
-        if inputs.len() > 1 {
-            let mut remaining_iterator = MultiFileIterator::new(inputs[1..].to_vec())?;
-            while let Some((sample_name, contig_name, sequence)) = remaining_iterator.next_contig()? {
-                if !sequence.is_empty() {
-                    compressor.push(sample_name, contig_name, sequence)?;
-                }
             }
         }
 
@@ -565,159 +366,96 @@ fn create_archive(
         return Ok(());
     }
 
-    Ok(())
-}
-
-fn write_bin<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
-    std::fs::create_dir_all(path.as_ref().parent().unwrap_or(Path::new(".")))?;
-    std::fs::write(path, data)?;
-    Ok(())
-}
-
-fn debug_cost_command(
-    archive: PathBuf,
-    sample: String,
-    contig: String,
-    index: usize,
-    left_group: Option<u32>,
-    right_group: Option<u32>,
-    left_prefix: bool,
-    right_prefix: bool,
-    verbosity: u32,
-) -> Result<()> {
-    let archive_str = archive.to_str().ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
-    let mut dec = Decompressor::open(archive_str, DecompressorConfig { verbosity })?;
-
-    // Load contig descriptors
-    let segments = dec.get_contig_segments_desc(&sample, &contig)?;
-    if index >= segments.len() {
-        anyhow::bail!("Index {} out of range (contig has {} segments)", index, segments.len());
-    }
-
-    let seg_desc = &segments[index];
-    let seg_data = dec.get_segment_data_by_desc(seg_desc)?;
-
-    // Auto-pick neighbor groups if not provided
-    let left_gid = if let Some(g) = left_group { g } else {
-        if index == 0 { anyhow::bail!("No left group for index 0; provide --left-group explicitly"); }
-        segments[index - 1].group_id
+    // Batch mode: regular StreamingCompressor
+    let config = StreamingCompressorConfig {
+        kmer_length,
+        segment_size,
+        min_match_len,
+        compression_level,
+        verbosity,
+        adaptive_mode: adaptive,
+        concatenated_genomes: concatenated,
+        num_threads,
+        ..StreamingCompressorConfig::default()
     };
-    let right_gid = if let Some(g) = right_group { g } else { segments[index].group_id };
 
-    let left_ref = dec.get_reference_segment(left_gid)?;
-    let right_ref = dec.get_reference_segment(right_gid)?;
+    let output_str = output
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid output path"))?;
 
-    // Write to tmp folder
-    let out_dir = PathBuf::from(format!("./tmp/cost_debug_{}_{}_{}", sample.replace('#', "_"), contig.replace('#', "_"), index));
-    std::fs::create_dir_all(&out_dir)?;
-    let seg_path = out_dir.join("segment.bin");
-    let left_path = out_dir.join("left_ref.bin");
-    let right_path = out_dir.join("right_ref.bin");
-    write_bin(&seg_path, &seg_data)?;
-    write_bin(&left_path, &left_ref)?;
-    write_bin(&right_path, &right_ref)?;
+    let mut compressor = StreamingCompressor::new(output_str, config)?;
 
-    println!("Wrote files:");
-    println!("  segment:   {} (len={})", seg_path.display(), seg_data.len());
-    println!("  left_ref:  {} (group_id={} len={})", left_path.display(), left_gid, left_ref.len());
-    println!("  right_ref: {} (group_id={} len={})", right_path.display(), right_gid, right_ref.len());
-
-    // Try run cost verifier if built
-    let verifier = PathBuf::from("./target/cost_verifier");
-    if !verifier.exists() {
-        println!("\nCost verifier not found at {}. To build it:", verifier.display());
-        println!("  scripts/build_cost_verifier.sh");
-    } else {
-        println!("\nRunning C++ verifier (left, prefix={})…", left_prefix);
-        let out = std::process::Command::new(&verifier)
-            .args([
-                if left_prefix {"1"} else {"0"},
-                left_path.to_str().unwrap(),
-                seg_path.to_str().unwrap(),
-            ])
-            .output()?;
-        std::io::stdout().write_all(&out.stdout)?;
-
-        println!("\nRunning C++ verifier (right, prefix={})…", right_prefix);
-        let out2 = std::process::Command::new(&verifier)
-            .args([
-                if right_prefix {"1"} else {"0"},
-                right_path.to_str().unwrap(),
-                seg_path.to_str().unwrap(),
-            ])
-            .output()?;
-        std::io::stdout().write_all(&out2.stdout)?;
-    }
-
-    // Compute Rust cost vectors for comparison
-    use ragc_core::LZDiff;
-    let mut lz_left = LZDiff::new(dec.min_match_len);
-    lz_left.prepare(&left_ref);
-    let mut lz_right = LZDiff::new(dec.min_match_len);
-    lz_right.prepare(&right_ref);
-
-    let mut v_left_raw = lz_left.get_coding_cost_vector(&seg_data, left_prefix);
-    let mut v_right_raw = lz_right.get_coding_cost_vector(&seg_data, right_prefix);
-    let mut v_left = v_left_raw.clone();
-    let mut v_right = v_right_raw.clone();
-
-    // Apply cumulative sums as streaming splitter does
-    // Left: always forward cumulative sum
-    let mut sum = 0u32;
-    for c in v_left.iter_mut() { sum = sum.saturating_add(*c); *c = sum; }
-
-    // Right: if suffix costs (prefix=false), we need reverse cumulative sum (right to left)
-    // Otherwise (prefix=true), forward cumulative then reverse the vector
-    if !right_prefix {
-        let mut acc = 0u32; for c in v_right.iter_mut().rev() { acc = acc.saturating_add(*c); *c = acc; }
-    } else {
-        let mut acc = 0u32; for c in v_right.iter_mut() { acc = acc.saturating_add(*c); *c = acc; }
-        v_right.reverse();
-    }
-
-    // Find best split pos by minimizing left[i] + right[i]
-    let mut best_sum = u64::MAX; let mut best_pos = 0usize;
-    for i in 0..v_left.len().min(v_right.len()) {
-        let s = (v_left[i] as u64) + (v_right[i] as u64);
-        if s < best_sum { best_sum = s; best_pos = i; }
-    }
-
-    println!("\n[RUST] RAW left len={} head20={:?}", v_left_raw.len(), &v_left_raw.iter().take(20).cloned().collect::<Vec<_>>());
-    println!("[RUST] RAW left tail20={:?}", &v_left_raw.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
-    println!("[RUST] RAW right len={} head20={:?}", v_right_raw.len(), &v_right_raw.iter().take(20).cloned().collect::<Vec<_>>());
-    println!("[RUST] RAW right tail20={:?}", &v_right_raw.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
-
-    println!("[RUST] CUM left head20={:?}", &v_left.iter().take(20).cloned().collect::<Vec<_>>());
-    println!("[RUST] CUM left tail20={:?}", &v_left.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
-    println!("[RUST] CUM right head20={:?}", &v_right.iter().take(20).cloned().collect::<Vec<_>>());
-    println!("[RUST] CUM right tail20={:?}", &v_right.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
-    println!("[RUST] best_pos={} best_sum={}", best_pos, best_sum);
-
-    // If FFI is available, compute C++ best split and show seg2_start
-    #[cfg(feature = "ffi_cost")]
-    {
-        let flm = {
-            // left group is usually (k1, k_mid), so flm indicates if k1 < k_mid
-            // We don't have k-mers here; assume forward orientation for display only
-            true
-        };
-        let mlb = true;
-        if let Some((ffi_best_pos, ffi_seg2_start)) = ragc_core::ragc_ffi::best_split(
-            &left_ref,
-            &right_ref,
-            &seg_data,
-            dec.min_match_len as u32,
-            dec.kmer_length as u32,
-            flm,
-            mlb,
-        ) {
-            println!("[FFI] best_pos={} seg2_start={}", ffi_best_pos, ffi_seg2_start);
-        } else {
-            println!("[FFI] best split unavailable (missing refs?)");
+    // Detect if we have multi-sample FASTAs (sample names in headers)
+    // or separate files (sample names from filenames)
+    if inputs.len() == 1 {
+        // Single input file - check if it's multi-sample
+        let input_path = &inputs[0];
+        if !input_path.exists() {
+            anyhow::bail!("Input file not found: {input_path:?}");
         }
+
+        let is_multi_sample = StreamingCompressor::detect_multi_sample_fasta(input_path)?;
+
+        if is_multi_sample {
+            // Multi-sample FASTA: group by sample names in headers
+            if verbosity > 0 {
+                eprintln!("Detected multi-sample FASTA format (sample#haplotype#chromosome)");
+                eprintln!("Will group contigs by sample names extracted from headers");
+                eprintln!();
+            }
+
+            // Use buffered in-memory reordering
+            use ragc_writer::contig_iterator::BufferedPansnFileIterator;
+            if verbosity > 0 {
+                eprintln!("Using buffered in-memory reordering");
+                eprintln!();
+            }
+            let iterator = BufferedPansnFileIterator::new(input_path)?;
+            compressor.add_contigs_with_splitters(Box::new(iterator))?;
+        } else {
+            // Single-sample file: use filename as sample name, with splitter-based segmentation
+            if verbosity > 0 {
+                eprintln!("Processing as single-sample file (sample name from filename)");
+                eprintln!("Using splitter-based segmentation (matching C++ AGC behavior)");
+                eprintln!();
+            }
+            let sample_name = extract_sample_name(input_path);
+            compressor.add_fasta_files_with_splitters(&[(sample_name, input_path.as_path())])?;
+        }
+    } else {
+        // Multiple input files: treat each file as a separate sample
+        // Use C++ AGC behavior: find splitters from first file only
+        if verbosity > 0 {
+            eprintln!("Processing multiple files (each file is a separate sample)");
+            eprintln!("Using first file for splitter determination (matching C++ AGC)");
+            eprintln!();
+        }
+
+        let mut file_paths_with_names = Vec::new();
+        for input_path in &inputs {
+            if !input_path.exists() {
+                eprintln!("Warning: Input file not found: {input_path:?}");
+                continue;
+            }
+            let sample_name = extract_sample_name(input_path);
+            file_paths_with_names.push((sample_name, input_path.as_path()));
+        }
+
+        compressor.add_fasta_files_with_splitters(&file_paths_with_names)?;
     }
 
-    println!("\nTo tweak inputs: change left/right groups to neighbor segment group_ids or adjust prefix flags to match orientation.");
+    // Finalize the archive
+    if verbosity > 0 {
+        eprintln!();
+        eprintln!("Finalizing archive...");
+    }
+
+    compressor.finalize()?;
+
+    if verbosity > 0 {
+        eprintln!("Archive created successfully: {output:?}");
+    }
+
     Ok(())
 }
 
@@ -732,7 +470,10 @@ fn getset_command(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
 
-    let config = DecompressorConfig { verbosity };
+    let config = DecompressorConfig {
+        verbosity,
+        ..Default::default()
+    };
     let mut decompressor = Decompressor::open(archive_str, config)?;
 
     // Determine which samples to extract
@@ -791,8 +532,7 @@ fn listset_command(archive: PathBuf, output: Option<PathBuf>) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
 
-    let config = DecompressorConfig { verbosity: 0 };
-    let decompressor = Decompressor::open(archive_str, config)?;
+    let decompressor = Decompressor::open(archive_str, DecompressorConfig::default())?;
 
     let samples = decompressor.list_samples();
 
@@ -815,8 +555,7 @@ fn listctg_command(archive: PathBuf, samples: Vec<String>, output: Option<PathBu
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
 
-    let config = DecompressorConfig { verbosity: 0 };
-    let mut decompressor = Decompressor::open(archive_str, config)?;
+    let mut decompressor = Decompressor::open(archive_str, DecompressorConfig::default())?;
 
     let mut output_lines = Vec::new();
 
