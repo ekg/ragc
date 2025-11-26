@@ -7,10 +7,6 @@ license.workspace = true
 description = "Core types and archive I/O for AGC genome compression"
 
 [dependencies]
-serde = { workspace = true }
 ahash = { workspace = true }
-hashbrown = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 zstd = { workspace = true }
-byteorder = "1.5"

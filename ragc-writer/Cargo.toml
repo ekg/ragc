@@ -11,23 +11,17 @@ description = "AGC archive compressor/writer"
 ragc-core = { path = "../ragc-core", version = "0.1.0" }
 
 # Workspace dependencies
-serde = { workspace = true }
 zstd = { workspace = true }
 flate2 = { workspace = true }
 ahash = { workspace = true }
-hashbrown = { workspace = true }
 dashmap = { workspace = true }
 rayon = { workspace = true }
 crossbeam = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
-sha2 = { workspace = true }
 num_cpus = { workspace = true }
 
 # Direct dependencies
-byteorder = "1.5"
 rdst = "0.20"
 
 [dev-dependencies]
-sha2 = { workspace = true }
 tempfile = "3.23"
