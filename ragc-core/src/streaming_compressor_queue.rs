@@ -2264,8 +2264,37 @@ fn worker_thread(
                     }
                     (kf, kb, sr)
                 } else {
-                    // Case 1 or 4: Both MISSING - use as-is
-                    (segment.front_kmer, segment.back_kmer, false)
+                    // Case 1: Both MISSING - try fallback minimizers (C++ AGC lines 1286-1298)
+                    let mut kf = MISSING_KMER;
+                    let mut kb = MISSING_KMER;
+                    let mut sr = false;
+
+                    if fallback_filter.is_enabled() {
+                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                            &segment.data,
+                            &segment_data_rc,
+                            config.k,
+                            1, // min_shared_kmers = 1 for Case 1 (matches C++ AGC line 1293)
+                            &fallback_filter,
+                            &map_fallback_minimizers,
+                            &map_segments,
+                            &segment_groups,
+                            &reference_segments,
+                            &config,
+                        );
+                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                            if config.verbosity > 1 {
+                                #[cfg(feature = "verbose_debug")]
+                                eprintln!("RAGC_CASE1_FALLBACK: sample={} found ({},{}) rc={} len={}",
+                                    task.sample_name, fb_kf, fb_kb, fb_sr, segment.data.len());
+                            }
+                            kf = fb_kf;
+                            kb = fb_kb;
+                            sr = fb_sr;
+                        }
+                    }
+
+                    (kf, kb, sr)
                 };
 
             // Create grouping key from normalized k-mers
