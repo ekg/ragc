@@ -545,13 +545,29 @@ fn create_archive(
             eprintln!();
         }
 
-        // Now process remaining samples
+        // Now process remaining samples ONE FILE AT A TIME (matching C++ AGC batch processing)
         // At this point, all reference groups exist, so splits can happen
+        // CRITICAL: Process each file separately to match C++ AGC's batch boundaries
+        // This ensures segments are added to groups in file order (not interleaved)
         if inputs.len() > 1 {
-            let mut remaining_iterator = MultiFileIterator::new(inputs[1..].to_vec())?;
-            while let Some((sample_name, contig_name, sequence)) = remaining_iterator.next_contig()? {
-                if !sequence.is_empty() {
-                    compressor.push(sample_name, contig_name, sequence)?;
+            for input_file in &inputs[1..] {
+                if verbosity > 0 {
+                    eprintln!("Processing sample file: {:?}", input_file);
+                }
+
+                let mut file_iterator = MultiFileIterator::new(vec![input_file.clone()])?;
+                while let Some((sample_name, contig_name, sequence)) = file_iterator.next_contig()? {
+                    if !sequence.is_empty() {
+                        compressor.push(sample_name, contig_name, sequence)?;
+                    }
+                }
+
+                // Drain after each file to establish batch boundary
+                // This matches C++ AGC's pack_cardinality batching
+                compressor.drain()?;
+
+                if verbosity > 0 {
+                    eprintln!("Sample complete!\n");
                 }
             }
         }

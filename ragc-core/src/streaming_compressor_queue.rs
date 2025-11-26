@@ -923,10 +923,11 @@ fn flush_pack(
 
     let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
 
-    // Sort segments to match C++ AGC (agc_compressor.h line 362: p->sort())
-    // This ensures the reference is chosen deterministically (alphabetically first sample/contig/part)
-    // instead of "whichever arrives first"
-    buffer.segments.sort();
+    // DO NOT SORT: With file-by-file batch processing (matching C++ AGC's pack_cardinality batching),
+    // segments arrive in the correct order already (file order = batch order).
+    // C++ AGC sorts WITHIN each batch BEFORE distributing to groups,
+    // so segments are already sorted when they arrive at each group.
+    // Sorting here would reorder segments from DIFFERENT batches alphabetically, which is wrong!
 
     // Write reference segment if not already written (first pack for this group)
     // Extract reference from sorted segments (matching C++ AGC: first segment after sort becomes reference)
