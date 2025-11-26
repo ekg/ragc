@@ -12,7 +12,6 @@ ragc-core = { path = "../ragc-core", version = "0.1.0" }
 
 # Workspace dependencies
 serde = { workspace = true }
-bincode = { workspace = true }
 zstd = { workspace = true }
 flate2 = { workspace = true }
 ahash = { workspace = true }

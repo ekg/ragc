@@ -8,7 +8,6 @@ description = "Core types and archive I/O for AGC genome compression"
 
 [dependencies]
 serde = { workspace = true }
-bincode = { workspace = true }
 ahash = { workspace = true }
 hashbrown = { workspace = true }
 thiserror = { workspace = true }
