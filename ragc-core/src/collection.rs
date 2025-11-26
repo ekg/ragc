@@ -478,6 +478,14 @@ impl CollectionV3 {
             .map(|&id| self.sample_desc[id].contigs.len())
     }
 
+    /// Get number of contig batches from archive
+    pub fn get_no_contig_batches(&self, archive: &Archive) -> Result<usize> {
+        let contig_stream_id = self
+            .collection_contigs_id
+            .context("collection-contigs stream not found")?;
+        Ok(archive.get_num_parts(contig_stream_id))
+    }
+
     /// Get contig list for a sample
     pub fn get_contig_list(&self, sample_name: &str) -> Option<Vec<String>> {
         self.sample_ids.get(sample_name).map(|&id| {
@@ -610,42 +618,46 @@ impl CollectionV3 {
         enc
     }
 
-    /// Decode contig name using delta from previous name (from raw bytes)
+    /// Decode contig name using delta from previous name (works with byte vectors)
+    /// IMPORTANT: Updates curr_split in-place to contain decoded components (matches C++ AGC)
+    /// Returns the decoded string
     #[allow(clippy::ptr_arg)]
-    fn decode_split(prev_split: &mut Vec<String>, curr_split_bytes: &[u8]) -> String {
-        // Split by space
-        let parts: Vec<&[u8]> = curr_split_bytes.split(|&b| b == b' ').collect();
-        let mut dec_parts = Vec::new();
+    fn decode_split_bytes(prev_split: &Vec<Vec<u8>>, curr_split: &mut Vec<Vec<u8>>) -> String {
+        let mut dec = Vec::new();
 
-        for i in 0..parts.len() {
-            if parts[i].len() == 1 && (parts[i][0] as i8) == -127 {
-                // Same component marker
-                dec_parts.push(prev_split[i].clone());
+        for i in 0..curr_split.len() {
+            if curr_split[i].len() == 1 && (curr_split[i][0] as i8) == -127 {
+                // Same component marker (-127 = byte 129)
+                dec.extend_from_slice(&prev_split[i]);
+                curr_split[i] = prev_split[i].clone();
             } else {
                 let mut cmp = Vec::new();
-                let p_bytes = prev_split[i].as_bytes();
+                let p_bytes = &prev_split[i];
                 let mut p_idx = 0;
 
-                for &byte in parts[i] {
+                for &byte in &curr_split[i] {
                     let c = byte as i8;
                     if c >= 0 {
+                        // Literal character
                         cmp.push(byte);
                         p_idx += 1;
                     } else {
-                        // Repetition count
+                        // Repetition count (negative byte value)
                         let count = -c as usize;
                         cmp.extend_from_slice(&p_bytes[p_idx..p_idx + count]);
                         p_idx += count;
                     }
                 }
 
-                let component = String::from_utf8(cmp).expect("Invalid UTF-8 in component");
-                prev_split[i] = component.clone();
-                dec_parts.push(component);
+                dec.extend_from_slice(&cmp);
+                curr_split[i] = cmp;
             }
+
+            dec.push(b' ');
         }
 
-        dec_parts.join(" ")
+        dec.pop(); // Remove final space
+        String::from_utf8(dec).expect("Invalid UTF-8 in decoded contig name")
     }
 
     /// Serialize contig names for a batch of samples
@@ -735,34 +747,40 @@ impl CollectionV3 {
             curr_sample.contigs.clear();
             curr_sample.contigs.reserve(no_contigs);
 
-            let mut prev_split = Vec::new();
+            let mut prev_split: Vec<Vec<u8>> = Vec::new();
 
             for _ in 0..no_contigs {
                 let enc_bytes = Self::decode_bytes_string(&mut ptr)?;
 
-                // Try to decode as UTF-8 first
-                let name = if let Ok(enc_str) = std::str::from_utf8(&enc_bytes) {
-                    let curr_split = Self::split_string(enc_str);
+                // CRITICAL: Match C++ AGC logic exactly!
+                // C++ AGC (collection_v3.cpp lines 519-531):
+                //   read(p, enc);  // Read encoded string (can contain bytes > 127)
+                //   curr_split = split_string(enc);  // Split by spaces
+                //   if (curr_split.size() != prev_split.size())
+                //       curr_sample.contigs[j].name = enc;  // Plain text
+                //   else
+                //       curr_sample.contigs[j].name = decode_split(prev_split, curr_split);  // Delta
+                //   prev_split = move(curr_split);  // Update to current split
+                //
+                // KEY: C++ std::string can hold arbitrary bytes, including delta-encoded bytes >127
+                // In Rust, we use Vec<u8> to preserve delta bytes until after decoding
 
-                    if prev_split.is_empty() || curr_split.len() != prev_split.len() {
-                        // Plain text (first contig or different structure)
-                        prev_split = curr_split;
-                        enc_str.to_string()
-                    } else {
-                        // Encoded with delta
-                        let decoded = Self::decode_split(&mut prev_split, &enc_bytes);
-                        prev_split = Self::split_string(&decoded);
-                        decoded
-                    }
+                // Split by spaces (keep as bytes to preserve delta encoding)
+                let mut curr_split: Vec<Vec<u8>> = enc_bytes
+                    .split(|&b| b == b' ')
+                    .map(|s| s.to_vec())
+                    .collect();
+
+                let name = if prev_split.is_empty() || curr_split.len() != prev_split.len() {
+                    // Plain text: first contig OR different number of components
+                    String::from_utf8_lossy(&enc_bytes).to_string()
                 } else {
-                    // Contains non-UTF8 bytes, must be encoded (should not happen if prev_split is empty)
-                    if prev_split.is_empty() {
-                        anyhow::bail!("Cannot decode non-UTF8 bytes without previous split");
-                    }
-                    let decoded = Self::decode_split(&mut prev_split, &enc_bytes);
-                    prev_split = Self::split_string(&decoded);
-                    decoded
+                    // Delta-encoded: decode_split_bytes updates curr_split in-place!
+                    Self::decode_split_bytes(&prev_split, &mut curr_split)
                 };
+
+                // CRITICAL: Update prev_split to curr_split (which now contains decoded bytes)
+                prev_split = curr_split;
 
                 curr_sample.contigs.push(ContigDesc::new(name));
             }

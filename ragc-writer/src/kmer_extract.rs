@@ -83,6 +83,53 @@ pub fn remove_non_singletons(vec: &mut Vec<u64>, virtual_begin: usize) {
     vec.truncate(curr_end);
 }
 
+/// Remove non-singleton k-mers from a vector, collecting duplicates
+///
+/// Like `remove_non_singletons`, but also collects the duplicated k-mers
+/// into a separate vector.
+///
+/// # Arguments
+/// * `vec` - Mutable vector of k-mers to filter (modified in place)
+/// * `duplicated` - Vector to collect duplicated k-mers (cleared and filled)
+/// * `virtual_begin` - Starting index for processing
+///
+/// # Behavior
+/// - Assumes the input vector is sorted
+/// - K-mers before `virtual_begin` are not checked and remain in the output
+/// - Modifies `vec` in place, resizing it to contain only singletons
+/// - Fills `duplicated` with k-mers appearing more than once
+pub fn remove_non_singletons_with_duplicates(
+    vec: &mut Vec<u64>,
+    duplicated: &mut Vec<u64>,
+    virtual_begin: usize,
+) {
+    duplicated.clear();
+
+    let mut curr_end = virtual_begin;
+    let mut i = virtual_begin;
+
+    while i < vec.len() {
+        // Find the end of the run of equal values
+        let mut j = i + 1;
+        while j < vec.len() && vec[i] == vec[j] {
+            j += 1;
+        }
+
+        // If this k-mer appears exactly once (singleton), keep it
+        if i + 1 == j {
+            vec[curr_end] = vec[i];
+            curr_end += 1;
+        } else {
+            // K-mer appears more than once - collect as duplicate
+            duplicated.push(vec[i]);
+        }
+
+        i = j;
+    }
+
+    vec.truncate(curr_end);
+}
+
 /// Find candidate k-mers (singletons) from a contig
 ///
 /// This is a convenience function that combines k-mer enumeration,
@@ -99,6 +146,67 @@ pub fn find_candidate_kmers(contig: &Contig, k: usize) -> Vec<u64> {
     kmers.sort_unstable();
     remove_non_singletons(&mut kmers, 0);
     kmers
+}
+
+/// Helper function: Set difference for sorted vectors
+/// Returns elements in `left` that are not in `right` (both must be sorted)
+fn set_difference_sorted(left: &[u64], right: &[u64]) -> Vec<u64> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < left.len() && j < right.len() {
+        if left[i] < right[j] {
+            result.push(left[i]);
+            i += 1;
+        } else if left[i] > right[j] {
+            j += 1;
+        } else {
+            // Equal - skip this element
+            i += 1;
+            j += 1;
+        }
+    }
+
+    // Add remaining elements from left
+    while i < left.len() {
+        result.push(left[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// Find new splitter k-mers from a contig by excluding reference k-mers
+///
+/// This function implements the k-mer filtering logic from C++ AGC's find_new_splitters():
+/// 1. Extract canonical k-mers from the contig
+/// 2. Filter to singletons only
+/// 3. Exclude k-mers that appear in reference singletons
+/// 4. Exclude k-mers that appear in reference duplicates
+///
+/// Returns: Vector of k-mer values that are novel to this contig
+pub fn find_new_splitters_kmers(
+    contig: &[u8],
+    k: u32,
+    candidate_kmers: &[u64],  // sorted reference singleton k-mers
+    candidate_kmers_offset: usize,
+    duplicated_kmers: &[u64],  // sorted reference duplicate k-mers
+) -> Vec<u64> {
+    // Step 1: Extract k-mers from contig and filter to singletons
+    let contig_vec = contig.to_vec();
+    let mut v_contig_kmers = enumerate_kmers(&contig_vec, k as usize);
+    v_contig_kmers.sort_unstable();
+    remove_non_singletons(&mut v_contig_kmers, 0);
+
+    // Step 2: Exclude k-mers in reference genome - singletons
+    let ref_singletons = &candidate_kmers[candidate_kmers_offset..];
+    let v_tmp = set_difference_sorted(&v_contig_kmers, ref_singletons);
+
+    // Step 3: Exclude k-mers in reference genome - duplicated
+    let result = set_difference_sorted(&v_tmp, duplicated_kmers);
+
+    result
 }
 
 #[cfg(test)]

@@ -5,8 +5,21 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Core types and archive I/O for AGC genome compression"
+build = "build.rs"
+
+[features]
+default = []
+# Enable C++ AGC FFI for byte-identical archives
+# Requires C++ AGC to be built and available at ../agc
+cpp_agc = []
 
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
 zstd = { workspace = true }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[target.'cfg(feature = "cpp_agc")'.build-dependencies]
+cc = "1"

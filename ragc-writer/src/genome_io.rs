@@ -226,8 +226,14 @@ impl<W: Write> GenomeWriter<W> {
         // For now, ignore gzip_level and write directly
         // Full gzip support would require the refresh library or similar
         writeln!(self.writer, ">{id}")?;
-        self.writer.write_all(contig)?;
-        writeln!(self.writer)?;
+
+        // Write sequence with line wrapping at 80 characters (matching C++ AGC behavior)
+        const LINE_WIDTH: usize = 80;
+        for chunk in contig.chunks(LINE_WIDTH) {
+            self.writer.write_all(chunk)?;
+            writeln!(self.writer)?;
+        }
+
         Ok(())
     }
 }

@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 /// Contig type (vector of nucleotides in numeric encoding)
 pub type Contig = Vec<u8>;
 
-/// Missing k-mer marker (both k1 and k2 = ~0 means no terminal splitters)
-pub const MISSING_KMER: u64 = !0u64;
+/// Missing k-mer marker (matches C++ AGC's kmer_t(-1) = u64::MAX)
+pub const MISSING_KMER: u64 = u64::MAX;
 
 /// Segment part for inline buffering
 #[derive(Debug, Clone)]
@@ -420,7 +420,8 @@ mod tests {
 
     #[test]
     fn test_missing_kmer_constant() {
-        assert_eq!(MISSING_KMER, !0u64);
+        // MISSING_KMER must be u64::MAX to match C++ AGC's kmer_t(-1)
+        assert_eq!(MISSING_KMER, u64::MAX);
     }
 
     #[test]
