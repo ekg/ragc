@@ -5,6 +5,24 @@
 
 use ragc_common::{hash::MurMur64Hash, types::Contig};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Debug counters for comparing with C++ AGC
+static TOTAL_MATCHES: AtomicU64 = AtomicU64::new(0);
+static TOTAL_LITERALS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_BANG_REPLACEMENTS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_ENCODED_BYTES: AtomicU64 = AtomicU64::new(0);
+static TOTAL_NRUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Print LZ encoding statistics (call at end of compression)
+pub fn print_lz_stats() {
+    eprintln!("LZ_STATS: matches={} literals={} bang_replacements={} nruns={} encoded_bytes={}",
+        TOTAL_MATCHES.load(Ordering::Relaxed),
+        TOTAL_LITERALS.load(Ordering::Relaxed),
+        TOTAL_BANG_REPLACEMENTS.load(Ordering::Relaxed),
+        TOTAL_NRUNS.load(Ordering::Relaxed),
+        TOTAL_ENCODED_BYTES.load(Ordering::Relaxed));
+}
 
 /// Constants for LZ diff encoding
 const N_CODE: u8 = 4;
@@ -412,9 +430,13 @@ impl LZDiff {
                 }
 
                 // Check if this is a match to end of sequence
+                // C++ AGC (line 781): i + len_bck + len_fwd == text_size && match_pos + len_bck + len_fwd == reference.size() - key_len
+                // But match_pos was already adjusted (line 762: match_pos -= len_bck), so:
+                // After C++ adjustment: (match_pos_adjusted) + len_bck + len_fwd = original_match_pos + len_fwd
+                // Since our match_pos is NOT adjusted yet, we check: match_pos + len_fwd == reference_len
                 let total_len = len_bck + len_fwd;
                 let len_to_encode = if i + (total_len as usize) == text_size
-                    && (match_pos as usize) + (total_len as usize) == self.reference_len
+                    && (match_pos as usize) + (len_fwd as usize) == self.reference_len
                 {
                     None // Match to end
                 } else {

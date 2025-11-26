@@ -331,6 +331,13 @@ pub struct StreamingQueueCompressor {
     map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>, // kmer -> [(front, back)] candidate group keys
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
     next_sequence: Arc<std::sync::atomic::AtomicU64>, // Increases for each contig (FASTA order)
+
+    // Deferred metadata streams - written AFTER segment data (C++ AGC compatibility)
+    // C++ AGC writes segment data first, then metadata streams at the end
+    deferred_file_type_info: (usize, Vec<u8>),    // (stream_id, data)
+    deferred_params: (usize, Vec<u8>),            // (stream_id, data)
+    deferred_splitters: (usize, Vec<u8>),         // (stream_id, data)
+    deferred_segment_splitters: (usize, Vec<u8>), // (stream_id, data)
 }
 
 impl StreamingQueueCompressor {
@@ -372,8 +379,12 @@ impl StreamingQueueCompressor {
         // C++ AGC expects collection-samples at stream 0, collection-contigs at 1, collection-details at 2
         collection.prepare_for_compression(&mut archive)?;
 
-        // Write file_type_info stream (after collection streams for C++ AGC compatibility)
-        {
+        // DEFERRED METADATA STREAMS (C++ AGC compatibility)
+        // C++ AGC writes segment data FIRST, then metadata streams at the END.
+        // We register streams now but defer writing data until finalize().
+
+        // Prepare file_type_info data (defer write)
+        let deferred_file_type_info = {
             let mut data = Vec::new();
             let append_str = |data: &mut Vec<u8>, s: &str| {
                 data.extend_from_slice(s.as_bytes());
@@ -403,33 +414,37 @@ impl StreamingQueueCompressor {
             );
 
             let stream_id = archive.register_stream("file_type_info");
-            archive.add_part(stream_id, &data, 7)?; // 7 key-value pairs
-        }
+            // DEFERRED: archive.add_part(stream_id, &data, 7) will be called in finalize()
+            (stream_id, data)
+        };
 
-        // Write params stream
-        {
-            let params_stream_id = archive.register_stream("params");
-            let mut params_data = Vec::new();
-            params_data.extend_from_slice(&(config.k as u32).to_le_bytes());
-            params_data.extend_from_slice(&(config.min_match_len as u32).to_le_bytes());
-            params_data.extend_from_slice(&50u32.to_le_bytes()); // pack_cardinality (default)
-            params_data.extend_from_slice(&(config.segment_size as u32).to_le_bytes());
-            archive.add_part(params_stream_id, &params_data, 0)?;
-        }
+        // Prepare params data (defer write)
+        let deferred_params = {
+            let stream_id = archive.register_stream("params");
+            let mut data = Vec::new();
+            data.extend_from_slice(&(config.k as u32).to_le_bytes());
+            data.extend_from_slice(&(config.min_match_len as u32).to_le_bytes());
+            data.extend_from_slice(&50u32.to_le_bytes()); // pack_cardinality (default)
+            data.extend_from_slice(&(config.segment_size as u32).to_le_bytes());
+            // DEFERRED: archive.add_part(stream_id, &data, 0) will be called in finalize()
+            (stream_id, data)
+        };
 
-        // Write empty splitters stream (C++ AGC compatibility)
-        {
-            let splitters_data = Vec::new();
+        // Prepare empty splitters stream (defer write)
+        let deferred_splitters = {
             let stream_id = archive.register_stream("splitters");
-            archive.add_part(stream_id, &splitters_data, 0)?;
-        }
+            let data = Vec::new();
+            // DEFERRED: archive.add_part(stream_id, &data, 0) will be called in finalize()
+            (stream_id, data)
+        };
 
-        // Write empty segment-splitters stream (C++ AGC compatibility)
-        {
-            let seg_splitters_data = Vec::new();
+        // Prepare empty segment-splitters stream (defer write)
+        let deferred_segment_splitters = {
             let stream_id = archive.register_stream("segment-splitters");
-            archive.add_part(stream_id, &seg_splitters_data, 0)?;
-        }
+            let data = Vec::new();
+            // DEFERRED: archive.add_part(stream_id, &data, 0) will be called in finalize()
+            (stream_id, data)
+        };
 
         let collection = Arc::new(Mutex::new(collection));
         let archive = Arc::new(Mutex::new(archive));
@@ -554,6 +569,11 @@ impl StreamingQueueCompressor {
             pending_batch_segments,
             map_fallback_minimizers,
             next_sequence,
+            // Deferred metadata streams (written at end for C++ AGC compatibility)
+            deferred_file_type_info,
+            deferred_params,
+            deferred_splitters,
+            deferred_segment_splitters,
         })
     }
 
@@ -817,6 +837,25 @@ impl StreamingQueueCompressor {
             let mut archive = self.archive.lock().unwrap();
             let mut collection = self.collection.lock().unwrap();
 
+            // DEFERRED METADATA WRITES (C++ AGC compatibility)
+            // C++ AGC writes metadata streams AFTER segment data, in this order:
+            // 1. params
+            // 2. splitters
+            // 3. segment-splitters
+            // 4. collection metadata (samples, contigs, details)
+            // 5. file_type_info
+            let (params_stream_id, params_data) = &self.deferred_params;
+            archive.add_part(*params_stream_id, params_data, 0)
+                .context("Failed to write params")?;
+
+            let (splitters_stream_id, splitters_data) = &self.deferred_splitters;
+            archive.add_part(*splitters_stream_id, splitters_data, 0)
+                .context("Failed to write splitters")?;
+
+            let (seg_splitters_stream_id, seg_splitters_data) = &self.deferred_segment_splitters;
+            archive.add_part(*seg_splitters_stream_id, seg_splitters_data, 0)
+                .context("Failed to write segment-splitters")?;
+
             // Write sample names
             collection
                 .store_batch_sample_names(&mut archive)
@@ -826,6 +865,11 @@ impl StreamingQueueCompressor {
             collection
                 .store_contig_batch(&mut archive, 0, num_samples)
                 .context("Failed to write contig batch")?;
+
+            // Write file_type_info LAST (matches C++ AGC store_file_type_info order)
+            let (file_type_info_stream_id, file_type_info_data) = &self.deferred_file_type_info;
+            archive.add_part(*file_type_info_stream_id, file_type_info_data, 7)
+                .context("Failed to write file_type_info")?;
 
             if self.config.verbosity > 0 {
                 eprintln!("Collection metadata written successfully");
@@ -906,10 +950,20 @@ fn flush_pack(
         // Metadata stores the uncompressed size
         let ref_size = ref_seg.data.len() as u64;
 
+        // CRITICAL: Check if compression helped (matching C++ AGC segment.h lines 179, 204)
+        // C++ AGC: if(packed_size + 1u < (uint32_t) data.size())
+        // If compression didn't help, write UNCOMPRESSED raw data with metadata=0
         {
             let mut arch = archive.lock().unwrap();
-            arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
-                .context("Failed to write reference")?;
+            if compressed.len() < ref_seg.data.len() {
+                // Compression helped - write compressed data with metadata=original_size
+                arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
+                    .context("Failed to write reference")?;
+            } else {
+                // Compression didn't help - write UNCOMPRESSED data with metadata=0
+                arch.add_part(buffer.ref_stream_id, &ref_seg.data, 0)
+                    .context("Failed to write uncompressed reference")?;
+            }
         }
 
         // Register reference in collection with in_group_id = 0
@@ -971,9 +1025,45 @@ fn flush_pack(
         } else {
             // LZ-encoded segment (groups >= 16 with reference)
             // Reuse prepared lz_diff (matching C++ AGC segment.cpp line 59: lz_diff->Encode(s, delta))
-            buffer.lz_diff.as_mut()
+            let ragc_encoded = buffer.lz_diff.as_mut()
                 .expect("lz_diff should be prepared when reference is written")
-                .encode(&seg.data)
+                .encode(&seg.data);
+
+            // Compare with C++ AGC encode
+            #[cfg(feature = "cpp_agc")]
+            if config.verbosity > 0 {
+                if let Some(ref_seg) = &buffer.reference_segment {
+                    if let Some(cpp_encoded) = crate::ragc_ffi::lzdiff_v2_encode(
+                        &ref_seg.data,
+                        &seg.data,
+                        config.min_match_len as u32,
+                    ) {
+                        if ragc_encoded != cpp_encoded {
+                            eprintln!("ENCODE_MISMATCH: ragc_len={} cpp_len={} ref_len={} seg_len={} group_id={}",
+                                ragc_encoded.len(), cpp_encoded.len(), ref_seg.data.len(), seg.data.len(), buffer.group_id);
+                            // Show context around first difference
+                            for (i, (r, c)) in ragc_encoded.iter().zip(cpp_encoded.iter()).enumerate() {
+                                if r != c {
+                                    let start = if i > 10 { i - 10 } else { 0 };
+                                    let ragc_ctx: Vec<_> = ragc_encoded[start..].iter().take(30).map(|&b| if b >= 32 && b < 127 { b as char } else { '?' }).collect();
+                                    let cpp_ctx: Vec<_> = cpp_encoded[start..].iter().take(30).map(|&b| if b >= 32 && b < 127 { b as char } else { '?' }).collect();
+                                    eprintln!("  first diff at byte {}: ragc='{}' cpp='{}'", i, *r as char, *c as char);
+                                    eprintln!("  ragc context: {:?}", String::from_iter(ragc_ctx));
+                                    eprintln!("  cpp  context: {:?}", String::from_iter(cpp_ctx));
+                                    // Show the extra bytes in RAGC
+                                    if ragc_encoded.len() > cpp_encoded.len() {
+                                        let extra: Vec<_> = ragc_encoded[cpp_encoded.len()..].iter().take(20).map(|&b| if b >= 32 && b < 127 { b as char } else { '?' }).collect();
+                                        eprintln!("  ragc extra bytes: {:?}", String::from_iter(extra));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            ragc_encoded
         };
 
         // Handle LZ groups with IMPROVED_LZ_ENCODING: empty delta means same as reference
@@ -1335,23 +1425,28 @@ fn find_group_with_one_kmer(
                     segment_data
                 };
 
-                // Use C++ AGC's EXACT CLZDiff_V2::Estimate algorithm via FFI
-                // This matches find_cand_segment_with_one_splitter's cost estimation
-                #[cfg(feature = "cpp_agc")]
-                let estim_size = crate::ragc_ffi::lzdiff_v2_estimate(
-                    ref_data,
-                    target_data,
-                    config.min_match_len as u32,
-                    best_estim_size as u32,  // bound = current threshold
-                ) as usize;
-
-                #[cfg(not(feature = "cpp_agc"))]
+                // Compute estimate - compare both RAGC native and C++ FFI when verbose
                 let estim_size = {
                     let mut lz = LZDiff::new(config.min_match_len as u32);
                     lz.prepare(&ref_data.to_vec());
                     // Use estimate() which matches C++ CLZDiff_V2::Estimate exactly
                     lz.estimate(&target_data.to_vec(), best_estim_size as u32) as usize
                 };
+
+                // Also compute with C++ FFI and compare
+                #[cfg(feature = "cpp_agc")]
+                let cpp_estim_size = crate::ragc_ffi::lzdiff_v2_estimate(
+                    ref_data,
+                    target_data,
+                    config.min_match_len as u32,
+                    best_estim_size as u32,
+                ) as usize;
+
+                #[cfg(feature = "cpp_agc")]
+                if estim_size != cpp_estim_size && config.verbosity > 0 {
+                    eprintln!("ESTIMATE_MISMATCH: ragc={} cpp={} ref_len={} tgt_len={} bound={}",
+                        estim_size, cpp_estim_size, ref_data.len(), target_data.len(), best_estim_size);
+                }
 
                 // DEBUG: Also compute estimate with initial threshold to check if tie would occur
                 #[cfg(not(feature = "cpp_agc"))]

@@ -199,4 +199,42 @@ uint32_t agc_lzdiff_v2_estimate(
     return (uint32_t)result;
 }
 
+// Encode using actual CLZDiff_V2::Encode
+// Returns encoded bytes via output buffer
+// Returns actual encoded length, or UINT32_MAX on error
+uint32_t agc_lzdiff_v2_encode(
+    const uint8_t* ref, size_t ref_len,
+    const uint8_t* text, size_t text_len,
+    uint32_t min_match_len,
+    uint8_t* out_buf, size_t out_buf_len
+) {
+    if (!ref || !text || !out_buf || ref_len == 0 || text_len == 0) {
+        return UINT32_MAX;
+    }
+
+    // Create CLZDiff_V2 with min_match_len
+    CLZDiff_V2 lz(min_match_len);
+
+    // Build reference contig
+    contig_t reference_contig(ref, ref + ref_len);
+
+    // Prepare() sets reference and prepares for encoding
+    lz.Prepare(reference_contig);
+
+    // Build text contig
+    contig_t text_contig(text, text + text_len);
+
+    // Encode
+    contig_t encoded;
+    lz.Encode(text_contig, encoded);
+
+    // Copy to output buffer
+    if (encoded.size() > out_buf_len) {
+        return UINT32_MAX;  // Buffer too small
+    }
+
+    std::memcpy(out_buf, encoded.data(), encoded.size());
+    return (uint32_t)encoded.size();
+}
+
 } // extern "C"

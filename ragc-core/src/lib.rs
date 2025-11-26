@@ -268,6 +268,17 @@ pub mod ragc_ffi {
             min_match_len: u32,
             bound: u32,
         ) -> u32;
+
+        // REAL CLZDiff_V2::Encode from agc_compress.cpp
+        pub fn agc_lzdiff_v2_encode(
+            ref_ptr: *const u8,
+            ref_len: usize,
+            text_ptr: *const u8,
+            text_len: usize,
+            min_match_len: u32,
+            out_buf: *mut u8,
+            out_buf_len: usize,
+        ) -> u32;
     }
 
     /// Compute estimate (total encoding cost) using C++ FFI for comparison
@@ -296,6 +307,30 @@ pub mod ragc_ffi {
                 min_match_len,
                 bound,
             )
+        }
+    }
+
+    /// Encode using the REAL CLZDiff_V2::Encode from C++ AGC
+    /// Returns the encoded bytes
+    pub fn lzdiff_v2_encode(reference: &[u8], text: &[u8], min_match_len: u32) -> Option<Vec<u8>> {
+        // Allocate buffer (worst case: same as text size + some margin)
+        let mut out_buf = vec![0u8; text.len() * 2 + 1024];
+        unsafe {
+            let result = agc_lzdiff_v2_encode(
+                reference.as_ptr(),
+                reference.len(),
+                text.as_ptr(),
+                text.len(),
+                min_match_len,
+                out_buf.as_mut_ptr(),
+                out_buf.len(),
+            );
+            if result == u32::MAX {
+                None
+            } else {
+                out_buf.truncate(result as usize);
+                Some(out_buf)
+            }
         }
     }
 
