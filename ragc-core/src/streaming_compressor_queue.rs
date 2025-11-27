@@ -2932,6 +2932,8 @@ fn find_middle_splitter(
                 "DEBUG_FIND_MIDDLE_MISS: front={} back={} front_conn={} back_conn={} shared=0",
                 front_kmer, back_kmer, front_connections.len(), back_connections.len()
             );
+            eprintln!("  front_connections: {:?}", &front_connections[..front_connections.len().min(5)]);
+            eprintln!("  back_connections: {:?}", &back_connections[..back_connections.len().min(5)]);
         }
         None
     }
