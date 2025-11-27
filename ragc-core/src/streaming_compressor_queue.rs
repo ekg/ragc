@@ -2519,10 +2519,9 @@ fn worker_thread(
                                             let mut eng = grouping_engine.lock().unwrap();
                                             eng.register_group(left_key.kmer_front, left_key.kmer_back, group_id);
                                         }
-                                        // Update BATCH-LOCAL terminators map for new group edge
-                                        // These will be merged to global at batch end (matches C++ AGC behavior)
+                                        // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC)
                                         if left_key.kmer_front != MISSING_KMER && left_key.kmer_back != MISSING_KMER {
-                                            let mut term_map = batch_local_terminators.lock().unwrap();
+                                            let mut term_map = map_segments_terminators.lock().unwrap();
                                             term_map.entry(left_key.kmer_front).or_insert_with(Vec::new).push(left_key.kmer_back);
                                             if left_key.kmer_front != left_key.kmer_back {
                                                 term_map.entry(left_key.kmer_back).or_insert_with(Vec::new).push(left_key.kmer_front);
@@ -2568,10 +2567,9 @@ fn worker_thread(
                                             let mut eng = grouping_engine.lock().unwrap();
                                             eng.register_group(right_key.kmer_front, right_key.kmer_back, group_id);
                                         }
-                                        // Update BATCH-LOCAL terminators map for new group edge
-                                        // These will be merged to global at batch end (matches C++ AGC behavior)
+                                        // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC)
                                         if right_key.kmer_front != MISSING_KMER && right_key.kmer_back != MISSING_KMER {
-                                            let mut term_map = batch_local_terminators.lock().unwrap();
+                                            let mut term_map = map_segments_terminators.lock().unwrap();
                                             term_map.entry(right_key.kmer_front).or_insert_with(Vec::new).push(right_key.kmer_back);
                                             if right_key.kmer_front != right_key.kmer_back {
                                                 term_map.entry(right_key.kmer_back).or_insert_with(Vec::new).push(right_key.kmer_front);
@@ -2774,11 +2772,11 @@ fn worker_thread(
                         eng.register_group(key.kmer_front, key.kmer_back, group_id);
                     }
 
-                    // Update BATCH-LOCAL terminators map for new group edge
-                    // These will be merged to global at batch end (matches C++ AGC behavior)
-                    // This is CRITICAL for split functionality - terminators enable find_middle_splitter()
+                    // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC agc_compressor.cpp:1017-1024)
+                    // C++ AGC updates map_segments_terminators synchronously during segment processing,
+                    // NOT at batch end. This enables intra-batch splitting.
                     if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                        let mut term_map = batch_local_terminators.lock().unwrap();
+                        let mut term_map = map_segments_terminators.lock().unwrap();
 
                         // Add bidirectional edge: front -> back
                         term_map.entry(key.kmer_front)
