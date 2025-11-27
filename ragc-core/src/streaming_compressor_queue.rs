@@ -1001,6 +1001,12 @@ fn flush_pack(
         }
     }
 
+    // CRITICAL: Sort segments by (sample_name, contig_name, seg_part_no) before processing
+    // This matches C++ AGC's sort_known() in agc_compressor.h line 236-238
+    // Without this sorting, segments are processed in file-system order which differs from
+    // C++ AGC's lexicographic order, causing different in_group_id assignments and worse compression
+    buffer.segments.sort();
+
     // Pack segments together with delta deduplication (matching C++ AGC segment.cpp lines 66-74)
     // Note: segments do NOT include the reference - it's stored separately
     // Track unique deltas and their in_group_ids (matching C++ AGC segment.cpp)
