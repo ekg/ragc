@@ -1284,6 +1284,10 @@ fn find_group_with_one_kmer(
             None => {
                 // No connections found - create new group with MISSING
                 // Match C++ AGC lines 1671-1679: check is_dir_oriented()
+                // Debug: log entry to no-connection path
+                if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+                    eprintln!("RAGC_FIND_GROUP_NO_CONN: kmer={} kmer_is_dir={}", kmer, kmer_is_dir);
+                }
                 if kmer_is_dir {
                     // Dir-oriented: (kmer, MISSING) with rc=false
                     if config.verbosity > 1 {
@@ -1307,6 +1311,11 @@ fn find_group_with_one_kmer(
         #[cfg(feature = "verbose_debug")]
         eprintln!("RAGC_CASE3_FOUND_CONNECTIONS: kmer={} connections={}",
             kmer, connected_kmers.len());
+    }
+    // Debug: log connections found
+    if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+        eprintln!("RAGC_FIND_GROUP_FOUND_CONN: kmer={} kmer_is_dir={} connections={:?}",
+            kmer, kmer_is_dir, connected_kmers);
     }
 
     // Build list of candidate groups
@@ -1336,22 +1345,38 @@ fn find_group_with_one_kmer(
                 kmer_back: key_back,
             };
 
-            // Check if this group exists in global registry (matching C++ AGC line 1711)
-            // CRITICAL FIX: Use seg_map to check ALL groups, not just buffered ones
-            if let Some(&group_id) = seg_map.get(&cand_key) {
+            // Check if this group exists in global registry OR batch-local buffer
+            // CRITICAL FIX: Check BOTH seg_map (global) AND groups (batch-local)
+            // This matches C++ AGC behavior where groups created in same batch are visible
+            // Debug: trace candidate lookup
+            if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+                eprintln!("RAGC_FIND_GROUP_CAND_CHECK: cand_key=({},{}) exists_in_seg_map={} exists_in_groups={}",
+                    key_front, key_back, seg_map.contains_key(&cand_key), groups.contains_key(&cand_key));
+            }
+
+            // Check global registry first
+            let in_global = seg_map.get(&cand_key);
+            // Also check batch-local buffer
+            let in_batch_local = groups.get(&cand_key);
+
+            if in_global.is_some() || in_batch_local.is_some() {
                 // Get reference segment size from buffer OR persistent storage
-                let ref_size = if let Some(group_buffer) = groups.get(&cand_key) {
+                let ref_size = if let Some(group_buffer) = in_batch_local {
                     // Group in buffer - get size from buffer
                     if let Some(ref_seg) = &group_buffer.reference_segment {
                         ref_seg.data.len()
                     } else {
                         segment_len // No reference yet, use current segment size
                     }
-                } else if let Some(ref_data) = ref_segs.get(&group_id) {
+                } else if let Some(&group_id) = in_global {
                     // Group flushed - get size from persistent storage
-                    ref_data.len()
+                    if let Some(ref_data) = ref_segs.get(&group_id) {
+                        ref_data.len()
+                    } else {
+                        // Group exists but no reference data yet
+                        segment_len
+                    }
                 } else {
-                    // Group exists but no reference data yet
                     segment_len
                 };
 
@@ -1362,11 +1387,31 @@ fn find_group_with_one_kmer(
 
     if candidates.is_empty() {
         // No existing groups found - create new with MISSING
-        if config.verbosity > 1 {
-            #[cfg(feature = "verbose_debug")]
-            eprintln!("RAGC_CASE3_NO_CANDIDATES: kmer={} -> (kmer, MISSING)", kmer);
+        // Must match C++ AGC is_dir_oriented logic (same as no-connections case above)
+        if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+            if kmer_is_dir {
+                eprintln!("RAGC_FIND_GROUP_NO_CAND: kmer={} kmer_is_dir={} -> returning ({},MISSING,false)",
+                    kmer, kmer_is_dir, kmer);
+            } else {
+                eprintln!("RAGC_FIND_GROUP_NO_CAND: kmer={} kmer_is_dir={} -> returning (MISSING,{},true)",
+                    kmer, kmer_is_dir, kmer);
+            }
         }
-        return (kmer, MISSING_KMER, false);
+        if kmer_is_dir {
+            // Dir-oriented: (kmer, MISSING) with rc=false
+            if config.verbosity > 1 {
+                #[cfg(feature = "verbose_debug")]
+                eprintln!("RAGC_CASE3_NO_CANDIDATES: kmer={} is_dir=true -> ({}, MISSING) rc=false", kmer, kmer);
+            }
+            return (kmer, MISSING_KMER, false);
+        } else {
+            // NOT dir-oriented: (MISSING, kmer) with rc=true
+            if config.verbosity > 1 {
+                #[cfg(feature = "verbose_debug")]
+                eprintln!("RAGC_CASE3_NO_CANDIDATES: kmer={} is_dir=false -> (MISSING, {}) rc=true", kmer, kmer);
+            }
+            return (MISSING_KMER, kmer, true);
+        }
     }
 
     // Sort candidates by reference segment size (C++ AGC lines 1710-1719)
@@ -2178,6 +2223,11 @@ fn worker_thread(
                     #[cfg(feature = "verbose_debug")]
                     eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} front_is_dir={} back=MISSING -> finding best group",
                         task.sample_name, segment.front_kmer, segment.front_kmer_is_dir);
+                    // Debug: trace is_dir value before find_group call
+                    if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+                        eprintln!("RAGC_CASE3A_CALL: contig={} seg_part={} front_kmer={} front_kmer_is_dir={}",
+                            task.contig_name, place, segment.front_kmer, segment.front_kmer_is_dir);
+                    }
                     let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
                         segment.front_kmer,
                         segment.front_kmer_is_dir, // Use actual orientation from segment detection
@@ -2726,6 +2776,87 @@ fn worker_thread(
                         // If split_result was None, fall through to normal path
                     }
                 }
+
+                // Phase 2.5: Secondary fallback attempt (C++ AGC lines 1477-1494)
+                // If the group doesn't exist yet, try fallback minimizers one more time with min_shared=2
+                // This helps segments find existing groups that share internal k-mers
+                let (key, key_front, key_back, should_reverse) = {
+                    // Re-check if key exists (may have changed since split logic ran)
+                    let key_exists_now = {
+                        let seg_map = map_segments.lock().unwrap();
+                        seg_map.contains_key(&key)
+                    };
+
+                    // Debug: count how many segments could be eligible for secondary fallback
+                    if std::env::var("RAGC_DEBUG_FALLBACK2").as_deref() == Ok("1") {
+                        if !key_exists_now && key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                            eprintln!("SECONDARY_FB_CANDIDATE: sample={} contig={} place={} key=({},{})",
+                                task.sample_name, task.contig_name, place, key.kmer_front, key.kmer_back);
+                        }
+                    }
+
+                    if !key_exists_now
+                        && key.kmer_front != MISSING_KMER
+                        && key.kmer_back != MISSING_KMER
+                        && fallback_filter.is_enabled()
+                    {
+                        // Generate reverse complement for fallback lookup
+                        let segment_data_rc_fb: Vec<u8> = segment_data.iter().rev().map(|&b| {
+                            if b > 3 { b } else { 3 - b }
+                        }).collect();
+
+                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                            &segment_data,
+                            &segment_data_rc_fb,
+                            config.k,
+                            2, // min_shared_kmers = 2 for secondary fallback (C++ AGC line 1482)
+                            &fallback_filter,
+                            &map_fallback_minimizers,
+                            &map_segments,
+                            &segment_groups,
+                            &reference_segments,
+                            &config,
+                        );
+
+                        if std::env::var("RAGC_DEBUG_FALLBACK2").as_deref() == Ok("1") {
+                            if fb_kf == MISSING_KMER || fb_kb == MISSING_KMER {
+                                eprintln!("SECONDARY_FB_NO_MATCH: orig_key=({},{})", key.kmer_front, key.kmer_back);
+                            } else {
+                                eprintln!("SECONDARY_FB_FOUND: orig=({},{}) found=({},{}) rc={}",
+                                    key.kmer_front, key.kmer_back, fb_kf, fb_kb, fb_sr);
+                            }
+                        }
+
+                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                            // Verify the found group actually exists
+                            let found_key = SegmentGroupKey {
+                                kmer_front: fb_kf,
+                                kmer_back: fb_kb,
+                            };
+                            let found_exists = {
+                                let seg_map = map_segments.lock().unwrap();
+                                seg_map.contains_key(&found_key)
+                            };
+
+                            if found_exists {
+                                if config.verbosity > 1 {
+                                    eprintln!("SECONDARY_FALLBACK_SUCCESS: ({},{}) -> ({},{}) sr={}->{}",
+                                        key_front, key_back, fb_kf, fb_kb, should_reverse, fb_sr);
+                                }
+                                (found_key, fb_kf, fb_kb, fb_sr)
+                            } else {
+                                // Fallback found k-mers but group doesn't exist - keep original
+                                (key, key_front, key_back, should_reverse)
+                            }
+                        } else {
+                            // Fallback didn't find anything - keep original
+                            (key, key_front, key_back, should_reverse)
+                        }
+                    } else {
+                        // Group exists or not eligible for fallback - keep original
+                        (key, key_front, key_back, should_reverse)
+                    }
+                };
 
                 // Phase 3: Normal path - add segment to group as-is (group exists, or split failed/impossible)
                 // Create buffered segment
