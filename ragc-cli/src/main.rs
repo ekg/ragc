@@ -387,6 +387,16 @@ fn create_archive(
         }
     });
 
+    // CRITICAL: Sort input files alphabetically by sample name to match C++ AGC behavior
+    // C++ AGC sorts samples alphabetically before processing, and the first sample becomes
+    // the reference for compression. Different reference selection = different compression.
+    let mut inputs = inputs;
+    inputs.sort_by(|a, b| {
+        let name_a = extract_sample_name(a);
+        let name_b = extract_sample_name(b);
+        name_a.cmp(&name_b)
+    });
+
     if verbosity > 0 {
         eprintln!("Creating AGC archive: {output:?}");
         eprintln!("Input files: {} FASTA file(s)", inputs.len());
