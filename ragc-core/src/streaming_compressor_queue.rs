@@ -126,10 +126,12 @@ impl Default for StreamingQueueConfig {
 ///
 /// Priority ordering matches C++ AGC:
 /// - Higher sample_priority first (sample1 > sample2 > sample3...)
-/// - Within same sample, FASTA order (lower sequence first)
+/// - Within same sample, lexicographic order on contig_name (ascending)
 ///
-/// NOTE: C++ AGC processes contigs in FASTA order (insertion order) with single thread,
-/// not by size. The priority queue only affects ordering when multiple items are queued.
+/// NOTE: C++ AGC uses a multimap<pair<priority, cost>, T> where cost=contig.size().
+/// Since multimap iterates in ascending key order, smaller names come first.
+/// This results in lexicographic ordering: chrI, chrII, chrIII, chrIV, chrIX, chrMT, chrV...
+/// RAGC must match this ordering for byte-identical archives.
 #[derive(Clone)]
 struct ContigTask {
     sample_name: String,
@@ -142,13 +144,13 @@ struct ContigTask {
 // Implement priority ordering for BinaryHeap (max-heap)
 // BinaryHeap pops the "greatest" element, so we want:
 // - Higher sample_priority = greater (first sample processed first)
-// - LOWER sequence = greater (FASTA order - earlier contigs processed first)
+// - Lexicographically SMALLER contig_name = greater (to be popped first)
 //
-// NOTE: C++ AGC with single thread processes in FASTA order because items are
-// consumed as fast as they're pushed. We match this by using sequence ordering.
+// C++ AGC uses multimap which iterates in ascending order, so "chrI" < "chrIX" < "chrMT" < "chrV"
+// To match this with a max-heap, we reverse the contig_name comparison.
 impl PartialEq for ContigTask {
     fn eq(&self, other: &Self) -> bool {
-        self.sample_priority == other.sample_priority && self.sequence == other.sequence
+        self.sample_priority == other.sample_priority && self.contig_name == other.contig_name
     }
 }
 
@@ -165,10 +167,12 @@ impl Ord for ContigTask {
         // First compare by sample_priority (higher priority first)
         match self.sample_priority.cmp(&other.sample_priority) {
             std::cmp::Ordering::Equal => {
-                // Then by sequence (FASTA order - lower sequence = higher priority)
-                // REVERSE comparison: other.sequence vs self.sequence
-                // This makes lower sequence values "greater" so they're popped first
-                other.sequence.cmp(&self.sequence)
+                // Then by contig_name (lexicographic ascending order)
+                // REVERSE comparison: other.contig_name vs self.contig_name
+                // This makes lexicographically smaller names "greater" so they're popped first
+                // E.g., "chrI" < "chrIX" < "chrMT" < "chrV" in ascending order
+                // So we want "chrI" to be popped first from the max-heap
+                other.contig_name.cmp(&self.contig_name)
             }
             other_ord => other_ord,
         }
