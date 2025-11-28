@@ -317,6 +317,11 @@ pub struct StreamingQueueCompressor {
     // for subsequent samples (fixes multi-sample group fragmentation bug)
     reference_segments: Arc<Mutex<std::collections::HashMap<u32, Vec<u8>>>>, // group_id -> reference segment data
 
+    // Reference orientation tracking - stores is_rev_comp for each group's reference segment
+    // When a delta segment joins an existing group, it MUST use the same orientation as the reference
+    // to ensure LZ encoding works correctly (fixes ZERO_MATCH bug in Case 3 terminator segments)
+    reference_orientations: Arc<Mutex<std::collections::HashMap<u32, bool>>>, // group_id -> reference is_rev_comp
+
     // Track segment splits for renumbering subsequent segments
     // Maps (sample_name, contig_name, original_place) -> number of splits inserted before this position
     split_offsets: Arc<Mutex<std::collections::HashMap<(String, String, usize), usize>>>,
@@ -472,6 +477,9 @@ impl StreamingQueueCompressor {
         // Persistent reference segment storage (matches C++ AGC v_segments)
         let reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 
+        // Reference orientation tracking (fixes ZERO_MATCH bug in Case 3 terminator segments)
+        let reference_orientations: Arc<Mutex<HashMap<u32, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+
         // FFI Grouping Engine - C++ AGC-compatible group assignment
         #[cfg(feature = "cpp_agc")]
         let grouping_engine = Arc::new(Mutex::new(crate::ragc_ffi::GroupingEngine::new(
@@ -505,6 +513,7 @@ impl StreamingQueueCompressor {
             let map_segments = Arc::clone(&map_segments);
             let map_segments_terminators = Arc::clone(&map_segments_terminators);
             let reference_segments = Arc::clone(&reference_segments);
+            let reference_orientations = Arc::clone(&reference_orientations);
             let split_offsets = Arc::clone(&split_offsets);
             #[cfg(feature = "cpp_agc")]
             let grouping_engine = Arc::clone(&grouping_engine);
@@ -529,6 +538,7 @@ impl StreamingQueueCompressor {
                     map_segments,
                     map_segments_terminators,
                     reference_segments,
+                    reference_orientations,
                     split_offsets,
                     #[cfg(feature = "cpp_agc")]
                     grouping_engine,
@@ -564,6 +574,7 @@ impl StreamingQueueCompressor {
             #[cfg(feature = "cpp_agc")]
             grouping_engine,
             reference_segments,
+            reference_orientations,
             split_offsets,
             sample_priorities,
             next_priority,
@@ -637,6 +648,7 @@ impl StreamingQueueCompressor {
                 let map_segments = Arc::clone(&self.map_segments);
                 let map_segments_terminators = Arc::clone(&self.map_segments_terminators);
                 let reference_segments = Arc::clone(&self.reference_segments);
+                let reference_orientations = Arc::clone(&self.reference_orientations);
                 let split_offsets = Arc::clone(&self.split_offsets);
                 #[cfg(feature = "cpp_agc")]
                 let grouping_engine = Arc::clone(&self.grouping_engine);
@@ -661,6 +673,7 @@ impl StreamingQueueCompressor {
                         map_segments,
                         map_segments_terminators,
                         reference_segments,
+                        reference_orientations,
                         split_offsets,
                         #[cfg(feature = "cpp_agc")]
                         grouping_engine,
@@ -1181,6 +1194,7 @@ fn write_reference_immediately(
     collection: &Arc<Mutex<CollectionV3>>,
     archive: &Arc<Mutex<Archive>>,
     reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    reference_orientations: &Arc<Mutex<HashMap<u32, bool>>>,
     config: &StreamingQueueConfig,
 ) -> Result<()> {
     use crate::segment_compression::compress_reference_segment;
@@ -1241,6 +1255,14 @@ fn write_reference_immediately(
     {
         let mut ref_segs = reference_segments.lock().unwrap();
         ref_segs.insert(buffer.group_id, segment.data.clone());
+    }
+
+    // 4c. Store reference orientation for ZERO_MATCH bug fix
+    // When a delta segment joins this group later, it MUST use the same orientation
+    // as the reference to ensure LZ encoding works correctly
+    {
+        let mut ref_orients = reference_orientations.lock().unwrap();
+        ref_orients.insert(buffer.group_id, segment.is_rev_comp);
     }
 
     // 5. Prepare LZ encoder with reference (matching C++ AGC segment.cpp line 43: lz_diff->Prepare(s))
@@ -2061,6 +2083,55 @@ fn flush_batch(
     Ok(())
 }
 
+/// Helper function to fix orientation of segment data to match reference orientation.
+/// Returns (fixed_data, fixed_is_rev_comp) tuple.
+/// Used for both normal segments and split segments to ensure consistent orientation within groups.
+fn fix_orientation_for_group(
+    data: &[u8],
+    should_reverse: bool,
+    key: &SegmentGroupKey,
+    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    batch_local_groups: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    reference_orientations: &Arc<Mutex<HashMap<u32, bool>>>,
+) -> (Vec<u8>, bool) {
+    // Look up group_id in both global (map_segments) and batch-local registries
+    let group_id_opt = {
+        let seg_map = map_segments.lock().unwrap();
+        if let Some(&gid) = seg_map.get(key) {
+            Some(gid)
+        } else {
+            drop(seg_map);
+            let batch_map = batch_local_groups.lock().unwrap();
+            batch_map.get(key).copied()
+        }
+    };
+
+    if let Some(group_id) = group_id_opt {
+        let ref_orients = reference_orientations.lock().unwrap();
+        if let Some(&ref_rc) = ref_orients.get(&group_id) {
+            // Group has a stored reference orientation
+            if ref_rc != should_reverse {
+                // Orientation mismatch - transform data to match reference
+                // The data is already transformed based on should_reverse, so we need to
+                // apply RC if ref_rc is true (to get RC), or use original if ref_rc is false (to get forward)
+                // But we're given the ALREADY-TRANSFORMED data, so we need to invert if mismatch
+                let fixed_data: Vec<u8> = data.iter().rev().map(|&base| {
+                    match base {
+                        0 => 3, // A -> T
+                        1 => 2, // C -> G
+                        2 => 1, // G -> C
+                        3 => 0, // T -> A
+                        _ => base, // N or other non-ACGT
+                    }
+                }).collect();
+                return (fixed_data, ref_rc);
+            }
+        }
+    }
+    // No fix needed - return as-is
+    (data.to_vec(), should_reverse)
+}
+
 /// Worker thread that pulls from queue and compresses
 fn worker_thread(
     worker_id: usize,
@@ -2075,6 +2146,7 @@ fn worker_thread(
     map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    reference_orientations: Arc<Mutex<HashMap<u32, bool>>>,
     split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>>,
     #[cfg(feature = "cpp_agc")]
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
@@ -2662,7 +2734,8 @@ fn worker_thread(
                                         drop(arch);
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
-                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: left_data.clone(), is_rev_comp: should_reverse };
+                                    let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, should_reverse, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
+                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_left_data, is_rev_comp: fixed_left_rc };
                                     left_buffer.segments.push(left_buffered);
                                     if left_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(left_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush left pack")?; }
                                 }
@@ -2711,7 +2784,8 @@ fn worker_thread(
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
                                     let seg_part = if is_degenerate_left { place } else { place + 1 };
-                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: right_data.clone(), is_rev_comp: should_reverse };
+                                    let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, should_reverse, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
+                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_right_data, is_rev_comp: fixed_right_rc };
                                     right_buffer.segments.push(right_buffered);
                                     if right_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(right_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush right pack")?; }
                                 }
@@ -2739,7 +2813,8 @@ fn worker_thread(
                                         drop(arch);
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
-                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: right_data.clone(), is_rev_comp: should_reverse };
+                                    let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, should_reverse, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
+                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_right_data, is_rev_comp: fixed_right_rc };
                                     right_buffer.segments.push(right_buffered);
                                     if right_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(right_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush right pack")?; }
                                 }
@@ -2766,7 +2841,8 @@ fn worker_thread(
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
                                     let seg_part = if is_degenerate_right { place } else { place + 1 };
-                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: left_data.clone(), is_rev_comp: should_reverse };
+                                    let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, should_reverse, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
+                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_left_data, is_rev_comp: fixed_left_rc };
                                     left_buffer.segments.push(left_buffered);
                                     if left_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(left_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush left pack")?; }
                                 }
@@ -2925,13 +3001,72 @@ fn worker_thread(
                 };
 
                 // Phase 3: Normal path - add segment to group as-is (group exists, or split failed/impossible)
-                // Create buffered segment
+
+                // FIX: When joining an existing group, use the reference's orientation
+                // to ensure LZ encoding works correctly (fixes ZERO_MATCH bug in Case 3 terminators)
+                let (final_should_reverse, final_segment_data) = {
+                    // Check if this group already has a reference with stored orientation
+                    // Check BOTH map_segments (previous batches) AND batch_local_groups (current batch)
+                    let group_id_opt = {
+                        let seg_map = map_segments.lock().unwrap();
+                        if let Some(&gid) = seg_map.get(&key) {
+                            Some(gid)
+                        } else {
+                            drop(seg_map);
+                            let batch_map = batch_local_groups.lock().unwrap();
+                            batch_map.get(&key).copied()
+                        }
+                    };
+
+                    if let Some(group_id) = group_id_opt {
+                        let ref_orients = reference_orientations.lock().unwrap();
+                        if let Some(&ref_rc) = ref_orients.get(&group_id) {
+                            // Group has a stored reference orientation
+                            if ref_rc != should_reverse {
+                                // Orientation mismatch - recompute segment_data with reference orientation
+                                if config.verbosity > 1 {
+                                    eprintln!("ORIENTATION_FIX: group={} sample={} contig={}:{} computed_rc={} ref_rc={}",
+                                        group_id, task.sample_name, task.contig_name, place, should_reverse, ref_rc);
+                                }
+                                // Recompute segment_data with the reference's orientation
+                                // Note: We need to reverse the ORIGINAL data, not segment_data which may already be reversed
+                                let fixed_data = if ref_rc {
+                                    // Need RC: reverse complement the original segment data
+                                    segment.data.iter().rev().map(|&base| {
+                                        match base {
+                                            0 => 3, // A -> T
+                                            1 => 2, // C -> G
+                                            2 => 1, // G -> C
+                                            3 => 0, // T -> A
+                                            _ => base, // N or other non-ACGT
+                                        }
+                                    }).collect()
+                                } else {
+                                    // Need forward: use original data as-is
+                                    segment.data.clone()
+                                };
+                                (ref_rc, fixed_data)
+                            } else {
+                                // Orientations match - use computed values
+                                (should_reverse, segment_data)
+                            }
+                        } else {
+                            // No stored orientation yet (this will be the reference)
+                            (should_reverse, segment_data)
+                        }
+                    } else {
+                        // New group - use computed orientation
+                        (should_reverse, segment_data)
+                    }
+                };
+
+                // Create buffered segment with corrected orientation
                 let buffered = BufferedSegment {
                     sample_name: task.sample_name.clone(),
                     contig_name: task.contig_name.clone(),
                     seg_part_no: place,
-                    data: segment_data,
-                    is_rev_comp: should_reverse,
+                    data: final_segment_data,
+                    is_rev_comp: final_should_reverse,
                 };
 
                 // DEBUG: Print data for degenerate k-mer reference segments
@@ -3047,7 +3182,7 @@ fn worker_thread(
                     let source = if key_exists { "global" } else { "batch_or_new" };
                     eprintln!("SEGMENT_GROUP,{},{},{},{},{},{},{},{}",
                         task.sample_name, task.contig_name, place,
-                        key.kmer_front, key.kmer_back, should_reverse, source, buffer.group_id);
+                        key.kmer_front, key.kmer_back, final_should_reverse, source, buffer.group_id);
                 }
 
                 // Add fallback mapping for this segment (matches C++ AGC add_fallback_mapping)
@@ -3073,7 +3208,7 @@ fn worker_thread(
                 if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
                     // This is the FIRST segment in an LZ group - make it the reference NOW
                     // (matches C++ AGC: lz_diff->Prepare(s); store_in_archive(s, zstd_cctx);)
-                    if let Err(e) = write_reference_immediately(&buffered, buffer, &collection, &archive, &reference_segments, &config) {
+                    if let Err(e) = write_reference_immediately(&buffered, buffer, &collection, &archive, &reference_segments, &reference_orientations, &config) {
                         eprintln!("ERROR: Failed to write immediate reference: {}", e);
                         // Fall back to buffering
                         buffer.segments.push(buffered);

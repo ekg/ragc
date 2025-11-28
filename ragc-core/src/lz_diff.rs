@@ -604,6 +604,22 @@ impl LZDiff {
             eprintln!("RAGC_LZ_SUMMARY: target_len={} match_coverage={}/{} ({:.1}%) ratio={:.3}",
                 target.len(), bases_covered_by_matches, target.len(), coverage_pct, compression_ratio);
 
+            // Debug: Show first/last 20 bytes when 0 matches - helps detect orientation mismatch
+            if match_count == 0 && target.len() > 40 {
+                let ref_first: String = self.reference.iter().take(20).map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
+                let ref_last: String = self.reference[self.reference_len.saturating_sub(20)..self.reference_len].iter().map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
+                let tgt_first: String = target.iter().take(20).map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
+                let tgt_last: String = target[target.len().saturating_sub(20)..].iter().map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
+                eprintln!("RAGC_ZERO_MATCH_DATA: ref_first={} ref_last={} tgt_first={} tgt_last={}",
+                    ref_first, ref_last, tgt_first, tgt_last);
+                // Check if target matches reverse of reference (strong orientation mismatch signal)
+                let ref_rc_first: String = self.reference[self.reference_len.saturating_sub(20)..self.reference_len]
+                    .iter().rev().map(|&b| match b { 0=>3, 1=>2, 2=>1, 3=>0, _=>b }).map(|b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
+                if tgt_first == ref_rc_first {
+                    eprintln!("RAGC_ZERO_MATCH_ORIENTATION: Target matches RC of reference - ORIENTATION MISMATCH DETECTED!");
+                }
+            }
+
             // Warning if encoding is bloated
             if encoded.len() > target.len() {
                 eprintln!("RAGC_LZ_WARNING: encoded LARGER than target! {} vs {} bytes (+{})",
