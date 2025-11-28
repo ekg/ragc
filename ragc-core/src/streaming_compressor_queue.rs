@@ -244,6 +244,12 @@ struct SegmentGroupBuffer {
     ref_written: bool,              // Whether reference has been written
     segments_written: u32,          // Counter for delta segments written (NOT including reference)
     lz_diff: Option<LZDiff>,        // LZ encoder prepared once with reference, reused for all segments (matches C++ AGC CSegment::lz_diff)
+    // CRITICAL: Partial pack persistence to ensure pack alignment with decompression expectations
+    // Pack N must contain entries for in_group_ids (N*50)+1 to (N+1)*50
+    // These fields persist unique deltas until we have exactly 50 for a complete pack
+    pending_deltas: Vec<Vec<u8>>,   // Unique deltas waiting to be written (< 50)
+    pending_delta_ids: Vec<u32>,    // in_group_ids for pending deltas (for deduplication)
+    raw_placeholder_written: bool,  // Whether raw group placeholder has been written
 }
 
 impl SegmentGroupBuffer {
@@ -257,6 +263,9 @@ impl SegmentGroupBuffer {
             ref_written: false,
             segments_written: 0,
             lz_diff: None,  // Prepared when reference is written (matches C++ AGC segment.cpp line 43)
+            pending_deltas: Vec::new(),
+            pending_delta_ids: Vec::new(),
+            raw_placeholder_written: false,
         }
     }
 }
@@ -832,6 +841,53 @@ impl StreamingQueueCompressor {
                     flush_pack(buffer, &self.collection, &self.archive, &self.config, &self.reference_segments)
                         .context("Failed to flush remaining pack")?;
                 }
+
+                // CRITICAL: Write any remaining pending_deltas as final partial pack
+                // This is where partial packs (< 50 entries) are written, ensuring
+                // pack boundaries align with decompression expectations
+                if !buffer.pending_deltas.is_empty() {
+                    use crate::segment_compression::compress_segment_configured;
+
+                    let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
+                    let mut packed_data = Vec::new();
+
+                    // Raw groups need placeholder if this is the first pack
+                    if !use_lz_encoding && !buffer.raw_placeholder_written {
+                        packed_data.push(0x7f);
+                        packed_data.push(CONTIG_SEPARATOR);
+                    }
+
+                    for delta in buffer.pending_deltas.iter() {
+                        packed_data.extend_from_slice(delta);
+                        packed_data.push(CONTIG_SEPARATOR);
+                    }
+
+                    if !packed_data.is_empty() {
+                        let total_raw_size = packed_data.len();
+                        let mut compressed = compress_segment_configured(&packed_data, self.config.compression_level)
+                            .context("Failed to compress final partial pack")?;
+                        compressed.push(0); // Marker 0 = plain ZSTD
+
+                        let mut arch = self.archive.lock().unwrap();
+                        if compressed.len() < total_raw_size {
+                            arch.add_part(buffer.stream_id, &compressed, total_raw_size as u64)
+                                .context("Failed to write compressed final partial pack")?;
+                        } else {
+                            arch.add_part(buffer.stream_id, &packed_data, 0)
+                                .context("Failed to write uncompressed final partial pack")?;
+                        }
+                    }
+
+                    if self.config.verbosity > 1 {
+                        eprintln!(
+                            "  Wrote final partial pack for group {} with {} deltas",
+                            buffer.group_id, buffer.pending_deltas.len()
+                        );
+                    }
+
+                    buffer.pending_deltas.clear();
+                    buffer.pending_delta_ids.clear();
+                }
             }
 
             if self.config.verbosity > 0 {
@@ -1034,23 +1090,55 @@ fn flush_pack(
 
     // Pack segments together with delta deduplication (matching C++ AGC segment.cpp lines 66-74)
     // Note: segments do NOT include the reference - it's stored separately
-    // Track unique deltas and their in_group_ids (matching C++ AGC segment.cpp)
-    // In C++ AGC:
-    // - Reference: in_group_id = 0
-    // - Empty delta (same as reference): in_group_id = 0 (IMPROVED_LZ_ENCODING)
-    // - New unique delta: in_group_id = no_seqs, then no_seqs++
-    // - Duplicate delta: reuse existing in_group_id
-    let mut unique_deltas: Vec<Vec<u8>> = Vec::new(); // v_lzp in C++ AGC
-    let mut delta_in_group_ids: Vec<u32> = Vec::new(); // in_group_id for each unique delta
-    let mut segment_in_group_ids: Vec<u32> = Vec::new(); // in_group_id for each segment
+    //
+    // CRITICAL FIX: Partial packs must persist across flush_pack calls to ensure pack boundaries
+    // align with decompression expectations. Pack N must contain entries for in_group_ids
+    // (N*50)+1 to (N+1)*50. Only write a pack when it has exactly 50 entries (or at finalization).
+    // Use buffer.pending_deltas and buffer.pending_delta_ids to persist partial packs.
 
-    // Continue from where previous pack left off for this group
-    // Both LZ and raw groups start at in_group_id=1 (slot 0 is reference position)
-    // In LZ groups, slot 0 has actual reference data
-    // In raw groups, slot 0 is conceptually skipped (matches C++ AGC behavior)
-    let mut no_seqs: u32 = buffer.segments_written.max(1);
+    let mut segment_in_group_ids: Vec<(usize, u32)> = Vec::new(); // (segment_index, in_group_id) for each segment
 
-    for seg in buffer.segments.iter() {
+    // Helper closure to write a complete pack (exactly 50 entries)
+    let write_complete_pack = |deltas: &[Vec<u8>], needs_raw_placeholder: bool, archive: &Arc<Mutex<Archive>>, stream_id: usize, config: &StreamingQueueConfig| -> Result<()> {
+        if deltas.is_empty() && !needs_raw_placeholder {
+            return Ok(());
+        }
+
+        let mut packed_data = Vec::new();
+
+        // CRITICAL: Raw groups need a placeholder segment at position 0
+        if needs_raw_placeholder {
+            packed_data.push(0x7f);
+            packed_data.push(CONTIG_SEPARATOR);
+        }
+
+        for delta in deltas.iter() {
+            packed_data.extend_from_slice(delta);
+            packed_data.push(CONTIG_SEPARATOR);
+        }
+
+        if packed_data.is_empty() {
+            return Ok(());
+        }
+
+        let total_raw_size = packed_data.len();
+        let mut compressed = compress_segment_configured(&packed_data, config.compression_level)
+            .context("Failed to compress pack")?;
+        compressed.push(0); // Marker 0 = plain ZSTD
+
+        let mut arch = archive.lock().unwrap();
+        if compressed.len() < total_raw_size {
+            arch.add_part(stream_id, &compressed, total_raw_size as u64)
+                .context("Failed to write compressed pack")?;
+        } else {
+            arch.add_part(stream_id, &packed_data, 0)
+                .context("Failed to write uncompressed pack")?;
+        }
+
+        Ok(())
+    };
+
+    for (seg_idx, seg) in buffer.segments.iter().enumerate() {
         let contig_data = if !use_lz_encoding || buffer.reference_segment.is_none() {
             // Raw segment: groups 0-15 OR groups without reference
             seg.data.clone()
@@ -1110,45 +1198,45 @@ fn flush_pack(
         // (matching C++ AGC segment.cpp lines 62-63)
         if use_lz_encoding && contig_data.is_empty() {
             // Same as reference - use in_group_id = 0
-            segment_in_group_ids.push(0);
+            segment_in_group_ids.push((seg_idx, 0));
             continue;
         }
 
-        // Check if this delta already exists (matching C++ AGC segment.cpp line 66)
-        if let Some(existing_idx) = unique_deltas.iter().position(|d| d == &contig_data) {
+        // Check if this delta already exists in pending pack (matching C++ AGC segment.cpp line 66)
+        // Note: deduplication is per-pack, not global
+        if let Some(existing_idx) = buffer.pending_deltas.iter().position(|d| d == &contig_data) {
             // Reuse existing delta's in_group_id (matching C++ AGC segment.cpp line 69)
-            let reused_id = delta_in_group_ids[existing_idx];
-            segment_in_group_ids.push(reused_id);
+            let reused_id = buffer.pending_delta_ids[existing_idx];
+            segment_in_group_ids.push((seg_idx, reused_id));
         } else {
             // New unique delta - assign next in_group_id (matching C++ AGC segment.cpp lines 74, 77)
-            let in_group_id = no_seqs;
-            no_seqs += 1;
-            delta_in_group_ids.push(in_group_id);
-            segment_in_group_ids.push(in_group_id);
-            unique_deltas.push(contig_data);
+            let in_group_id = buffer.segments_written.max(1);
+            buffer.segments_written += 1;
+            buffer.pending_delta_ids.push(in_group_id);
+            segment_in_group_ids.push((seg_idx, in_group_id));
+            buffer.pending_deltas.push(contig_data);
+
+            // CRITICAL: Flush when pending_deltas reaches PACK_CARDINALITY (matching C++ AGC segment.cpp lines 51-54)
+            // C++ AGC: if (v_lzp.size() == contigs_in_pack) { store_in_archive(v_lzp); v_lzp.clear(); }
+            if buffer.pending_deltas.len() == PACK_CARDINALITY {
+                // Write complete pack with raw placeholder only if this is the first pack of a raw group
+                let needs_placeholder = !use_lz_encoding && !buffer.raw_placeholder_written;
+                write_complete_pack(&buffer.pending_deltas, needs_placeholder, archive, buffer.stream_id, config)?;
+                buffer.raw_placeholder_written = true;
+
+                // Clear for next pack - deduplication starts fresh
+                buffer.pending_deltas.clear();
+                buffer.pending_delta_ids.clear();
+            }
         }
     }
 
-    // Second pass: pack unique deltas and register segments
-    let mut packed_data = Vec::new();
+    // DO NOT write partial pack here - leave it in buffer.pending_deltas for next flush_pack call
+    // Partial packs are only written in finalize() to ensure pack boundaries align with decompression
 
-    // CRITICAL: Raw groups need a placeholder segment at position 0
-    // (C++ AGC agc_compressor.cpp line 2315: v_segments[no_segments]->add_raw(empty_ctg, nullptr, nullptr))
-    // The placeholder {0x7f} is added once when the group is created, taking slot 0
-    // This is only needed for the FIRST pack of each raw group (segments_written was 0 before max(1))
-    if !use_lz_encoding && buffer.segments_written == 0 {
-        // Add placeholder for raw groups: {0x7f} followed by separator
-        packed_data.push(0x7f);
-        packed_data.push(CONTIG_SEPARATOR);
-    }
-
-    for delta in unique_deltas.iter() {
-        packed_data.extend_from_slice(delta);
-        packed_data.push(CONTIG_SEPARATOR);
-    }
-
-    // Register segments in collection with their in_group_ids
-    for (seg, &in_group_id) in buffer.segments.iter().zip(segment_in_group_ids.iter()) {
+    // Register ALL segments in collection with their in_group_ids
+    for &(seg_idx, in_group_id) in segment_in_group_ids.iter() {
+        let seg = &buffer.segments[seg_idx];
         let mut coll = collection.lock().unwrap();
         coll.add_segment_placed(
             &seg.sample_name,
@@ -1162,32 +1250,7 @@ fn flush_pack(
         .context("Failed to register segment")?;
     }
 
-    // Update counter to track no_seqs (counts reference + unique deltas)
-    buffer.segments_written = no_seqs;
-
-    // Compress and write the packed data (if we have any delta segments)
-    if !packed_data.is_empty() {
-        let total_raw_size = packed_data.len();
-
-        let mut compressed = compress_segment_configured(&packed_data, config.compression_level)
-            .context("Failed to compress pack")?;
-        compressed.push(0); // Marker 0 = plain ZSTD
-
-        // CRITICAL: Check if compression helped (matching C++ AGC segment.h line 179)
-        // C++ AGC: if(packed_size + 1u < (uint32_t) data.size())
-        let mut arch = archive.lock().unwrap();
-        if compressed.len() < total_raw_size {
-            // Compression helped - write compressed data with metadata=original_size
-            arch.add_part(buffer.stream_id, &compressed, total_raw_size as u64)
-                .context("Failed to write compressed pack")?;
-        } else {
-            // Compression didn't help - write UNCOMPRESSED data with metadata=0
-            arch.add_part(buffer.stream_id, &packed_data, 0)
-                .context("Failed to write uncompressed pack")?;
-        }
-    }
-
-    // Clear segments for next pack
+    // Clear segments for next batch (but keep pending_deltas!)
     buffer.segments.clear();
 
     Ok(())
