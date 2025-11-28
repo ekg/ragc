@@ -2975,39 +2975,42 @@ fn worker_thread(
                         eng.register_group(key.kmer_front, key.kmer_back, group_id);
                     }
 
-                    // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC agc_compressor.cpp:1017-1024)
-                    // C++ AGC updates map_segments_terminators synchronously during segment processing,
-                    // NOT at batch end. This enables intra-batch splitting.
+                    // Update BATCH-LOCAL terminators (NOT global) - C++ AGC agc_compressor.cpp:1015-1024
                     //
-                    // IMPORTANT: Also register groups with ONE MISSING k-mer!
-                    // This allows subsequent segments to find groups like (MISSING, K) when they
-                    // have k-mer K. Previously we skipped these, causing segments to create new
-                    // groups instead of joining existing ones.
-                    {
-                        let mut term_map = map_segments_terminators.lock().unwrap();
+                    // CRITICAL: C++ AGC updates terminators in store_segments (called at batch END),
+                    // NOT during segment processing. This means segments in the SAME batch cannot
+                    // see each other through terminators - they only see groups from PREVIOUS batches.
+                    //
+                    // Previous code incorrectly updated GLOBAL terminators immediately, causing
+                    // later segments in a batch to find and use groups created earlier in the same
+                    // batch. This produced different grouping than C++ AGC.
+                    //
+                    // Now we update batch_local_terminators, which is merged to global at batch end
+                    // via flush_batch() - matching C++ AGC's timing exactly.
+                    //
+                    // C++ AGC also requires BOTH k-mers to be non-MISSING (line 1015):
+                    //   if (kmer1 != ~0ull && kmer2 != ~0ull)
+                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                        let mut term_map = batch_local_terminators.lock().unwrap();
 
-                        // Add bidirectional edge: front -> back (if front is not MISSING)
-                        if key.kmer_front != MISSING_KMER {
-                            term_map.entry(key.kmer_front)
-                                .or_insert_with(Vec::new)
-                                .push(key.kmer_back);
-                        }
+                        // Add bidirectional edge: front -> back
+                        term_map.entry(key.kmer_front)
+                            .or_insert_with(Vec::new)
+                            .push(key.kmer_back);
 
-                        // Add bidirectional edge: back -> front (if back is not MISSING and different from front)
-                        if key.kmer_back != MISSING_KMER && key.kmer_front != key.kmer_back {
+                        // Add bidirectional edge: back -> front (if different from front)
+                        if key.kmer_front != key.kmer_back {
                             term_map.entry(key.kmer_back)
                                 .or_insert_with(Vec::new)
                                 .push(key.kmer_front);
                         }
 
                         // Sort to maintain sorted order for set_intersection
-                        if key.kmer_front != MISSING_KMER {
-                            if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
-                                front_vec.sort_unstable();
-                                front_vec.dedup();
-                            }
+                        if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
+                            front_vec.sort_unstable();
+                            front_vec.dedup();
                         }
-                        if key.kmer_back != MISSING_KMER && key.kmer_front != key.kmer_back {
+                        if key.kmer_front != key.kmer_back {
                             if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
                                 back_vec.sort_unstable();
                                 back_vec.dedup();
