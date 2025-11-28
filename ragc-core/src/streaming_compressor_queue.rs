@@ -2407,13 +2407,29 @@ fn worker_thread(
                 // When front == back, it just sets store_rc based on orientation, does NOT call
                 // find_cand_segment_with_missing_middle_splitter. We must do the same.
                 let split_allowed = if std::env::var("RAGC_SPLIT_ALL").as_deref() == Ok("1") { true } else { !key_exists };
+
+                // Debug: trace split decision
+                if std::env::var("RAGC_DEBUG_SPLIT").is_ok() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
+                    eprintln!("RAGC_SPLIT_CHECK: contig={} seg={} key=({},{}) key_exists={} split_allowed={} front_missing={} back_missing={} front==back={}",
+                        task.contig_name, place, key_front, key_back, key_exists, split_allowed,
+                        key_front == MISSING_KMER, key_back == MISSING_KMER, key_front == key_back);
+                }
+
                 if split_allowed && key_front != MISSING_KMER && key_back != MISSING_KMER && key_front != key_back {
                     // CRITICAL: First attempt to find middle splitter
                     // Use ONLY global terminators (not batch-local) to match C++ AGC behavior
                     // C++ AGC only sees terminators from previous batches, not the current one
                     let middle_kmer_opt = {
                         let terminators = map_segments_terminators.lock().unwrap();
-                        find_middle_splitter(key_front, key_back, &terminators)
+                        let result = find_middle_splitter(key_front, key_back, &terminators);
+                        // Debug: trace middle splitter result
+                        if std::env::var("RAGC_DEBUG_SPLIT").is_ok() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
+                            let front_conn = terminators.get(&key_front).map(|v| v.len()).unwrap_or(0);
+                            let back_conn = terminators.get(&key_back).map(|v| v.len()).unwrap_or(0);
+                            eprintln!("RAGC_SPLIT_MIDDLE: contig={} seg={} key=({},{}) middle={:?} front_conn={} back_conn={}",
+                                task.contig_name, place, key_front, key_back, result, front_conn, back_conn);
+                        }
+                        result
                     };
 
                     #[cfg(feature = "verbose_debug")]
@@ -2433,6 +2449,12 @@ fn worker_thread(
                         // Found potential middle k-mer
                         // Now check if BOTH split groups already exist in map_segments
                         // (This is the key difference from just checking terminators!)
+
+                        // Debug: trace middle found
+                        if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+                            eprintln!("RAGC_SPLIT_FOUND_MIDDLE: contig={} seg={} middle={}", task.contig_name, place, middle_kmer);
+                        }
+
                         let left_key = if key_front <= middle_kmer {
                             SegmentGroupKey {
                                 kmer_front: key_front,
@@ -2457,9 +2479,35 @@ fn worker_thread(
                             }
                         };
 
-                        // CRITICAL: C++ AGC only checks if k-mers exist as TERMINATORS (line 1379-1382)
-                        // This is already validated by find_middle_splitter above!
-                        // Do NOT check if groups exist - splits can create NEW groups
+                        // CRITICAL: C++ AGC requires BOTH target groups to exist in map_segments
+                        // at split decision time (agc_compressor.cpp lines 1472, 1486 use .at() which throws)
+                        // If either group doesn't exist, C++ AGC aborts the split.
+                        // We must check map_segments (global), not batch_local_groups, to match C++ behavior.
+                        let (left_exists, right_exists) = {
+                            let global_map = map_segments.lock().unwrap();
+                            (global_map.contains_key(&left_key), global_map.contains_key(&right_key))
+                        };
+
+                        if !left_exists || !right_exists {
+                            // Skip split - one or both target groups don't exist yet
+                            // This matches C++ AGC behavior where .at() would throw
+                            if config.verbosity > 1 {
+                                eprintln!(
+                                    "SPLIT_SKIP_NO_GROUP: left_key=({},{}) exists={} right_key=({},{}) exists={}",
+                                    left_key.kmer_front, left_key.kmer_back, left_exists,
+                                    right_key.kmer_front, right_key.kmer_back, right_exists
+                                );
+                            }
+                            if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+                                eprintln!(
+                                    "RAGC_SPLIT_SKIP_NO_GROUP: left=({},{}) exists={} right=({},{}) exists={}",
+                                    left_key.kmer_front, left_key.kmer_back, left_exists,
+                                    right_key.kmer_front, right_key.kmer_back, right_exists
+                                );
+                            }
+                            // Don't attempt split - fall through to normal segment processing
+                        } else {
+                        // Both groups exist - proceed with split cost calculation
                         #[cfg(feature = "verbose_debug")]
                         if config.verbosity > 0 {
                             eprintln!("DEBUG_SPLIT: Attempting cost-based split for ({},{}) sample={}",
@@ -2774,6 +2822,7 @@ fn worker_thread(
                             continue;
                         }
                         // If split_result was None, fall through to normal path
+                        } // end of else { both groups exist }
                     }
                 }
 
@@ -3174,6 +3223,14 @@ fn try_split_segment_with_cost(
         );
     }
 
+    // Debug: trace split attempt
+    if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+        eprintln!("RAGC_SPLIT_TRY: front={} back={} middle={} left_key=({},{}) right_key=({},{})",
+            front_kmer, back_kmer, middle_kmer,
+            left_key.kmer_front, left_key.kmer_back,
+            right_key.kmer_front, right_key.kmer_back);
+    }
+
     // Prepare LZDiff for both groups from persistent storage
     // C++ AGC uses global v_segments[segment_id] (agc_compressor.cpp:1535-1536)
     // RAGC uses reference_segments HashMap - ALWAYS prepare on-demand
@@ -3184,16 +3241,18 @@ fn try_split_segment_with_cost(
         let map_segments_locked = map_segments.lock().unwrap();
         let ref_segments_locked = reference_segments.lock().unwrap();
 
-        // C++ AGC uses map_segments[key] which returns 0 (default) if key doesn't exist
-        // This matches C++ AGC behavior: agc_compressor.cpp:1553-1554
-        let segment_id = map_segments_locked.get(key).copied().unwrap_or(0);
+        // C++ AGC uses map_segments[key] which returns 0 (default) if key doesn't exist.
+        // v_segments[0] is a raw group initialized with empty_ctg = { 0x7f } (1 byte).
+        // This gives maximum LZ cost (no compression) for non-existent groups.
+        // To match C++ AGC behavior, use the actual reference if available,
+        // otherwise use empty reference (gives max cost like C++ AGC's v_segments[0]).
+        let segment_id = map_segments_locked.get(key).copied();
 
-        if let Some(ref_data) = ref_segments_locked.get(&segment_id) {
+        if let Some(ref_data) = segment_id.and_then(|id| ref_segments_locked.get(&id)) {
             // Reference exists! Prepare LZDiff on-demand
-            #[cfg(feature = "verbose_debug")]
-            if config.verbosity > 0 {
+            if std::env::var("RAGC_DEBUG_SPLIT_REF").is_ok() {
                 eprintln!(
-                    "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} ref_size={}",
+                    "RAGC_SPLIT_REF: {}_key=({},{}) segment_id={:?} ref_size={} (ACTUAL)",
                     label, key.kmer_front, key.kmer_back, segment_id, ref_data.len()
                 );
             }
@@ -3202,17 +3261,23 @@ fn try_split_segment_with_cost(
             lz.prepare(ref_data);
             return Some(lz);
         } else {
-            // Segment ID exists but no reference data
-            // This can happen when groups don't exist yet (segment_id=0 may not have reference)
-            #[cfg(feature = "verbose_debug")]
-            if config.verbosity > 0 {
+            // No reference data available for this group
+            // C++ AGC uses v_segments[0] which is initialized with empty_ctg = { 0x7f } (1 byte)
+            // This gives maximum LZ cost (no compression matches possible)
+            // Return LZDiff prepared with empty reference to match C++ AGC behavior
+            if std::env::var("RAGC_DEBUG_SPLIT_REF").is_ok() {
                 eprintln!(
-                    "DEBUG_LZDIFF: {}_key=({},{}) segment_id={} NO REFERENCE DATA (group may not exist yet)",
+                    "RAGC_SPLIT_REF: {}_key=({},{}) segment_id={:?} ref_size=1 (EMPTY FALLBACK)",
                     label, key.kmer_front, key.kmer_back, segment_id
                 );
             }
+
+            // Use 1-byte dummy reference like C++ AGC's empty_ctg = { 0x7f }
+            let empty_ref: Vec<u8> = vec![0x7f];
+            let mut lz = LZDiff::new(config.min_match_len as u32);
+            lz.prepare(&empty_ref);
+            return Some(lz);
         }
-        None
     };
 
     // Build segment in both orientations once
@@ -3316,6 +3381,9 @@ fn try_split_segment_with_cost(
         }
         } else {
         if config.verbosity > 1 { eprintln!("SPLIT_SKIP: left group has no reference yet"); }
+        if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+            eprintln!("RAGC_SPLIT_SKIP_LEFT: left_key=({},{}) has no reference", left_key.kmer_front, left_key.kmer_back);
+        }
         return None;
         }
     } else { Vec::new() };
