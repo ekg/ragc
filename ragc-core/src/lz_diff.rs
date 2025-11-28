@@ -212,12 +212,15 @@ impl LZDiff {
     }
 
     /// Encode a match
+    /// Format: <pos>,<len>. or <pos>,. (comma always present, "to end" has comma followed by period)
     fn encode_match(&self, ref_pos: u32, len: Option<u32>, pred_pos: u32, encoded: &mut Vec<u8>) {
         let dif_pos = (ref_pos as i32) - (pred_pos as i32);
         self.append_int(encoded, dif_pos as i64);
 
+        // C++ AGC format: comma is ALWAYS present
+        encoded.push(b',');
+
         if let Some(match_len) = len {
-            encoded.push(b',');
             self.append_int(encoded, (match_len - self.min_match_len) as i64);
         }
 
@@ -632,9 +635,11 @@ impl LZDiff {
 
     /// Decode encoded sequence using reference
     pub fn decode(&self, encoded: &[u8]) -> Vec<u8> {
+        let debug_decode = std::env::var("RAGC_DEBUG_LZ_DECODE").is_ok();
         let mut decoded = Vec::new();
         let mut pred_pos = 0usize;
         let mut i = 0;
+        let mut op_count = 0;
 
         while i < encoded.len() {
             if self.is_literal(encoded[i]) {
@@ -645,12 +650,22 @@ impl LZDiff {
                     c
                 };
                 decoded.push(actual_c);
+                if debug_decode && op_count < 10 {
+                    eprintln!("  LZ_DECODE op={}: LITERAL byte={} c={} actual_c={} pred_pos={} decoded_len={}",
+                        op_count, encoded[i], c, actual_c, pred_pos, decoded.len());
+                }
                 pred_pos += 1;
                 i += 1;
+                op_count += 1;
             } else if encoded[i] == N_RUN_STARTER_CODE {
                 let (len, consumed) = self.decode_nrun(&encoded[i..]);
                 decoded.resize(decoded.len() + len as usize, N_CODE);
+                if debug_decode && op_count < 10 {
+                    eprintln!("  LZ_DECODE op={}: NRUN len={} consumed={} decoded_len={}",
+                        op_count, len, consumed, decoded.len());
+                }
                 i += consumed;
+                op_count += 1;
             } else {
                 // It's a match
                 let (ref_pos, len, consumed) = self.decode_match(&encoded[i..], pred_pos);
@@ -660,10 +675,26 @@ impl LZDiff {
                 } else {
                     len as usize
                 };
+                if debug_decode && op_count < 10 {
+                    eprintln!("  LZ_DECODE op={}: MATCH ref_pos={} len={} actual_len={} consumed={} pred_pos={} ref_len={} decoded_len_before={}",
+                        op_count, ref_pos, len, actual_len, consumed, pred_pos, self.reference_len, decoded.len());
+                }
                 decoded.extend_from_slice(&self.reference[ref_pos..ref_pos + actual_len]);
                 pred_pos = ref_pos + actual_len;
                 i += consumed;
+                op_count += 1;
             }
+        }
+
+        if debug_decode {
+            eprintln!("  LZ_DECODE: total_ops={} final_decoded_len={} ref_len={}",
+                op_count, decoded.len(), self.reference_len);
+        }
+
+        // Debug: trace when decoded is significantly longer than reference
+        if std::env::var("RAGC_DEBUG_LZ_DECODE_FULL").is_ok() && decoded.len() > self.reference_len + 50 {
+            eprintln!("  LZ_DECODE_BLOAT: ref_len={} decoded_len={} encoded_len={}", self.reference_len, decoded.len(), encoded.len());
+            eprintln!("    Encoded first 100 bytes: {:?}", &encoded[..encoded.len().min(100)]);
         }
 
         decoded
@@ -693,6 +724,7 @@ impl LZDiff {
     }
 
     /// Decode a match, returns (ref_pos, length, bytes_consumed)
+    /// Format: <pos>,<len>. or <pos>,. (comma always present, "to end" has comma followed by period)
     fn decode_match(&self, data: &[u8], pred_pos: usize) -> (usize, u32, usize) {
         let mut i = 0;
         let (raw_pos, pos_bytes) = self.read_int(&data[i..]);
@@ -700,15 +732,21 @@ impl LZDiff {
 
         let ref_pos = ((pred_pos as i64) + raw_pos) as usize;
 
-        let len = if data[i] == b',' {
-            i += 1; // Skip comma
+        // C++ AGC format: comma is ALWAYS present
+        // - With length: <pos>,<len>.
+        // - Without length (to end): <pos>,.
+        i += 1; // Skip comma (always present)
+
+        let len = if data[i] == b'.' {
+            // "To end" case: <pos>,.
+            i += 1; // Skip period
+            u32::MAX // Sentinel for "to end of sequence"
+        } else {
+            // With length: <pos>,<len>.
             let (raw_len, len_bytes) = self.read_int(&data[i..]);
             i += len_bytes;
             i += 1; // Skip period
             (raw_len as u32) + self.min_match_len
-        } else {
-            i += 1; // Skip period
-            u32::MAX // Sentinel for "to end of sequence"
         };
 
         (ref_pos, len, i)

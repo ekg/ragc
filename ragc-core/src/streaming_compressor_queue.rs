@@ -953,6 +953,14 @@ fn flush_pack(
         // Remove first segment (alphabetically first) to use as reference
         let ref_seg = buffer.segments.remove(0);
 
+        if std::env::var("RAGC_DEBUG_REF_WRITE").is_ok() {
+            eprintln!(
+                "DEBUG_REF_WRITE: group={} sample={} contig={} seg={} data_len={} segments_remaining={}",
+                buffer.group_id, ref_seg.sample_name, ref_seg.contig_name,
+                ref_seg.seg_part_no, ref_seg.data.len(), buffer.segments.len()
+            );
+        }
+
         if config.verbosity > 1 {
             eprintln!(
                 "  Flushing group {}: reference from {} (chosen from {} sorted segments)",
@@ -1198,6 +1206,14 @@ fn write_reference_immediately(
     config: &StreamingQueueConfig,
 ) -> Result<()> {
     use crate::segment_compression::compress_reference_segment;
+
+    if std::env::var("RAGC_DEBUG_REF_WRITE").is_ok() {
+        eprintln!(
+            "DEBUG_REF_IMMEDIATE: group={} sample={} contig={} seg={} data_len={}",
+            buffer.group_id, segment.sample_name, segment.contig_name,
+            segment.seg_part_no, segment.data.len()
+        );
+    }
 
     if config.verbosity > 1 {
         eprintln!(

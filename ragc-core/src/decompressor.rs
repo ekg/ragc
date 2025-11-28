@@ -2,9 +2,10 @@
 // Extracts genomes from AGC archives
 
 use crate::{
-    genome_io::GenomeWriter, kmer::reverse_complement, lz_diff::LZDiff,
+    genome_io::{GenomeWriter, CNV_NUM}, lz_diff::LZDiff,
     segment_compression::decompress_segment_with_marker,
 };
+
 use anyhow::{anyhow, Context, Result};
 use ragc_common::{
     stream_delta_name, stream_ref_name, Archive, CollectionV3, Contig, SegmentDesc, AGC_FILE_MAJOR,
@@ -367,11 +368,21 @@ impl Decompressor {
     }
 
     /// Apply reverse complement to a segment (reverse order and complement each base)
+    ///
+    /// C++ AGC compatibility: Only complement bases 0-3 (A, C, G, T).
+    /// IUPAC ambiguity codes (4+) are reversed but NOT complemented.
+    /// This matches C++ AGC's behavior: `(*p < 4) ? 3 - *p : *p`
     fn reverse_complement_segment(segment: &[u8]) -> Contig {
         segment
             .iter()
             .rev()
-            .map(|&base| reverse_complement(base as u64) as u8)
+            .map(|&base| {
+                if base < 4 {
+                    3 - base // Complement: A(0)<->T(3), C(1)<->G(2)
+                } else {
+                    base // Keep IUPAC codes unchanged (just reverse position)
+                }
+            })
             .collect()
     }
 
@@ -390,7 +401,7 @@ impl Decompressor {
         for (i, segment_desc) in segments.iter().enumerate() {
             let mut segment_data = self.get_segment(segment_desc)?;
 
-            // Apply reverse complement if needed
+            // Apply reverse complement if the segment was stored in reverse orientation
             if segment_desc.is_rev_comp {
                 segment_data = Self::reverse_complement_segment(&segment_data);
             }
@@ -511,14 +522,25 @@ impl Decompressor {
                 // Check if data is in 2-bit packed format (C++ AGC compatibility)
                 // If decompressed length is ~1/4 of raw_length, it's packed
                 // Allow small tolerance for rounding (last byte can encode 1-4 bases)
-                let is_packed = decompressed_ref.len() * 4 >= desc.raw_length as usize
-                    && decompressed_ref.len() * 4 < desc.raw_length as usize + 8;
+                //
+                // CRITICAL: Use ref_metadata (original reference size) NOT desc.raw_length (requested segment size)
+                // When ref_metadata != 0, it contains the original uncompressed size of the REFERENCE.
+                // desc.raw_length is the size of the segment being requested, which may differ from the reference.
+                let expected_ref_len = if ref_metadata != 0 {
+                    ref_metadata as usize
+                } else {
+                    // If ref_metadata == 0, the reference was stored uncompressed, so use actual size
+                    decompressed_ref.len()
+                };
+
+                let is_packed = decompressed_ref.len() * 4 >= expected_ref_len
+                    && decompressed_ref.len() * 4 < expected_ref_len + 8;
 
                 if self.config.verbosity > 2 {
                     eprintln!(
-                        "  DEBUG: decompressed_len={}, raw_length={}, decompressed*4={}, is_packed={}",
+                        "  DEBUG: decompressed_len={}, expected_ref_len={}, decompressed*4={}, is_packed={}",
                         decompressed_ref.len(),
-                        desc.raw_length,
+                        expected_ref_len,
                         decompressed_ref.len() * 4,
                         is_packed
                     );
@@ -527,7 +549,7 @@ impl Decompressor {
                 if is_packed {
                     // Unpack from 2-bit format to 1-byte-per-base format
                     decompressed_ref =
-                        Self::unpack_2bit(&decompressed_ref, desc.raw_length as usize);
+                        Self::unpack_2bit(&decompressed_ref, expected_ref_len);
 
                     if self.config.verbosity > 1 {
                         eprintln!(
@@ -624,6 +646,22 @@ impl Decompressor {
                 lz_diff.decode(&lz_encoded)
             };
 
+            // Debug: check for corruption pattern (AAAA = zeros)
+            if std::env::var("RAGC_DEBUG_DECODE").is_ok() {
+                // Critical: check if decoded length mismatches raw_length
+                if decoded.len() as u32 != desc.raw_length {
+                    eprintln!("RAGC_DEBUG_DECODE_MISMATCH: group={} in_group={} raw_len={} decoded_len={} ref_len={} lz_encoded_len={}",
+                        desc.group_id, desc.in_group_id, desc.raw_length, decoded.len(), reference.len(), lz_encoded.len());
+                    eprintln!("  LZ encoded bytes (first 100): {:?}", &lz_encoded[..lz_encoded.len().min(100)]);
+
+                    // Show first few bytes of decoded and expected
+                    let dec_start: Vec<u8> = decoded.iter().take(30).copied().collect();
+                    let ref_start: Vec<u8> = reference.iter().take(30).copied().collect();
+                    eprintln!("  Decoded[0:30]={:?}", dec_start);
+                    eprintln!("  Reference[0:30]={:?}", ref_start);
+                }
+            }
+
             if self.config.verbosity > 1 {
                 eprintln!("Decoded segment: length={}", decoded.len());
             }
@@ -662,10 +700,21 @@ impl Decompressor {
                 return Ok(decompressed_ref);
             }
 
-            // Otherwise, load delta from delta stream at position (in_group_id - 1)
-            let delta_position = (desc.in_group_id - 1) as usize;
-            let pack_id = delta_position / PACK_CARDINALITY;
-            let position_in_pack = delta_position % PACK_CARDINALITY;
+            // Otherwise, load delta from delta stream
+            // CRITICAL: Raw groups have a placeholder {0x7f} at position 0 in the first pack
+            // So for in_group_id=1, we need to read position 1 (not 0) to skip the placeholder
+            // For subsequent packs, the placeholder is only in pack 0, so we need to adjust
+            let delta_position = desc.in_group_id as usize; // Don't subtract 1 - placeholder takes slot 0
+            let pack_id = delta_position / (PACK_CARDINALITY + 1); // +1 for placeholder in pack 0
+            // Position within pack: for pack 0, position = in_group_id; for later packs, no placeholder
+            let position_in_pack = if pack_id == 0 {
+                delta_position
+            } else {
+                // Segments after pack 0 don't have placeholder
+                // Pack 0 holds: placeholder + PACK_CARDINALITY segments (indices 1 to PACK_CARDINALITY)
+                // Pack 1 holds: segments PACK_CARDINALITY+1 onwards
+                (delta_position - (PACK_CARDINALITY + 1)) % PACK_CARDINALITY
+            };
 
             if self.config.verbosity > 1 {
                 eprintln!("  Raw group: delta_position={delta_position}, pack_id={pack_id}, position_in_pack={position_in_pack}");
@@ -808,15 +857,17 @@ impl Decompressor {
         let mut writer = GenomeWriter::<File>::create(output_path)?;
 
         for (contig_name, contig_data) in contigs {
-            // Convert numeric encoding back to ASCII (0→A, 1→C, 2→G, 3→T)
+            // Convert numeric encoding back to ASCII using CNV_NUM lookup table
+            // CNV_NUM[0..16] = [A, C, G, T, N, R, Y, S, W, K, M, B, D, H, V, U]
+            // This preserves all IUPAC ambiguity codes, not just ACGT
             let mut ascii_data = Vec::with_capacity(contig_data.len());
             for &base in &contig_data {
-                let ascii_base = match base {
-                    0 => b'A',
-                    1 => b'C',
-                    2 => b'G',
-                    3 => b'T',
-                    _ => b'N',
+                // Use CNV_NUM[0..16] for proper IUPAC code decoding
+                // Values 0-15 map to valid bases, anything else (shouldn't happen) maps to N
+                let ascii_base = if base < 16 {
+                    CNV_NUM[base as usize]
+                } else {
+                    b'N'
                 };
                 ascii_data.push(ascii_base);
             }
