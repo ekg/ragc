@@ -1334,57 +1334,70 @@ fn find_group_with_one_kmer(
         for &cand_kmer in &connected_kmers {
             // Create candidate group key normalized (smaller, larger)
             // C++ AGC lines 1691-1704
-            let (key_front, key_back, needs_rc) = if cand_kmer < kmer {
+            //
+            // IMPORTANT: When cand_kmer is MISSING, we need to try BOTH orderings!
+            // Groups with MISSING k-mers can be stored as either (MISSING, kmer) or (kmer, MISSING)
+            // depending on kmer_is_dir when they were created. We must match the actual stored key.
+            let candidate_orderings: Vec<(u64, u64, bool)> = if cand_kmer == MISSING_KMER {
+                // MISSING is involved - try both orderings to find the group
+                vec![
+                    (MISSING_KMER, kmer, true),   // (MISSING, kmer) with RC
+                    (kmer, MISSING_KMER, false),  // (kmer, MISSING) without RC
+                ]
+            } else if cand_kmer < kmer {
                 // cand_kmer is smaller - it goes first
                 // This means we need to RC (C++ AGC line 1696: get<2>(ck) = true)
-                (cand_kmer, kmer, true)
+                vec![(cand_kmer, kmer, true)]
             } else {
                 // kmer is smaller - it goes first
                 // No RC needed (C++ AGC line 1703: get<2>(ck) = false)
-                (kmer, cand_kmer, false)
+                vec![(kmer, cand_kmer, false)]
             };
 
-            let cand_key = SegmentGroupKey {
-                kmer_front: key_front,
-                kmer_back: key_back,
-            };
-
-            // Check if this group exists in global registry OR batch-local buffer
-            // CRITICAL FIX: Check BOTH seg_map (global) AND groups (batch-local)
-            // This matches C++ AGC behavior where groups created in same batch are visible
-            // Debug: trace candidate lookup
-            if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
-                eprintln!("RAGC_FIND_GROUP_CAND_CHECK: cand_key=({},{}) exists_in_seg_map={} exists_in_groups={}",
-                    key_front, key_back, seg_map.contains_key(&cand_key), groups.contains_key(&cand_key));
-            }
-
-            // Check global registry first
-            let in_global = seg_map.get(&cand_key);
-            // Also check batch-local buffer
-            let in_batch_local = groups.get(&cand_key);
-
-            if in_global.is_some() || in_batch_local.is_some() {
-                // Get reference segment size from buffer OR persistent storage
-                let ref_size = if let Some(group_buffer) = in_batch_local {
-                    // Group in buffer - get size from buffer
-                    if let Some(ref_seg) = &group_buffer.reference_segment {
-                        ref_seg.data.len()
-                    } else {
-                        segment_len // No reference yet, use current segment size
-                    }
-                } else if let Some(&group_id) = in_global {
-                    // Group flushed - get size from persistent storage
-                    if let Some(ref_data) = ref_segs.get(&group_id) {
-                        ref_data.len()
-                    } else {
-                        // Group exists but no reference data yet
-                        segment_len
-                    }
-                } else {
-                    segment_len
+            for (key_front, key_back, needs_rc) in candidate_orderings {
+                let cand_key = SegmentGroupKey {
+                    kmer_front: key_front,
+                    kmer_back: key_back,
                 };
 
-                candidates.push((key_front, key_back, needs_rc, ref_size));
+                // Check if this group exists in global registry OR batch-local buffer
+                // CRITICAL FIX: Check BOTH seg_map (global) AND groups (batch-local)
+                // This matches C++ AGC behavior where groups created in same batch are visible
+                // Debug: trace candidate lookup
+                if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+                    eprintln!("RAGC_FIND_GROUP_CAND_CHECK: cand_key=({},{}) exists_in_seg_map={} exists_in_groups={}",
+                        key_front, key_back, seg_map.contains_key(&cand_key), groups.contains_key(&cand_key));
+                }
+
+                // Check global registry first
+                let in_global = seg_map.get(&cand_key);
+                // Also check batch-local buffer
+                let in_batch_local = groups.get(&cand_key);
+
+                if in_global.is_some() || in_batch_local.is_some() {
+                    // Get reference segment size from buffer OR persistent storage
+                    let ref_size = if let Some(group_buffer) = in_batch_local {
+                        // Group in buffer - get size from buffer
+                        if let Some(ref_seg) = &group_buffer.reference_segment {
+                            ref_seg.data.len()
+                        } else {
+                            segment_len // No reference yet, use current segment size
+                        }
+                    } else if let Some(&group_id) = in_global {
+                        // Group flushed - get size from persistent storage
+                        if let Some(ref_data) = ref_segs.get(&group_id) {
+                            ref_data.len()
+                        } else {
+                            // Group exists but no reference data yet
+                            segment_len
+                        }
+                    } else {
+                        segment_len
+                    };
+
+                    candidates.push((key_front, key_back, needs_rc, ref_size));
+                    break; // Found a match for this cand_kmer, move to next
+                }
             }
         }
     }
@@ -2965,27 +2978,36 @@ fn worker_thread(
                     // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC agc_compressor.cpp:1017-1024)
                     // C++ AGC updates map_segments_terminators synchronously during segment processing,
                     // NOT at batch end. This enables intra-batch splitting.
-                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                    //
+                    // IMPORTANT: Also register groups with ONE MISSING k-mer!
+                    // This allows subsequent segments to find groups like (MISSING, K) when they
+                    // have k-mer K. Previously we skipped these, causing segments to create new
+                    // groups instead of joining existing ones.
+                    {
                         let mut term_map = map_segments_terminators.lock().unwrap();
 
-                        // Add bidirectional edge: front -> back
-                        term_map.entry(key.kmer_front)
-                            .or_insert_with(Vec::new)
-                            .push(key.kmer_back);
+                        // Add bidirectional edge: front -> back (if front is not MISSING)
+                        if key.kmer_front != MISSING_KMER {
+                            term_map.entry(key.kmer_front)
+                                .or_insert_with(Vec::new)
+                                .push(key.kmer_back);
+                        }
 
-                        // Add bidirectional edge: back -> front (if different)
-                        if key.kmer_front != key.kmer_back {
+                        // Add bidirectional edge: back -> front (if back is not MISSING and different from front)
+                        if key.kmer_back != MISSING_KMER && key.kmer_front != key.kmer_back {
                             term_map.entry(key.kmer_back)
                                 .or_insert_with(Vec::new)
                                 .push(key.kmer_front);
                         }
 
                         // Sort to maintain sorted order for set_intersection
-                        if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
-                            front_vec.sort_unstable();
-                            front_vec.dedup();
+                        if key.kmer_front != MISSING_KMER {
+                            if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
+                                front_vec.sort_unstable();
+                                front_vec.dedup();
+                            }
                         }
-                        if key.kmer_front != key.kmer_back {
+                        if key.kmer_back != MISSING_KMER && key.kmer_front != key.kmer_back {
                             if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
                                 back_vec.sort_unstable();
                                 back_vec.dedup();
