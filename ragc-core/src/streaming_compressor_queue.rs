@@ -1210,7 +1210,11 @@ fn flush_pack(
             segment_in_group_ids.push((seg_idx, reused_id));
         } else {
             // New unique delta - assign next in_group_id (matching C++ AGC segment.cpp lines 74, 77)
-            let in_group_id = buffer.segments_written.max(1);
+            // FIX: Apply .max(1) BEFORE using segments_written to ensure unique IDs when no reference
+            // Bug was: max(0,1)=1, increment to 1 → max(1,1)=1 (COLLISION!)
+            // Fixed: max(0,1)=1, id=1, increment to 2 → id=2 (UNIQUE!)
+            buffer.segments_written = buffer.segments_written.max(1);
+            let in_group_id = buffer.segments_written;
             buffer.segments_written += 1;
             buffer.pending_delta_ids.push(in_group_id);
             segment_in_group_ids.push((seg_idx, in_group_id));
