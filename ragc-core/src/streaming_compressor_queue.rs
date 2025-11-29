@@ -1,10 +1,11 @@
 // Queue-based streaming compressor API
 // Provides simple push() interface with automatic backpressure and constant memory usage
 
+use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
 use crate::lz_diff::LZDiff;
 use crate::memory_bounded_queue::MemoryBoundedQueue;
 use crate::segment::{split_at_splitters_with_size, MISSING_KMER};
-use crate::splitters::determine_splitters;
+use crate::splitters::{determine_splitters, find_new_splitters_for_contig};
 use anyhow::{Context, Result};
 use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -103,6 +104,12 @@ pub struct StreamingQueueConfig {
     /// Fallback fraction: fraction of minimizers to use for fallback grouping
     /// (matches C++ AGC --fallback-frac parameter, default 0.0)
     pub fallback_frac: f64,
+
+    /// Batch size: number of samples to accumulate before sorting and distributing
+    /// (matches C++ AGC pack_cardinality parameter, default 50)
+    /// Segments from batch_size samples are sorted by (sample, contig, seg_part_no)
+    /// before distribution to groups, ensuring consistent pack boundaries with C++ AGC.
+    pub batch_size: usize,
 }
 
 impl Default for StreamingQueueConfig {
@@ -117,6 +124,7 @@ impl Default for StreamingQueueConfig {
             verbosity: 1,
             adaptive_mode: false, // Default matches C++ AGC (adaptive mode off)
             fallback_frac: 0.0,   // Default matches C++ AGC (fallback disabled)
+            batch_size: 50,       // Default matches C++ AGC pack_cardinality
         }
     }
 }
@@ -187,7 +195,8 @@ struct SegmentGroupKey {
 }
 
 /// Pending segment for batch-local processing (before group assignment)
-#[derive(Debug, Clone)]
+/// Segments are sorted by (sample_name, contig_name, place) to match C++ AGC order
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingSegment {
     key: SegmentGroupKey,
     segment_data: Vec<u8>,
@@ -195,6 +204,33 @@ struct PendingSegment {
     sample_name: String,
     contig_name: String,
     place: usize,
+}
+
+// Match C++ AGC sorting order (agc_compressor.h lines 112-119)
+// Sort by: sample_name, then contig_name, then place (seg_part_no)
+impl PartialOrd for PendingSegment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingSegment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // First compare by sample_name
+        match self.sample_name.cmp(&other.sample_name) {
+            std::cmp::Ordering::Equal => {
+                // Then by contig_name
+                match self.contig_name.cmp(&other.contig_name) {
+                    std::cmp::Ordering::Equal => {
+                        // Finally by place (seg_part_no)
+                        self.place.cmp(&other.place)
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 /// Buffered segment waiting to be packed
@@ -340,8 +376,8 @@ pub struct StreamingQueueCompressor {
     sample_priorities: Arc<Mutex<std::collections::HashMap<String, i32>>>, // sample_name -> priority
 
     // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
-    // When sample changes, we flush pending segments and clear batch-local state
-    current_batch_sample: Arc<Mutex<Option<String>>>, // Current sample being processed
+    // When batch_samples reaches batch_size, we flush pending segments and clear batch-local state
+    batch_samples: Arc<Mutex<HashSet<String>>>, // Samples in current batch (matches C++ AGC pack_cardinality batch)
     batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>, // Batch-local m_kmers equivalent
     batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>, // Batch-local terminators - only merged to global at batch end
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>, // Buffer segments until batch boundary
@@ -356,6 +392,11 @@ pub struct StreamingQueueCompressor {
     deferred_params: (usize, Vec<u8>),            // (stream_id, data)
     deferred_splitters: (usize, Vec<u8>),         // (stream_id, data)
     deferred_segment_splitters: (usize, Vec<u8>), // (stream_id, data)
+
+    // Dynamic splitter discovery for adaptive mode (matches C++ AGC find_new_splitters)
+    // Stores reference k-mers to exclude when finding new splitters for non-reference contigs
+    ref_singletons: Arc<Vec<u64>>, // Sorted for binary search - reference singleton k-mers (v_candidate_kmers)
+    ref_duplicates: Arc<HashSet<u64>>, // Reference duplicate k-mers (v_duplicated_kmers)
 }
 
 impl StreamingQueueCompressor {
@@ -371,6 +412,24 @@ impl StreamingQueueCompressor {
         output_path: impl AsRef<Path>,
         config: StreamingQueueConfig,
         splitters: HashSet<u64>,
+    ) -> Result<Self> {
+        // Call internal with empty ref data (no dynamic splitter discovery)
+        Self::with_splitters_internal(
+            output_path,
+            config,
+            splitters,
+            Arc::new(Vec::new()),
+            Arc::new(HashSet::new()),
+        )
+    }
+
+    /// Internal constructor that accepts all splitter data
+    fn with_splitters_internal(
+        output_path: impl AsRef<Path>,
+        config: StreamingQueueConfig,
+        splitters: HashSet<u64>,
+        ref_singletons: Arc<Vec<u64>>,
+        ref_duplicates: Arc<HashSet<u64>>,
     ) -> Result<Self> {
         let output_path = output_path.as_ref();
         let archive_path = output_path.to_string_lossy().to_string();
@@ -471,6 +530,8 @@ impl StreamingQueueCompressor {
         let queue = Arc::new(MemoryBoundedQueue::new(config.queue_capacity));
 
         let splitters = Arc::new(splitters);
+        // ref_singletons and ref_duplicates are passed as parameters to ensure workers
+        // get the same Arc as stored in self (critical for dynamic splitter discovery)
 
         // Segment grouping for LZ packing (using BTreeMap for better memory efficiency)
         let segment_groups = Arc::new(Mutex::new(BTreeMap::new()));
@@ -502,7 +563,7 @@ impl StreamingQueueCompressor {
         let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Increases for each contig (FASTA order)
 
         // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
-        let current_batch_sample: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let batch_samples: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
         let batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
         let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
@@ -514,6 +575,8 @@ impl StreamingQueueCompressor {
             let queue = Arc::clone(&queue);
             let collection = Arc::clone(&collection);
             let splitters = Arc::clone(&splitters);
+            let ref_singletons = Arc::clone(&ref_singletons);
+            let ref_duplicates = Arc::clone(&ref_duplicates);
             let archive = Arc::clone(&archive);
             let segment_groups = Arc::clone(&segment_groups);
             let group_counter = Arc::clone(&group_counter);
@@ -526,7 +589,7 @@ impl StreamingQueueCompressor {
             let split_offsets = Arc::clone(&split_offsets);
             #[cfg(feature = "cpp_agc")]
             let grouping_engine = Arc::clone(&grouping_engine);
-            let current_batch_sample = Arc::clone(&current_batch_sample);
+            let batch_samples = Arc::clone(&batch_samples);
             let batch_local_groups = Arc::clone(&batch_local_groups);
             let batch_local_terminators = Arc::clone(&batch_local_terminators);
             let pending_batch_segments = Arc::clone(&pending_batch_segments);
@@ -539,6 +602,8 @@ impl StreamingQueueCompressor {
                     queue,
                     collection,
                     splitters,
+                    ref_singletons,
+                    ref_duplicates,
                     archive,
                     segment_groups,
                     group_counter,
@@ -551,7 +616,7 @@ impl StreamingQueueCompressor {
                     split_offsets,
                     #[cfg(feature = "cpp_agc")]
                     grouping_engine,
-                    current_batch_sample,
+                    batch_samples,
                     batch_local_groups,
                     batch_local_terminators,
                     pending_batch_segments,
@@ -587,7 +652,7 @@ impl StreamingQueueCompressor {
             split_offsets,
             sample_priorities,
             next_priority,
-            current_batch_sample,
+            batch_samples,
             batch_local_groups,
             batch_local_terminators,
             pending_batch_segments,
@@ -598,7 +663,51 @@ impl StreamingQueueCompressor {
             deferred_params,
             deferred_splitters,
             deferred_segment_splitters,
+            // Dynamic splitter discovery - MUST use the SAME Arcs passed to workers!
+            // (empty by default - populated with_full_splitter_data)
+            ref_singletons,
+            ref_duplicates,
         })
+    }
+
+    /// Create a new streaming compressor with full splitter data for dynamic discovery
+    ///
+    /// This is the preferred constructor when using adaptive mode. It accepts:
+    /// - `splitters`: Pre-computed splitter k-mers from reference (for initial segmentation)
+    /// - `singletons`: All singleton k-mers from reference (for exclusion in find_new_splitters)
+    /// - `duplicates`: All duplicate k-mers from reference (for exclusion in find_new_splitters)
+    ///
+    /// # Arguments
+    /// * `output_path` - Path to output AGC archive
+    /// * `config` - Compression configuration
+    /// * `splitters` - Pre-computed splitter k-mers
+    /// * `singletons` - Reference singleton k-mers (sorted Vec for binary search)
+    /// * `duplicates` - Reference duplicate k-mers
+    pub fn with_full_splitter_data(
+        output_path: impl AsRef<Path>,
+        config: StreamingQueueConfig,
+        splitters: HashSet<u64>,
+        singletons: Vec<u64>,
+        duplicates: HashSet<u64>,
+    ) -> Result<Self> {
+        // Sort singletons for binary search before creating compressor
+        let mut sorted_singletons = singletons;
+        sorted_singletons.sort_unstable();
+
+        let verbosity = config.verbosity;
+        let ref_singletons = Arc::new(sorted_singletons);
+        let ref_duplicates = Arc::new(duplicates);
+
+        if verbosity > 0 {
+            eprintln!(
+                "  Dynamic splitter discovery enabled: {} ref singletons, {} ref duplicates",
+                ref_singletons.len(),
+                ref_duplicates.len()
+            );
+        }
+
+        // Call internal constructor with ref data so workers get the correct Arcs
+        Self::with_splitters_internal(output_path, config, splitters, ref_singletons, ref_duplicates)
     }
 
     /// Create compressor and determine splitters from first contig
@@ -649,6 +758,8 @@ impl StreamingQueueCompressor {
                 let queue = Arc::clone(&self.queue);
                 let collection = Arc::clone(&self.collection);
                 let splitters = Arc::clone(&self.splitters);
+                let ref_singletons = Arc::clone(&self.ref_singletons);
+                let ref_duplicates = Arc::clone(&self.ref_duplicates);
                 let archive = Arc::clone(&self.archive);
                 let segment_groups = Arc::clone(&self.segment_groups);
                 let group_counter = Arc::clone(&self.group_counter);
@@ -661,7 +772,7 @@ impl StreamingQueueCompressor {
                 let split_offsets = Arc::clone(&self.split_offsets);
                 #[cfg(feature = "cpp_agc")]
                 let grouping_engine = Arc::clone(&self.grouping_engine);
-                let current_batch_sample = Arc::clone(&self.current_batch_sample);
+                let batch_samples = Arc::clone(&self.batch_samples);
                 let batch_local_groups = Arc::clone(&self.batch_local_groups);
                 let batch_local_terminators = Arc::clone(&self.batch_local_terminators);
                 let pending_batch_segments = Arc::clone(&self.pending_batch_segments);
@@ -674,6 +785,8 @@ impl StreamingQueueCompressor {
                         queue,
                         collection,
                         splitters,
+                        ref_singletons,
+                        ref_duplicates,
                         archive,
                         segment_groups,
                         group_counter,
@@ -686,7 +799,7 @@ impl StreamingQueueCompressor {
                         split_offsets,
                         #[cfg(feature = "cpp_agc")]
                         grouping_engine,
-                        current_batch_sample,
+                        batch_samples,
                         batch_local_groups,
                         batch_local_terminators,
                         pending_batch_segments,
@@ -996,17 +1109,17 @@ fn flush_pack(
 
     let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
 
-    // DO NOT SORT: With file-by-file batch processing (matching C++ AGC's pack_cardinality batching),
-    // segments arrive in the correct order already (file order = batch order).
-    // C++ AGC sorts WITHIN each batch BEFORE distributing to groups,
-    // so segments are already sorted when they arrive at each group.
-    // Sorting here would reorder segments from DIFFERENT batches alphabetically, which is wrong!
+    // CRITICAL FIX: Sort ALL segments FIRST by (sample_name, contig_name, seg_part_no)
+    // BEFORE picking the reference. This ensures the lexicographically first segment
+    // becomes the reference, matching C++ AGC's behavior.
+    // (Previous code sorted AFTER picking reference, causing wrong reference selection)
+    buffer.segments.sort();
 
     // Write reference segment if not already written (first pack for this group)
     // Extract reference from sorted segments (matching C++ AGC: first segment after sort becomes reference)
     // NOTE: Raw groups (0-15) do NOT have a reference - all segments stored raw
     if use_lz_encoding && !buffer.ref_written && !buffer.segments.is_empty() {
-        // Remove first segment (alphabetically first) to use as reference
+        // Remove first segment (alphabetically first after sorting) to use as reference
         let ref_seg = buffer.segments.remove(0);
 
         if std::env::var("RAGC_DEBUG_REF_WRITE").is_ok() {
@@ -1082,11 +1195,8 @@ fn flush_pack(
         }
     }
 
-    // CRITICAL: Sort segments by (sample_name, contig_name, seg_part_no) before processing
-    // This matches C++ AGC's sort_known() in agc_compressor.h line 236-238
-    // Without this sorting, segments are processed in file-system order which differs from
-    // C++ AGC's lexicographic order, causing different in_group_id assignments and worse compression
-    buffer.segments.sort();
+    // NOTE: Segments are already sorted at the start of flush_pack (line ~1003)
+    // This sort was moved earlier to ensure correct reference selection.
 
     // Pack segments together with delta deduplication (matching C++ AGC segment.cpp lines 66-74)
     // Note: segments do NOT include the reference - it's stored separately
@@ -2221,6 +2331,8 @@ fn worker_thread(
     queue: Arc<MemoryBoundedQueue<ContigTask>>,
     collection: Arc<Mutex<CollectionV3>>,
     splitters: Arc<HashSet<u64>>,
+    ref_singletons: Arc<Vec<u64>>,      // For dynamic splitter discovery (sorted)
+    ref_duplicates: Arc<HashSet<u64>>,  // For dynamic splitter discovery
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>,
@@ -2233,7 +2345,7 @@ fn worker_thread(
     split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>>,
     #[cfg(feature = "cpp_agc")]
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
-    current_batch_sample: Arc<Mutex<Option<String>>>,
+    batch_samples: Arc<Mutex<HashSet<String>>>,
     batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
@@ -2277,18 +2389,19 @@ fn worker_thread(
             break;
         };
 
-        // Check if we're starting a new sample (batch boundary)
+        // Check if we're starting a new sample - if batch is full, flush it first
         {
-            let mut current = current_batch_sample.lock().unwrap();
-            if current.as_ref() != Some(&task.sample_name) {
-                if current.is_some() {
+            let mut samples = batch_samples.lock().unwrap();
+            if !samples.contains(&task.sample_name) {
+                // New sample - check if batch is full
+                if samples.len() >= config.batch_size {
                     // Batch boundary detected - flush previous batch
                     #[cfg(feature = "verbose_debug")]
                     if config.verbosity > 0 {
-                        eprintln!("BATCH_BOUNDARY: Flushing batch for sample {:?}, starting new batch for {}",
-                            current, task.sample_name);
+                        eprintln!("BATCH_BOUNDARY: Flushing batch with {} samples, starting new batch for {}",
+                            samples.len(), task.sample_name);
                     }
-                    drop(current); // Release lock before flush
+                    drop(samples); // Release lock before flush
                     flush_batch(
                         &segment_groups,
                         &pending_batch_segments,
@@ -2304,15 +2417,48 @@ fn worker_thread(
                         &grouping_engine,
                         &config,
                     )?;
-                    current = current_batch_sample.lock().unwrap();
+                    samples = batch_samples.lock().unwrap();
+                    samples.clear(); // Clear after flushing
                 }
-                *current = Some(task.sample_name.clone());
+                samples.insert(task.sample_name.clone());
             }
         }
 
         // Split into segments
-        let segments =
-            split_at_splitters_with_size(&task.data, &splitters, config.k, config.segment_size);
+        // Dynamic splitter discovery for non-reference contigs (matches C++ AGC find_new_splitters)
+        let is_reference_sample = {
+            let ref_name = reference_sample_name.lock().unwrap();
+            ref_name.as_ref() == Some(&task.sample_name)
+        };
+
+        let segments = if !is_reference_sample && !ref_singletons.is_empty() {
+            // Non-reference contig with dynamic discovery enabled
+            // Find NEW splitter k-mers unique to this contig (not in reference)
+            // Position-based selection ensures only optimally-positioned k-mers become splitters
+            let new_splitters = find_new_splitters_for_contig(
+                &task.data,
+                config.k,
+                config.segment_size,
+                &ref_singletons,
+                &ref_duplicates,
+            );
+
+            // Combine base splitters with new splitters
+            let mut combined_splitters = (*splitters).clone();
+            combined_splitters.extend(new_splitters.iter());
+
+            if config.verbosity > 2 && !new_splitters.is_empty() {
+                eprintln!(
+                    "DYNAMIC_SPLITTER: {} found {} new splitters for {} (total: {})",
+                    task.sample_name, new_splitters.len(), task.contig_name, combined_splitters.len()
+                );
+            }
+
+            split_at_splitters_with_size(&task.data, &combined_splitters, config.k, config.segment_size)
+        } else {
+            // Reference contig or dynamic discovery disabled - use base splitters only
+            split_at_splitters_with_size(&task.data, &splitters, config.k, config.segment_size)
+        };
 
         if config.verbosity > 2 {
             eprintln!(
@@ -2660,25 +2806,37 @@ fn worker_thread(
                             (global_map.contains_key(&left_key), global_map.contains_key(&right_key))
                         };
 
+                        // EXPERIMENTAL: Allow split even when groups don't exist
+                        // Set RAGC_SPLIT_CREATE_GROUPS=1 to enable creating new groups during split
+                        // This is needed for streaming mode where non-reference samples may create
+                        // new segment groups that the reference sample didn't have.
+                        let allow_create_groups = std::env::var("RAGC_SPLIT_CREATE_GROUPS").as_deref() == Ok("1");
+
                         if !left_exists || !right_exists {
                             // Skip split - one or both target groups don't exist yet
                             // This matches C++ AGC behavior where .at() would throw
+                            // UNLESS we're in experimental mode where we allow creating groups
                             if config.verbosity > 1 {
                                 eprintln!(
-                                    "SPLIT_SKIP_NO_GROUP: left_key=({},{}) exists={} right_key=({},{}) exists={}",
+                                    "SPLIT_SKIP_NO_GROUP: left_key=({},{}) exists={} right_key=({},{}) exists={} allow_create={}",
                                     left_key.kmer_front, left_key.kmer_back, left_exists,
-                                    right_key.kmer_front, right_key.kmer_back, right_exists
+                                    right_key.kmer_front, right_key.kmer_back, right_exists, allow_create_groups
                                 );
                             }
                             if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
                                 eprintln!(
-                                    "RAGC_SPLIT_SKIP_NO_GROUP: left=({},{}) exists={} right=({},{}) exists={}",
+                                    "RAGC_SPLIT_SKIP_NO_GROUP: left=({},{}) exists={} right=({},{}) exists={} allow_create={}",
                                     left_key.kmer_front, left_key.kmer_back, left_exists,
-                                    right_key.kmer_front, right_key.kmer_back, right_exists
+                                    right_key.kmer_front, right_key.kmer_back, right_exists, allow_create_groups
                                 );
                             }
-                            // Don't attempt split - fall through to normal segment processing
-                        } else {
+                            if !allow_create_groups {
+                                // Don't attempt split - fall through to normal segment processing
+                            }
+                        }
+
+                        // Proceed with split if groups exist OR if we allow creating groups
+                        if (left_exists && right_exists) || allow_create_groups {
                         // Both groups exist - proceed with split cost calculation
                         #[cfg(feature = "verbose_debug")]
                         if config.verbosity > 0 {
@@ -2698,6 +2856,7 @@ fn worker_thread(
                             &reference_segments,
                             &config,
                             should_reverse,
+                            allow_create_groups, // Force split at middle k-mer position if refs are empty
                         );
 
                         if let Some((left_data, right_data, _mid)) = split_result {
@@ -3193,45 +3352,73 @@ fn worker_thread(
                         eng.register_group(key.kmer_front, key.kmer_back, group_id);
                     }
 
-                    // Update BATCH-LOCAL terminators (NOT global) - C++ AGC agc_compressor.cpp:1015-1024
+                    // Update terminators - split between GLOBAL and BATCH-LOCAL based on sample type
                     //
-                    // CRITICAL: C++ AGC updates terminators in store_segments (called at batch END),
-                    // NOT during segment processing. This means segments in the SAME batch cannot
-                    // see each other through terminators - they only see groups from PREVIOUS batches.
+                    // For REFERENCE sample: Populate GLOBAL map_segments_terminators immediately.
+                    // This ensures non-reference samples can use reference terminators for split detection
+                    // (find_middle_splitter uses global map). Without this, split detection fails because
+                    // terminators aren't visible until batch end.
                     //
-                    // Previous code incorrectly updated GLOBAL terminators immediately, causing
-                    // later segments in a batch to find and use groups created earlier in the same
-                    // batch. This produced different grouping than C++ AGC.
+                    // For NON-REFERENCE samples: Populate batch_local_terminators (matches C++ AGC behavior).
+                    // C++ AGC updates terminators in store_segments (called at batch END), so segments in
+                    // the SAME batch cannot see each other through terminators.
                     //
-                    // Now we update batch_local_terminators, which is merged to global at batch end
-                    // via flush_batch() - matching C++ AGC's timing exactly.
-                    //
-                    // C++ AGC also requires BOTH k-mers to be non-MISSING (line 1015):
+                    // C++ AGC requires BOTH k-mers to be non-MISSING (line 1015):
                     //   if (kmer1 != ~0ull && kmer2 != ~0ull)
                     if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                        let mut term_map = batch_local_terminators.lock().unwrap();
+                        // Choose which map to update based on whether this is the reference sample
+                        if is_reference_sample {
+                            // Reference sample: populate GLOBAL terminators immediately
+                            // This is critical for split detection on non-reference samples
+                            if std::env::var("RAGC_DEBUG_TERM").is_ok() {
+                                eprintln!("RAGC_TERM_GLOBAL: sample={} is_ref=true front={} back={}",
+                                    task.sample_name, key.kmer_front, key.kmer_back);
+                            }
+                            let mut term_map = map_segments_terminators.lock().unwrap();
 
-                        // Add bidirectional edge: front -> back
-                        term_map.entry(key.kmer_front)
-                            .or_insert_with(Vec::new)
-                            .push(key.kmer_back);
-
-                        // Add bidirectional edge: back -> front (if different from front)
-                        if key.kmer_front != key.kmer_back {
-                            term_map.entry(key.kmer_back)
+                            term_map.entry(key.kmer_front)
                                 .or_insert_with(Vec::new)
-                                .push(key.kmer_front);
-                        }
+                                .push(key.kmer_back);
 
-                        // Sort to maintain sorted order for set_intersection
-                        if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
-                            front_vec.sort_unstable();
-                            front_vec.dedup();
-                        }
-                        if key.kmer_front != key.kmer_back {
-                            if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
-                                back_vec.sort_unstable();
-                                back_vec.dedup();
+                            if key.kmer_front != key.kmer_back {
+                                term_map.entry(key.kmer_back)
+                                    .or_insert_with(Vec::new)
+                                    .push(key.kmer_front);
+                            }
+
+                            if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
+                                front_vec.sort_unstable();
+                                front_vec.dedup();
+                            }
+                            if key.kmer_front != key.kmer_back {
+                                if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
+                                    back_vec.sort_unstable();
+                                    back_vec.dedup();
+                                }
+                            }
+                        } else {
+                            // Non-reference sample: populate batch-local (merged at batch end)
+                            let mut term_map = batch_local_terminators.lock().unwrap();
+
+                            term_map.entry(key.kmer_front)
+                                .or_insert_with(Vec::new)
+                                .push(key.kmer_back);
+
+                            if key.kmer_front != key.kmer_back {
+                                term_map.entry(key.kmer_back)
+                                    .or_insert_with(Vec::new)
+                                    .push(key.kmer_front);
+                            }
+
+                            if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
+                                front_vec.sort_unstable();
+                                front_vec.dedup();
+                            }
+                            if key.kmer_front != key.kmer_back {
+                                if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
+                                    back_vec.sort_unstable();
+                                    back_vec.dedup();
+                                }
                             }
                         }
                     }
@@ -3462,6 +3649,7 @@ fn try_split_segment_with_cost(
     reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
     should_reverse: bool,
+    force_split_on_empty_refs: bool, // When true, split at middle k-mer position even if FFI says no
 ) -> Option<(Vec<u8>, Vec<u8>, u64)> {
     if config.verbosity > 1 {
         eprintln!(
@@ -3586,8 +3774,146 @@ fn try_split_segment_with_cost(
             if config.verbosity > 1 {
                 eprintln!("FFI_DECIDE: has_middle={} middle={:#x} best_pos={} seg2_start={} should_split={} refs L={} R={}", has_mid, mid, bp, s2, should, ref_left.len(), ref_right.len());
             }
-            if !has_mid || !should { return None; }
-            maybe_best = Some((bp, s2));
+            if !has_mid { return None; }
+
+            // FFI found middle k-mer but may have said !should due to empty refs
+            if should {
+                maybe_best = Some((bp, s2));
+            } else if force_split_on_empty_refs && ref_left.is_empty() && ref_right.is_empty() {
+                // FALLBACK: FFI can't compute costs because refs are empty, but we want to
+                // create new groups. Search for ANY terminator k-mer in the segment that can serve as a split point.
+                // This handles the case where the exact middle_kmer from reference has a mutation in this sample.
+                if config.verbosity > 1 {
+                    eprintln!("SPLIT_FALLBACK: FFI said no but force_split_on_empty_refs=true, searching for any terminator k-mer in segment");
+                }
+
+                // Build a set of potential middle k-mers from both neighbor lists
+                use std::collections::HashSet;
+                let mut potential_middles: HashSet<u64> = HashSet::new();
+                for &kmer in front_neighbors.iter() {
+                    if kmer != MISSING_KMER && kmer != front_kmer && kmer != back_kmer {
+                        potential_middles.insert(kmer);
+                    }
+                }
+                for &kmer in back_neighbors.iter() {
+                    if kmer != MISSING_KMER && kmer != front_kmer && kmer != back_kmer {
+                        potential_middles.insert(kmer);
+                    }
+                }
+
+                if config.verbosity > 1 {
+                    eprintln!("SPLIT_FALLBACK: {} potential middle k-mers from terminators", potential_middles.len());
+                    for &pm in potential_middles.iter().take(5) {
+                        eprintln!("  potential_middle: {:#x}", pm);
+                    }
+                }
+
+                // Search for ANY terminator k-mer in the segment
+                let k = config.k;
+                if segment_dir.len() >= k && !potential_middles.is_empty() {
+                    let mut found_pos: Option<(usize, u64)> = None; // (pos, kmer)
+                    let mut kmer_obj = crate::kmer::Kmer::new(k as u32, crate::kmer::KmerMode::Canonical);
+                    for (i, &base) in segment_dir.iter().enumerate() {
+                        if base > 3 {
+                            kmer_obj.reset();
+                        } else {
+                            kmer_obj.insert(base as u64);
+                            if kmer_obj.is_full() {
+                                let kmer_at_pos = kmer_obj.data();
+                                let pos = i + 1 - k; // Position of k-mer start
+                                // Check if this k-mer is in our set of potential middles
+                                if potential_middles.contains(&kmer_at_pos) {
+                                    // Ensure we're not at the very beginning or end
+                                    if pos > k && pos + k + k < segment_dir.len() {
+                                        found_pos = Some((pos, kmer_at_pos));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((pos, found_kmer)) = found_pos {
+                        // Split at position just after the found k-mer
+                        let split_pos = pos + k;
+                        if split_pos > k + 1 && split_pos + k + 1 < segment_dir.len() {
+                            if config.verbosity > 1 {
+                                eprintln!("SPLIT_FALLBACK_FOUND: terminator kmer={:#x} found at pos={}, splitting at {}", found_kmer, pos, split_pos);
+                            }
+                            maybe_best = Some((split_pos, split_pos));
+                        } else if config.verbosity > 1 {
+                            eprintln!("SPLIT_FALLBACK_DEGENERATE: pos={} split_pos={} segment_len={}", pos, split_pos, segment_dir.len());
+                        }
+                    } else {
+                        // FALLBACK 2: Terminators not found - discover a NEW singleton k-mer in the segment
+                        // Similar to C++ AGC's find_new_splitters() but simpler: just find any singleton
+                        if config.verbosity > 1 {
+                            eprintln!("SPLIT_FALLBACK_DISCOVER: trying to find singleton k-mer in segment (len={})", segment_dir.len());
+                        }
+
+                        // Collect all k-mers in the middle region of the segment
+                        let min_margin = k * 2; // Don't split too close to edges
+                        let search_start = min_margin;
+                        let search_end = segment_dir.len().saturating_sub(min_margin);
+
+                        if search_end > search_start + k {
+                            // Enumerate k-mers and find singletons
+                            let mut kmer_positions: Vec<(u64, usize)> = Vec::new();
+                            let mut kmer_obj2 = crate::kmer::Kmer::new(k as u32, crate::kmer::KmerMode::Canonical);
+
+                            for (i, &base) in segment_dir[search_start..search_end].iter().enumerate() {
+                                if base > 3 {
+                                    kmer_obj2.reset();
+                                } else {
+                                    kmer_obj2.insert(base as u64);
+                                    if kmer_obj2.is_full() {
+                                        let kmer_val = kmer_obj2.data();
+                                        let pos = search_start + i + 1 - k;
+                                        kmer_positions.push((kmer_val, pos));
+                                    }
+                                }
+                            }
+
+                            // Sort by k-mer value to find duplicates
+                            kmer_positions.sort_by_key(|&(kmer, _)| kmer);
+
+                            // Find first singleton (k-mer that appears exactly once)
+                            let mut singleton_pos: Option<usize> = None;
+                            let mut i = 0;
+                            while i < kmer_positions.len() {
+                                let (kmer, pos) = kmer_positions[i];
+                                let mut j = i + 1;
+                                while j < kmer_positions.len() && kmer_positions[j].0 == kmer {
+                                    j += 1;
+                                }
+                                // If exactly one occurrence, it's a singleton
+                                if j == i + 1 {
+                                    singleton_pos = Some(pos);
+                                    if config.verbosity > 1 {
+                                        eprintln!("SPLIT_FALLBACK_SINGLETON: found singleton kmer={:#x} at pos={}", kmer, pos);
+                                    }
+                                    break;
+                                }
+                                i = j;
+                            }
+
+                            if let Some(pos) = singleton_pos {
+                                let split_pos = pos + k;
+                                if config.verbosity > 1 {
+                                    eprintln!("SPLIT_FALLBACK_SINGLETON_SPLIT: splitting at {}", split_pos);
+                                }
+                                maybe_best = Some((split_pos, split_pos));
+                            } else if config.verbosity > 1 {
+                                eprintln!("SPLIT_FALLBACK_NO_SINGLETON: no singleton k-mers found in middle region");
+                            }
+                        } else if config.verbosity > 1 {
+                            eprintln!("SPLIT_FALLBACK_TOO_SHORT: segment too short for singleton search");
+                        }
+                    }
+                }
+            } else {
+                return None;
+            }
         } else if config.verbosity > 1 {
             eprintln!("FFI_DECIDE: unavailable (decide_split returned None)");
         }

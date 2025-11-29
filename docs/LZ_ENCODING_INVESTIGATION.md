@@ -1,10 +1,14 @@
 # LZ Encoding Investigation: RAGC vs C++ AGC
 
-## Investigation Status: COMPLETE (2025-11-29)
+## Investigation Status: UPDATED (2025-11-29)
 
 ## Executive Summary
 
-**Root Cause Identified**: RAGC archives are ~7.8% larger than C++ AGC due to different reference selection order (`in_group_id` values), NOT LZ encoding differences.
+**Root Causes Identified** (Two separate issues):
+
+1. **Segment Count Difference** (~6% of overhead): RAGC has FEWER segments in non-reference samples because it lacks C++ AGC's dynamic splitter discovery. C++ AGC discovers NEW k-mer splitters unique to each non-reference contig, creating additional segment boundaries.
+
+2. **Reference Selection Order** (~7-8% of overhead): Different `in_group_id` values due to streaming vs batch architecture.
 
 **Key Finding**: LZ encoding is byte-identical between RAGC and C++ AGC (verified via FFI parity tests).
 
@@ -56,9 +60,44 @@ RAGC archives are consistently ~7.8% larger than C++ AGC archives when compressi
 | Correctness | 100% | 100% | Both correct |
 | Compatibility | Full | Full | Cross-compatible |
 
+### Issue 1: Dynamic Splitter Discovery (NEW FINDING 2025-11-29)
+
+**Problem**: RAGC has 84-102 FEWER segments per non-reference sample compared to C++ AGC.
+
+**Evidence** (3-sample test):
+| Sample | RAGC Segments | C++ AGC Segments | Difference |
+|--------|---------------|------------------|------------|
+| AAA#0 (reference) | 1243 | 1243 | Same ✓ |
+| AAB#0 | 1132 | 1216 | -84 (-7%) |
+| AAC#0 | 1095 | 1197 | -102 (-8.5%) |
+
+**Root Cause**: C++ AGC has `find_new_splitters()` function that dynamically discovers NEW k-mer splitters for each non-reference contig:
+```cpp
+void CAGCCompressor::find_new_splitters(contig_t& ctg, uint32_t thread_id) {
+    // 1. Enumerate ALL k-mers in current contig
+    enumerate_kmers(ctg, v_contig_kmers);
+
+    // 2. Filter out k-mers already in reference genome
+    p_end = set_difference(v_contig_kmers, v_candidate_kmers, v_tmp);
+
+    // 3. These become NEW splitters for this contig
+    find_splitters_in_contig(ctg, v_contig_kmers, vv_splitters[thread_id], ...);
+}
+```
+
+**RAGC Behavior**: Uses ONLY splitters from first file. Non-reference contigs may lack the same k-mers (due to mutations), resulting in fewer segment boundaries.
+
+**Impact**: Fewer segments → larger average segment size → worse LZ compression → ~6% larger archives.
+
+**Fix Required**: Implement dynamic splitter discovery (significant architectural change).
+
 ### Attempted Fixes
 
-1. **Deferred Reference Selection in flush_pack()**: Tried sorting segments before picking reference at flush time. Result: Made archives 18% LARGER because:
+1. **Multi-file splitter detection**: Tried collecting splitters from ALL input files (up to 50). Result: Made archives 18% LARGER because:
+   - Too many splitters (3682 vs 1226)
+   - Over-segmentation → too many small segments → worse compression
+
+2. **Deferred Reference Selection in flush_pack()**: Tried sorting segments before picking reference at flush time. Result: Made archives 18% LARGER because:
    - BufferedSegment stores already-transformed data
    - At flush time, original data isn't available for proper re-orientation
    - Would need to store both original and transformed data (2x memory)
@@ -66,8 +105,12 @@ RAGC archives are consistently ~7.8% larger than C++ AGC archives when compressi
 ## Conclusions
 
 1. **LZ encoding is correct** - the algorithm matches C++ AGC exactly
-2. **7.8% overhead is architectural** - streaming vs batch mode fundamentally differ in segment ordering
-3. **Fix requires batch mode** - see `docs/BATCH_ARCHITECTURE_PLAN.md` for implementation plan
+2. **~13% total overhead** is from two architectural issues:
+   - **~6%**: Missing dynamic splitter discovery for non-reference contigs
+   - **~7-8%**: Different reference selection order (streaming vs batch)
+3. **Two fixes required**:
+   - Implement dynamic splitter discovery (see C++ AGC's `find_new_splitters()`)
+   - Implement batch mode for reference selection (see `docs/BATCH_ARCHITECTURE_PLAN.md`)
 
 ## Trade-offs
 

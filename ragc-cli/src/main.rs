@@ -499,28 +499,29 @@ fn create_archive(
             ..StreamingQueueConfig::default()
         };
 
-        // Detect splitters from first input file
+        // Two-pass splitter discovery (matching C++ AGC batch mode)
+        // Pass 1: Discover ALL splitters from ALL files (including new splitters for hard contigs)
+        // Pass 2: Process all files with combined splitter set (done below)
         if inputs.is_empty() {
             anyhow::bail!("No input files provided");
         }
 
-        if verbosity > 0 {
-            eprintln!("Detecting splitters from first input file: {:?}", inputs[0]);
-        }
-
-        let splitters = ragc_core::determine_splitters_streaming(
-            &inputs[0],
+        // Use two-pass splitter discovery for C++ AGC compatibility
+        // This reads all files once to find hard contigs and discover new splitters,
+        // then returns the combined splitter set to use for ALL contigs
+        let splitters = ragc_core::two_pass_splitter_discovery(
+            &inputs,
             kmer_length as usize,
             segment_size as usize,
-        )?
-        .0;
+            verbosity as usize,
+        )?;
 
         if verbosity > 0 {
-            eprintln!("Found {} splitters", splitters.len());
+            eprintln!("Final splitter count: {}", splitters.len());
             eprintln!();
         }
 
-        // Create compressor with splitters from first file
+        // Create compressor with combined splitter set
         let mut compressor =
             StreamingQueueCompressor::with_splitters(output_str, config, splitters)?;
 

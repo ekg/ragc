@@ -404,6 +404,240 @@ pub fn is_splitter(kmer: u64, splitters: &HashSet<u64>) -> bool {
     splitters.contains(&kmer)
 }
 
+/// Check if a contig is "hard" - meaning it has NO splitters from the existing set
+///
+/// This matches C++ AGC's logic in compress_contig where a contig is considered "hard"
+/// when walking through it finds no splitter k-mers (split_kmer remains canonical).
+///
+/// # Arguments
+/// * `contig` - The contig sequence to check
+/// * `k` - K-mer length
+/// * `splitters` - Set of splitter k-mers to check against
+///
+/// # Returns
+/// true if the contig has NO splitters from the set, false if at least one splitter is found
+pub fn is_hard_contig(contig: &Contig, k: usize, splitters: &HashSet<u64>) -> bool {
+    use crate::kmer::{Kmer, KmerMode};
+
+    if contig.len() < k {
+        return true; // Too short to have any k-mers
+    }
+
+    let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
+
+    for &base in contig.iter() {
+        if base > 3 {
+            // N or other invalid base - reset k-mer
+            kmer.reset();
+            continue;
+        }
+
+        kmer.insert(base as u64);
+
+        if kmer.is_full() {
+            let kmer_value = kmer.data_canonical();
+            if splitters.contains(&kmer_value) {
+                // Found at least one splitter - not a hard contig
+                return false;
+            }
+        }
+    }
+
+    // No splitter found - this is a hard contig
+    true
+}
+
+/// Find NEW splitter k-mers for a non-reference contig
+///
+/// This matches C++ AGC's `find_new_splitters()` function which discovers k-mers
+/// unique to each non-reference contig to use as additional splitter candidates.
+///
+/// Algorithm (matching C++ AGC):
+/// 1. Enumerate all k-mers in the contig
+/// 2. Sort and remove non-singletons (keep only k-mers appearing once)
+/// 3. Subtract reference singletons (v_candidate_kmers)
+/// 4. Subtract reference duplicates (v_duplicated_kmers)
+/// 5. Return remaining k-mers sorted (for binary search in split_at_splitters)
+///
+/// # Arguments
+/// * `contig` - The non-reference contig sequence
+/// * `k` - K-mer length
+/// * `segment_size` - Minimum segment size (for position-based selection)
+/// * `ref_singletons` - Sorted reference singleton k-mers to exclude
+/// * `ref_duplicates` - Reference duplicate k-mers to exclude
+///
+/// # Returns
+/// Vec of new splitter k-mers unique to this contig, selected at optimal positions
+/// (only k-mers at positions where segment_size has been accumulated are returned)
+pub fn find_new_splitters_for_contig(
+    contig: &Contig,
+    k: usize,
+    segment_size: usize,
+    ref_singletons: &[u64],
+    ref_duplicates: &HashSet<u64>,
+) -> Vec<u64> {
+    use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
+
+    // Step 1: Enumerate all k-mers in the contig
+    let mut contig_kmers = enumerate_kmers(contig, k);
+
+    // Step 2: Sort and remove non-singletons
+    contig_kmers.sort_unstable();
+    remove_non_singletons(&mut contig_kmers, 0);
+
+    // Step 3: Subtract reference singletons using set_difference
+    // (ref_singletons is already sorted)
+    let mut tmp: Vec<u64> = Vec::with_capacity(contig_kmers.len());
+    let mut i = 0;
+    let mut j = 0;
+    while i < contig_kmers.len() && j < ref_singletons.len() {
+        match contig_kmers[i].cmp(&ref_singletons[j]) {
+            std::cmp::Ordering::Less => {
+                tmp.push(contig_kmers[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                j += 1;
+            }
+        }
+    }
+    // Add remaining elements from contig_kmers
+    tmp.extend_from_slice(&contig_kmers[i..]);
+
+    // Step 4: Subtract reference duplicates
+    // Since ref_duplicates is a HashSet, we filter in place
+    tmp.retain(|kmer| !ref_duplicates.contains(kmer));
+
+    // Step 5: Use position-based selection (matching C++ AGC's find_splitters_in_contig)
+    // The unique k-mers are the CANDIDATE set - only select those at optimal positions
+    let candidates: HashSet<u64> = tmp.into_iter().collect();
+
+    // Call find_actual_splitters_in_contig to select properly-positioned splitters
+    find_actual_splitters_in_contig(contig, &candidates, k, segment_size)
+}
+
+/// Two-pass splitter discovery matching C++ AGC batch mode
+///
+/// This implements C++ AGC's approach where:
+/// 1. Pass 1: Discover initial splitters from reference + find new splitters for hard contigs
+/// 2. Pass 2: (done by caller) Re-segment ALL contigs with combined splitter set
+///
+/// The key difference from single-pass is:
+/// - Reference is NOT segmented until we have ALL splitters
+/// - Hard contigs (those with NO reference splitters) get new splitters discovered
+/// - Final splitter set is used for ALL contigs (including reference)
+///
+/// # Arguments
+/// * `input_files` - All input FASTA files (first is reference)
+/// * `k` - K-mer length
+/// * `segment_size` - Minimum segment size
+/// * `verbosity` - Verbosity level for logging
+///
+/// # Returns
+/// HashSet of final splitters to use for ALL contigs
+pub fn two_pass_splitter_discovery(
+    input_files: &[std::path::PathBuf],
+    k: usize,
+    segment_size: usize,
+    verbosity: usize,
+) -> Result<HashSet<u64>> {
+    use crate::genome_io::GenomeIO;
+    use std::io::Read;
+
+    if input_files.is_empty() {
+        anyhow::bail!("No input files provided");
+    }
+
+    if verbosity > 0 {
+        eprintln!("Two-pass splitter discovery (matching C++ AGC batch mode)");
+        eprintln!("Pass 1: Discovering splitters from all files...");
+    }
+
+    // Step 1: Get initial splitters, singletons, and duplicates from reference file
+    let (initial_splitters, ref_singletons_set, ref_duplicates) = determine_splitters_streaming(
+        &input_files[0],
+        k,
+        segment_size,
+    )?;
+
+    // Convert singletons to sorted Vec for set_difference operations
+    let mut ref_singletons: Vec<u64> = ref_singletons_set.into_iter().collect();
+    ref_singletons.sort_unstable();
+
+    if verbosity > 0 {
+        eprintln!("  Reference: {} initial splitters, {} singletons, {} duplicates",
+                 initial_splitters.len(), ref_singletons.len(), ref_duplicates.len());
+    }
+
+    // Start with initial splitters as our combined set
+    let mut combined_splitters = initial_splitters;
+    let mut hard_contigs_found = 0;
+    let mut new_splitters_found = 0;
+
+    // Step 2: Read ALL files (including reference!) and find hard contigs
+    // For each hard contig, discover new splitters
+    for (file_idx, input_file) in input_files.iter().enumerate() {
+        let is_reference = file_idx == 0;
+        let mut reader = GenomeIO::<Box<dyn Read>>::open(input_file)?;
+
+        while let Some((_full_header, _sample_name, contig_name, sequence)) =
+            reader.read_contig_with_sample()?
+        {
+            if sequence.is_empty() {
+                continue;
+            }
+
+            // Check if this contig is "hard" (has NO splitters from current set)
+            // Match C++ AGC: only contigs >= segment_size are candidates for new splitters
+            if sequence.len() >= segment_size && is_hard_contig(&sequence, k, &combined_splitters) {
+                hard_contigs_found += 1;
+
+                if verbosity > 1 {
+                    eprintln!("    Found hard contig: {} ({} bp, file {})",
+                             contig_name, sequence.len(), input_file.display());
+                }
+
+                // Discover new splitters for this hard contig
+                let new_splitters = find_new_splitters_for_contig(
+                    &sequence,
+                    k,
+                    segment_size,
+                    &ref_singletons,
+                    &ref_duplicates,
+                );
+
+                // Add new splitters to combined set
+                for splitter in new_splitters {
+                    if combined_splitters.insert(splitter) {
+                        new_splitters_found += 1;
+                    }
+                }
+            }
+        }
+
+        if verbosity > 0 && !is_reference {
+            eprintln!("  File {}: {} hard contigs so far, {} new splitters",
+                     file_idx, hard_contigs_found, new_splitters_found);
+        }
+    }
+
+    if verbosity > 0 {
+        eprintln!("Pass 1 complete:");
+        eprintln!("  Total hard contigs: {}", hard_contigs_found);
+        eprintln!("  New splitters discovered: {}", new_splitters_found);
+        eprintln!("  Final splitter count: {} (was {})",
+                 combined_splitters.len(),
+                 combined_splitters.len() - new_splitters_found);
+        eprintln!();
+    }
+
+    Ok(combined_splitters)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
