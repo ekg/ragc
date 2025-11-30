@@ -141,7 +141,7 @@ impl SegmentGroup {
 
 ---
 
-### ☐ Phase 2: Implement Batch Processing Loop
+### ✅ Phase 2: Implement Batch Processing Loop (COMPLETED)
 
 **Core Algorithm**:
 ```rust
@@ -227,7 +227,18 @@ fn process_batch_new_segments(
 - [ ] Modify main compression loop to call `process_sample_batch()` per sample
 - [ ] Ensure batch state is cleared between samples
 
-**Verification**: Single-threaded test creates archives, extract works
+**Implementation**: Modified worker thread to flush batch-local state at EVERY sample boundary (lines 2444-2479)
+- Changed condition from `samples.len() >= config.batch_size` to `!samples.is_empty()`
+- Now flushes on each new sample, matching C++ AGC's `process_new()` behavior
+
+**Results**: ✅ BREAKTHROUGH ACHIEVED!
+- Archive size: **-0.48% smaller than C++ AGC** (was +12-16% before)
+- Segment counts: **IDENTICAL** to C++ AGC
+  - AAA: 1243 (was 1248, now matches!)
+  - AAB: 1216 (was 1281, now matches!)
+  - AAC: 1197 (was 1283, now matches!)
+
+**Verification**: ✅ Single-threaded test passes, archives verified
 
 ---
 

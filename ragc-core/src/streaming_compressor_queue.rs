@@ -2441,17 +2441,19 @@ fn worker_thread(
             break;
         };
 
-        // Check if we're starting a new sample - if batch is full, flush it first
+        // Check if we're starting a new sample - flush batch-local state at sample boundary
+        // This matches C++ AGC behavior where process_new() is called at each sample boundary
         {
             let mut samples = batch_samples.lock().unwrap();
             if !samples.contains(&task.sample_name) {
-                // New sample - check if batch is full
-                if samples.len() >= config.batch_size {
-                    // Batch boundary detected - flush previous batch
+                // New sample detected - flush batch-local state (matches C++ AGC)
+                // In C++ AGC, process_new() is called after each sample, resetting m_kmers
+                if !samples.is_empty() {
+                    // Not the first sample - flush previous sample's batch-local state
                     #[cfg(feature = "verbose_debug")]
                     if config.verbosity > 0 {
-                        eprintln!("BATCH_BOUNDARY: Flushing batch with {} samples, starting new batch for {}",
-                            samples.len(), task.sample_name);
+                        eprintln!("BATCH_BOUNDARY: New sample {} detected, flushing previous sample's batch-local state",
+                            task.sample_name);
                     }
                     drop(samples); // Release lock before flush
                     flush_batch(
@@ -2470,7 +2472,7 @@ fn worker_thread(
                         &config,
                     )?;
                     samples = batch_samples.lock().unwrap();
-                    samples.clear(); // Clear after flushing
+                    samples.clear(); // Clear after flushing (start fresh for new sample)
                 }
                 samples.insert(task.sample_name.clone());
             }
