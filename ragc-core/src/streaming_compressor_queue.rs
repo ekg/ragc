@@ -3033,7 +3033,11 @@ fn worker_thread(
                                     let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, should_reverse, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
                                     let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_left_data, is_rev_comp: fixed_left_rc };
                                     left_buffer.segments.push(left_buffered);
-                                    if left_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(left_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush left pack")?; }
+                                    // Flush pack if full (matches C++ AGC write-as-you-go behavior)
+                                    if left_buffer.should_flush_pack(config.pack_size) {
+                                        flush_pack(left_buffer, &collection, &archive, &config, &reference_segments)
+                                            .context("Failed to flush left pack")?;
+                                    }
                                 }
                                 if !is_degenerate_right {
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
@@ -3083,7 +3087,11 @@ fn worker_thread(
                                     let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, should_reverse, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
                                     let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_right_data, is_rev_comp: fixed_right_rc };
                                     right_buffer.segments.push(right_buffered);
-                                    if right_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(right_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush right pack")?; }
+                                    // Flush pack if full (matches C++ AGC write-as-you-go behavior)
+                                    if right_buffer.should_flush_pack(config.pack_size) {
+                                        flush_pack(right_buffer, &collection, &archive, &config, &reference_segments)
+                                            .context("Failed to flush right pack")?;
+                                    }
                                 }
                             } else {
                                 // reversed: right first
@@ -3112,7 +3120,11 @@ fn worker_thread(
                                     let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, should_reverse, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
                                     let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_right_data, is_rev_comp: fixed_right_rc };
                                     right_buffer.segments.push(right_buffered);
-                                    if right_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(right_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush right pack")?; }
+                                    // Flush pack if full (matches C++ AGC write-as-you-go behavior)
+                                    if right_buffer.should_flush_pack(config.pack_size) {
+                                        flush_pack(right_buffer, &collection, &archive, &config, &reference_segments)
+                                            .context("Failed to flush right pack")?;
+                                    }
                                 }
                                 if !is_degenerate_left {
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
@@ -3140,7 +3152,11 @@ fn worker_thread(
                                     let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, should_reverse, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
                                     let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_left_data, is_rev_comp: fixed_left_rc };
                                     left_buffer.segments.push(left_buffered);
-                                    if left_buffer.segments.len() >= PACK_CARDINALITY + 1 { flush_pack(left_buffer, &collection, &archive, &config, &reference_segments).context("Failed to flush left pack")?; }
+                                    // Flush pack if full (matches C++ AGC write-as-you-go behavior)
+                                    if left_buffer.should_flush_pack(config.pack_size) {
+                                        flush_pack(left_buffer, &collection, &archive, &config, &reference_segments)
+                                            .context("Failed to flush left pack")?;
+                                    }
                                 }
                             }
 
@@ -3542,8 +3558,8 @@ fn worker_thread(
                     buffer.segments.push(buffered);
                 }
 
-                // Flush pack if buffer is full
-                if buffer.segments.len() >= PACK_CARDINALITY + 1 {
+                // Flush pack if buffer is full (matches C++ AGC write-as-you-go behavior)
+                if buffer.should_flush_pack(config.pack_size) {
                     flush_pack(buffer, &collection, &archive, &config, &reference_segments)
                         .context("Failed to flush pack")?;
                 }
