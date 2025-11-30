@@ -724,7 +724,7 @@ impl LZDiff {
     }
 
     /// Decode a match, returns (ref_pos, length, bytes_consumed)
-    /// Format: <pos>,<len>. or <pos>,. (comma always present, "to end" has comma followed by period)
+    /// Format: <pos>,<len>. or <pos>. (comma only present when length is specified)
     fn decode_match(&self, data: &[u8], pred_pos: usize) -> (usize, u32, usize) {
         let mut i = 0;
         let (raw_pos, pos_bytes) = self.read_int(&data[i..]);
@@ -732,21 +732,39 @@ impl LZDiff {
 
         let ref_pos = ((pred_pos as i64) + raw_pos) as usize;
 
-        // C++ AGC format: comma is ALWAYS present
+        // C++ AGC format has two cases:
         // - With length: <pos>,<len>.
-        // - Without length (to end): <pos>,.
-        i += 1; // Skip comma (always present)
+        // - Without length (to end): <pos>.
+
+        // Bounds check before reading next character
+        if i >= data.len() {
+            eprintln!("ERROR: decode_match - expected comma or period at position {} but data length is {}", i, data.len());
+            eprintln!("  ref_pos={}, data prefix: {:?}", ref_pos, &data[..data.len().min(20)]);
+            panic!("Malformed LZ match encoding: missing separator after position");
+        }
 
         let len = if data[i] == b'.' {
-            // "To end" case: <pos>,.
+            // "To end" case: <pos>.
             i += 1; // Skip period
             u32::MAX // Sentinel for "to end of sequence"
-        } else {
+        } else if data[i] == b',' {
             // With length: <pos>,<len>.
+            i += 1; // Skip comma
+
+            if i >= data.len() {
+                eprintln!("ERROR: decode_match - expected length at position {} but data length is {}", i, data.len());
+                eprintln!("  ref_pos={}, data prefix: {:?}", ref_pos, &data[..data.len().min(20)]);
+                panic!("Malformed LZ match encoding: missing length after comma");
+            }
+
             let (raw_len, len_bytes) = self.read_int(&data[i..]);
             i += len_bytes;
             i += 1; // Skip period
             (raw_len as u32) + self.min_match_len
+        } else {
+            eprintln!("ERROR: decode_match - unexpected character {} at position {}", data[i], i);
+            eprintln!("  ref_pos={}, data prefix: {:?}", ref_pos, &data[..data.len().min(20)]);
+            panic!("Malformed LZ match encoding: expected comma or period");
         };
 
         (ref_pos, len, i)
