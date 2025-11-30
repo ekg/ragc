@@ -110,6 +110,11 @@ pub struct StreamingQueueConfig {
     /// Segments from batch_size samples are sorted by (sample, contig, seg_part_no)
     /// before distribution to groups, ensuring consistent pack boundaries with C++ AGC.
     pub batch_size: usize,
+
+    /// Pack size: number of segments per pack (matches C++ AGC contigs_in_pack)
+    /// When a group reaches this many segments, write a pack immediately
+    /// (default: 50, matching PACK_CARDINALITY)
+    pub pack_size: usize,
 }
 
 impl Default for StreamingQueueConfig {
@@ -125,6 +130,7 @@ impl Default for StreamingQueueConfig {
             adaptive_mode: false, // Default matches C++ AGC (adaptive mode off)
             fallback_frac: 0.0,   // Default matches C++ AGC (fallback disabled)
             batch_size: 50,       // Default matches C++ AGC pack_cardinality
+            pack_size: 50,        // Default matches C++ AGC contigs_in_pack / PACK_CARDINALITY
         }
     }
 }
@@ -303,6 +309,52 @@ impl SegmentGroupBuffer {
             pending_delta_ids: Vec::new(),
             raw_placeholder_written: false,
         }
+    }
+
+    /// Check if this group should write a pack (has >= pack_size segments)
+    /// Matches C++ AGC's logic for writing packs when full
+    fn should_flush_pack(&self, pack_size: usize) -> bool {
+        // Count buffered segments (excluding reference which is handled separately)
+        self.segments.len() >= pack_size
+    }
+
+    /// Get current segment count (for pack-full detection)
+    fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+/// Batch-local state for processing new segments
+/// Equivalent to C++ AGC's `m_kmers` local variable in process_new()
+/// This is RESET at each sample boundary to match C++ AGC behavior
+struct BatchState {
+    /// New segments discovered in THIS batch (not found in global registry)
+    /// Key: (front_kmer, back_kmer)
+    /// Value: Vec of segments with that k-mer pair
+    new_segments: BTreeMap<(u64, u64), Vec<PendingSegment>>,
+
+    /// Starting group ID for this batch (continues from global count)
+    next_group_id: u32,
+}
+
+impl BatchState {
+    fn new(starting_group_id: u32) -> Self {
+        BatchState {
+            new_segments: BTreeMap::new(),
+            next_group_id: starting_group_id,
+        }
+    }
+
+    /// Clear batch state for next sample (resets new_segments map)
+    /// next_group_id continues incrementing
+    fn clear(&mut self) {
+        self.new_segments.clear();
+        // next_group_id NOT reset - it continues from where it left off
+    }
+
+    /// Add a new segment to this batch
+    fn add_segment(&mut self, key: (u64, u64), segment: PendingSegment) {
+        self.new_segments.entry(key).or_insert_with(Vec::new).push(segment);
     }
 }
 
