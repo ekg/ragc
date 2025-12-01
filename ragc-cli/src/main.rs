@@ -170,6 +170,10 @@ enum Commands {
         #[arg(long)]
         segment_layout: bool,
 
+        /// Show pack layout (how segments are organized into ZSTD packs)
+        #[arg(long)]
+        pack_layout: bool,
+
         /// Show compression statistics for each stream (group packs)
         #[arg(short = 'c', long)]
         compression: bool,
@@ -337,6 +341,7 @@ fn main() -> Result<()> {
             group_id,
             single_groups,
             segment_layout,
+            pack_layout,
             compression,
             sample,
             contig,
@@ -353,6 +358,7 @@ fn main() -> Result<()> {
                 segment_index: index,
                 show_single_segment_groups: single_groups,
                 show_segment_layout: segment_layout,
+                show_pack_layout: pack_layout,
                 show_compression: compression,
             };
             inspect::inspect_archive(archive, config)?

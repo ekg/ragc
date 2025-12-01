@@ -16,6 +16,7 @@ pub struct InspectConfig {
     pub segment_index: Option<usize>,
     pub show_single_segment_groups: bool,
     pub show_segment_layout: bool,
+    pub show_pack_layout: bool,
     pub show_compression: bool,
 }
 
@@ -31,6 +32,7 @@ impl Default for InspectConfig {
             segment_index: None,
             show_single_segment_groups: false,
             show_segment_layout: false,
+            show_pack_layout: false,
             show_compression: false,
         }
     }
@@ -68,6 +70,11 @@ pub fn inspect_archive(archive_path: PathBuf, config: InspectConfig) -> Result<(
 
     if config.show_segment_layout {
         show_segment_layout(&mut decompressor)?;
+        return Ok(());
+    }
+
+    if config.show_pack_layout {
+        show_pack_layout(&mut decompressor)?;
         return Ok(());
     }
 
@@ -298,4 +305,105 @@ fn show_compression_stats(decompressor: &Decompressor) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Show pack layout - how segments are distributed across ZSTD packs
+fn show_pack_layout(decompressor: &mut Decompressor) -> Result<()> {
+    let all_segments = decompressor.get_all_segments()?;
+    let compression_stats = decompressor.get_compression_stats();
+
+    // CSV header
+    println!("group_id,pack_id,segment_count,sample,contig,segment_indices");
+
+    // Build a map of group_id -> segments
+    let mut group_segments: std::collections::HashMap<u32, Vec<(String, String, usize, usize)>> =
+        std::collections::HashMap::new();
+
+    for (sample_name, contig_name, segments) in &all_segments {
+        for (seg_idx, seg) in segments.iter().enumerate() {
+            group_segments
+                .entry(seg.group_id)
+                .or_default()
+                .push((sample_name.clone(), contig_name.clone(), seg_idx, seg.in_group_id as usize));
+        }
+    }
+
+    // Find delta streams and their pack counts
+    for (stream_name, _raw, _packed, num_parts) in &compression_stats {
+        // AGC v3 uses "xGd" (short name with 'd' suffix for delta)
+        // AGC v2 uses "seg-1234-delta" (long name with "-delta" suffix)
+        let is_delta = stream_name.ends_with('d') && stream_name.starts_with('x');
+        if !is_delta {
+            continue;
+        }
+
+        // Extract group_id from stream name
+        // AGC v3: "xGd" -> decode base64 "G" -> group_id
+        let group_id: u32 = if stream_name.starts_with('x') {
+            // Remove 'x' prefix and 'd' suffix, then decode base64
+            let b64_str = stream_name.trim_start_matches('x').trim_end_matches('d');
+            base64_decode(b64_str)
+        } else {
+            // AGC v2: "seg-1234-delta" -> 1234
+            stream_name
+                .trim_start_matches("seg-")
+                .trim_end_matches("-delta")
+                .parse()
+                .unwrap_or(0)
+        };
+
+        if let Some(segments) = group_segments.get(&group_id) {
+            // Sort segments by in_group_id
+            let mut sorted_segments = segments.clone();
+            sorted_segments.sort_by_key(|s| s.3);
+
+            // Group into packs of 50 (PACK_CARDINALITY)
+            const PACK_CARDINALITY: usize = 50;
+            for pack_id in 0..*num_parts {
+                let pack_start = pack_id * PACK_CARDINALITY;
+                let pack_end = (pack_start + PACK_CARDINALITY).min(sorted_segments.len());
+
+                if pack_start >= sorted_segments.len() {
+                    break;
+                }
+
+                let pack_segments = &sorted_segments[pack_start..pack_end];
+
+                // Format segment info: "sample#contig[idx]"
+                let seg_info: Vec<String> = pack_segments
+                    .iter()
+                    .map(|(sample, contig, idx, _)| format!("{}#{}[{}]", sample, contig, idx))
+                    .collect();
+
+                println!(
+                    "{},{},{},\"{}\",\"{}\",\"{}\"",
+                    group_id,
+                    pack_id,
+                    pack_segments.len(),
+                    pack_segments[0].0, // First sample name
+                    pack_segments[0].1, // First contig name
+                    seg_info.join(";")
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Decode base64 stream name to group_id (matches C++ int_to_base64)
+fn base64_decode(s: &str) -> u32 {
+    const DIGITS: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_#";
+    
+    let mut result = 0u32;
+    let mut multiplier = 1u32;
+    
+    for c in s.chars() {
+        if let Some(digit_value) = DIGITS.find(c) {
+            result += (digit_value as u32) * multiplier;
+            multiplier *= 64;
+        }
+    }
+    
+    result
 }
