@@ -190,6 +190,33 @@ impl Archive {
         }
     }
 
+    /// Get packed (compressed) size for a stream
+    pub fn get_packed_size(&self, stream_id: usize) -> u64 {
+        if stream_id < self.streams.len() {
+            self.streams[stream_id].packed_size
+        } else {
+            0
+        }
+    }
+
+    /// Get packed data size (compressed data only, without metadata)
+    pub fn get_packed_data_size(&self, stream_id: usize) -> u64 {
+        if stream_id < self.streams.len() {
+            self.streams[stream_id].packed_data_size
+        } else {
+            0
+        }
+    }
+
+    /// Get stream name by ID
+    pub fn get_stream_name(&self, stream_id: usize) -> Option<&str> {
+        if stream_id < self.streams.len() {
+            Some(&self.streams[stream_id].stream_name)
+        } else {
+            None
+        }
+    }
+
     /// Get number of streams
     pub fn get_num_streams(&self) -> usize {
         self.streams.len()

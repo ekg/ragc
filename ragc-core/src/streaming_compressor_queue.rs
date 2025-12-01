@@ -1288,6 +1288,16 @@ fn flush_pack(
             .context("Failed to compress pack")?;
         compressed.push(0); // Marker 0 = plain ZSTD
 
+        // Debug: Log compression sizes at each stage
+        if std::env::var("RAGC_DEBUG_COMPRESSION_SIZES").is_ok() {
+            eprintln!("COMPRESS_PACK: group={} raw_segments={} lz_encoded={} zstd_compressed={} ratio={:.2}%",
+                buffer.group_id,
+                buffer.segments.iter().map(|s| s.data.len()).sum::<usize>(),
+                total_raw_size,
+                compressed.len(),
+                (compressed.len() as f64 / total_raw_size as f64) * 100.0);
+        }
+
         let mut arch = archive.lock().unwrap();
         if compressed.len() < total_raw_size {
             arch.add_part(stream_id, &compressed, total_raw_size as u64)
@@ -1319,9 +1329,9 @@ fn flush_pack(
                 .expect("lz_diff should be prepared when reference is written")
                 .encode(&seg.data);
 
-            // Compare with C++ AGC encode
+            // Compare with C++ AGC encode (TEST HARNESS)
             #[cfg(feature = "cpp_agc")]
-            if config.verbosity > 0 {
+            if std::env::var("RAGC_TEST_LZ_ENCODING").is_ok() {
                 if let Some(ref_seg) = &buffer.reference_segment {
                     if let Some(cpp_encoded) = crate::ragc_ffi::lzdiff_v2_encode(
                         &ref_seg.data,
@@ -1329,25 +1339,104 @@ fn flush_pack(
                         config.min_match_len as u32,
                     ) {
                         if ragc_encoded != cpp_encoded {
-                            eprintln!("ENCODE_MISMATCH: ragc_len={} cpp_len={} ref_len={} seg_len={} group_id={}",
-                                ragc_encoded.len(), cpp_encoded.len(), ref_seg.data.len(), seg.data.len(), buffer.group_id);
-                            // Show context around first difference
+                            eprintln!("\n========================================");
+                            eprintln!("🔥 LZ ENCODING MISMATCH DETECTED!");
+                            eprintln!("========================================");
+                            eprintln!("Group:          {}", buffer.group_id);
+                            eprintln!("Sample:         {}", seg.sample_name);
+                            eprintln!("Contig:         {}", seg.contig_name);
+                            eprintln!("Segment:        {}", seg.seg_part_no);
+                            eprintln!("Reference len:  {}", ref_seg.data.len());
+                            eprintln!("Target len:     {}", seg.data.len());
+                            eprintln!("RAGC encoded:   {} bytes", ragc_encoded.len());
+                            eprintln!("C++ AGC encoded: {} bytes", cpp_encoded.len());
+                            eprintln!("Difference:     {} bytes", (ragc_encoded.len() as i64 - cpp_encoded.len() as i64).abs());
+                            eprintln!();
+
+                            // Find first difference
+                            let mut first_diff_byte = None;
                             for (i, (r, c)) in ragc_encoded.iter().zip(cpp_encoded.iter()).enumerate() {
                                 if r != c {
-                                    let start = if i > 10 { i - 10 } else { 0 };
-                                    let ragc_ctx: Vec<_> = ragc_encoded[start..].iter().take(30).map(|&b| if b >= 32 && b < 127 { b as char } else { '?' }).collect();
-                                    let cpp_ctx: Vec<_> = cpp_encoded[start..].iter().take(30).map(|&b| if b >= 32 && b < 127 { b as char } else { '?' }).collect();
-                                    eprintln!("  first diff at byte {}: ragc='{}' cpp='{}'", i, *r as char, *c as char);
-                                    eprintln!("  ragc context: {:?}", String::from_iter(ragc_ctx));
-                                    eprintln!("  cpp  context: {:?}", String::from_iter(cpp_ctx));
-                                    // Show the extra bytes in RAGC
-                                    if ragc_encoded.len() > cpp_encoded.len() {
-                                        let extra: Vec<_> = ragc_encoded[cpp_encoded.len()..].iter().take(20).map(|&b| if b >= 32 && b < 127 { b as char } else { '?' }).collect();
-                                        eprintln!("  ragc extra bytes: {:?}", String::from_iter(extra));
-                                    }
+                                    first_diff_byte = Some(i);
                                     break;
                                 }
                             }
+
+                            if let Some(i) = first_diff_byte {
+                                eprintln!("First difference at byte {}", i);
+                                let start = if i > 20 { i - 20 } else { 0 };
+                                let end = (i + 30).min(ragc_encoded.len()).min(cpp_encoded.len());
+
+                                eprintln!("\nRAGC output around difference:");
+                                let ragc_hex: Vec<_> = ragc_encoded[start..end].iter().map(|b| format!("{:02x}", b)).collect();
+                                let ragc_ascii: String = ragc_encoded[start..end].iter().map(|&b| {
+                                    if b >= 32 && b < 127 { b as char } else { '.' }
+                                }).collect();
+                                eprintln!("  Hex:   {}", ragc_hex.join(" "));
+                                eprintln!("  ASCII: {}", ragc_ascii);
+
+                                eprintln!("\nC++ AGC output around difference:");
+                                let cpp_hex: Vec<_> = cpp_encoded[start..end].iter().map(|b| format!("{:02x}", b)).collect();
+                                let cpp_ascii: String = cpp_encoded[start..end].iter().map(|&b| {
+                                    if b >= 32 && b < 127 { b as char } else { '.' }
+                                }).collect();
+                                eprintln!("  Hex:   {}", cpp_hex.join(" "));
+                                eprintln!("  ASCII: {}", cpp_ascii);
+
+                                eprintln!("\nByte at position {}:", i);
+                                eprintln!("  RAGC:    0x{:02x} ('{}')", ragc_encoded[i],
+                                    if ragc_encoded[i] >= 32 && ragc_encoded[i] < 127 { ragc_encoded[i] as char } else { '?' });
+                                eprintln!("  C++ AGC: 0x{:02x} ('{}')", cpp_encoded[i],
+                                    if cpp_encoded[i] >= 32 && cpp_encoded[i] < 127 { cpp_encoded[i] as char } else { '?' });
+                            } else if ragc_encoded.len() != cpp_encoded.len() {
+                                eprintln!("Encodings match for first {} bytes, but lengths differ",
+                                    ragc_encoded.len().min(cpp_encoded.len()));
+                                if ragc_encoded.len() > cpp_encoded.len() {
+                                    let extra_start = cpp_encoded.len();
+                                    let extra_hex: Vec<_> = ragc_encoded[extra_start..].iter().take(40).map(|b| format!("{:02x}", b)).collect();
+                                    let extra_ascii: String = ragc_encoded[extra_start..].iter().take(40).map(|&b| {
+                                        if b >= 32 && b < 127 { b as char } else { '.' }
+                                    }).collect();
+                                    eprintln!("RAGC has {} extra bytes:", ragc_encoded.len() - cpp_encoded.len());
+                                    eprintln!("  Hex:   {}", extra_hex.join(" "));
+                                    eprintln!("  ASCII: {}", extra_ascii);
+                                } else {
+                                    let extra_start = ragc_encoded.len();
+                                    let extra_hex: Vec<_> = cpp_encoded[extra_start..].iter().take(40).map(|b| format!("{:02x}", b)).collect();
+                                    let extra_ascii: String = cpp_encoded[extra_start..].iter().take(40).map(|&b| {
+                                        if b >= 32 && b < 127 { b as char } else { '.' }
+                                    }).collect();
+                                    eprintln!("C++ AGC has {} extra bytes:", cpp_encoded.len() - ragc_encoded.len());
+                                    eprintln!("  Hex:   {}", extra_hex.join(" "));
+                                    eprintln!("  ASCII: {}", extra_ascii);
+                                }
+                            }
+
+                            // Show last 10 bytes of each
+                            eprintln!("\nLast 10 bytes of each encoding:");
+                            let ragc_tail_start = if ragc_encoded.len() > 10 { ragc_encoded.len() - 10 } else { 0 };
+                            let ragc_tail_hex: Vec<_> = ragc_encoded[ragc_tail_start..].iter().map(|b| format!("{:02x}", b)).collect();
+                            let ragc_tail_ascii: String = ragc_encoded[ragc_tail_start..].iter().map(|&b| {
+                                if b >= 32 && b < 127 { b as char } else { '.' }
+                            }).collect();
+                            eprintln!("RAGC    (bytes {}-{}):", ragc_tail_start, ragc_encoded.len()-1);
+                            eprintln!("  Hex:   {}", ragc_tail_hex.join(" "));
+                            eprintln!("  ASCII: {}", ragc_tail_ascii);
+
+                            let cpp_tail_start = if cpp_encoded.len() > 10 { cpp_encoded.len() - 10 } else { 0 };
+                            let cpp_tail_hex: Vec<_> = cpp_encoded[cpp_tail_start..].iter().map(|b| format!("{:02x}", b)).collect();
+                            let cpp_tail_ascii: String = cpp_encoded[cpp_tail_start..].iter().map(|&b| {
+                                if b >= 32 && b < 127 { b as char } else { '.' }
+                            }).collect();
+                            eprintln!("C++ AGC (bytes {}-{}):", cpp_tail_start, cpp_encoded.len()-1);
+                            eprintln!("  Hex:   {}", cpp_tail_hex.join(" "));
+                            eprintln!("  ASCII: {}", cpp_tail_ascii);
+
+                            eprintln!("\n========================================");
+                            eprintln!("Aborting on first LZ encoding mismatch!");
+                            eprintln!("========================================\n");
+
+                            panic!("LZ encoding mismatch detected - see details above");
                         }
                     }
                 }

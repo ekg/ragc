@@ -212,15 +212,17 @@ impl LZDiff {
     }
 
     /// Encode a match
-    /// Format: <pos>,<len>. or <pos>,. (comma always present, "to end" has comma followed by period)
+    /// Format: <pos>,<len>. or <pos>. (comma ONLY when length is present)
+    /// Match-to-end: len=None → "pos." (no comma, matching C++ AGC lz_diff.cpp:637-641)
+    /// Normal match: len=Some → "pos,len." (with comma)
     fn encode_match(&self, ref_pos: u32, len: Option<u32>, pred_pos: u32, encoded: &mut Vec<u8>) {
         let dif_pos = (ref_pos as i32) - (pred_pos as i32);
         self.append_int(encoded, dif_pos as i64);
 
-        // C++ AGC format: comma is ALWAYS present
-        encoded.push(b',');
-
+        // C++ AGC V2 format: comma ONLY if length is present (not match-to-end)
+        // See lz_diff.cpp lines 637-641: if (len != ~0u) { encoded.emplace_back(','); ... }
         if let Some(match_len) = len {
+            encoded.push(b',');
             self.append_int(encoded, (match_len - self.min_match_len) as i64);
         }
 

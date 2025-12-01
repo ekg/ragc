@@ -170,6 +170,10 @@ enum Commands {
         #[arg(long)]
         segment_layout: bool,
 
+        /// Show compression statistics for each stream (group packs)
+        #[arg(short = 'c', long)]
+        compression: bool,
+
         /// Look up segment by sample name
         #[arg(long)]
         sample: Option<String>,
@@ -333,6 +337,7 @@ fn main() -> Result<()> {
             group_id,
             single_groups,
             segment_layout,
+            compression,
             sample,
             contig,
             index,
@@ -348,6 +353,7 @@ fn main() -> Result<()> {
                 segment_index: index,
                 show_single_segment_groups: single_groups,
                 show_segment_layout: segment_layout,
+                show_compression: compression,
             };
             inspect::inspect_archive(archive, config)?
         }

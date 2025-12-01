@@ -166,6 +166,21 @@ impl Decompressor {
         self.collection.get_samples_list(false)
     }
 
+    /// Get compression statistics for all streams
+    /// Returns: Vec<(stream_name, raw_size, packed_size, num_parts)>
+    pub fn get_compression_stats(&self) -> Vec<(String, u64, u64, usize)> {
+        let mut stats = Vec::new();
+        for stream_id in 0..self.archive.get_num_streams() {
+            if let Some(name) = self.archive.get_stream_name(stream_id) {
+                let raw_size = self.archive.get_raw_size(stream_id);
+                let packed_size = self.archive.get_packed_size(stream_id);
+                let num_parts = self.archive.get_num_parts(stream_id);
+                stats.push((name.to_string(), raw_size, packed_size, num_parts));
+            }
+        }
+        stats
+    }
+
     /// Get list of contigs for a specific sample
     pub fn list_contigs(&mut self, sample_name: &str) -> Result<Vec<String>> {
         if self.config.verbosity > 1 {

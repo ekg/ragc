@@ -16,6 +16,7 @@ pub struct InspectConfig {
     pub segment_index: Option<usize>,
     pub show_single_segment_groups: bool,
     pub show_segment_layout: bool,
+    pub show_compression: bool,
 }
 
 impl Default for InspectConfig {
@@ -30,6 +31,7 @@ impl Default for InspectConfig {
             segment_index: None,
             show_single_segment_groups: false,
             show_segment_layout: false,
+            show_compression: false,
         }
     }
 }
@@ -66,6 +68,11 @@ pub fn inspect_archive(archive_path: PathBuf, config: InspectConfig) -> Result<(
 
     if config.show_segment_layout {
         show_segment_layout(&mut decompressor)?;
+        return Ok(());
+    }
+
+    if config.show_compression {
+        show_compression_stats(&decompressor)?;
         return Ok(());
     }
 
@@ -220,6 +227,73 @@ fn show_segment_layout(decompressor: &mut Decompressor) -> Result<()> {
             println!("{},{},{},{},{},{}",
                 sample_name, contig_name, seg_idx,
                 seg.group_id, seg.in_group_id, seg.raw_length);
+        }
+    }
+
+    Ok(())
+}
+
+/// Show compression statistics for all streams
+fn show_compression_stats(decompressor: &Decompressor) -> Result<()> {
+    println!("\n=== Compression Statistics ===");
+
+    let stats = decompressor.get_compression_stats();
+
+    // Calculate totals
+    let total_raw: u64 = stats.iter().map(|(_, raw, _, _)| raw).sum();
+    let total_packed: u64 = stats.iter().map(|(_, _, packed, _)| packed).sum();
+    let total_parts: usize = stats.iter().map(|(_, _, _, parts)| parts).sum();
+
+    println!("\nOverall:");
+    println!("  Total streams:     {}", stats.len());
+    println!("  Total parts:       {}", total_parts);
+    println!("  Total raw size:    {} bytes ({:.2} MB)", total_raw, total_raw as f64 / 1_000_000.0);
+    println!("  Total packed size: {} bytes ({:.2} MB)", total_packed, total_packed as f64 / 1_000_000.0);
+    if total_raw > 0 {
+        println!("  Compression ratio: {:.2}:1", total_raw as f64 / total_packed as f64);
+        println!("  Space saved:       {:.2}%", (1.0 - (total_packed as f64 / total_raw as f64)) * 100.0);
+    }
+
+    // Group streams by type
+    let mut ref_streams = Vec::new();
+    let mut delta_streams = Vec::new();
+    let mut other_streams = Vec::new();
+
+    for (name, raw, packed, parts) in &stats {
+        if name.ends_with(".ref") {
+            ref_streams.push((name, *raw, *packed, *parts));
+        } else if name.ends_with(".delta") {
+            delta_streams.push((name, *raw, *packed, *parts));
+        } else {
+            other_streams.push((name, *raw, *packed, *parts));
+        }
+    }
+
+    // Show reference streams
+    if !ref_streams.is_empty() {
+        println!("\n=== Reference Streams ({}) ===", ref_streams.len());
+        let ref_raw: u64 = ref_streams.iter().map(|(_, raw, _, _)| raw).sum();
+        let ref_packed: u64 = ref_streams.iter().map(|(_, _, packed, _)| packed).sum();
+        println!("Total: {} bytes -> {} bytes (ratio: {:.2}:1)",
+                 ref_raw, ref_packed,
+                 if ref_packed > 0 { ref_raw as f64 / ref_packed as f64 } else { 0.0 });
+    }
+
+    // Show delta streams
+    if !delta_streams.is_empty() {
+        println!("\n=== Delta Streams ({}) ===", delta_streams.len());
+        let delta_raw: u64 = delta_streams.iter().map(|(_, raw, _, _)| raw).sum();
+        let delta_packed: u64 = delta_streams.iter().map(|(_, _, packed, _)| packed).sum();
+        println!("Total: {} bytes -> {} bytes (ratio: {:.2}:1)",
+                 delta_raw, delta_packed,
+                 if delta_packed > 0 { delta_raw as f64 / delta_packed as f64 } else { 0.0 });
+    }
+
+    // Show metadata/other streams
+    if !other_streams.is_empty() {
+        println!("\n=== Metadata Streams ({}) ===", other_streams.len());
+        for (name, raw, packed, _parts) in &other_streams {
+            println!("  {}: {} -> {} bytes", name, raw, packed);
         }
     }
 
