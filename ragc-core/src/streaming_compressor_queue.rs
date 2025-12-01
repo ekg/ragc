@@ -181,8 +181,9 @@ impl PartialOrd for ContigTask {
 
 impl Ord for ContigTask {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // C++ AGC orders by: (sample_priority, cost, contig_name)
-        // Since we use a max-heap, we need to reverse cost and contig_name comparisons
+        // C++ AGC orders by: (sample_priority, cost) with tie-breaking by insertion order
+        // Due to streaming nature (contigs added incrementally while workers pop),
+        // C++ AGC effectively uses file order as tie-breaker, not lexicographic name order
 
         // First compare by sample_priority (higher priority first)
         match self.sample_priority.cmp(&other.sample_priority) {
@@ -192,10 +193,12 @@ impl Ord for ContigTask {
                 // This makes larger contigs "greater" so they're popped first
                 match self.cost.cmp(&other.cost) {
                     std::cmp::Ordering::Equal => {
-                        // Finally by contig_name (lexicographic ascending order)
-                        // REVERSE comparison: other.contig_name vs self.contig_name
-                        // This makes lexicographically smaller names "greater" so they're popped first
-                        other.contig_name.cmp(&self.contig_name)
+                        // Finally by sequence (FASTA file order, lower = earlier = higher priority)
+                        // REVERSE comparison: other.sequence vs self.sequence
+                        // This makes earlier-in-file contigs "greater" so they're popped first
+                        // Matches C++ AGC's streaming behavior where contigs are processed in file order
+                        // when they have the same (priority, cost)
+                        other.sequence.cmp(&self.sequence)
                     }
                     cost_ord => cost_ord,
                 }
