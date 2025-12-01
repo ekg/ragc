@@ -607,7 +607,18 @@ impl StreamingQueueCompressor {
         let reference_sample_name = Arc::new(Mutex::new(None)); // Shared across all workers
 
         // Segment splitting support (Phase 1)
-        let map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        // Initialize map_segments with (MISSING_KMER, MISSING_KMER) → 0
+        // This matches C++ AGC line 2396: map_segments[make_pair(~0ull, ~0ull)] = 0
+        // All raw segments (both k-mers missing) will map to group 0
+        let mut initial_map_segments = BTreeMap::new();
+        initial_map_segments.insert(
+            SegmentGroupKey {
+                kmer_front: MISSING_KMER,
+                kmer_back: MISSING_KMER,
+            },
+            0,
+        );
+        let map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(initial_map_segments));
         let map_segments_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
@@ -2917,20 +2928,12 @@ fn worker_thread(
                 };
 
             // Create grouping key from normalized k-mers
-            // For raw segments (both k-mers MISSING), use round-robin distribution
-            // across groups 0-15 to match C++ AGC behavior
-            let key = if key_front == MISSING_KMER && key_back == MISSING_KMER {
-                let raw_id = raw_group_counter.fetch_add(1, Ordering::SeqCst);
-                let raw_group = raw_id % NO_RAW_GROUPS;
-                SegmentGroupKey {
-                    kmer_front: raw_group as u64,
-                    kmer_back: MISSING_KMER,
-                }
-            } else {
-                SegmentGroupKey {
-                    kmer_front: key_front,
-                    kmer_back: key_back,
-                }
+            // For raw segments (both k-mers MISSING), use the same key for all
+            // This matches C++ AGC: map_segments[make_pair(~0ull, ~0ull)] = 0
+            // All raw segments share the same grouping key and will be assigned to the same group
+            let key = SegmentGroupKey {
+                kmer_front: key_front,
+                kmer_back: key_back,
             };
 
             // Reverse complement data if needed (matching C++ AGC lines 1315-1316, 1320-1321)
