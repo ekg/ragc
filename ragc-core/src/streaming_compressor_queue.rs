@@ -3181,18 +3181,20 @@ fn worker_thread(
                                 // left first
                                 if !is_degenerate_left {
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
-                                        // BATCH-LOCAL: Check global first, then batch-local
+                                        // Check global map_segments first, create new group if not found
                                         let group_id = {
-                                            let global_map = map_segments.lock().unwrap();
+                                            let mut global_map = map_segments.lock().unwrap();
                                             if let Some(&existing_id) = global_map.get(&left_key) {
-                                                drop(global_map);
                                                 existing_id
                                             } else {
+                                                // Create new group ID and register IMMEDIATELY to global map
+                                                let new_id = group_counter.fetch_add(1, Ordering::SeqCst);
+                                                global_map.insert(left_key.clone(), new_id);
                                                 drop(global_map);
+                                                // Also register to batch-local for flush tracking
                                                 let mut batch_map = batch_local_groups.lock().unwrap();
-                                                *batch_map.entry(left_key.clone()).or_insert_with(|| {
-                                                    group_counter.fetch_add(1, Ordering::SeqCst)
-                                                })
+                                                batch_map.insert(left_key.clone(), new_id);
+                                                new_id
                                             }
                                         };
                                         // Register with FFI engine
@@ -3234,18 +3236,20 @@ fn worker_thread(
                                 }
                                 if !is_degenerate_right {
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
-                                        // BATCH-LOCAL: Check global first, then batch-local
+                                        // Check global map_segments first, create new group if not found
                                         let group_id = {
-                                            let global_map = map_segments.lock().unwrap();
+                                            let mut global_map = map_segments.lock().unwrap();
                                             if let Some(&existing_id) = global_map.get(&right_key) {
-                                                drop(global_map);
                                                 existing_id
                                             } else {
+                                                // Create new group ID and register IMMEDIATELY to global map
+                                                let new_id = group_counter.fetch_add(1, Ordering::SeqCst);
+                                                global_map.insert(right_key.clone(), new_id);
                                                 drop(global_map);
+                                                // Also register to batch-local for flush tracking
                                                 let mut batch_map = batch_local_groups.lock().unwrap();
-                                                *batch_map.entry(right_key.clone()).or_insert_with(|| {
-                                                    group_counter.fetch_add(1, Ordering::SeqCst)
-                                                })
+                                                batch_map.insert(right_key.clone(), new_id);
+                                                new_id
                                             }
                                         };
                                         // Register with FFI engine
@@ -3584,27 +3588,27 @@ fn worker_thread(
                 // Get or create buffer for this group
                 // If group doesn't exist yet, allocate group_id using BATCH-LOCAL logic
                 let buffer = groups.entry(key.clone()).or_insert_with(|| {
-                    // BATCH-LOCAL GROUP ASSIGNMENT (matches C++ AGC m_kmers per-batch behavior)
-                    // 1. Check GLOBAL registry first (for groups from previous batches)
-                    // 2. If not found globally, check/create in BATCH-LOCAL map
+                    // Check GLOBAL registry first, create new group if not found
+                    // CRITICAL FIX: Register to global map IMMEDIATELY (not batch-local only)
+                    // This ensures subsequent segments in same sample can find the group
                     let group_id = {
-                        let global_map = map_segments.lock().unwrap();
+                        let mut global_map = map_segments.lock().unwrap();
                         if let Some(&existing_id) = global_map.get(&key) {
-                            // Group exists from previous batch - reuse it
-                            drop(global_map);
+                            // Group exists - reuse it
                             existing_id
                         } else {
-                            // Not in global registry - check batch-local map
+                            // New group - allocate ID and register IMMEDIATELY to global map
+                            let new_id = if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
+                                key.kmer_front as u32  // Raw groups use ID from key
+                            } else {
+                                group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
+                            };
+                            global_map.insert(key.clone(), new_id);
                             drop(global_map);
+                            // Also register to batch-local for flush tracking
                             let mut batch_map = batch_local_groups.lock().unwrap();
-                            *batch_map.entry(key.clone()).or_insert_with(|| {
-                                // New group for this batch - allocate ID
-                                if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
-                                    key.kmer_front as u32  // Raw groups use ID from key
-                                } else {
-                                    group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
-                                }
-                            })
+                            batch_map.insert(key.clone(), new_id);
+                            new_id
                         }
                     };
 

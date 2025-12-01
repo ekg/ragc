@@ -578,9 +578,9 @@ pub fn two_pass_splitter_discovery(
     let mut hard_contigs_found = 0;
     let mut new_splitters_found = 0;
 
-    // Step 2: Read reference file to find hard contigs
-    // (matching C++ AGC - only reference contributes to splitter set)
-    for (file_idx, input_file) in input_files.iter().take(1).enumerate() {
+    // Step 2: Read ALL files to find hard contigs
+    // (matching C++ AGC batch mode - all samples contribute splitters for hard contigs)
+    for (file_idx, input_file) in input_files.iter().enumerate() {
         let is_reference = file_idx == 0;
         let mut reader = GenomeIO::<Box<dyn Read>>::open(input_file)?;
 
