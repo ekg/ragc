@@ -415,7 +415,7 @@ pub struct StreamingQueueCompressor {
     reference_sample_name: Arc<Mutex<Option<String>>>, // First sample becomes reference
     // Segment splitting support (Phase 1)
     map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id (BTreeMap for deterministic iteration)
-    map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>, // kmer -> [connected kmers]
+    map_segments_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>, // kmer -> [connected kmers] (BTreeMap for determinism)
 
     // FFI Grouping Engine - C++ AGC-compatible group assignment
     #[cfg(feature = "cpp_agc")]
@@ -424,29 +424,29 @@ pub struct StreamingQueueCompressor {
     // Persistent reference segment storage (matches C++ AGC v_segments)
     // Stores reference segment data even after groups are flushed, enabling LZ cost estimation
     // for subsequent samples (fixes multi-sample group fragmentation bug)
-    reference_segments: Arc<Mutex<std::collections::HashMap<u32, Vec<u8>>>>, // group_id -> reference segment data
+    reference_segments: Arc<Mutex<BTreeMap<u32, Vec<u8>>>>, // group_id -> reference segment data (BTreeMap for determinism)
 
     // Reference orientation tracking - stores is_rev_comp for each group's reference segment
     // When a delta segment joins an existing group, it MUST use the same orientation as the reference
     // to ensure LZ encoding works correctly (fixes ZERO_MATCH bug in Case 3 terminator segments)
-    reference_orientations: Arc<Mutex<std::collections::HashMap<u32, bool>>>, // group_id -> reference is_rev_comp
+    reference_orientations: Arc<Mutex<BTreeMap<u32, bool>>>, // group_id -> reference is_rev_comp (BTreeMap for determinism)
 
     // Track segment splits for renumbering subsequent segments
     // Maps (sample_name, contig_name, original_place) -> number of splits inserted before this position
-    split_offsets: Arc<Mutex<std::collections::HashMap<(String, String, usize), usize>>>,
+    split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>>, // BTreeMap for determinism
 
     // Priority assignment for interleaved processing (matches C++ AGC)
     // Higher priority = processed first (sample1 > sample2 > sample3...)
-    sample_priorities: Arc<Mutex<std::collections::HashMap<String, i32>>>, // sample_name -> priority
+    sample_priorities: Arc<Mutex<BTreeMap<String, i32>>>, // sample_name -> priority (BTreeMap for determinism)
 
     // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
     // When batch_samples reaches batch_size, we flush pending segments and clear batch-local state
     batch_samples: Arc<Mutex<HashSet<String>>>, // Samples in current batch (matches C++ AGC pack_cardinality batch)
     batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>, // Batch-local m_kmers equivalent (BTreeMap for deterministic iteration)
-    batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>, // Batch-local terminators - only merged to global at batch end
+    batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>, // Batch-local terminators (BTreeMap for determinism)
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>, // Buffer segments until batch boundary
     // Fallback minimizers map for segments with no terminator match (matches C++ AGC map_fallback_minimizers)
-    map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>, // kmer -> [(front, back)] candidate group keys
+    map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>, // kmer -> [(front, back)] candidate group keys (BTreeMap for determinism)
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
     next_sequence: Arc<std::sync::atomic::AtomicU64>, // Increases for each contig (FASTA order)
 
@@ -605,14 +605,14 @@ impl StreamingQueueCompressor {
 
         // Segment splitting support (Phase 1)
         let map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
-        let map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        let map_segments_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
         // Persistent reference segment storage (matches C++ AGC v_segments)
-        let reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let reference_segments: Arc<Mutex<BTreeMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
         // Reference orientation tracking (fixes ZERO_MATCH bug in Case 3 terminator segments)
-        let reference_orientations: Arc<Mutex<HashMap<u32, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+        let reference_orientations: Arc<Mutex<BTreeMap<u32, bool>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
         // FFI Grouping Engine - C++ AGC-compatible group assignment
         #[cfg(feature = "cpp_agc")]
@@ -622,16 +622,16 @@ impl StreamingQueueCompressor {
         )));
 
         // Priority tracking for interleaved processing (matches C++ AGC)
-        let sample_priorities: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let sample_priorities: Arc<Mutex<BTreeMap<String, i32>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
         let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Increases for each contig (FASTA order)
 
         // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
         let batch_samples: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
-        let batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
-        let map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -1164,7 +1164,7 @@ fn flush_pack(
     collection: &Arc<Mutex<CollectionV3>>,
     archive: &Arc<Mutex<Archive>>,
     config: &StreamingQueueConfig,
-    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
 ) -> Result<()> {
     use crate::segment_compression::{compress_reference_segment, compress_segment_configured};
 
@@ -1533,8 +1533,8 @@ fn write_reference_immediately(
     buffer: &mut SegmentGroupBuffer,
     collection: &Arc<Mutex<CollectionV3>>,
     archive: &Arc<Mutex<Archive>>,
-    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
-    reference_orientations: &Arc<Mutex<HashMap<u32, bool>>>,
+    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
     config: &StreamingQueueConfig,
 ) -> Result<()> {
     use crate::segment_compression::compress_reference_segment;
@@ -1641,10 +1641,10 @@ fn find_group_with_one_kmer(
     kmer_is_dir: bool,
     segment_data: &[u8],      // Segment data in forward orientation
     segment_data_rc: &[u8],   // Segment data in reverse complement
-    map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    map_segments_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
-    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
 ) -> (u64, u64, bool) {
     let segment_len = segment_data.len();
@@ -2056,10 +2056,10 @@ fn find_cand_segment_using_fallback_minimizers(
     k: usize,
     min_shared_kmers: u64,
     fallback_filter: &FallbackFilter,
-    map_fallback_minimizers: &Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>,
+    map_fallback_minimizers: &Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
     map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
-    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
 ) -> (u64, u64, bool) {
     use crate::segment::MISSING_KMER;
@@ -2074,7 +2074,7 @@ fn find_cand_segment_using_fallback_minimizers(
 
     // Scan segment for k-mers and count candidates
     // Map from candidate group key to list of shared k-mers
-    let mut cand_seg_counts: HashMap<(u64, u64), Vec<u64>> = HashMap::new();
+    let mut cand_seg_counts: BTreeMap<(u64, u64), Vec<u64>> = BTreeMap::new(); // BTreeMap for determinism
 
     // K-mer scanning state (matches C++ AGC CKmer behavior)
     let mut kmer_data: u64 = 0;
@@ -2305,7 +2305,7 @@ fn add_fallback_mapping(
     splitter1: u64,
     splitter2: u64,
     fallback_filter: &FallbackFilter,
-    map_fallback_minimizers: &Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>,
+    map_fallback_minimizers: &Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
 ) {
     use crate::segment::MISSING_KMER;
 
@@ -2367,13 +2367,13 @@ fn flush_batch(
     _segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     _pending_batch_segments: &Arc<Mutex<Vec<PendingSegment>>>,
     batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    batch_local_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    batch_local_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     _group_counter: &Arc<AtomicU32>,
-    map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    map_segments_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     _archive: &Arc<Mutex<Archive>>,
     _collection: &Arc<Mutex<CollectionV3>>,
-    _reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    _reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
     #[cfg(feature = "cpp_agc")]
     _grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     config: &StreamingQueueConfig,
@@ -2440,7 +2440,7 @@ fn fix_orientation_for_group(
     key: &SegmentGroupKey,
     map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    reference_orientations: &Arc<Mutex<HashMap<u32, bool>>>,
+    reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
 ) -> (Vec<u8>, bool) {
     // Look up group_id in both global (map_segments) and batch-local registries
     let group_id_opt = {
@@ -2494,17 +2494,17 @@ fn worker_thread(
     raw_group_counter: Arc<AtomicU32>,
     reference_sample_name: Arc<Mutex<Option<String>>>,
     map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
-    reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
-    reference_orientations: Arc<Mutex<HashMap<u32, bool>>>,
-    split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>>,
+    map_segments_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
+    reference_segments: Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    reference_orientations: Arc<Mutex<BTreeMap<u32, bool>>>,
+    split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>>,
     #[cfg(feature = "cpp_agc")]
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     batch_samples: Arc<Mutex<HashSet<String>>>,
     batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
-    map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>,
+    map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
@@ -3684,7 +3684,7 @@ fn worker_thread(
 fn find_middle_splitter(
     front_kmer: u64,
     back_kmer: u64,
-    terminators: &HashMap<u64, Vec<u64>>,
+    terminators: &BTreeMap<u64, Vec<u64>>,
 ) -> Option<u64> {
     let front_connections = terminators.get(&front_kmer)?;
     let back_connections = terminators.get(&back_kmer)?;
@@ -3818,8 +3818,8 @@ fn try_split_segment_with_cost(
     left_key: &SegmentGroupKey,
     right_key: &SegmentGroupKey,
     map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
-    reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
+    map_segments_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
+    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
     should_reverse: bool,
     force_split_on_empty_refs: bool, // When true, split at middle k-mer position even if FFI says no
