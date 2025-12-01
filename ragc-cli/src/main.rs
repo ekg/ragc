@@ -506,22 +506,31 @@ fn create_archive(
             ..StreamingQueueConfig::default()
         };
 
-        // Two-pass splitter discovery (matching C++ AGC batch mode)
-        // Pass 1: Discover ALL splitters from ALL files (including new splitters for hard contigs)
-        // Pass 2: Process all files with combined splitter set (done below)
+        // Splitter discovery strategy depends on adaptive mode (matching C++ AGC)
         if inputs.is_empty() {
             anyhow::bail!("No input files provided");
         }
 
-        // Use two-pass splitter discovery for C++ AGC compatibility
-        // This reads all files once to find hard contigs and discover new splitters,
-        // then returns the combined splitter set to use for ALL contigs
-        let splitters = ragc_core::two_pass_splitter_discovery(
-            &inputs,
-            kmer_length as usize,
-            segment_size as usize,
-            verbosity as usize,
-        )?;
+        let splitters = if adaptive {
+            // Adaptive mode: Discover splitters from hard contigs across ALL files
+            // (matches C++ AGC with -a flag)
+            ragc_core::two_pass_splitter_discovery(
+                &inputs,
+                kmer_length as usize,
+                segment_size as usize,
+                verbosity as usize,
+            )?
+        } else {
+            // Non-adaptive mode: Use splitters from reference file ONLY
+            // (matches C++ AGC default behavior - agc_compressor.cpp:428-563)
+            let (splitters, _singletons, _duplicates) =
+                ragc_core::determine_splitters_streaming(
+                    &inputs[0],
+                    kmer_length as usize,
+                    segment_size as usize,
+                )?;
+            splitters
+        };
 
         if verbosity > 0 {
             eprintln!("Final splitter count: {}", splitters.len());
