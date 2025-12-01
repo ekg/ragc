@@ -154,6 +154,7 @@ struct ContigTask {
     sample_priority: i32, // Higher = process first (decreases for each sample)
     cost: usize, // Contig size in bytes (matches C++ AGC cost calculation)
     sequence: u64, // Insertion order within sample - lower = processed first (FASTA order)
+    is_sync_token: bool, // True if this is a synchronization token (matches C++ AGC registration tokens)
 }
 
 // Implement priority ordering for BinaryHeap (max-heap)
@@ -181,23 +182,21 @@ impl PartialOrd for ContigTask {
 
 impl Ord for ContigTask {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // C++ AGC uses (priority, cost) as the multimap key, but empirically processes
-        // contigs in FILE ORDER within each sample (chrI, chrII, chrIII, chrIV, ...).
+        // C++ AGC uses (priority, cost) as the multimap key with PopLarge (rbegin).
+        // multimap is sorted by (priority, cost) in ASCENDING order.
+        // rbegin() returns LARGEST element, so within same priority, LARGEST cost is popped first.
         //
-        // This is NOT cost order (chrIV at 1.5MB would come before chrII at 800KB).
-        // The streaming nature and fast workers make the queue effectively FIFO = file order.
+        // Example: AAA#0 contigs are processed by SIZE (largest first):
+        //   chrIV (1.5MB) → chrXV (1.1MB) → chrVII (1.1MB) → ... → chrMT (86KB)
         //
-        // We match C++ AGC's empirical behavior: (priority, sequence) ordering.
-        // cost is still calculated and stored (matching C++ AGC data structure), but
-        // used for queue capacity management, not ordering.
+        // This is NOT file order! Instrumentation shows C++ AGC pops by (priority, cost).
 
         // First compare by sample_priority (higher priority first)
         match self.sample_priority.cmp(&other.sample_priority) {
             std::cmp::Ordering::Equal => {
-                // Then by sequence (FASTA file order, lower = earlier = higher priority)
-                // REVERSE comparison: other.sequence vs self.sequence
-                // This makes earlier-in-file contigs "greater" so they're popped first
-                other.sequence.cmp(&self.sequence)
+                // Then by cost (LARGER cost = higher priority, processed first)
+                // Match C++ AGC's PopLarge behavior
+                self.cost.cmp(&other.cost)
             }
             priority_ord => priority_ord,
         }
@@ -404,6 +403,7 @@ const NO_RAW_GROUPS: u32 = 16;
 pub struct StreamingQueueCompressor {
     queue: Arc<MemoryBoundedQueue<ContigTask>>,
     workers: Vec<JoinHandle<Result<()>>>,
+    barrier: Arc<std::sync::Barrier>, // Synchronization barrier for batch boundaries (matches C++ AGC bar.arrive_and_wait())
     collection: Arc<Mutex<CollectionV3>>,
     splitters: Arc<HashSet<u64>>,
     config: StreamingQueueConfig,
@@ -437,6 +437,9 @@ pub struct StreamingQueueCompressor {
     // Priority assignment for interleaved processing (matches C++ AGC)
     // Higher priority = processed first (sample1 > sample2 > sample3...)
     sample_priorities: Arc<Mutex<BTreeMap<String, i32>>>, // sample_name -> priority (BTreeMap for determinism)
+
+    // Track last sample to detect sample boundaries for sync token insertion
+    last_sample_name: Arc<Mutex<Option<String>>>, // Last sample that was pushed
 
     // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
     // When batch_samples reaches batch_size, we flush pending segments and clear batch-local state
@@ -623,6 +626,7 @@ impl StreamingQueueCompressor {
 
         // Priority tracking for interleaved processing (matches C++ AGC)
         let sample_priorities: Arc<Mutex<BTreeMap<String, i32>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let last_sample_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None)); // Track last sample for boundary detection
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
         let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Increases for each contig (FASTA order)
         let sample_contig_counts: Arc<Mutex<BTreeMap<String, usize>>> = Arc::new(Mutex::new(BTreeMap::new())); // Track contigs per sample
@@ -633,6 +637,10 @@ impl StreamingQueueCompressor {
         let batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
         let map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+
+        // Initialize barrier for sample boundary synchronization (matches C++ AGC barrier)
+        // All workers must synchronize at sample boundaries to ensure batch flush completes before processing new samples
+        let barrier = Arc::new(std::sync::Barrier::new(config.num_threads));
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -659,6 +667,7 @@ impl StreamingQueueCompressor {
             let batch_local_terminators = Arc::clone(&batch_local_terminators);
             let pending_batch_segments = Arc::clone(&pending_batch_segments);
             let map_fallback_minimizers = Arc::clone(&map_fallback_minimizers);
+            let barrier = Arc::clone(&barrier);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
@@ -686,6 +695,7 @@ impl StreamingQueueCompressor {
                     batch_local_terminators,
                     pending_batch_segments,
                     map_fallback_minimizers,
+                    barrier,
                     config,
                 )
             });
@@ -700,6 +710,7 @@ impl StreamingQueueCompressor {
         Ok(Self {
             queue,
             workers,
+            barrier,
             collection,
             splitters,
             config,
@@ -716,6 +727,7 @@ impl StreamingQueueCompressor {
             reference_orientations,
             split_offsets,
             sample_priorities,
+            last_sample_name,
             next_priority,
             batch_samples,
             batch_local_groups,
@@ -843,6 +855,7 @@ impl StreamingQueueCompressor {
                 let batch_local_terminators = Arc::clone(&self.batch_local_terminators);
                 let pending_batch_segments = Arc::clone(&self.pending_batch_segments);
                 let map_fallback_minimizers = Arc::clone(&self.map_fallback_minimizers);
+                let barrier = Arc::clone(&self.barrier);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
@@ -870,6 +883,7 @@ impl StreamingQueueCompressor {
                         batch_local_terminators,
                         pending_batch_segments,
                         map_fallback_minimizers,
+                        barrier,
                         config,
                     )
                 });
@@ -938,20 +952,57 @@ impl StreamingQueueCompressor {
             current_priority  // Use priority BEFORE potential decrement (this contig uses current priority)
         };
 
+        // Insert sync tokens at sample boundaries (matches C++ AGC registration tokens)
+        // When transitioning to a new sample, insert num_threads sync tokens to trigger barrier synchronization
+        {
+            let mut last_sample = self.last_sample_name.lock().unwrap();
+            if let Some(ref last) = *last_sample {
+                if last != &sample_name {
+                    // Sample boundary detected - insert sync tokens
+                    if self.config.verbosity > 0 {
+                        eprintln!(
+                            "SAMPLE_BOUNDARY: Inserting {} sync tokens (transitioning from {} to {})",
+                            self.config.num_threads, last, sample_name
+                        );
+                    }
+
+                    // Insert num_threads sync tokens (matches C++ AGC EmplaceManyNoCost)
+                    // All workers must pop a token and synchronize before processing new sample
+                    for _ in 0..self.config.num_threads {
+                        let sync_token = ContigTask {
+                            sample_name: sample_name.clone(),
+                            contig_name: String::from("<SYNC>"),
+                            data: Vec::new(), // Empty data for sync token
+                            sample_priority,
+                            cost: 0, // No cost for sync tokens
+                            sequence,
+                            is_sync_token: true,
+                        };
+                        self.queue.push(sync_token, 0)?; // 0 size for sync tokens
+                    }
+                }
+            }
+            // Update last sample name
+            *last_sample = Some(sample_name.clone());
+        }
+
         // Create task with priority information
         // NOTE: sequence is used for FASTA ordering (lower = processed first)
         let cost = data.len(); // C++ AGC: auto cost = contig.size()
         let task = ContigTask {
-            sample_name,
+            sample_name: sample_name.clone(),
             contig_name,
             data,
             sample_priority,
             cost,
             sequence,
+            is_sync_token: false, // Normal contig task, not a sync token
         };
 
         // Push to queue (BLOCKS if queue is full!)
         // Queue is now a priority queue - highest priority processed first
+        eprintln!("[RAGC PUSH] sample={} contig={} priority={} cost={} sequence={}",
+                  &task.sample_name, &task.contig_name, task.sample_priority, task.cost, task.sequence);
         self.queue
             .push(task, task_size)
             .context("Failed to push to queue")?;
@@ -2525,6 +2576,7 @@ fn worker_thread(
     batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
     map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
+    barrier: Arc<std::sync::Barrier>, // Synchronization barrier for batch boundaries
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
@@ -2564,41 +2616,56 @@ fn worker_thread(
             break;
         };
 
-        // Check if we're starting a new sample - flush batch-local state at sample boundary
-        // This matches C++ AGC behavior where process_new() is called at each sample boundary
+        eprintln!("[RAGC POP] worker={} sample={} contig={}", worker_id, &task.sample_name, &task.contig_name);
+
+        // Handle sync tokens with barrier synchronization (matches C++ AGC registration stage)
+        if task.is_sync_token {
+            if config.verbosity > 0 {
+                eprintln!("Worker {} hit sync token for sample {}", worker_id, task.sample_name);
+            }
+
+            // Barrier 1: All workers arrive at sample boundary
+            barrier.wait();
+
+            // Only worker 0 performs the flush (matches C++ AGC thread_id == 0 check)
+            if worker_id == 0 {
+                if config.verbosity > 0 {
+                    eprintln!("Worker 0 flushing batch at sample boundary for {}", task.sample_name);
+                }
+
+                flush_batch(
+                    &segment_groups,
+                    &pending_batch_segments,
+                    &batch_local_groups,
+                    &batch_local_terminators,
+                    &map_segments,
+                    &group_counter,
+                    &map_segments_terminators,
+                    &archive,
+                    &collection,
+                    &reference_segments,
+                    #[cfg(feature = "cpp_agc")]
+                    &grouping_engine,
+                    &config,
+                )?;
+
+                // Clear batch-local state after flush (start fresh for new sample)
+                let mut samples = batch_samples.lock().unwrap();
+                samples.clear();
+            }
+
+            // Barrier 2: Wait for flush to complete before all workers proceed
+            // This ensures all workers see the updated map_segments state
+            barrier.wait();
+
+            // Sync token processed - continue to next task
+            continue;
+        }
+
+        // Update batch samples tracking (for non-sync tasks)
         {
             let mut samples = batch_samples.lock().unwrap();
-            if !samples.contains(&task.sample_name) {
-                // New sample detected - flush batch-local state (matches C++ AGC)
-                // In C++ AGC, process_new() is called after each sample, resetting m_kmers
-                if !samples.is_empty() {
-                    // Not the first sample - flush previous sample's batch-local state
-                    #[cfg(feature = "verbose_debug")]
-                    if config.verbosity > 0 {
-                        eprintln!("BATCH_BOUNDARY: New sample {} detected, flushing previous sample's batch-local state",
-                            task.sample_name);
-                    }
-                    drop(samples); // Release lock before flush
-                    flush_batch(
-                        &segment_groups,
-                        &pending_batch_segments,
-                        &batch_local_groups,
-                        &batch_local_terminators,
-                        &map_segments,
-                        &group_counter,
-                        &map_segments_terminators,
-                        &archive,
-                        &collection,
-                        &reference_segments,
-                        #[cfg(feature = "cpp_agc")]
-                        &grouping_engine,
-                        &config,
-                    )?;
-                    samples = batch_samples.lock().unwrap();
-                    samples.clear(); // Clear after flushing (start fresh for new sample)
-                }
-                samples.insert(task.sample_name.clone());
-            }
+            samples.insert(task.sample_name.clone());
         }
 
         // Split into segments
