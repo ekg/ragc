@@ -181,27 +181,23 @@ impl PartialOrd for ContigTask {
 
 impl Ord for ContigTask {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // C++ AGC orders by: (sample_priority, cost) with tie-breaking by insertion order
-        // Due to streaming nature (contigs added incrementally while workers pop),
-        // C++ AGC effectively uses file order as tie-breaker, not lexicographic name order
+        // C++ AGC uses (priority, cost) as the multimap key, but empirically processes
+        // contigs in FILE ORDER within each sample (chrI, chrII, chrIII, chrIV, ...).
+        //
+        // This is NOT cost order (chrIV at 1.5MB would come before chrII at 800KB).
+        // The streaming nature and fast workers make the queue effectively FIFO = file order.
+        //
+        // We match C++ AGC's empirical behavior: (priority, sequence) ordering.
+        // cost is still calculated and stored (matching C++ AGC data structure), but
+        // used for queue capacity management, not ordering.
 
         // First compare by sample_priority (higher priority first)
         match self.sample_priority.cmp(&other.sample_priority) {
             std::cmp::Ordering::Equal => {
-                // Then by cost (HIGHER cost = larger contig first, matching C++ AGC rbegin())
-                // NORMAL comparison: self.cost vs other.cost
-                // This makes larger contigs "greater" so they're popped first
-                match self.cost.cmp(&other.cost) {
-                    std::cmp::Ordering::Equal => {
-                        // Finally by sequence (FASTA file order, lower = earlier = higher priority)
-                        // REVERSE comparison: other.sequence vs self.sequence
-                        // This makes earlier-in-file contigs "greater" so they're popped first
-                        // Matches C++ AGC's streaming behavior where contigs are processed in file order
-                        // when they have the same (priority, cost)
-                        other.sequence.cmp(&self.sequence)
-                    }
-                    cost_ord => cost_ord,
-                }
+                // Then by sequence (FASTA file order, lower = earlier = higher priority)
+                // REVERSE comparison: other.sequence vs self.sequence
+                // This makes earlier-in-file contigs "greater" so they're popped first
+                other.sequence.cmp(&self.sequence)
             }
             priority_ord => priority_ord,
         }
@@ -452,6 +448,7 @@ pub struct StreamingQueueCompressor {
     map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>, // kmer -> [(front, back)] candidate group keys (BTreeMap for determinism)
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
     next_sequence: Arc<std::sync::atomic::AtomicU64>, // Increases for each contig (FASTA order)
+    sample_contig_counts: Arc<Mutex<BTreeMap<String, usize>>>, // Track contigs per sample for priority synchronization (C++ AGC: cnt_contigs_in_sample)
 
     // Deferred metadata streams - written AFTER segment data (C++ AGC compatibility)
     // C++ AGC writes segment data first, then metadata streams at the end
@@ -628,6 +625,7 @@ impl StreamingQueueCompressor {
         let sample_priorities: Arc<Mutex<BTreeMap<String, i32>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
         let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Increases for each contig (FASTA order)
+        let sample_contig_counts: Arc<Mutex<BTreeMap<String, usize>>> = Arc::new(Mutex::new(BTreeMap::new())); // Track contigs per sample
 
         // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
         let batch_samples: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -725,6 +723,7 @@ impl StreamingQueueCompressor {
             pending_batch_segments,
             map_fallback_minimizers,
             next_sequence,
+            sample_contig_counts,
             // Deferred metadata streams (written at end for C++ AGC compatibility)
             deferred_file_type_info,
             deferred_params,
@@ -910,15 +909,33 @@ impl StreamingQueueCompressor {
 
         // Get or assign priority for this sample (matches C++ AGC priority queue)
         // Higher priority = processed first (decreases for each new sample)
+        // C++ AGC also decrements priority every 50 contigs WITHIN a sample (max_no_contigs_before_synchronization)
         let sample_priority = {
             let mut priorities = self.sample_priorities.lock().unwrap();
-            *priorities.entry(sample_name.clone()).or_insert_with(|| {
+            let current_priority = *priorities.entry(sample_name.clone()).or_insert_with(|| {
                 // First time seeing this sample - assign new priority
                 let mut next_p = self.next_priority.lock().unwrap();
                 let priority = *next_p;
                 *next_p -= 1; // Decrement for next sample (C++ AGC uses --sample_priority)
                 priority
-            })
+            });
+
+            // Track contig count and decrement priority every 50 contigs (pack_cardinality)
+            // Matches C++ AGC: if (++cnt_contigs_in_sample >= max_no_contigs_before_synchronization)
+            let mut counts = self.sample_contig_counts.lock().unwrap();
+            let count = counts.entry(sample_name.clone()).or_insert(0);
+            *count += 1;
+
+            if *count >= self.config.pack_size {
+                // Reached synchronization point - decrement priority for next batch
+                // C++ AGC does: cnt_contigs_in_sample = 0; --sample_priority;
+                *count = 0;
+                if let Some(priority) = priorities.get_mut(&sample_name) {
+                    *priority -= 1;
+                }
+            }
+
+            current_priority  // Use priority BEFORE potential decrement (this contig uses current priority)
         };
 
         // Create task with priority information
