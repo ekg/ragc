@@ -152,6 +152,7 @@ struct ContigTask {
     contig_name: String,
     data: Contig, // Vec<u8>
     sample_priority: i32, // Higher = process first (decreases for each sample)
+    cost: usize, // Contig size in bytes (matches C++ AGC cost calculation)
     sequence: u64, // Insertion order within sample - lower = processed first (FASTA order)
 }
 
@@ -164,7 +165,9 @@ struct ContigTask {
 // To match this with a max-heap, we reverse the contig_name comparison.
 impl PartialEq for ContigTask {
     fn eq(&self, other: &Self) -> bool {
-        self.sample_priority == other.sample_priority && self.contig_name == other.contig_name
+        self.sample_priority == other.sample_priority
+            && self.cost == other.cost
+            && self.contig_name == other.contig_name
     }
 }
 
@@ -178,17 +181,26 @@ impl PartialOrd for ContigTask {
 
 impl Ord for ContigTask {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // C++ AGC orders by: (sample_priority, cost, contig_name)
+        // Since we use a max-heap, we need to reverse cost and contig_name comparisons
+
         // First compare by sample_priority (higher priority first)
         match self.sample_priority.cmp(&other.sample_priority) {
             std::cmp::Ordering::Equal => {
-                // Then by contig_name (lexicographic ascending order)
-                // REVERSE comparison: other.contig_name vs self.contig_name
-                // This makes lexicographically smaller names "greater" so they're popped first
-                // E.g., "chrI" < "chrIX" < "chrMT" < "chrV" in ascending order
-                // So we want "chrI" to be popped first from the max-heap
-                other.contig_name.cmp(&self.contig_name)
+                // Then by cost (HIGHER cost = larger contig first, matching C++ AGC rbegin())
+                // NORMAL comparison: self.cost vs other.cost
+                // This makes larger contigs "greater" so they're popped first
+                match self.cost.cmp(&other.cost) {
+                    std::cmp::Ordering::Equal => {
+                        // Finally by contig_name (lexicographic ascending order)
+                        // REVERSE comparison: other.contig_name vs self.contig_name
+                        // This makes lexicographically smaller names "greater" so they're popped first
+                        other.contig_name.cmp(&self.contig_name)
+                    }
+                    cost_ord => cost_ord,
+                }
             }
-            other_ord => other_ord,
+            priority_ord => priority_ord,
         }
     }
 }
@@ -402,7 +414,7 @@ pub struct StreamingQueueCompressor {
     raw_group_counter: Arc<AtomicU32>, // Round-robin counter for raw groups (0-15)
     reference_sample_name: Arc<Mutex<Option<String>>>, // First sample becomes reference
     // Segment splitting support (Phase 1)
-    map_segments: Arc<Mutex<std::collections::HashMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id
+    map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id (BTreeMap for deterministic iteration)
     map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>, // kmer -> [connected kmers]
 
     // FFI Grouping Engine - C++ AGC-compatible group assignment
@@ -430,7 +442,7 @@ pub struct StreamingQueueCompressor {
     // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
     // When batch_samples reaches batch_size, we flush pending segments and clear batch-local state
     batch_samples: Arc<Mutex<HashSet<String>>>, // Samples in current batch (matches C++ AGC pack_cardinality batch)
-    batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>, // Batch-local m_kmers equivalent
+    batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>, // Batch-local m_kmers equivalent (BTreeMap for deterministic iteration)
     batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>, // Batch-local terminators - only merged to global at batch end
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>, // Buffer segments until batch boundary
     // Fallback minimizers map for segments with no terminator match (matches C++ AGC map_fallback_minimizers)
@@ -592,7 +604,7 @@ impl StreamingQueueCompressor {
         let reference_sample_name = Arc::new(Mutex::new(None)); // Shared across all workers
 
         // Segment splitting support (Phase 1)
-        let map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
         let split_offsets: Arc<Mutex<HashMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -616,7 +628,7 @@ impl StreamingQueueCompressor {
 
         // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
         let batch_samples: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(HashMap::new()));
         let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
         let map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -908,11 +920,13 @@ impl StreamingQueueCompressor {
 
         // Create task with priority information
         // NOTE: sequence is used for FASTA ordering (lower = processed first)
+        let cost = data.len(); // C++ AGC: auto cost = contig.size()
         let task = ContigTask {
             sample_name,
             contig_name,
             data,
             sample_priority,
+            cost,
             sequence,
         };
 
@@ -1628,7 +1642,7 @@ fn find_group_with_one_kmer(
     segment_data: &[u8],      // Segment data in forward orientation
     segment_data_rc: &[u8],   // Segment data in reverse complement
     map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
-    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
@@ -2043,7 +2057,7 @@ fn find_cand_segment_using_fallback_minimizers(
     min_shared_kmers: u64,
     fallback_filter: &FallbackFilter,
     map_fallback_minimizers: &Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>,
-    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
@@ -2352,9 +2366,9 @@ fn add_fallback_mapping(
 fn flush_batch(
     _segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     _pending_batch_segments: &Arc<Mutex<Vec<PendingSegment>>>,
-    batch_local_groups: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
-    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     _group_counter: &Arc<AtomicU32>,
     map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     _archive: &Arc<Mutex<Archive>>,
@@ -2424,8 +2438,8 @@ fn fix_orientation_for_group(
     data: &[u8],
     should_reverse: bool,
     key: &SegmentGroupKey,
-    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
-    batch_local_groups: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     reference_orientations: &Arc<Mutex<HashMap<u32, bool>>>,
 ) -> (Vec<u8>, bool) {
     // Look up group_id in both global (map_segments) and batch-local registries
@@ -2479,7 +2493,7 @@ fn worker_thread(
     group_counter: Arc<AtomicU32>,
     raw_group_counter: Arc<AtomicU32>,
     reference_sample_name: Arc<Mutex<Option<String>>>,
-    map_segments: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     reference_segments: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     reference_orientations: Arc<Mutex<HashMap<u32, bool>>>,
@@ -2487,7 +2501,7 @@ fn worker_thread(
     #[cfg(feature = "cpp_agc")]
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     batch_samples: Arc<Mutex<HashSet<String>>>,
-    batch_local_groups: Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
     map_fallback_minimizers: Arc<Mutex<HashMap<u64, Vec<(u64, u64)>>>>,
@@ -3803,7 +3817,7 @@ fn try_split_segment_with_cost(
     middle_kmer: u64,
     left_key: &SegmentGroupKey,
     right_key: &SegmentGroupKey,
-    map_segments: &Arc<Mutex<HashMap<SegmentGroupKey, u32>>>,
+    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     map_segments_terminators: &Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     reference_segments: &Arc<Mutex<HashMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
