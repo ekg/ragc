@@ -442,8 +442,10 @@ mod tests {
         queue.push(vec![0u8; 200], 200).unwrap();
         assert_eq!(queue.current_size(), 300);
 
+        // This is a priority queue (max-heap)! vec![0;200] > vec![0;100]
+        // So we'll pull the 200-byte vector first, leaving 100 bytes
         queue.pull().unwrap();
-        assert_eq!(queue.current_size(), 200);
+        assert_eq!(queue.current_size(), 100);
 
         queue.pull().unwrap();
         assert_eq!(queue.current_size(), 0);

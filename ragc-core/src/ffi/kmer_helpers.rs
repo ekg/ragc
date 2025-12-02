@@ -296,8 +296,8 @@ mod tests {
 
         unsafe {
             let kmers = slice::from_raw_parts(array.data, array.len);
-            // Should have 4 k-mers: ACG, then reset at N, then ACG, CGT
-            assert_eq!(kmers.len(), 4);
+            // Should have 3 k-mers: ACG (0-2), then reset at N, then ACG (4-6), CGT (5-7)
+            assert_eq!(kmers.len(), 3);
         }
 
         ragc_free_kmer_array(array);
