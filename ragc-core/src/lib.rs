@@ -127,12 +127,12 @@ pub mod lz_diff;
 pub mod lz_matcher;
 pub mod memory_bounded_queue;
 pub mod preprocessing;
+pub mod agc_compressor;
 pub mod priority_queue;
 pub mod segment;
 pub mod segment_buffer;
 pub mod segment_compression;
 pub mod splitters;
-pub mod streaming_compressor_queue;
 pub mod task;
 pub mod tuple_packing;
 pub mod worker;
@@ -504,5 +504,5 @@ pub use splitters::{
     determine_splitters, determine_splitters_streaming, find_candidate_kmers_multi, is_hard_contig,
     is_splitter, two_pass_splitter_discovery,
 };
-pub use streaming_compressor_queue::{QueueStats, StreamingQueueCompressor, StreamingQueueConfig};
+pub use agc_compressor::{QueueStats, StreamingQueueCompressor, StreamingQueueConfig};
 pub use worker::create_agc_archive;
