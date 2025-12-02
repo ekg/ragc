@@ -1,17 +1,16 @@
 // ZSTD Context Pooling - Matching C++ AGC Design
 //
-// C++ AGC creates ONE ZSTD_CCtx per thread and reuses it for all compressions.
-// This module implements the exact same approach using zstd-safe bindings.
+// C++ AGC creates ONE ZSTD_CCtx per thread and reuses it for ALL compressions
+// with DIFFERENT levels by passing level as a parameter to ZSTD_compressCCtx().
 //
-// CRITICAL FIX: Previous implementation used zstd::stream::copy_encode which:
-// 1. Created a new encoder context for each call (massive overhead!)
-// 2. Did internal buffering we don't need
-// 3. Cloned the output buffer (defeating pooling!)
+// CRITICAL: Previous implementation used zstd::bulk::Compressor which LOCKS
+// the compression level at creation, forcing context recreation when level changes.
+// This doesn't match C++ AGC behavior and may affect compression efficiency!
 //
-// New implementation matches C++ AGC line-by-line:
-// - Thread-local ZSTD_CCtx reused for all compressions (like C++ line 176)
-// - Pre-allocated output buffer (like C++ new uint8_t[a_size])
-// - Direct compression into buffer (like ZSTD_compressCCtx)
+// New implementation uses zstd_safe raw bindings to match C++ AGC exactly:
+// - ONE thread-local ZSTD_CCtx reused for ALL compressions
+// - Compression level passed as parameter to each call (not stored in context)
+// - Matches C++ AGC: ZSTD_compressCCtx(ctx, ..., level)
 
 use anyhow::Result;
 use ragc_common::types::{Contig, PackedBlock};
@@ -19,12 +18,13 @@ use std::cell::RefCell;
 
 thread_local! {
     /// Thread-local ZSTD compression context - EXACTLY like C++ AGC
-    /// C++ AGC: ZSTD_CCtx* zstd_ctx (reused per thread)
-    /// Rust: zstd::bulk::Compressor<'static> (same concept)
+    /// C++ AGC: ZSTD_CCtx* zstd_ctx = ZSTD_createCCtx() (reused per thread)
+    /// Rust: zstd::zstd_safe::CCtx<'static> (same concept)
     ///
-    /// Note: We store (Compressor, level) to detect level changes.
-    /// In practice, compression level rarely changes within a thread.
-    static ZSTD_ENCODER: RefCell<Option<(zstd::bulk::Compressor<'static>, i32)>> = const { RefCell::new(None) };
+    /// CRITICAL: We do NOT store the compression level in the context!
+    /// Level is passed as a parameter to each compression call, allowing
+    /// the same context to handle levels 13, 17, and 19 without recreation.
+    static ZSTD_CCTX: RefCell<Option<zstd::zstd_safe::CCtx<'static>>> = const { RefCell::new(None) };
 }
 
 /// Compress a segment using thread-local ZSTD context (MATCHING C++ AGC)
@@ -38,28 +38,36 @@ thread_local! {
 /// delete[] packed;
 /// ```
 ///
-/// Our Rust implementation does the same but with thread-local context pooling.
+/// Our Rust implementation does the same with thread-local context.
 pub fn compress_segment_pooled(data: &Contig, level: i32) -> Result<PackedBlock> {
-    ZSTD_ENCODER.with(|encoder_cell| {
-        let mut encoder_opt = encoder_cell.borrow_mut();
+    ZSTD_CCTX.with(|ctx_cell| {
+        let mut ctx_opt = ctx_cell.borrow_mut();
 
-        // Get or create encoder for this level
-        let encoder = match encoder_opt.as_mut() {
-            Some((enc, cached_level)) if *cached_level == level => enc,
-            _ => {
-                // Create new encoder for this level
-                let new_encoder = zstd::bulk::Compressor::new(level)
-                    .map_err(|e| anyhow::anyhow!("Failed to create ZSTD encoder: {e}"))?;
-                *encoder_opt = Some((new_encoder, level));
-                &mut encoder_opt.as_mut().unwrap().0
+        // Get or create context (only created once per thread)
+        let ctx = match ctx_opt.as_mut() {
+            Some(c) => c,
+            None => {
+                let new_ctx = zstd::zstd_safe::CCtx::create();
+                *ctx_opt = Some(new_ctx);
+                ctx_opt.as_mut().unwrap()
             }
         };
 
-        // Compress directly - bulk::Compressor handles buffer internally
-        // and returns owned Vec (no clone needed!)
-        encoder
-            .compress(data.as_slice())
-            .map_err(|e| anyhow::anyhow!("ZSTD compression failed: {e}"))
+        // Calculate maximum compressed size (matching C++ AGC ZSTD_compressBound)
+        let max_size = zstd::zstd_safe::compress_bound(data.len());
+
+        // Allocate output buffer (matching C++ AGC: new uint8_t[a_size])
+        let mut compressed = vec![0u8; max_size];
+
+        // Compress with level parameter (matching C++ AGC: ZSTD_compressCCtx)
+        // CRITICAL: Level is passed HERE, not stored in context!
+        let compressed_size = ctx
+            .compress(&mut compressed, data, level)
+            .map_err(|e| anyhow::anyhow!("ZSTD compression failed: {e}"))?;
+
+        // Truncate to actual compressed size
+        compressed.truncate(compressed_size);
+        Ok(compressed)
     })
 }
 

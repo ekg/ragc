@@ -589,9 +589,8 @@ fn create_archive(
                     }
                 }
 
-                // Drain after each file to establish batch boundary
-                // This matches C++ AGC's pack_cardinality batching
-                compressor.drain()?;
+                // Note: No drain() here - synchronization happens every 50 contigs within streaming queue
+                // to match C++ AGC's max_no_contigs_before_synchronization = pack_cardinality
 
                 if verbosity > 0 {
                     eprintln!("Sample complete!\n");

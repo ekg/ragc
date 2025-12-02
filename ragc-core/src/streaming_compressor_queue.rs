@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -196,7 +196,16 @@ impl Ord for ContigTask {
             std::cmp::Ordering::Equal => {
                 // Then by cost (LARGER cost = higher priority, processed first)
                 // Match C++ AGC's PopLarge behavior
-                self.cost.cmp(&other.cost)
+                match self.cost.cmp(&other.cost) {
+                    std::cmp::Ordering::Equal => {
+                        // CRITICAL TIE-BREAKER: When sizes are equal, use FASTA order (sequence field)
+                        // to ensure deterministic ordering. Without this, the BinaryHeap order is
+                        // non-deterministic, causing different segment splitting and 19% size difference.
+                        // LOWER sequence = earlier in FASTA = processed first (reverse comparison for max-heap)
+                        other.sequence.cmp(&self.sequence)
+                    }
+                    cost_ord => cost_ord,
+                }
             }
             priority_ord => priority_ord,
         }
@@ -451,7 +460,7 @@ pub struct StreamingQueueCompressor {
     map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>, // kmer -> [(front, back)] candidate group keys (BTreeMap for determinism)
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
     next_sequence: Arc<std::sync::atomic::AtomicU64>, // Increases for each contig (FASTA order)
-    sample_contig_counts: Arc<Mutex<BTreeMap<String, usize>>>, // Track contigs per sample for priority synchronization (C++ AGC: cnt_contigs_in_sample)
+    global_contig_count: Arc<AtomicUsize>, // GLOBAL contig counter for synchronization (C++ AGC: cnt_contigs_in_sample)
 
     // Deferred metadata streams - written AFTER segment data (C++ AGC compatibility)
     // C++ AGC writes segment data first, then metadata streams at the end
@@ -640,7 +649,7 @@ impl StreamingQueueCompressor {
         let last_sample_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None)); // Track last sample for boundary detection
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
         let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Increases for each contig (FASTA order)
-        let sample_contig_counts: Arc<Mutex<BTreeMap<String, usize>>> = Arc::new(Mutex::new(BTreeMap::new())); // Track contigs per sample
+        let global_contig_count = Arc::new(AtomicUsize::new(0)); // GLOBAL counter across all samples (C++ AGC: cnt_contigs_in_sample)
 
         // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
         let batch_samples: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -746,7 +755,7 @@ impl StreamingQueueCompressor {
             pending_batch_segments,
             map_fallback_minimizers,
             next_sequence,
-            sample_contig_counts,
+            global_contig_count,
             // Deferred metadata streams (written at end for C++ AGC compatibility)
             deferred_file_type_info,
             deferred_params,
@@ -945,22 +954,51 @@ impl StreamingQueueCompressor {
                 priority
             });
 
-            // Track contig count and decrement priority every 50 contigs (pack_cardinality)
-            // Matches C++ AGC: if (++cnt_contigs_in_sample >= max_no_contigs_before_synchronization)
-            let mut counts = self.sample_contig_counts.lock().unwrap();
-            let count = counts.entry(sample_name.clone()).or_insert(0);
-            *count += 1;
+            // Track GLOBAL contig count and insert sync tokens every 50 contigs (pack_cardinality)
+            // C++ AGC: if (++cnt_contigs_in_sample >= max_no_contigs_before_synchronization)
+            // NOTE: Despite the name, C++ AGC's cnt_contigs_in_sample is GLOBAL, not per-sample!
+            let count = self.global_contig_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let need_sync = (count + 1) % self.config.pack_size == 0;
 
-            if *count >= self.config.pack_size {
-                // Reached synchronization point - decrement priority for next batch
+            if need_sync {
+                // Reached synchronization point (every 50 contigs GLOBALLY)
                 // C++ AGC does: cnt_contigs_in_sample = 0; --sample_priority;
-                *count = 0;
                 if let Some(priority) = priorities.get_mut(&sample_name) {
                     *priority -= 1;
                 }
-            }
 
-            current_priority  // Use priority BEFORE potential decrement (this contig uses current priority)
+                // Get the NEW priority (after decrement) for sync tokens
+                let new_priority = *priorities.get(&sample_name).unwrap();
+
+                // Drop locks before inserting sync tokens to avoid deadlock
+                drop(priorities);
+
+                // Insert sync tokens (matches C++ AGC EmplaceManyNoCost)
+                if self.config.verbosity > 0 {
+                    eprintln!(
+                        "PACK_BOUNDARY: Inserting {} sync tokens after {} contigs (global count)",
+                        self.config.num_threads, count + 1
+                    );
+                }
+
+                for _ in 0..self.config.num_threads {
+                    let sync_token = ContigTask {
+                        sample_name: sample_name.clone(),
+                        contig_name: String::from("<SYNC>"),
+                        data: Vec::new(),
+                        sample_priority: new_priority,
+                        cost: 0,
+                        sequence,
+                        is_sync_token: true,
+                    };
+                    self.queue.push(sync_token, 0)?;
+                }
+
+                // Return NEW priority for subsequent contigs
+                new_priority
+            } else {
+                current_priority  // Use priority BEFORE potential decrement (this contig uses current priority)
+            }
         };
 
         // Insert sync tokens at sample boundaries (matches C++ AGC registration tokens)
