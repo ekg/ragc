@@ -329,7 +329,7 @@ impl LZDiff {
         let mut best_len_fwd = 0u32;
         let mut min_to_update = self.min_match_len as usize;
 
-        let mut ht_pos = (hash & self.ht_mask) as usize;
+        let ht_pos = (hash & self.ht_mask) as usize;
         let mut probes = 0usize;
         let mut found_match = false;
 

@@ -255,6 +255,7 @@ fn parse_capacity(s: &str) -> Result<usize> {
 ///   scerevisiae8.fa.gz -> scerevisiae8
 ///   genome.fasta       -> genome
 ///   data.fa            -> data
+#[cfg(feature = "cpp_agc")]
 fn extract_sample_name(path: &Path) -> String {
     let mut name = path
         .file_name()
@@ -704,8 +705,8 @@ fn debug_cost_command(
     let mut lz_right = LZDiff::new(dec.min_match_len);
     lz_right.prepare(&right_ref);
 
-    let mut v_left_raw = lz_left.get_coding_cost_vector(&seg_data, left_prefix);
-    let mut v_right_raw = lz_right.get_coding_cost_vector(&seg_data, right_prefix);
+    let v_left_raw = lz_left.get_coding_cost_vector(&seg_data, left_prefix);
+    let v_right_raw = lz_right.get_coding_cost_vector(&seg_data, right_prefix);
     let mut v_left = v_left_raw.clone();
     let mut v_right = v_right_raw.clone();
 

@@ -1074,7 +1074,7 @@ impl StreamingQueueCompressor {
     /// # let mut compressor = StreamingQueueCompressor::with_splitters("out.agc", StreamingQueueConfig::default(), HashSet::new())?;
     /// // ... push sequences ...
     /// compressor.finalize()?;
-    /// # Ok::<(), antml:Error>(())
+    /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn drain(&self) -> Result<()> {
         if self.config.verbosity > 0 {
@@ -4027,7 +4027,7 @@ fn try_split_segment_with_cost(
 
     // Calculate compression costs and best split position using C++ FFI if enabled
     // Falls back to Rust implementation otherwise
-    let mut maybe_best: Option<(usize, usize)> = None; // (best_pos, seg2_start)
+    let maybe_best: Option<(usize, usize)> = None; // (best_pos, seg2_start)
     #[cfg(feature = "cpp_agc")]
     {
         // Inspect availability of left/right references and log keys
@@ -4226,7 +4226,7 @@ fn try_split_segment_with_cost(
 
     // If FFI provided best position, use it; otherwise compute costs in Rust
     let mut v_costs1 = if maybe_best.is_none() {
-        if let Some(mut lz_left) = prepare_on_demand(left_key, "left") {
+        if let Some(lz_left) = prepare_on_demand(left_key, "left") {
         #[cfg(feature = "cpp_agc")]
         {
             // Unused path when FFI returns best split; kept for completeness
@@ -4273,8 +4273,8 @@ fn try_split_segment_with_cost(
         *cost = sum;
     }
 
-    let mut v_costs2 = if maybe_best.is_none() {
-        if let Some(mut lz_right) = prepare_on_demand(right_key, "right") {
+    let v_costs2 = if maybe_best.is_none() {
+        if let Some(lz_right) = prepare_on_demand(right_key, "right") {
         #[cfg(feature = "cpp_agc")]
         {
             let ref_right = {
