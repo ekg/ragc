@@ -154,6 +154,10 @@ enum Commands {
         /// Input archive file path
         archive: PathBuf,
 
+        /// Compare with another archive (reports differences in grouping, segments, references, packs)
+        #[arg(long)]
+        compare: Option<PathBuf>,
+
         /// Show detailed segment information
         #[arg(short = 's', long)]
         segments: bool,
@@ -337,6 +341,7 @@ fn main() -> Result<()> {
 
         Commands::Inspect {
             archive,
+            compare,
             segments,
             group_id,
             single_groups,
@@ -360,6 +365,7 @@ fn main() -> Result<()> {
                 show_segment_layout: segment_layout,
                 show_pack_layout: pack_layout,
                 show_compression: compression,
+                compare_with: compare,
             };
             inspect::inspect_archive(archive, config)?
         }
