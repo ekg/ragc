@@ -13,6 +13,7 @@
 
 use anyhow::{bail, Context, Result};
 use ragc_core::{
+    contig_iterator::ContigIterator,
     determine_splitters_streaming, Decompressor, DecompressorConfig, MultiFileIterator,
     StreamingQueueCompressor, StreamingQueueConfig,
 };
