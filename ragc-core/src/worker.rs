@@ -672,7 +672,8 @@ fn register_segments(shared: &Arc<SharedCompressorState>) {
     buffered.sort_known(1); // Single-threaded for now
 
     // Step 2: Process NEW segments - assign group IDs
-    let no_new = buffered.process_new();
+    // Pass global map_segments so new segments can find existing groups
+    let no_new = buffered.process_new(&shared.map_segments);
 
     drop(buffered);
 

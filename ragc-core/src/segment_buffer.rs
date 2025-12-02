@@ -258,7 +258,7 @@ impl BufferedSegments {
     /// Matches C++ AGC's CBufferedSegPart::process_new (agc_compressor.h:384-415)
     ///
     /// Returns: Number of NEW groups created
-    pub fn process_new(&mut self) -> u32 {
+    pub fn process_new(&mut self, map_segments: &std::sync::Mutex<std::collections::HashMap<(u64, u64), u32>>) -> u32 {
         let _lock = self.resize_mtx.lock().unwrap();
         let mut s_seg_part = self.s_seg_part.lock().unwrap();
 
@@ -267,16 +267,25 @@ impl BufferedSegments {
         }
 
         // Assign group IDs to unique (kmer1, kmer2) pairs
+        // CRITICAL FIX: Check global map_segments FIRST before assigning new group IDs
+        let global_map = map_segments.lock().unwrap();
         let mut m_kmers = std::collections::HashMap::new();
         let mut group_id = self.vl_seg_part.len() as u32;
 
         for part in s_seg_part.iter() {
             let key = (part.kmer1, part.kmer2);
-            if !m_kmers.contains_key(&key) {
+
+            // Check global registry first for existing group
+            if let Some(&existing_group_id) = global_map.get(&key) {
+                m_kmers.insert(key, existing_group_id);
+            } else if !m_kmers.contains_key(&key) {
+                // New group needed - assign new ID
                 m_kmers.insert(key, group_id);
                 group_id += 1;
             }
         }
+
+        drop(global_map);
 
         let no_new = group_id - self.vl_seg_part.len() as u32;
 
