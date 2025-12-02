@@ -1050,8 +1050,8 @@ impl StreamingQueueCompressor {
 
         // Push to queue (BLOCKS if queue is full!)
         // Queue is now a priority queue - highest priority processed first
-        eprintln!("[RAGC PUSH] sample={} contig={} priority={} cost={} sequence={}",
-                  &task.sample_name, &task.contig_name, task.sample_priority, task.cost, task.sequence);
+        // eprintln!("[RAGC PUSH] sample={} contig={} priority={} cost={} sequence={}",
+        //           &task.sample_name, &task.contig_name, task.sample_priority, task.cost, task.sequence);
         self.queue
             .push(task, task_size)
             .context("Failed to push to queue")?;
@@ -2665,7 +2665,7 @@ fn worker_thread(
             break;
         };
 
-        eprintln!("[RAGC POP] worker={} sample={} contig={}", worker_id, &task.sample_name, &task.contig_name);
+        // eprintln!("[RAGC POP] worker={} sample={} contig={}", worker_id, &task.sample_name, &task.contig_name);
 
         // Handle sync tokens with barrier synchronization (matches C++ AGC registration stage)
         if task.is_sync_token {
