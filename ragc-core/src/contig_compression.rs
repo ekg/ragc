@@ -89,25 +89,33 @@ pub fn compress_contig(
         // Check if this k-mer is a splitter
         // C++ AGC: bloom_splitters.check(d) && hs_splitters.check(d)
         if is_splitter(kmer_val, ctx) {
-            // Found splitter - extract segment from split_pos to current position
-            let seg_start = split_pos;
-            let seg_end = pos + 1; // Inclusive of current position
-            let segment = contig[seg_start..seg_end].to_vec();
+            // Calculate where next segment would start (with k-base overlap)
+            let new_split_pos = pos + 1 - kmer_length as usize;
 
-            // Add segment with terminal k-mers (split_kmer, current kmer)
-            add_segment(
-                sample_name,
-                contig_name,
-                seg_part_no,
-                segment,
-                &split_kmer,
-                &kmer,
-                ctx,
-            );
+            // Only create a segment if it's longer than just the overlapping k-mer
+            // If new_split_pos <= split_pos, the segment would be at most k bases long
+            if new_split_pos > split_pos {
+                // Found splitter - extract segment from split_pos to current position
+                let seg_start = split_pos;
+                let seg_end = pos + 1; // Inclusive of current position
+                let segment = contig[seg_start..seg_end].to_vec();
 
-            // Update for next segment
-            seg_part_no += 1;
-            split_pos = pos + 1 - kmer_length as usize; // Start of next segment overlaps by kmer_length
+                // Add segment with terminal k-mers (split_kmer, current kmer)
+                add_segment(
+                    sample_name,
+                    contig_name,
+                    seg_part_no,
+                    segment,
+                    &split_kmer,
+                    &kmer,
+                    ctx,
+                );
+
+                seg_part_no += 1;
+            }
+
+            // Always update split position and k-mer for next segment
+            split_pos = new_split_pos;
             split_kmer = kmer.clone();
         }
     }
@@ -121,7 +129,8 @@ pub fn compress_contig(
     }
 
     // Add final segment (from last splitter to end of contig)
-    if split_pos < contig.len() {
+    // Skip if the final segment would be k bases or shorter (just the overlap)
+    if split_pos < contig.len() && contig.len() - split_pos > ctx.kmer_length {
         let segment = contig[split_pos..].to_vec();
 
         add_segment(
