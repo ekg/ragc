@@ -2484,31 +2484,145 @@ fn add_fallback_mapping(
 /// This updates the global map_segments registry with batch-local groups,
 /// then clears the batch-local state (like C++ AGC destroying m_kmers at batch end)
 fn flush_batch(
-    _segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
-    _pending_batch_segments: &Arc<Mutex<Vec<PendingSegment>>>,
+    segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    pending_batch_segments: &Arc<Mutex<Vec<PendingSegment>>>,
     batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    _group_counter: &Arc<AtomicU32>,
+    group_counter: &Arc<AtomicU32>,
     map_segments_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
-    _archive: &Arc<Mutex<Archive>>,
-    _collection: &Arc<Mutex<CollectionV3>>,
-    _reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    archive: &Arc<Mutex<Archive>>,
+    collection: &Arc<Mutex<CollectionV3>>,
+    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
     #[cfg(feature = "cpp_agc")]
-    _grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
+    grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     config: &StreamingQueueConfig,
 ) -> Result<()> {
-    // Get batch-local groups
-    let batch_map = batch_local_groups.lock().unwrap();
-    let batch_terms = batch_local_terminators.lock().unwrap();
+    // Process pending segments in SORTED order (matches C++ AGC process_new())
+    let mut pending = pending_batch_segments.lock().unwrap();
 
-    if batch_map.is_empty() && batch_terms.is_empty() {
+    if pending.is_empty() {
         #[cfg(feature = "verbose_debug")]
         if config.verbosity > 0 {
-            eprintln!("FLUSH_BATCH: No pending groups to flush");
+            eprintln!("FLUSH_BATCH: No pending segments to process");
         }
-        return Ok(());
+    } else {
+        // Sort segments by (sample_name, contig_name, place) - PendingSegment already has Ord
+        pending.sort();
+
+        if config.verbosity > 0 {
+            eprintln!("FLUSH_BATCH: Processing {} pending segments in sorted order", pending.len());
+        }
+
+        // Track which keys we've assigned group_ids to IN THIS BATCH (like C++ AGC's m_kmers)
+        let mut batch_key_to_group: std::collections::HashMap<SegmentGroupKey, u32> = std::collections::HashMap::new();
+
+        // Iterate through sorted segments and assign group_ids
+        for seg in pending.iter() {
+            // Check if we've already assigned a group_id for this key in THIS batch
+            let group_id = if let Some(&existing_id) = batch_key_to_group.get(&seg.key) {
+                // Key seen earlier in THIS batch - reuse ID
+                existing_id
+            } else {
+                // New key in this batch - assign next group_id
+                let new_id = if seg.key.kmer_back == MISSING_KMER && seg.key.kmer_front < NO_RAW_GROUPS as u64 {
+                    seg.key.kmer_front as u32  // Raw groups use ID from key
+                } else {
+                    group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
+                };
+
+                batch_key_to_group.insert(seg.key.clone(), new_id);
+
+                // Register with batch_local_groups for terminator tracking
+                let mut batch_map = batch_local_groups.lock().unwrap();
+                batch_map.insert(seg.key.clone(), new_id);
+                drop(batch_map);
+
+                // Register with FFI engine
+                #[cfg(feature = "cpp_agc")]
+                if seg.key.kmer_front != MISSING_KMER && seg.key.kmer_back != MISSING_KMER {
+                    let mut eng = grouping_engine.lock().unwrap();
+                    eng.register_group(seg.key.kmer_front, seg.key.kmer_back, new_id);
+                }
+
+                // Update batch-local terminators
+                if seg.key.kmer_front != MISSING_KMER && seg.key.kmer_back != MISSING_KMER {
+                    let mut term_map = batch_local_terminators.lock().unwrap();
+
+                    term_map.entry(seg.key.kmer_front)
+                        .or_insert_with(Vec::new)
+                        .push(seg.key.kmer_back);
+
+                    if seg.key.kmer_front != seg.key.kmer_back {
+                        term_map.entry(seg.key.kmer_back)
+                            .or_insert_with(Vec::new)
+                            .push(seg.key.kmer_front);
+                    }
+
+                    if let Some(front_vec) = term_map.get_mut(&seg.key.kmer_front) {
+                        front_vec.sort_unstable();
+                        front_vec.dedup();
+                    }
+                    if seg.key.kmer_front != seg.key.kmer_back {
+                        if let Some(back_vec) = term_map.get_mut(&seg.key.kmer_back) {
+                            back_vec.sort_unstable();
+                            back_vec.dedup();
+                        }
+                    }
+                }
+
+                if config.verbosity > 1 {
+                    eprintln!("NEW_GROUP_SORTED: group_id={} front={} back={} sample={} contig={} place={}",
+                        new_id, seg.key.kmer_front, seg.key.kmer_back, seg.sample_name, seg.contig_name, seg.place);
+                }
+
+                // Register streams for this group
+                let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                let delta_stream_name = ragc_common::stream_delta_name(archive_version, new_id);
+                let ref_stream_name = ragc_common::stream_ref_name(archive_version, new_id);
+
+                let mut arch = archive.lock().unwrap();
+                arch.register_stream(&delta_stream_name);
+                arch.register_stream(&ref_stream_name);
+                drop(arch);
+
+                new_id
+            };
+
+            // Add segment to its group buffer
+            let buffered = BufferedSegment {
+                sample_name: seg.sample_name.clone(),
+                contig_name: seg.contig_name.clone(),
+                seg_part_no: seg.place,
+                data: seg.segment_data.clone(),
+                is_rev_comp: seg.should_reverse,
+            };
+
+            let mut groups = segment_groups.lock().unwrap();
+            let buffer = groups.entry(seg.key.clone()).or_insert_with(|| {
+                let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                let stream_id = {
+                    let arch = archive.lock().unwrap();
+                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                    arch.get_stream_id(&delta_stream_name).unwrap_or(0)
+                };
+                let ref_stream_id = {
+                    let arch = archive.lock().unwrap();
+                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+                    arch.get_stream_id(&ref_stream_name).unwrap_or(0)
+                };
+                SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+            });
+            buffer.segments.push(buffered);
+        }
+
+        // Clear pending segments after processing
+        pending.clear();
     }
+
+    // Get batch-local groups and terminators
+    let batch_map = batch_local_groups.lock().unwrap();
+    let batch_terms = batch_local_terminators.lock().unwrap();
 
     #[cfg(feature = "verbose_debug")]
     if config.verbosity > 0 {
@@ -2973,6 +3087,13 @@ fn worker_thread(
                 kmer_front: key_front,
                 kmer_back: key_back,
             };
+
+            // Debug: Trace grouping decision for specific segment
+            if task.sample_name == "BBT#0" && place == 0 {
+                eprintln!("RAGC_GROUP_TRACE: sample={} contig={} seg={} key=({},{}) should_reverse={} front_kmer={} back_kmer={}",
+                    task.sample_name, task.contig_name, place, key_front, key_back, should_reverse,
+                    segment.front_kmer, segment.back_kmer);
+            }
 
             // Reverse complement data if needed (matching C++ AGC lines 1315-1316, 1320-1321)
             let segment_data = if should_reverse {
@@ -3623,181 +3744,46 @@ fn worker_thread(
                         task.sample_name, task.contig_name, place, key_front, key_back, should_reverse, buffered.data.len(), data_first5);
                 }
 
-                // Get or create buffer for this group
-                // If group doesn't exist yet, allocate group_id using BATCH-LOCAL logic
-                let buffer = groups.entry(key.clone()).or_insert_with(|| {
-                    // Check GLOBAL registry first, create new group if not found
-                    // CRITICAL FIX: Register to global map IMMEDIATELY (not batch-local only)
-                    // This ensures subsequent segments in same sample can find the group
-                    let group_id = {
-                        let mut global_map = map_segments.lock().unwrap();
-                        if let Some(&existing_id) = global_map.get(&key) {
-                            // Group exists - reuse it
-                            existing_id
-                        } else {
-                            // New group - allocate ID and register IMMEDIATELY to global map
-                            let new_id = if key.kmer_back == MISSING_KMER && key.kmer_front < NO_RAW_GROUPS as u64 {
-                                key.kmer_front as u32  // Raw groups use ID from key
-                            } else {
-                                group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
-                            };
-                            global_map.insert(key.clone(), new_id);
-                            drop(global_map);
-                            // Also register to batch-local for flush tracking
-                            let mut batch_map = batch_local_groups.lock().unwrap();
-                            batch_map.insert(key.clone(), new_id);
-                            new_id
-                        }
-                    };
+                // Check if this key already exists in the global registry
+                let existing_group_id = {
+                    let global_map = map_segments.lock().unwrap();
+                    global_map.get(&key).copied()
+                };
 
-                    // Register with FFI engine
-                    #[cfg(feature = "cpp_agc")]
-                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                        let mut eng = grouping_engine.lock().unwrap();
-                        eng.register_group(key.kmer_front, key.kmer_back, group_id);
-                    }
+                // If key exists, process immediately. If not, defer to batch flush (sorted assignment).
+                if let Some(group_id) = existing_group_id {
+                    // EXISTING GROUP: Add to buffer immediately
+                    let buffer = groups.entry(key.clone()).or_insert_with(|| {
+                        // Get stream IDs from archive
+                        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                        let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                        let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
 
-                    // Update terminators - split between GLOBAL and BATCH-LOCAL based on sample type
-                    //
-                    // For REFERENCE sample: Populate GLOBAL map_segments_terminators immediately.
-                    // This ensures non-reference samples can use reference terminators for split detection
-                    // (find_middle_splitter uses global map). Without this, split detection fails because
-                    // terminators aren't visible until batch end.
-                    //
-                    // For NON-REFERENCE samples: Populate batch_local_terminators (matches C++ AGC behavior).
-                    // C++ AGC updates terminators in store_segments (called at batch END), so segments in
-                    // the SAME batch cannot see each other through terminators.
-                    //
-                    // C++ AGC requires BOTH k-mers to be non-MISSING (line 1015):
-                    //   if (kmer1 != ~0ull && kmer2 != ~0ull)
-                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                        // Choose which map to update based on whether this is the reference sample
-                        if is_reference_sample {
-                            // Reference sample: populate GLOBAL terminators immediately
-                            // This is critical for split detection on non-reference samples
-                            if std::env::var("RAGC_DEBUG_TERM").is_ok() {
-                                eprintln!("RAGC_TERM_GLOBAL: sample={} is_ref=true front={} back={}",
-                                    task.sample_name, key.kmer_front, key.kmer_back);
-                            }
-                            let mut term_map = map_segments_terminators.lock().unwrap();
+                        let arch = archive.lock().unwrap();
+                        let stream_id = arch.get_stream_id(&delta_stream_name).unwrap_or(0);
+                        let ref_stream_id = arch.get_stream_id(&ref_stream_name).unwrap_or(0);
+                        drop(arch);
 
-                            term_map.entry(key.kmer_front)
-                                .or_insert_with(Vec::new)
-                                .push(key.kmer_back);
-
-                            if key.kmer_front != key.kmer_back {
-                                term_map.entry(key.kmer_back)
-                                    .or_insert_with(Vec::new)
-                                    .push(key.kmer_front);
-                            }
-
-                            if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
-                                front_vec.sort_unstable();
-                                front_vec.dedup();
-                            }
-                            if key.kmer_front != key.kmer_back {
-                                if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
-                                    back_vec.sort_unstable();
-                                    back_vec.dedup();
-                                }
-                            }
-                        } else {
-                            // Non-reference sample: populate batch-local (merged at batch end)
-                            let mut term_map = batch_local_terminators.lock().unwrap();
-
-                            term_map.entry(key.kmer_front)
-                                .or_insert_with(Vec::new)
-                                .push(key.kmer_back);
-
-                            if key.kmer_front != key.kmer_back {
-                                term_map.entry(key.kmer_back)
-                                    .or_insert_with(Vec::new)
-                                    .push(key.kmer_front);
-                            }
-
-                            if let Some(front_vec) = term_map.get_mut(&key.kmer_front) {
-                                front_vec.sort_unstable();
-                                front_vec.dedup();
-                            }
-                            if key.kmer_front != key.kmer_back {
-                                if let Some(back_vec) = term_map.get_mut(&key.kmer_back) {
-                                    back_vec.sort_unstable();
-                                    back_vec.dedup();
-                                }
-                            }
-                        }
-                    }
-
-                    if config.verbosity > 1 {
-                        eprintln!("NEW_GROUP: group_id={} front={} back={} sample={}",
-                            group_id, key_front, key_back, task.sample_name);
-                    }
-
-                    // Register streams for this group
-                    let archive_version =
-                        ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                    let delta_stream_name =
-                        ragc_common::stream_delta_name(archive_version, group_id);
-                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-
-                    let mut arch = archive.lock().unwrap();
-                    let stream_id = arch.register_stream(&delta_stream_name);
-                    let ref_stream_id = arch.register_stream(&ref_stream_name);
-                    drop(arch);
-
-                    // NOTE: Terminator updates already done in batch_local_terminators above
-                    // Removed redundant duplicate block here
-
-                    SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
-                });
-
-                // CSV logging for ALL segment grouping decisions (enabled via RAGC_GROUP_LOG=1)
-                // This logs every segment, including those joining existing batch-local groups
-                if std::env::var("RAGC_GROUP_LOG").as_deref() == Ok("1") {
-                    let source = if key_exists { "global" } else { "batch_or_new" };
-                    eprintln!("SEGMENT_GROUP,{},{},{},{},{},{},{},{}",
-                        task.sample_name, task.contig_name, place,
-                        key.kmer_front, key.kmer_back, final_should_reverse, source, buffer.group_id);
-                }
-
-                // Add fallback mapping for this segment (matches C++ AGC add_fallback_mapping)
-                // This populates the fallback minimizers map for use by find_cand_segment_using_fallback_minimizers
-                add_fallback_mapping(
-                    &buffered.data,
-                    config.k,
-                    key.kmer_front,
-                    key.kmer_back,
-                    &fallback_filter,
-                    &map_fallback_minimizers,
-                );
-
-                if key_exists && config.verbosity > 1 {
-                    eprintln!("REUSE_GROUP: group_id={} front={} back={} sample={}",
-                        buffer.group_id, key_front, key_back, task.sample_name);
-                }
-
-                // CRITICAL: Match C++ AGC behavior - write reference IMMEDIATELY for LZ groups
-                // (C++ AGC segment.cpp lines 41-48: if (no_seqs == 0) writes reference right away)
-                // BUT: Raw groups (0-15) don't have references - they skip position 0
-                let is_raw_group = buffer.group_id < NO_RAW_GROUPS;
-                if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
-                    // This is the FIRST segment in an LZ group - make it the reference NOW
-                    // (matches C++ AGC: lz_diff->Prepare(s); store_in_archive(s, zstd_cctx);)
-                    if let Err(e) = write_reference_immediately(&buffered, buffer, &collection, &archive, &reference_segments, &reference_orientations, &config) {
-                        eprintln!("ERROR: Failed to write immediate reference: {}", e);
-                        // Fall back to buffering
-                        buffer.segments.push(buffered);
-                    }
-                } else {
-                    // Buffer segment: either raw group, or subsequent LZ segment
+                        SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+                    });
                     buffer.segments.push(buffered);
+                } else {
+                    // NEW GROUP: Defer assignment to batch flush (for sorted group_id allocation)
+                    // This matches C++ AGC's process_new() which iterates s_seg_part in sorted order
+                    let mut pending = pending_batch_segments.lock().unwrap();
+                    pending.push(PendingSegment {
+                        key: key.clone(),
+                        segment_data: buffered.data.clone(),
+                        should_reverse: buffered.is_rev_comp,
+                        sample_name: task.sample_name.clone(),
+                        contig_name: task.contig_name.clone(),
+                        place,
+                    });
                 }
 
-                // Flush pack if buffer is full (matches C++ AGC write-as-you-go behavior)
-                if buffer.should_flush_pack(config.pack_size) {
-                    flush_pack(buffer, &collection, &archive, &config, &reference_segments)
-                        .context("Failed to flush pack")?;
-                }
+                // NOTE: For NEW groups, FFI registration and terminator updates are deferred to flush_batch
+                // This ensures group_ids are assigned in sorted order before any dependent operations
+
             }
         }
 

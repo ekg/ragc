@@ -104,11 +104,23 @@ pub fn split_at_splitters_with_size(
     // Store (position, kmer_value, is_dir_oriented) to match C++ AGC's orientation logic
     let mut recent_kmers: Vec<(usize, u64, bool)> = Vec::new();
 
+    // DEBUG: Enable detailed tracing for specific contigs
+    let enable_trace = std::env::var("RAGC_TRACE_CONTIG").ok()
+        .map(|s| s.contains("chrMT"))
+        .unwrap_or(false);
+
+    if enable_trace {
+        eprintln!("TRACE: Starting segmentation of contig, length={}", contig.len());
+    }
+
     for (pos, &base) in contig.iter().enumerate() {
         if base > 3 {
             // Non-ACGT base, reset k-mer
             kmer.reset();
             recent_kmers.clear();
+            if enable_trace && pos < 50 {
+                eprintln!("TRACE: pos={} base={} (non-ACGT, reset k-mer)", pos, base);
+            }
         } else {
             kmer.insert(base as u64);
 
@@ -122,6 +134,9 @@ pub fn split_at_splitters_with_size(
                 // during SPLITTER FINDING to select which k-mers become splitters.
                 // During SEGMENTATION, we split at every occurrence without distance check.
                 if splitters.contains(&kmer_value) {
+                    if enable_trace {
+                        eprintln!("TRACE: pos={} FOUND SPLITTER kmer={}", pos, kmer_value);
+                    }
                     // Use this as a splitter
                     let segment_end = pos + 1;
                     let segment_data = contig[segment_start..segment_end].to_vec();
@@ -156,6 +171,12 @@ pub fn split_at_splitters_with_size(
                                 if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
                                 if seg_back == MISSING_KMER { "MISSING".to_string() } else { seg_back.to_string() });
                         }
+                        if enable_trace {
+                            eprintln!("TRACE: Created segment [{}..{}) length={} front={} back={}",
+                                segment_start, segment_end, segment_data.len(),
+                                if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
+                                if seg_back == MISSING_KMER { "MISSING".to_string() } else { seg_back.to_string() });
+                        }
                         segments.push(Segment::new(segment_data, seg_front, seg_back, seg_front_is_dir, seg_back_is_dir));
                     }
 
@@ -166,6 +187,9 @@ pub fn split_at_splitters_with_size(
                     if debug {
                         eprintln!("  Setting segment_start: {} -> {} (overlap of {} bytes)", segment_start, new_start, (pos + 1) - new_start);
                     }
+                    if enable_trace {
+                        eprintln!("TRACE: Next segment starts at {} (overlap={} bytes)", new_start, (pos + 1) - new_start);
+                    }
                     segment_start = new_start;
                     front_kmer = kmer_value;
                     front_kmer_is_dir = is_dir;
@@ -174,6 +198,10 @@ pub fn split_at_splitters_with_size(
                 }
             }
         }
+    }
+
+    if enable_trace {
+        eprintln!("TRACE: End of contig loop, segment_start={} contig.len()={}", segment_start, contig.len());
     }
 
     // End-of-contig handling: C++ AGC segmentation does not perform any

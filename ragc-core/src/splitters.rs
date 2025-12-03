@@ -108,6 +108,20 @@ pub fn determine_splitters(
         splitters.len()
     );
 
+    // DEBUG: Export splitters to file for comparison with C++ AGC
+    {
+        use std::fs::File;
+        use std::io::Write;
+        let mut sorted_splitters: Vec<u64> = splitters.iter().copied().collect();
+        sorted_splitters.sort_unstable();
+        if let Ok(mut f) = File::create("/tmp/ragc_splitters.txt") {
+            for s in &sorted_splitters {
+                let _ = writeln!(f, "{}", s);
+            }
+            eprintln!("DEBUG: Wrote {} splitters to /tmp/ragc_splitters.txt", sorted_splitters.len());
+        }
+    }
+
     (splitters, candidates, duplicates)
 }
 
@@ -229,6 +243,20 @@ pub fn determine_splitters_streaming(
 
     #[cfg(feature = "verbose_debug")]
     eprintln!("DEBUG: {} actually-used splitters", splitters.len());
+
+    // DEBUG: Export splitters to file for comparison with C++ AGC
+    {
+        use std::fs::File;
+        use std::io::Write;
+        let mut sorted_splitters: Vec<u64> = splitters.iter().copied().collect();
+        sorted_splitters.sort_unstable();
+        if let Ok(mut f) = File::create("/tmp/ragc_splitters.txt") {
+            for s in &sorted_splitters {
+                let _ = writeln!(f, "{}", s);
+            }
+            eprintln!("DEBUG: Wrote {} splitters to /tmp/ragc_splitters.txt", sorted_splitters.len());
+        }
+    }
 
     Ok((splitters, candidates, duplicates))
 }

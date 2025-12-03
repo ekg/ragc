@@ -26,12 +26,20 @@ struct SegmentPlacement {
     raw_length: u32, // Uncompressed segment length
 }
 
+/// Pack cardinality - number of deltas per ZSTD pack
+/// Matches C++ AGC's contigs_in_pack parameter (default 50)
+const PACK_CARDINALITY: usize = 50;
+
+/// Contig separator byte for packing deltas
+/// Matches C++ AGC's contig_separator = 0xFF
+const CONTIG_SEPARATOR: u8 = 0xFF;
+
 /// Segment group manager matching C++ AGC's CSegment
 ///
 /// Manages a group of segments with the same (kmer1, kmer2) pair:
 /// - Stores reference segment (first in group)
-/// - Buffers subsequent delta segments
-/// - Writes to archive streams
+/// - Buffers subsequent delta segments (v_lzp)
+/// - Writes packs of 50 deltas to archive
 struct SegmentGroup {
     group_id: u32,
     stream_id: usize,          // Delta stream for packed segments
@@ -39,6 +47,7 @@ struct SegmentGroup {
     reference: Option<Contig>, // First segment (reference for LZ encoding)
     ref_written: bool,         // Whether reference has been written
     in_group_counter: u32,     // Counter for in_group_id assignment
+    delta_buffer: Vec<Vec<u8>>, // Buffer for delta segments (matches C++ AGC's v_lzp)
 }
 
 impl SegmentGroup {
@@ -50,6 +59,7 @@ impl SegmentGroup {
             reference: None,
             ref_written: false,
             in_group_counter: 0,
+            delta_buffer: Vec::new(), // Buffer for packing deltas (v_lzp)
         }
     }
 
@@ -75,17 +85,71 @@ impl SegmentGroup {
             Ok(in_group_id) // in_group_id = 0 for reference
         } else {
             // Subsequent segment - delta encode against reference
-            // TODO: Implement LZ encoding - for now just compress with ZSTD
-            let seg_vec = seg_data.to_vec();
-            let compressed = compress_segment_pooled(&seg_vec, 17)?;
+            // TODO: Implement LZ encoding - for now use raw segment
 
-            // Write compressed delta to archive (marker 0 = plain ZSTD)
-            archive.add_part(self.stream_id, &compressed, 0)?;
+            // PACK BOUNDARY CHECK - matches C++ AGC's logic (segment.cpp:50-54)
+            if self.delta_buffer.len() == PACK_CARDINALITY {
+                // Buffer full (50 deltas) - pack, compress, write
+                self.pack_and_write(archive)?;
+                // delta_buffer is now empty, ready for next pack
+            }
+
+            // Add delta to buffer (NOT written yet!)
+            // Matches C++ AGC: v_lzp.emplace_back(move(delta))
+            let seg_vec = seg_data.to_vec();
+            self.delta_buffer.push(seg_vec);
 
             let in_group_id = self.in_group_counter;
             self.in_group_counter += 1;
             Ok(in_group_id)
         }
+    }
+
+    /// Pack and write buffered deltas to archive
+    ///
+    /// Matches C++ AGC's store_in_archive(const vector<contig_t>& v_data, ZSTD_CCtx* zstd_ctx)
+    /// in segment.cpp:258-280
+    ///
+    /// Concatenates all deltas with 0xFF separator, compresses as one ZSTD block, writes to archive
+    fn pack_and_write(&mut self, archive: &mut Archive) -> anyhow::Result<()> {
+        if self.delta_buffer.is_empty() {
+            return Ok(());
+        }
+
+        // Calculate pack size (all deltas + separators)
+        let mut pack_size = 0;
+        for delta in &self.delta_buffer {
+            pack_size += delta.len() + 1; // delta + separator byte
+        }
+
+        // Concatenate all deltas with 0xFF separator
+        let mut pack = Vec::with_capacity(pack_size);
+        for delta in &self.delta_buffer {
+            pack.extend_from_slice(delta);
+            pack.push(CONTIG_SEPARATOR); // 0xFF
+        }
+
+        // Compress the entire pack with ZSTD level 17 (matches C++ AGC)
+        let compressed = compress_segment_pooled(&pack, 17)?;
+
+        // Write compressed pack to archive (marker 0 = plain ZSTD)
+        archive.add_part(self.stream_id, &compressed, 0)?;
+
+        // Clear buffer for next pack
+        self.delta_buffer.clear();
+
+        Ok(())
+    }
+
+    /// Flush any remaining deltas in buffer
+    ///
+    /// Matches C++ AGC's finish() in segment.cpp:124-129
+    /// Called at end of compression to write partial packs
+    fn finish(&mut self, archive: &mut Archive) -> anyhow::Result<()> {
+        if !self.delta_buffer.is_empty() {
+            self.pack_and_write(archive)?;
+        }
+        Ok(())
     }
 }
 
@@ -884,6 +948,18 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
                     placement.is_rev_comp,
                     placement.raw_length,
                 );
+            }
+        }
+    }
+
+    // Step 10: Flush partial packs (matches C++ AGC's finish() in segment.cpp:124-129)
+    // Call finish() on all SegmentGroups to write any remaining buffered deltas
+    if let Some(archive_mutex) = &shared.archive {
+        let mut archive = archive_mutex.lock().unwrap();
+        let mut v_segments = shared.v_segments.lock().unwrap();
+        for segment_group_opt in v_segments.iter_mut() {
+            if let Some(segment_group) = segment_group_opt {
+                let _ = segment_group.finish(&mut archive);
             }
         }
     }
