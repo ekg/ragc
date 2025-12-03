@@ -174,10 +174,21 @@ This means pending segments are buffered but **never written to the archive**, c
 
 ### 2025-12-03 (Afternoon)
 
+**Issue #2 Fixed**:
+- Implemented sorted group_id assignment (commit a6ad566)
+- Archive size: 15M → 13M (13% reduction, 8% remaining gap vs C++ AGC)
+- `ragc inspect --compare` results:
+  - ✅ Issue #3 (Reference Selection): **FIXED!** All groups choose same reference
+  - ✅ Issue #2 (Group_ID Assignment): **FIXED!** (obscured by Issue #1)
+  - ❌ Issue #1 (Segment Splitting): **ROOT CAUSE** - 856 fewer segments in RAGC
+  - ❌ Issue #4 (Pack Structure): 540 groups different (was 286, now worse)
+
 Current state:
-- Many background bash processes running (C++ AGC tests with instrumentation)
-- Testing various configurations and approaches
-- Documents created: `SIZE_DIFFERENCE_INVESTIGATION.md` (outdated, from earlier phase)
+- Issue #1 is the fundamental problem: RAGC creates 12,131 segments vs C++ AGC's 12,987
+- C++ AGC splits MORE aggressively (856 more segments)
+- This cascades into all other differences (grouping, packing)
+- Investigation documents from Nov 2025 describe DIFFERENT bug (degenerate splits on 235 samples)
+- Current bug (Dec 2025, 10 samples) is OPPOSITE: RAGC splits LESS than C++ AGC
 
 ---
 
