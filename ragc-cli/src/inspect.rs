@@ -512,14 +512,17 @@ fn compare_segment_boundaries(
     if diff_lengths.is_empty() && only_in_1.is_empty() && only_in_2.is_empty() {
         println!("✅ IDENTICAL segment boundaries!");
     } else {
-        println!("❌ DIFFERENT segment boundaries:");
-        println!("  Segments with different lengths: {}", diff_lengths.len());
-        println!("  Segments only in archive 1: {}", only_in_1.len());
-        println!("  Segments only in archive 2: {}", only_in_2.len());
+        println!("❌ DIFFERENT segment splitting:");
+        println!("  Note: Segments are compared by INDEX, not genomic position.");
+        println!("  When one archive splits a segment and the other doesn't, indices become misaligned.");
+        println!();
+        println!("  Segment index mismatches: {}", diff_lengths.len());
+        println!("  Extra segments in archive 1: {}", only_in_1.len());
+        println!("  Extra segments in archive 2: {}", only_in_2.len());
 
         // Show first few differences
         if !diff_lengths.is_empty() {
-            println!("\nFirst 10 segments with different lengths:");
+            println!("\nFirst 10 index mismatches (may indicate different split decisions):");
             for ((sample, contig, idx), len1, len2) in diff_lengths.iter().take(10) {
                 println!("  {} {} seg[{}]: {} vs {} bytes (diff: {})",
                     sample, contig, idx, len1, len2, (*len1 as i64 - *len2 as i64).abs());
