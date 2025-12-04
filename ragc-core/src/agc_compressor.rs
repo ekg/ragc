@@ -242,20 +242,15 @@ impl PartialOrd for PendingSegment {
 
 impl Ord for PendingSegment {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // First compare by sample_priority (DESCENDING - higher priority first)
-        match other.sample_priority.cmp(&self.sample_priority) {
+        // Match C++ AGC: pure lexicographic ordering (no sample_priority)
+        // Sort by: sample_name, then contig_name, then place (seg_part_no)
+        match self.sample_name.cmp(&other.sample_name) {
             std::cmp::Ordering::Equal => {
-                // Then by sample_name
-                match self.sample_name.cmp(&other.sample_name) {
+                // Then by contig_name
+                match self.contig_name.cmp(&other.contig_name) {
                     std::cmp::Ordering::Equal => {
-                        // Then by contig_name
-                        match self.contig_name.cmp(&other.contig_name) {
-                            std::cmp::Ordering::Equal => {
-                                // Finally by place (seg_part_no)
-                                self.place.cmp(&other.place)
-                            }
-                            other => other,
-                        }
+                        // Finally by place (seg_part_no)
+                        self.place.cmp(&other.place)
                     }
                     other => other,
                 }
@@ -276,8 +271,8 @@ struct BufferedSegment {
     sample_priority: i32, // Sample processing order (higher = earlier)
 }
 
-// Match C++ AGC sorting order (agc_compressor.h lines 112-119)
-// Sort by: sample_priority (DESCENDING), then sample_name, contig_name, seg_part_no
+// Match C++ AGC sorting order: pure lexicographic (no sample_priority)
+// Sort by: sample_name, contig_name, seg_part_no
 impl PartialOrd for BufferedSegment {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -286,20 +281,15 @@ impl PartialOrd for BufferedSegment {
 
 impl Ord for BufferedSegment {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // First compare by sample_priority (DESCENDING - higher priority first)
-        match other.sample_priority.cmp(&self.sample_priority) {
+        // Match C++ AGC: pure lexicographic ordering (no sample_priority)
+        // Sort by: sample_name, then contig_name, then seg_part_no
+        match self.sample_name.cmp(&other.sample_name) {
             std::cmp::Ordering::Equal => {
-                // Then by sample_name
-                match self.sample_name.cmp(&other.sample_name) {
+                // Then by contig_name
+                match self.contig_name.cmp(&other.contig_name) {
                     std::cmp::Ordering::Equal => {
-                        // Then by contig_name
-                        match self.contig_name.cmp(&other.contig_name) {
-                            std::cmp::Ordering::Equal => {
-                                // Finally by seg_part_no
-                                self.seg_part_no.cmp(&other.seg_part_no)
-                            }
-                            other => other,
-                        }
+                        // Finally by seg_part_no
+                        self.seg_part_no.cmp(&other.seg_part_no)
                     }
                     other => other,
                 }
@@ -625,7 +615,7 @@ impl StreamingQueueCompressor {
 
         // Segment grouping for LZ packing (using BTreeMap for better memory efficiency)
         let segment_groups = Arc::new(Mutex::new(BTreeMap::new()));
-        let group_counter = Arc::new(AtomicU32::new(NO_RAW_GROUPS)); // Start at 16 (LZ groups), raw groups 0-15 handled separately
+        let group_counter = Arc::new(AtomicU32::new(NO_RAW_GROUPS)); // Start at 16 (LZ groups), group 0 reserved for orphan segments
         let raw_group_counter = Arc::new(AtomicU32::new(0)); // Round-robin counter for raw groups (0-15)
         let reference_sample_name = Arc::new(Mutex::new(None)); // Shared across all workers
 
@@ -655,7 +645,7 @@ impl StreamingQueueCompressor {
         #[cfg(feature = "cpp_agc")]
         let grouping_engine = Arc::new(Mutex::new(crate::ragc_ffi::GroupingEngine::new(
             config.k as u32,
-            NO_RAW_GROUPS,  // Start group IDs at 16 (raw groups 0-15 handled separately)
+            NO_RAW_GROUPS,  // Start group IDs at 16 (group 0 reserved for orphan segments)
         )));
 
         // Priority tracking for interleaved processing (matches C++ AGC)
@@ -1166,7 +1156,7 @@ impl StreamingQueueCompressor {
                 if !buffer.pending_deltas.is_empty() {
                     use crate::segment_compression::compress_segment_configured;
 
-                    let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
+                    let use_lz_encoding = buffer.group_id > 0;  // group 0 = orphan/raw, group 1+ = LZ
                     let mut packed_data = Vec::new();
 
                     // Raw groups need placeholder if this is the first pack
@@ -2550,11 +2540,35 @@ fn flush_batch(
     let mut groups_map = segment_groups.lock().unwrap();
 
     for pend in pending.iter() {
-        // Assign group_id: Raw groups use kmer as ID, LZ groups use counter
-        let group_id = if pend.key.kmer_back == MISSING_KMER && pend.key.kmer_front < NO_RAW_GROUPS as u64 {
-            pend.key.kmer_front as u32  // Raw groups
+        // Assign group_id: Orphan segments (both k-mers MISSING) go to group 0
+        // For segments with k-mers: lookup existing group, or create new group if not found
+        // This matches C++ AGC: map_segments[make_pair(~0ull, ~0ull)] = 0 (line 358, 2427)
+        let group_id = if pend.key.kmer_back == MISSING_KMER && pend.key.kmer_front == MISSING_KMER {
+            0  // Single raw group for orphan segments
         } else {
-            group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups - sorted assignment!
+            // Check if this k-mer pair already has a group assigned
+            let mut global_map = map_segments.lock().unwrap();
+            if let Some(&existing_group_id) = global_map.get(&pend.key) {
+                // Use existing group
+                if std::env::var("RAGC_TRACE_GROUP").is_ok() {
+                    eprintln!("GROUPING_LOOKUP_HIT: sample={} contig={} place={} front={} back={} found_group={}",
+                        pend.sample_name, pend.contig_name, pend.place,
+                        pend.key.kmer_front, pend.key.kmer_back, existing_group_id);
+                }
+                drop(global_map);
+                existing_group_id
+            } else {
+                // Create new group
+                let new_group_id = group_counter.fetch_add(1, Ordering::SeqCst);
+                if std::env::var("RAGC_TRACE_GROUP").is_ok() {
+                    eprintln!("GROUPING_LOOKUP_MISS: sample={} contig={} place={} front={} back={} creating_group={} (map has {} entries)",
+                        pend.sample_name, pend.contig_name, pend.place,
+                        pend.key.kmer_front, pend.key.kmer_back, new_group_id, global_map.len());
+                }
+                global_map.insert(pend.key.clone(), new_group_id);
+                drop(global_map);
+                new_group_id
+            }
         };
 
         if config.verbosity > 2 {
@@ -2563,18 +2577,21 @@ fn flush_batch(
                 pend.sample_name, pend.contig_name, pend.place);
         }
 
-        // Register to global and batch-local maps
-        {
+        // Register orphan segments to global map (non-orphans already registered above)
+        if pend.key.kmer_back == MISSING_KMER && pend.key.kmer_front == MISSING_KMER {
             let mut global_map = map_segments.lock().unwrap();
             global_map.insert(pend.key.clone(), group_id);
-
-            // TRACE: Log when segments from AAA#0 are registered
-            if std::env::var("RAGC_TRACE_GROUP").is_ok() && pend.sample_name.contains("AAA#0") {
-                eprintln!("TRACE_REGISTER: sample={} contig={} place={} front={} back={} group_id={} (map_segments now has {} entries)",
-                    pend.sample_name, pend.contig_name, pend.place,
-                    pend.key.kmer_front, pend.key.kmer_back, group_id, global_map.len());
-            }
         }
+
+        // TRACE: Log when segments from AAA#0 are registered
+        if std::env::var("RAGC_TRACE_GROUP").is_ok() && pend.sample_name.contains("AAA#0") {
+            let global_map = map_segments.lock().unwrap();
+            eprintln!("TRACE_REGISTER: sample={} contig={} place={} front={} back={} group_id={} (map_segments now has {} entries)",
+                pend.sample_name, pend.contig_name, pend.place,
+                pend.key.kmer_front, pend.key.kmer_back, group_id, global_map.len());
+        }
+
+        // Register to batch-local map
         {
             let mut batch_map = batch_local_groups.lock().unwrap();
             batch_map.insert(pend.key.clone(), group_id);
@@ -2629,7 +2646,7 @@ fn flush_batch(
         };
 
         // Add to buffer or write as reference
-        let is_raw_group = group_id < NO_RAW_GROUPS;
+        let is_raw_group = group_id < NO_RAW_GROUPS;  // Groups 0-15 are raw groups (match C++ AGC)
         if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
             // First segment in LZ group - write as reference immediately
             let reference_orientations = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
@@ -3881,8 +3898,8 @@ fn worker_thread(
 
                 // CRITICAL: Match C++ AGC behavior - write reference IMMEDIATELY for LZ groups
                 // (C++ AGC segment.cpp lines 41-48: if (no_seqs == 0) writes reference right away)
-                // BUT: Raw groups (0-15) don't have references - they skip position 0
-                let is_raw_group = buffer.group_id < NO_RAW_GROUPS;
+                // BUT: Raw groups 0-15 (orphan segments) don't have references - they skip position 0
+                let is_raw_group = buffer.group_id < NO_RAW_GROUPS;  // Groups 0-15 are raw groups (match C++ AGC)
                 if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
                     // This is the FIRST segment in an LZ group - make it the reference NOW
                     // (matches C++ AGC: lz_diff->Prepare(s); store_in_archive(s, zstd_cctx);)

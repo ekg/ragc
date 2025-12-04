@@ -49,6 +49,11 @@ enum Commands {
         #[arg(short = 'm', long, default_value_t = 20)]
         min_match_len: u32,
 
+        /// Pack cardinality: number of contigs between batch flushes
+        /// (matches C++ AGC -l flag for max_no_contigs_before_synchronization)
+        #[arg(short = 'l', long, default_value_t = 50)]
+        pack_cardinality: u32,
+
         /// ZSTD compression level (1-22, higher = better compression but slower)
         #[arg(short = 'c', long, default_value_t = 17)]
         compression_level: i32,
@@ -293,6 +298,7 @@ fn main() -> Result<()> {
             kmer_length,
             segment_size,
             min_match_len,
+            pack_cardinality,
             compression_level,
             verbosity,
             adaptive,
@@ -308,6 +314,7 @@ fn main() -> Result<()> {
             kmer_length,
             segment_size,
             min_match_len,
+            pack_cardinality,
             compression_level,
             verbosity,
             adaptive,
@@ -386,6 +393,7 @@ fn create_archive(
     kmer_length: u32,
     segment_size: u32,
     min_match_len: u32,
+    pack_cardinality: u32,
     compression_level: i32,
     verbosity: u32,
     adaptive: bool,
@@ -467,7 +475,7 @@ fn create_archive(
             kmer_length,
             segment_size,
             min_match_len,
-            50, // pack_cardinality (default)
+            pack_cardinality,
             concatenated,
             adaptive,
             verbosity,
@@ -505,6 +513,7 @@ fn create_archive(
             k: kmer_length as usize,
             segment_size: segment_size as usize,
             min_match_len: min_match_len as usize,
+            pack_size: pack_cardinality as usize,
             queue_capacity,
             num_threads,
             verbosity: verbosity as usize,

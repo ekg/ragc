@@ -192,13 +192,23 @@ pub fn split_at_splitters_with_size(
     if segment_start < contig.len() {
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
-            // Final segment has front k-mer (from previous split) and MISSING back k-mer
-            let (final_front, final_back) = if front_kmer == MISSING_KMER {
-                // No front k-mer at all
-                (MISSING_KMER, MISSING_KMER)
+            // Final segment k-mer extraction
+            let (final_front, final_back, final_front_is_dir, final_back_is_dir) = if front_kmer == MISSING_KMER {
+                // No splitters found - use k-mers from the sequence itself
+                // recent_kmers contains all k-mers from the entire contig
+                let (front, front_is_dir) = recent_kmers.first()
+                    .map(|(_, kmer, is_dir)| (*kmer, *is_dir))
+                    .unwrap_or((MISSING_KMER, false));
+                let (back, back_is_dir) = recent_kmers.last()
+                    .map(|(_, kmer, is_dir)| (*kmer, *is_dir))
+                    .unwrap_or((MISSING_KMER, false));
+                (front, back, front_is_dir, back_is_dir)
             } else {
-                // Front k-mer present, back is MISSING (end of contig)
-                (front_kmer, MISSING_KMER)
+                // Front k-mer present (from last splitter), extract back k-mer from sequence
+                let (back, back_is_dir) = recent_kmers.last()
+                    .map(|(_, kmer, is_dir)| (*kmer, *is_dir))
+                    .unwrap_or((MISSING_KMER, false));
+                (front_kmer, back, front_kmer_is_dir, back_is_dir)
             };
             if debug {
                 eprintln!("  FINAL: segment=[{}..{}) len={}", segment_start, contig.len(), segment_data.len());
@@ -208,12 +218,11 @@ pub fn split_at_splitters_with_size(
                 segment_start, contig.len(), segment_data.len(),
                 if final_front == MISSING_KMER { "MISSING".to_string() } else { final_front.to_string() },
                 if final_back == MISSING_KMER { "MISSING".to_string() } else { final_back.to_string() });
-            // For final segment: front uses front_kmer_is_dir, back is always false (MISSING)
             // Debug logging for Case 3 is_dir investigation
             if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() && final_back == MISSING_KMER && final_front != MISSING_KMER {
-                eprintln!("RAGC_FINAL_SEG_IS_DIR: front_kmer={} front_kmer_is_dir={}", final_front, front_kmer_is_dir);
+                eprintln!("RAGC_FINAL_SEG_IS_DIR: front_kmer={} front_kmer_is_dir={}", final_front, final_front_is_dir);
             }
-            segments.push(Segment::new(segment_data, final_front, final_back, front_kmer_is_dir, false));
+            segments.push(Segment::new(segment_data, final_front, final_back, final_front_is_dir, final_back_is_dir));
         }
     }
 
