@@ -974,6 +974,8 @@ impl StreamingQueueCompressor {
                 drop(priorities);
 
                 // Insert sync tokens (matches C++ AGC EmplaceManyNoCost)
+                // CRITICAL: Sync tokens must have HIGHER priority than subsequent contigs
+                // to ensure they're processed before any contigs with the new_priority.
                 if self.config.verbosity > 0 {
                     eprintln!(
                         "PACK_BOUNDARY: Inserting {} sync tokens after {} contigs (global count)",
@@ -986,7 +988,7 @@ impl StreamingQueueCompressor {
                         sample_name: sample_name.clone(),
                         contig_name: String::from("<SYNC>"),
                         data: Vec::new(),
-                        sample_priority: new_priority,
+                        sample_priority: new_priority + 1, // Higher priority than subsequent contigs
                         cost: 0,
                         sequence,
                         is_sync_token: true,
@@ -1017,12 +1019,15 @@ impl StreamingQueueCompressor {
 
                     // Insert num_threads sync tokens (matches C++ AGC EmplaceManyNoCost)
                     // All workers must pop a token and synchronize before processing new sample
+                    // CRITICAL: Sync tokens must have HIGHER priority than new sample's contigs
+                    // to ensure they're pulled and processed BEFORE any contigs from new sample.
+                    // Give them priority+1 so they sort before cost-based ordering takes effect.
                     for _ in 0..self.config.num_threads {
                         let sync_token = ContigTask {
                             sample_name: sample_name.clone(),
                             contig_name: String::from("<SYNC>"),
                             data: Vec::new(), // Empty data for sync token
-                            sample_priority,
+                            sample_priority: sample_priority + 1, // Higher priority than new sample's contigs
                             cost: 0, // No cost for sync tokens
                             sequence,
                             is_sync_token: true,
@@ -2548,6 +2553,13 @@ fn flush_batch(
         {
             let mut global_map = map_segments.lock().unwrap();
             global_map.insert(pend.key.clone(), group_id);
+
+            // TRACE: Log when segments from AAA#0 are registered
+            if std::env::var("RAGC_TRACE_GROUP").is_ok() && pend.sample_name.contains("AAA#0") {
+                eprintln!("TRACE_REGISTER: sample={} contig={} place={} front={} back={} group_id={} (map_segments now has {} entries)",
+                    pend.sample_name, pend.contig_name, pend.place,
+                    pend.key.kmer_front, pend.key.kmer_back, group_id, global_map.len());
+            }
         }
         {
             let mut batch_map = batch_local_groups.lock().unwrap();
@@ -2828,6 +2840,26 @@ fn worker_thread(
         {
             let mut samples = batch_samples.lock().unwrap();
             samples.insert(task.sample_name.clone());
+        }
+
+        // TRACE: Log map_segments state when AAB#0 chrI arrives
+        if std::env::var("RAGC_TRACE_GROUP").is_ok() && task.sample_name.contains("AAB#0") && task.contig_name.contains("chrI") {
+            let seg_map = map_segments.lock().unwrap();
+            eprintln!("TRACE_LOOKUP: Processing {} {} - map_segments has {} entries",
+                task.sample_name, task.contig_name, seg_map.len());
+
+            // Look for entries with matching k-mers to what we expect
+            let mut found_624 = false;
+            for (key, gid) in seg_map.iter() {
+                if *gid == 624 {
+                    eprintln!("  Found group 624: front={} back={}", key.kmer_front, key.kmer_back);
+                    found_624 = true;
+                }
+            }
+            if !found_624 {
+                eprintln!("  WARNING: Group 624 not found in map_segments!");
+            }
+            drop(seg_map);
         }
 
         // Split into segments
