@@ -509,6 +509,12 @@ fn create_archive(
             .ok_or_else(|| anyhow::anyhow!("Invalid output path"))?;
 
         let queue_capacity = parse_capacity(queue_capacity_str)?;
+
+        // FIX 5: Determine if we're in concatenated genomes mode
+        // Matches C++ AGC behavior: concatenated mode uses pack_cardinality for sync tokens,
+        // non-concatenated mode uses sample boundaries for sync tokens
+        let concatenated_genomes = concatenated || inputs.len() == 1;
+
         let config = StreamingQueueConfig {
             k: kmer_length as usize,
             segment_size: segment_size as usize,
@@ -519,6 +525,7 @@ fn create_archive(
             verbosity: verbosity as usize,
             adaptive_mode: adaptive,
             fallback_frac,
+            concatenated_genomes,
             ..StreamingQueueConfig::default()
         };
 

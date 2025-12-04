@@ -115,6 +115,11 @@ pub struct StreamingQueueConfig {
     /// When a group reaches this many segments, write a pack immediately
     /// (default: 50, matching PACK_CARDINALITY)
     pub pack_size: usize,
+
+    /// Concatenated genomes mode: if true, send sync tokens every pack_size contigs
+    /// If false (multiple input files), only send sync tokens at sample boundaries
+    /// Matches C++ AGC's concatenated_genomes behavior
+    pub concatenated_genomes: bool,
 }
 
 impl Default for StreamingQueueConfig {
@@ -131,6 +136,7 @@ impl Default for StreamingQueueConfig {
             fallback_frac: 0.0,   // Default matches C++ AGC (fallback disabled)
             batch_size: 50,       // Default matches C++ AGC pack_cardinality
             pack_size: 50,        // Default matches C++ AGC contigs_in_pack / PACK_CARDINALITY
+            concatenated_genomes: false, // Default: multiple input files (non-concatenated)
         }
     }
 }
@@ -961,8 +967,10 @@ impl StreamingQueueCompressor {
             // Track GLOBAL contig count and insert sync tokens every 50 contigs (pack_cardinality)
             // C++ AGC: if (++cnt_contigs_in_sample >= max_no_contigs_before_synchronization)
             // NOTE: Despite the name, C++ AGC's cnt_contigs_in_sample is GLOBAL, not per-sample!
+            // FIX 5: Only send PACK_BOUNDARY sync tokens in concatenated mode (single file)
+            // In non-concatenated mode (multiple files), only SAMPLE_BOUNDARY sync tokens are sent
             let count = self.global_contig_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let need_sync = (count + 1) % self.config.pack_size == 0;
+            let need_sync = self.config.concatenated_genomes && (count + 1) % self.config.pack_size == 0;
 
             if need_sync {
                 // Reached synchronization point (every 50 contigs GLOBALLY)
