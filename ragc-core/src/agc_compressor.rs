@@ -2657,21 +2657,32 @@ fn flush_batch(
                 buffer.segments.push(buffered);
             }
         } else {
-            // Buffer segment
+            // Buffer segment (will be flushed at end of batch)
             buffer.segments.push(buffered);
         }
 
-        // CRITICAL FIX: Call flush_pack if buffer is full
-        // This was MISSING in commit ff00e87, causing "Unknown frame descriptor" errors
-        if buffer.should_flush_pack(config.pack_size) {
-            flush_pack(buffer, collection, archive, config, reference_segments)
-                .context("Failed to flush pack in flush_batch")?;
-        }
+        // FIX 4: Removed mid-batch pack flush to match C++ AGC's batch-level sorting
+        // C++ AGC calls sort_known() on ALL segments in batch BEFORE writing ANY
+        // Flushing mid-batch would write segments in pack-level sorted order, not batch-level
+        // All groups will be flushed at end of batch (after loop) instead
     }
 
     // Clear pending segments
     pending.clear();
     drop(pending);
+
+    // FIX 4: Flush all group buffers at end of batch (match C++ AGC's sort_known + store_segments)
+    // This ensures segments within each group are sorted globally across the entire batch,
+    // not just within individual packs. Matches C++ AGC architecture:
+    // - C++ AGC: register_segments() calls sort_known() on ALL segments, then store_segments() writes ALL
+    // - RAGC: Accumulate all segments for batch, then flush_pack() sorts + writes at end
+    for (_key, buffer) in groups_map.iter_mut() {
+        if !buffer.segments.is_empty() || !buffer.ref_written {
+            flush_pack(buffer, collection, archive, config, reference_segments)
+                .context("Failed to flush pack at end of batch")?;
+        }
+    }
+
     drop(groups_map);
 
     // Update global registry with batch-local groups (from existing group processing)
