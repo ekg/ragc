@@ -229,6 +229,7 @@ struct PendingSegment {
     sample_name: String,
     contig_name: String,
     place: usize,
+    sample_priority: i32, // Sample processing order (higher = earlier)
 }
 
 // Match C++ AGC sorting order (agc_compressor.h lines 112-119)
@@ -241,14 +242,20 @@ impl PartialOrd for PendingSegment {
 
 impl Ord for PendingSegment {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // First compare by sample_name
-        match self.sample_name.cmp(&other.sample_name) {
+        // First compare by sample_priority (DESCENDING - higher priority first)
+        match other.sample_priority.cmp(&self.sample_priority) {
             std::cmp::Ordering::Equal => {
-                // Then by contig_name
-                match self.contig_name.cmp(&other.contig_name) {
+                // Then by sample_name
+                match self.sample_name.cmp(&other.sample_name) {
                     std::cmp::Ordering::Equal => {
-                        // Finally by place (seg_part_no)
-                        self.place.cmp(&other.place)
+                        // Then by contig_name
+                        match self.contig_name.cmp(&other.contig_name) {
+                            std::cmp::Ordering::Equal => {
+                                // Finally by place (seg_part_no)
+                                self.place.cmp(&other.place)
+                            }
+                            other => other,
+                        }
                     }
                     other => other,
                 }
@@ -266,10 +273,11 @@ struct BufferedSegment {
     seg_part_no: usize,
     data: Contig,
     is_rev_comp: bool,
+    sample_priority: i32, // Sample processing order (higher = earlier)
 }
 
 // Match C++ AGC sorting order (agc_compressor.h lines 112-119)
-// Sort by: sample_name, then contig_name, then seg_part_no
+// Sort by: sample_priority (DESCENDING), then sample_name, contig_name, seg_part_no
 impl PartialOrd for BufferedSegment {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -278,14 +286,20 @@ impl PartialOrd for BufferedSegment {
 
 impl Ord for BufferedSegment {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // First compare by sample_name
-        match self.sample_name.cmp(&other.sample_name) {
+        // First compare by sample_priority (DESCENDING - higher priority first)
+        match other.sample_priority.cmp(&self.sample_priority) {
             std::cmp::Ordering::Equal => {
-                // Then by contig_name
-                match self.contig_name.cmp(&other.contig_name) {
+                // Then by sample_name
+                match self.sample_name.cmp(&other.sample_name) {
                     std::cmp::Ordering::Equal => {
-                        // Finally by seg_part_no
-                        self.seg_part_no.cmp(&other.seg_part_no)
+                        // Then by contig_name
+                        match self.contig_name.cmp(&other.contig_name) {
+                            std::cmp::Ordering::Equal => {
+                                // Finally by seg_part_no
+                                self.seg_part_no.cmp(&other.seg_part_no)
+                            }
+                            other => other,
+                        }
                     }
                     other => other,
                 }
@@ -2611,6 +2625,7 @@ fn flush_batch(
             seg_part_no: pend.place,
             data: pend.segment_data.clone(),
             is_rev_comp: pend.should_reverse,
+            sample_priority: pend.sample_priority,
         };
 
         // Add to buffer or write as reference
@@ -3409,7 +3424,7 @@ fn worker_thread(
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
                                     let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, should_reverse, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
-                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_left_data, is_rev_comp: fixed_left_rc };
+                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_left_data, is_rev_comp: fixed_left_rc, sample_priority: task.sample_priority };
                                     left_buffer.segments.push(left_buffered);
                                     // Flush pack if full (matches C++ AGC write-as-you-go behavior)
                                     if left_buffer.should_flush_pack(config.pack_size) {
@@ -3465,7 +3480,7 @@ fn worker_thread(
                                     });
                                     let seg_part = if is_degenerate_left { place } else { place + 1 };
                                     let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, should_reverse, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
-                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_right_data, is_rev_comp: fixed_right_rc };
+                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_right_data, is_rev_comp: fixed_right_rc, sample_priority: task.sample_priority };
                                     right_buffer.segments.push(right_buffered);
                                     // Flush pack if full (matches C++ AGC write-as-you-go behavior)
                                     if right_buffer.should_flush_pack(config.pack_size) {
@@ -3498,7 +3513,7 @@ fn worker_thread(
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
                                     let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, should_reverse, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
-                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_right_data, is_rev_comp: fixed_right_rc };
+                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_right_data, is_rev_comp: fixed_right_rc, sample_priority: task.sample_priority };
                                     right_buffer.segments.push(right_buffered);
                                     // Flush pack if full (matches C++ AGC write-as-you-go behavior)
                                     if right_buffer.should_flush_pack(config.pack_size) {
@@ -3530,7 +3545,7 @@ fn worker_thread(
                                     });
                                     let seg_part = if is_degenerate_right { place } else { place + 1 };
                                     let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, should_reverse, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
-                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_left_data, is_rev_comp: fixed_left_rc };
+                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_left_data, is_rev_comp: fixed_left_rc, sample_priority: task.sample_priority };
                                     left_buffer.segments.push(left_buffered);
                                     // Flush pack if full (matches C++ AGC write-as-you-go behavior)
                                     if left_buffer.should_flush_pack(config.pack_size) {
@@ -3780,6 +3795,7 @@ fn worker_thread(
                         sample_name: task.sample_name.clone(),
                         contig_name: task.contig_name.clone(),
                         place,
+                        sample_priority: task.sample_priority,
                     });
 
                     // Skip immediate processing - segment will be handled in flush_batch
@@ -3828,6 +3844,7 @@ fn worker_thread(
                     seg_part_no: place,
                     data: final_segment_data,
                     is_rev_comp: final_should_reverse,
+                    sample_priority: task.sample_priority,
                 };
 
                 // DEBUG: Print data for degenerate k-mer reference segments
