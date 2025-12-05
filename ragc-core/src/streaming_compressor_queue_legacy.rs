@@ -3623,6 +3623,18 @@ fn worker_thread(
                         task.sample_name, task.contig_name, place, key_front, key_back, should_reverse, buffered.data.len(), data_first5);
                 }
 
+                // DEBUG: Track specific segments for investigation
+                if std::env::var("RAGC_TRACE_GROUPS").is_ok() {
+                    if task.sample_name.contains("ADI") && task.contig_name.contains("chrI") && place == 22 {
+                        eprintln!("RAGC_TRACE: ADI#0#chrI seg 22: key=({},{}) len={} should_reverse={}",
+                            key_front, key_back, buffered.data.len(), should_reverse);
+                    }
+                    if task.sample_name.contains("CFF") && task.contig_name.contains("chrXII") && place == 0 {
+                        eprintln!("RAGC_TRACE: CFF#2#chrXII_1 seg 0: key=({},{}) len={} should_reverse={}",
+                            key_front, key_back, buffered.data.len(), should_reverse);
+                    }
+                }
+
                 // Get or create buffer for this group
                 // If group doesn't exist yet, allocate group_id using BATCH-LOCAL logic
                 let buffer = groups.entry(key.clone()).or_insert_with(|| {
@@ -3633,6 +3645,10 @@ fn worker_thread(
                         let mut global_map = map_segments.lock().unwrap();
                         if let Some(&existing_id) = global_map.get(&key) {
                             // Group exists - reuse it
+                            if std::env::var("RAGC_TRACE_GROUPS").is_ok() {
+                                eprintln!("RAGC_TRACE: FOUND existing group {} for key=({},{})",
+                                    existing_id, key.kmer_front, key.kmer_back);
+                            }
                             existing_id
                         } else {
                             // New group - allocate ID and register IMMEDIATELY to global map
@@ -3641,6 +3657,10 @@ fn worker_thread(
                             } else {
                                 group_counter.fetch_add(1, Ordering::SeqCst)  // LZ groups use counter
                             };
+                            if std::env::var("RAGC_TRACE_GROUPS").is_ok() {
+                                eprintln!("RAGC_TRACE: CREATED new group {} for key=({},{}) sample={} contig={} seg={}",
+                                    new_id, key.kmer_front, key.kmer_back, task.sample_name, task.contig_name, place);
+                            }
                             global_map.insert(key.clone(), new_id);
                             drop(global_map);
                             // Also register to batch-local for flush tracking

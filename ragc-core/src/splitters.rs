@@ -289,8 +289,9 @@ fn find_actual_splitters_in_contig_named(
     // Try to add rightmost candidate k-mer
     for &kmer_value in recent_kmers.iter().rev() {
         if candidates.contains(&kmer_value) {
-            #[cfg(feature = "verbose_debug")]
-            eprintln!("DEBUG_RAGC_SPLITTER_USED_RIGHTMOST: contig={} kmer={}", contig_name, kmer_value);
+            // ALWAYS log end-of-contig splitters (not just in verbose mode)
+            eprintln!("RAGC_END_SPLITTER: contig={} kmer={} recent_kmers_len={} pos={}",
+                     contig_name, kmer_value, recent_kmers.len(), pos);
             used_splitters.push(kmer_value);
             break;
         }

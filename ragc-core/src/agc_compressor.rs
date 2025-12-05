@@ -4515,24 +4515,24 @@ fn try_split_segment_with_cost(
         }
     }
 
-    // Apply degenerate position rules only when computing best_pos locally.
-    // When FFI is used, these rules have already been applied in C++.
-    if maybe_best.is_none() {
-        let k = config.k;
-        let original_best_pos = best_pos;  // Save for logging
-        if best_pos < k + 1 {
-            best_pos = 0; // Too close to start
-        }
-        if best_pos + k + 1 > v_costs1.len() {
-            best_pos = v_costs1.len(); // Too close to end
-        }
+    // Apply degenerate position rules ALWAYS to prevent tiny segments at boundaries.
+    // Even when FFI or fallback paths provide best_pos, we must enforce this constraint
+    // to match C++ AGC behavior (agc_compressor.cpp:1685-1688).
+    let k = config.k;
+    let original_best_pos = best_pos;  // Save for logging
+    if best_pos < k + 1 {
+        best_pos = 0; // Too close to start
+    }
+    if best_pos + k + 1 > v_costs1.len() {
+        best_pos = v_costs1.len(); // Too close to end
+    }
 
-        if config.verbosity > 1 && original_best_pos != best_pos {
-            eprintln!(
-                "COST_CALC: original_best_pos={} forced_to={} (len={}, k+1={})",
-                original_best_pos, best_pos, v_costs1.len(), k + 1
-            );
-        }
+    if config.verbosity > 1 && original_best_pos != best_pos {
+        eprintln!(
+            "BOUNDARY_CLAMP: original_best_pos={} clamped_to={} (len={}, k+1={}) source={}",
+            original_best_pos, best_pos, v_costs1.len(), k + 1,
+            if maybe_best.is_some() { "FFI/fallback" } else { "cost_calc" }
+        );
     }
 
     // Check if split is degenerate (C++ AGC agc_compressor.cpp:1400-1415)

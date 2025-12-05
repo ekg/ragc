@@ -122,6 +122,12 @@ pub fn split_at_splitters_with_size(
                 // during SPLITTER FINDING to select which k-mers become splitters.
                 // During SEGMENTATION, we split at every occurrence without distance check.
                 if splitters.contains(&kmer_value) {
+                    // Comprehensive split logging for debugging
+                    if std::env::var("RAGC_TRACE_ALL_SPLITS").is_ok() {
+                        let segment_len = (pos + 1) - segment_start;
+                        eprintln!("RAGC_SPLIT: pos={} kmer={} segment_start={} segment_len={} contig_len={}",
+                                  pos, kmer_value, segment_start, segment_len, contig.len());
+                    }
                     // Use this as a splitter
                     let segment_end = pos + 1;
                     let segment_data = contig[segment_start..segment_end].to_vec();
