@@ -2511,6 +2511,7 @@ fn flush_batch(
     archive: &Arc<Mutex<Archive>>,
     collection: &Arc<Mutex<CollectionV3>>,
     reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
     #[cfg(feature = "cpp_agc")]
     grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     config: &StreamingQueueConfig,
@@ -2657,16 +2658,34 @@ fn flush_batch(
         let is_raw_group = group_id < NO_RAW_GROUPS;  // Groups 0-15 are raw groups (match C++ AGC)
         if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
             // First segment in LZ group - write as reference immediately
-            let reference_orientations = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+            // Use shared reference_orientations so subsequent segments can find the reference orientation
             if let Err(e) = write_reference_immediately(
-                &buffered, buffer, collection, archive, reference_segments, &reference_orientations, config
+                &buffered, buffer, collection, archive, reference_segments, reference_orientations, config
             ) {
                 eprintln!("ERROR in flush_batch: Failed to write reference: {}", e);
                 buffer.segments.push(buffered);
             }
         } else {
             // Buffer segment (will be flushed at end of batch)
-            buffer.segments.push(buffered);
+            // FIX 12: Fix orientation to match reference before buffering
+            // This ensures LZ encoding will find matches (fixes 62 zero-match segments bug)
+            let (fixed_data, fixed_rc) = fix_orientation_for_group(
+                &pend.segment_data,
+                pend.should_reverse,
+                &pend.key,
+                map_segments,
+                batch_local_groups,
+                reference_orientations,
+            );
+            let fixed_buffered = BufferedSegment {
+                sample_name: pend.sample_name.clone(),
+                contig_name: pend.contig_name.clone(),
+                seg_part_no: pend.place,
+                data: fixed_data,
+                is_rev_comp: fixed_rc,
+                sample_priority: pend.sample_priority,
+            };
+            buffer.segments.push(fixed_buffered);
         }
 
         // FIX 4: Removed mid-batch pack flush to match C++ AGC's batch-level sorting
@@ -2827,6 +2846,7 @@ fn worker_thread(
                 &archive,
                 &collection,
                 &reference_segments,
+                &reference_orientations,
                 #[cfg(feature = "cpp_agc")]
                 &grouping_engine,
                 &config,
@@ -2869,6 +2889,7 @@ fn worker_thread(
                     &archive,
                     &collection,
                     &reference_segments,
+                    &reference_orientations,
                     #[cfg(feature = "cpp_agc")]
                     &grouping_engine,
                     &config,
