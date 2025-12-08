@@ -3782,63 +3782,10 @@ fn worker_thread(
 
                 // Phase 3: Normal path - add segment to group as-is (group exists, or split failed/impossible)
 
-                // FIX: When joining an existing group, use the reference's orientation
-                // to ensure LZ encoding works correctly (fixes ZERO_MATCH bug in Case 3 terminators)
-                let (final_should_reverse, final_segment_data) = {
-                    // Check if this group already has a reference with stored orientation
-                    // Check BOTH map_segments (previous batches) AND batch_local_groups (current batch)
-                    let group_id_opt = {
-                        let seg_map = map_segments.lock().unwrap();
-                        if let Some(&gid) = seg_map.get(&key) {
-                            Some(gid)
-                        } else {
-                            drop(seg_map);
-                            let batch_map = batch_local_groups.lock().unwrap();
-                            batch_map.get(&key).copied()
-                        }
-                    };
-
-                    if let Some(group_id) = group_id_opt {
-                        let ref_orients = reference_orientations.lock().unwrap();
-                        if let Some(&ref_rc) = ref_orients.get(&group_id) {
-                            // Group has a stored reference orientation
-                            if ref_rc != should_reverse {
-                                // Orientation mismatch - recompute segment_data with reference orientation
-                                if config.verbosity > 1 {
-                                    eprintln!("ORIENTATION_FIX: group={} sample={} contig={}:{} computed_rc={} ref_rc={}",
-                                        group_id, task.sample_name, task.contig_name, place, should_reverse, ref_rc);
-                                }
-                                // Recompute segment_data with the reference's orientation
-                                // Note: We need to reverse the ORIGINAL data, not segment_data which may already be reversed
-                                let fixed_data = if ref_rc {
-                                    // Need RC: reverse complement the original segment data
-                                    segment.data.iter().rev().map(|&base| {
-                                        match base {
-                                            0 => 3, // A -> T
-                                            1 => 2, // C -> G
-                                            2 => 1, // G -> C
-                                            3 => 0, // T -> A
-                                            _ => base, // N or other non-ACGT
-                                        }
-                                    }).collect()
-                                } else {
-                                    // Need forward: use original data as-is
-                                    segment.data.clone()
-                                };
-                                (ref_rc, fixed_data)
-                            } else {
-                                // Orientations match - use computed values
-                                (should_reverse, segment_data)
-                            }
-                        } else {
-                            // No stored orientation yet (this will be the reference)
-                            (should_reverse, segment_data)
-                        }
-                    } else {
-                        // New group - use computed orientation
-                        (should_reverse, segment_data)
-                    }
-                };
+                // DISABLED: Orientation fix removed to match C++ AGC behavior
+                // C++ AGC does NOT force delta segments to match reference orientation
+                // Each segment uses its independently computed orientation
+                let (final_should_reverse, final_segment_data) = (should_reverse, segment_data);
 
                 // Check if this group already exists (global OR batch-local)
                 // If it does NOT exist, defer to pending_batch_segments for sorted group_id assignment
