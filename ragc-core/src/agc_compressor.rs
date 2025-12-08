@@ -2511,6 +2511,7 @@ fn flush_batch(
     archive: &Arc<Mutex<Archive>>,
     collection: &Arc<Mutex<CollectionV3>>,
     reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
     #[cfg(feature = "cpp_agc")]
     grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     config: &StreamingQueueConfig,
@@ -2643,29 +2644,63 @@ fn flush_batch(
             SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
         });
 
-        // Create BufferedSegment
-        let buffered = BufferedSegment {
-            sample_name: pend.sample_name.clone(),
-            contig_name: pend.contig_name.clone(),
-            seg_part_no: pend.place,
-            data: pend.segment_data.clone(),
-            is_rev_comp: pend.should_reverse,
-            sample_priority: pend.sample_priority,
-        };
-
         // Add to buffer or write as reference
         let is_raw_group = group_id < NO_RAW_GROUPS;  // Groups 0-15 are raw groups (match C++ AGC)
         if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
             // First segment in LZ group - write as reference immediately
-            let reference_orientations = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+            // Create BufferedSegment with original orientation (reference sets the group orientation)
+            let buffered = BufferedSegment {
+                sample_name: pend.sample_name.clone(),
+                contig_name: pend.contig_name.clone(),
+                seg_part_no: pend.place,
+                data: pend.segment_data.clone(),
+                is_rev_comp: pend.should_reverse,
+                sample_priority: pend.sample_priority,
+            };
             if let Err(e) = write_reference_immediately(
-                &buffered, buffer, collection, archive, reference_segments, &reference_orientations, config
+                &buffered, buffer, collection, archive, reference_segments, reference_orientations, config
             ) {
                 eprintln!("ERROR in flush_batch: Failed to write reference: {}", e);
                 buffer.segments.push(buffered);
             }
         } else {
-            // Buffer segment (will be flushed at end of batch)
+            // Delta segment (joining existing group) - fix orientation to match reference
+            // Look up the reference orientation for this group
+            let (fixed_data, fixed_rc) = {
+                let ref_orients = reference_orientations.lock().unwrap();
+                if let Some(&ref_rc) = ref_orients.get(&group_id) {
+                    // Group has a stored reference orientation
+                    if ref_rc != pend.should_reverse {
+                        // Orientation mismatch - transform data to match reference
+                        let fixed_data: Vec<u8> = pend.segment_data.iter().rev().map(|&base| {
+                            match base {
+                                0 => 3, // A -> T
+                                1 => 2, // C -> G
+                                2 => 1, // G -> C
+                                3 => 0, // T -> A
+                                _ => base, // N or other non-ACGT
+                            }
+                        }).collect();
+                        (fixed_data, ref_rc)
+                    } else {
+                        // Orientations match - no fix needed
+                        (pend.segment_data.clone(), pend.should_reverse)
+                    }
+                } else {
+                    // No reference orientation stored (raw group or first segment)
+                    (pend.segment_data.clone(), pend.should_reverse)
+                }
+            };
+
+            // Create BufferedSegment with fixed orientation
+            let buffered = BufferedSegment {
+                sample_name: pend.sample_name.clone(),
+                contig_name: pend.contig_name.clone(),
+                seg_part_no: pend.place,
+                data: fixed_data,
+                is_rev_comp: fixed_rc,
+                sample_priority: pend.sample_priority,
+            };
             buffer.segments.push(buffered);
         }
 
@@ -2827,6 +2862,7 @@ fn worker_thread(
                 &archive,
                 &collection,
                 &reference_segments,
+                &reference_orientations,
                 #[cfg(feature = "cpp_agc")]
                 &grouping_engine,
                 &config,
@@ -2869,6 +2905,7 @@ fn worker_thread(
                     &archive,
                     &collection,
                     &reference_segments,
+                    &reference_orientations,
                     #[cfg(feature = "cpp_agc")]
                     &grouping_engine,
                     &config,

@@ -234,14 +234,14 @@ fn show_single_segment_groups(decompressor: &mut Decompressor) -> Result<()> {
 fn show_segment_layout(decompressor: &mut Decompressor) -> Result<()> {
     let all_segments = decompressor.get_all_segments()?;
 
-    // CSV header
-    println!("sample,contig,segment_index,group_id,in_group_id,raw_length");
+    // CSV header - includes is_rev_comp for orientation comparison
+    println!("sample,contig,segment_index,group_id,in_group_id,is_rev_comp,raw_length");
 
     for (sample_name, contig_name, segments) in &all_segments {
         for (seg_idx, seg) in segments.iter().enumerate() {
-            println!("{},{},{},{},{},{}",
+            println!("{},{},{},{},{},{},{}",
                 sample_name, contig_name, seg_idx,
-                seg.group_id, seg.in_group_id, seg.raw_length);
+                seg.group_id, seg.in_group_id, seg.is_rev_comp, seg.raw_length);
         }
     }
 
@@ -443,10 +443,11 @@ fn compare_archives(archive1_path: &Path, archive2_path: &Path, config: &Inspect
     println!("Archive 2: {}", archive2_path.display());
     println!();
 
-    // Run all 4 comparisons
+    // Run all 5 comparisons
     compare_segment_boundaries(&mut dec1, &mut dec2, archive1_path, archive2_path)?;
     compare_grouping(&mut dec1, &mut dec2, archive1_path, archive2_path)?;
     compare_references(&mut dec1, &mut dec2, archive1_path, archive2_path)?;
+    compare_orientations(&mut dec1, &mut dec2, archive1_path, archive2_path)?;
     compare_packs(&mut dec1, &mut dec2, archive1_path, archive2_path)?;
 
     Ok(())
@@ -723,7 +724,85 @@ fn compare_references(
     Ok(())
 }
 
-/// 4. Compare pack structure: Are segments organized into the same ZSTD packs?
+/// 4. Compare segment orientations: Are segments stored in the same orientation (rev comp)?
+fn compare_orientations(
+    dec1: &mut Decompressor,
+    dec2: &mut Decompressor,
+    arch1_name: &Path,
+    arch2_name: &Path,
+) -> Result<()> {
+    println!("\n=== 4. SEGMENT ORIENTATION COMPARISON ===");
+
+    let segs1 = dec1.get_all_segments()?;
+    let segs2 = dec2.get_all_segments()?;
+
+    // Build map: (sample, contig, seg_idx) -> is_rev_comp
+    let mut map1: BTreeMap<(String, String, usize), bool> = BTreeMap::new();
+    let mut map2: BTreeMap<(String, String, usize), bool> = BTreeMap::new();
+
+    for (sample, contig, segments) in &segs1 {
+        for (idx, seg) in segments.iter().enumerate() {
+            map1.insert((sample.clone(), contig.clone(), idx), seg.is_rev_comp);
+        }
+    }
+
+    for (sample, contig, segments) in &segs2 {
+        for (idx, seg) in segments.iter().enumerate() {
+            map2.insert((sample.clone(), contig.clone(), idx), seg.is_rev_comp);
+        }
+    }
+
+    // Find differences
+    let mut diff_orientations = Vec::new();
+
+    for (key, rc1) in &map1 {
+        if let Some(rc2) = map2.get(key) {
+            if rc1 != rc2 {
+                diff_orientations.push((key.clone(), *rc1, *rc2));
+            }
+        }
+    }
+
+    // Count orientation stats
+    let rc_true_1 = map1.values().filter(|&&rc| rc).count();
+    let rc_true_2 = map2.values().filter(|&&rc| rc).count();
+
+    println!("Orientation statistics:");
+    println!("  {}: {} rev_comp=true out of {} total",
+        arch1_name.file_name().unwrap().to_str().unwrap(), rc_true_1, map1.len());
+    println!("  {}: {} rev_comp=true out of {} total",
+        arch2_name.file_name().unwrap().to_str().unwrap(), rc_true_2, map2.len());
+    println!();
+
+    if diff_orientations.is_empty() {
+        println!("✅ IDENTICAL segment orientations!");
+        println!("   All segments have the same is_rev_comp flag.");
+    } else {
+        println!("❌ DIFFERENT segment orientations:");
+        println!("  {} segments have different orientations", diff_orientations.len());
+
+        println!("\nFirst 20 segments with different orientations:");
+        for ((sample, contig, idx), rc1, rc2) in diff_orientations.iter().take(20) {
+            println!("  {} {} seg[{}]: archive1 rc={} vs archive2 rc={}",
+                sample, contig, idx, rc1, rc2);
+        }
+
+        // Show summary by contig
+        let mut contig_diffs: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for ((sample, contig, _), _, _) in &diff_orientations {
+            *contig_diffs.entry((sample.clone(), contig.clone())).or_default() += 1;
+        }
+
+        println!("\nOrientation differences by contig:");
+        for ((sample, contig), count) in &contig_diffs {
+            println!("  {}/{}: {} segments differ", sample, contig, count);
+        }
+    }
+
+    Ok(())
+}
+
+/// 5. Compare pack structure: Are segments organized into the same ZSTD packs?
 fn compare_packs(
     dec1: &mut Decompressor,
     dec2: &mut Decompressor,
