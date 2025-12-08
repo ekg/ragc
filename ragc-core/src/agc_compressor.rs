@@ -2507,6 +2507,7 @@ fn flush_batch(
     batch_local_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     group_counter: &Arc<AtomicU32>,
+    raw_group_counter: &Arc<AtomicU32>, // FIX 17: Round-robin counter for raw groups (0-15)
     map_segments_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     archive: &Arc<Mutex<Archive>>,
     collection: &Arc<Mutex<CollectionV3>>,
@@ -2549,11 +2550,13 @@ fn flush_batch(
     let mut groups_map = segment_groups.lock().unwrap();
 
     for pend in pending.iter() {
-        // Assign group_id: Orphan segments (both k-mers MISSING) go to group 0
+        // Assign group_id: Orphan segments (both k-mers MISSING) distributed across raw groups 0-15
         // For segments with k-mers: lookup existing group, or create new group if not found
-        // This matches C++ AGC: map_segments[make_pair(~0ull, ~0ull)] = 0 (line 358, 2427)
+        // FIX 17: Distribute orphan segments across groups 0-15 (round-robin) to match C++ AGC's
+        // distribute_segments(0, 0, no_raw_groups) behavior (agc_compressor.cpp line 986)
         let group_id = if pend.key.kmer_back == MISSING_KMER && pend.key.kmer_front == MISSING_KMER {
-            0  // Single raw group for orphan segments
+            // Round-robin distribution across raw groups 0-15
+            raw_group_counter.fetch_add(1, Ordering::SeqCst) % NO_RAW_GROUPS
         } else {
             // Check if this k-mer pair already has a group assigned
             let mut global_map = map_segments.lock().unwrap();
@@ -2664,41 +2667,16 @@ fn flush_batch(
                 buffer.segments.push(buffered);
             }
         } else {
-            // Delta segment (joining existing group) - fix orientation to match reference
-            // Look up the reference orientation for this group
-            let (fixed_data, fixed_rc) = {
-                let ref_orients = reference_orientations.lock().unwrap();
-                if let Some(&ref_rc) = ref_orients.get(&group_id) {
-                    // Group has a stored reference orientation
-                    if ref_rc != pend.should_reverse {
-                        // Orientation mismatch - transform data to match reference
-                        let fixed_data: Vec<u8> = pend.segment_data.iter().rev().map(|&base| {
-                            match base {
-                                0 => 3, // A -> T
-                                1 => 2, // C -> G
-                                2 => 1, // G -> C
-                                3 => 0, // T -> A
-                                _ => base, // N or other non-ACGT
-                            }
-                        }).collect();
-                        (fixed_data, ref_rc)
-                    } else {
-                        // Orientations match - no fix needed
-                        (pend.segment_data.clone(), pend.should_reverse)
-                    }
-                } else {
-                    // No reference orientation stored (raw group or first segment)
-                    (pend.segment_data.clone(), pend.should_reverse)
-                }
-            };
-
-            // Create BufferedSegment with fixed orientation
+            // Delta segment (joining existing group)
+            // FIX 18: Do NOT adjust orientation to match reference - C++ AGC stores each segment
+            // with its own computed is_rev_comp based on k-mer comparison (front < back -> false,
+            // front >= back -> true). Segments in the same group can have different is_rev_comp.
             let buffered = BufferedSegment {
                 sample_name: pend.sample_name.clone(),
                 contig_name: pend.contig_name.clone(),
                 seg_part_no: pend.place,
-                data: fixed_data,
-                is_rev_comp: fixed_rc,
+                data: pend.segment_data.clone(),
+                is_rev_comp: pend.should_reverse,
                 sample_priority: pend.sample_priority,
             };
             buffer.segments.push(buffered);
@@ -2768,46 +2746,14 @@ fn flush_batch(
 fn fix_orientation_for_group(
     data: &[u8],
     should_reverse: bool,
-    key: &SegmentGroupKey,
-    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
+    _key: &SegmentGroupKey,
+    _map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    _batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    _reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
 ) -> (Vec<u8>, bool) {
-    // Look up group_id in both global (map_segments) and batch-local registries
-    let group_id_opt = {
-        let seg_map = map_segments.lock().unwrap();
-        if let Some(&gid) = seg_map.get(key) {
-            Some(gid)
-        } else {
-            drop(seg_map);
-            let batch_map = batch_local_groups.lock().unwrap();
-            batch_map.get(key).copied()
-        }
-    };
-
-    if let Some(group_id) = group_id_opt {
-        let ref_orients = reference_orientations.lock().unwrap();
-        if let Some(&ref_rc) = ref_orients.get(&group_id) {
-            // Group has a stored reference orientation
-            if ref_rc != should_reverse {
-                // Orientation mismatch - transform data to match reference
-                // The data is already transformed based on should_reverse, so we need to
-                // apply RC if ref_rc is true (to get RC), or use original if ref_rc is false (to get forward)
-                // But we're given the ALREADY-TRANSFORMED data, so we need to invert if mismatch
-                let fixed_data: Vec<u8> = data.iter().rev().map(|&base| {
-                    match base {
-                        0 => 3, // A -> T
-                        1 => 2, // C -> G
-                        2 => 1, // G -> C
-                        3 => 0, // T -> A
-                        _ => base, // N or other non-ACGT
-                    }
-                }).collect();
-                return (fixed_data, ref_rc);
-            }
-        }
-    }
-    // No fix needed - return as-is
+    // FIX 18: Do NOT adjust orientation to match reference - C++ AGC stores each segment
+    // with its own computed is_rev_comp based on k-mer comparison. Segments in the same
+    // group can have different is_rev_comp values.
     (data.to_vec(), should_reverse)
 }
 
@@ -2858,6 +2804,7 @@ fn worker_thread(
                 &batch_local_terminators,
                 &map_segments,
                 &group_counter,
+                &raw_group_counter, // FIX 17: Pass raw_group_counter for round-robin distribution
                 &map_segments_terminators,
                 &archive,
                 &collection,
@@ -2901,6 +2848,7 @@ fn worker_thread(
                     &batch_local_terminators,
                     &map_segments,
                     &group_counter,
+                    &raw_group_counter, // FIX 17: Pass raw_group_counter for round-robin distribution
                     &map_segments_terminators,
                     &archive,
                     &collection,
@@ -3782,63 +3730,10 @@ fn worker_thread(
 
                 // Phase 3: Normal path - add segment to group as-is (group exists, or split failed/impossible)
 
-                // FIX: When joining an existing group, use the reference's orientation
-                // to ensure LZ encoding works correctly (fixes ZERO_MATCH bug in Case 3 terminators)
-                let (final_should_reverse, final_segment_data) = {
-                    // Check if this group already has a reference with stored orientation
-                    // Check BOTH map_segments (previous batches) AND batch_local_groups (current batch)
-                    let group_id_opt = {
-                        let seg_map = map_segments.lock().unwrap();
-                        if let Some(&gid) = seg_map.get(&key) {
-                            Some(gid)
-                        } else {
-                            drop(seg_map);
-                            let batch_map = batch_local_groups.lock().unwrap();
-                            batch_map.get(&key).copied()
-                        }
-                    };
-
-                    if let Some(group_id) = group_id_opt {
-                        let ref_orients = reference_orientations.lock().unwrap();
-                        if let Some(&ref_rc) = ref_orients.get(&group_id) {
-                            // Group has a stored reference orientation
-                            if ref_rc != should_reverse {
-                                // Orientation mismatch - recompute segment_data with reference orientation
-                                if config.verbosity > 1 {
-                                    eprintln!("ORIENTATION_FIX: group={} sample={} contig={}:{} computed_rc={} ref_rc={}",
-                                        group_id, task.sample_name, task.contig_name, place, should_reverse, ref_rc);
-                                }
-                                // Recompute segment_data with the reference's orientation
-                                // Note: We need to reverse the ORIGINAL data, not segment_data which may already be reversed
-                                let fixed_data = if ref_rc {
-                                    // Need RC: reverse complement the original segment data
-                                    segment.data.iter().rev().map(|&base| {
-                                        match base {
-                                            0 => 3, // A -> T
-                                            1 => 2, // C -> G
-                                            2 => 1, // G -> C
-                                            3 => 0, // T -> A
-                                            _ => base, // N or other non-ACGT
-                                        }
-                                    }).collect()
-                                } else {
-                                    // Need forward: use original data as-is
-                                    segment.data.clone()
-                                };
-                                (ref_rc, fixed_data)
-                            } else {
-                                // Orientations match - use computed values
-                                (should_reverse, segment_data)
-                            }
-                        } else {
-                            // No stored orientation yet (this will be the reference)
-                            (should_reverse, segment_data)
-                        }
-                    } else {
-                        // New group - use computed orientation
-                        (should_reverse, segment_data)
-                    }
-                };
+                // FIX 18: Do NOT adjust orientation to match reference - C++ AGC stores each segment
+                // with its own computed is_rev_comp based on k-mer comparison. Segments in the same
+                // group can have different is_rev_comp values.
+                let (final_should_reverse, final_segment_data) = (should_reverse, segment_data);
 
                 // Check if this group already exists (global OR batch-local)
                 // If it does NOT exist, defer to pending_batch_segments for sorted group_id assignment
