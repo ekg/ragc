@@ -121,6 +121,15 @@ pub fn split_at_splitters_with_size(
                 // The distance check (current_len >= min_segment_size) only happens
                 // during SPLITTER FINDING to select which k-mers become splitters.
                 // During SEGMENTATION, we split at every occurrence without distance check.
+
+                // DEBUG: Trace positions near end of contig
+                if std::env::var("RAGC_DEBUG_ENDPOS").is_ok() && pos + 50 >= contig.len() {
+                    let is_splitter = splitters.contains(&kmer_value);
+                    let bytes_left = contig.len() - (pos + 1);
+                    eprintln!("ENDPOS_TRACE: pos={} kmer={:#x} is_splitter={} bytes_left={} k={} contig_len={}",
+                              pos, kmer_value, is_splitter, bytes_left, k, contig.len());
+                }
+
                 if splitters.contains(&kmer_value) {
                     // Comprehensive split logging for debugging
                     if std::env::var("RAGC_TRACE_ALL_SPLITS").is_ok() {
@@ -210,11 +219,10 @@ pub fn split_at_splitters_with_size(
                     .unwrap_or((MISSING_KMER, false));
                 (front, back, front_is_dir, back_is_dir)
             } else {
-                // Front k-mer present (from last splitter), extract back k-mer from sequence
-                let (back, back_is_dir) = recent_kmers.last()
-                    .map(|(_, kmer, is_dir)| (*kmer, *is_dir))
-                    .unwrap_or((MISSING_KMER, false));
-                (front_kmer, back, front_kmer_is_dir, back_is_dir)
+                // Front k-mer present (from last splitter)
+                // C++ AGC uses MISSING_KMER for back k-mer of final segments
+                // (see agc_compressor.cpp line 2188)
+                (front_kmer, MISSING_KMER, front_kmer_is_dir, false)
             };
             if debug {
                 eprintln!("  FINAL: segment=[{}..{}) len={}", segment_start, contig.len(), segment_data.len());
