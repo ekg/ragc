@@ -209,15 +209,11 @@ pub fn split_at_splitters_with_size(
         if !segment_data.is_empty() {
             // Final segment k-mer extraction
             let (final_front, final_back, final_front_is_dir, final_back_is_dir) = if front_kmer == MISSING_KMER {
-                // No splitters found - use k-mers from the sequence itself
-                // recent_kmers contains all k-mers from the entire contig
-                let (front, front_is_dir) = recent_kmers.first()
-                    .map(|(_, kmer, is_dir)| (*kmer, *is_dir))
-                    .unwrap_or((MISSING_KMER, false));
-                let (back, back_is_dir) = recent_kmers.last()
-                    .map(|(_, kmer, is_dir)| (*kmer, *is_dir))
-                    .unwrap_or((MISSING_KMER, false));
-                (front, back, front_is_dir, back_is_dir)
+                // No splitters found in entire contig - this is an orphan segment
+                // C++ AGC uses (MISSING_KMER, MISSING_KMER) for orphan segments,
+                // which routes them to raw group 0 (see distribute_segments in agc_compressor.h)
+                // FIX 15: Match C++ AGC behavior - use MISSING for both k-mers
+                (MISSING_KMER, MISSING_KMER, false, false)
             } else {
                 // Front k-mer present (from last splitter)
                 // C++ AGC uses MISSING_KMER for back k-mer of final segments
