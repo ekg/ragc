@@ -3326,6 +3326,48 @@ fn worker_thread(
                         );
 
                         if let Some((left_data, right_data, _mid)) = split_result {
+                            // FIX 27 v4: Compute separate orientations for left and right parts
+                            // C++ AGC lines 1526-1536 and 1540-1550:
+                            //   store_rc = (kmer_front.data() >= split_match.first)  -- for left
+                            //   store2_rc = (split_match.first >= kmer_back.data())  -- for right
+                            //
+                            // When should_reverse=true, the segment was RC'd before splitting,
+                            // so "left" in the split is from original RIGHT, and "right" is from original LEFT.
+                            // We need to swap the k-mer comparisons accordingly.
+                            let (left_should_rc, right_should_rc) = if should_reverse {
+                                // Segment was RC'd: left is from original right, right is from original left
+                                // Swap the k-mer associations
+                                let left_should_rc = middle_kmer >= segment.back_kmer;  // use back_kmer for "left"
+                                let right_should_rc = segment.front_kmer >= middle_kmer;  // use front_kmer for "right"
+                                (left_should_rc, right_should_rc)
+                            } else {
+                                // Normal: left is from original left, right is from original right
+                                let left_should_rc = segment.front_kmer >= middle_kmer;
+                                let right_should_rc = middle_kmer >= segment.back_kmer;
+                                (left_should_rc, right_should_rc)
+                            };
+
+                            // Transform data if needed: current state is `should_reverse`
+                            // If target state differs, we RC the data
+                            let left_data = if left_should_rc != should_reverse {
+                                left_data.iter().rev().map(|&base| {
+                                    match base {
+                                        0 => 3, 1 => 2, 2 => 1, 3 => 0, _ => base
+                                    }
+                                }).collect::<Vec<u8>>()
+                            } else {
+                                left_data
+                            };
+                            let right_data = if right_should_rc != should_reverse {
+                                right_data.iter().rev().map(|&base| {
+                                    match base {
+                                        0 => 3, 1 => 2, 2 => 1, 3 => 0, _ => base
+                                    }
+                                }).collect::<Vec<u8>>()
+                            } else {
+                                right_data
+                            };
+
                             // Check if this is a degenerate split (one side empty)
                             let is_degenerate_left = left_data.is_empty();
                             let is_degenerate_right = right_data.is_empty();
@@ -3444,7 +3486,8 @@ fn worker_thread(
                                         drop(arch);
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
-                                    let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, should_reverse, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
+                                    // FIX 27 v4: Use left_should_rc instead of should_reverse
+                                    let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, left_should_rc, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
                                     let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_left_data, is_rev_comp: fixed_left_rc, sample_priority: task.sample_priority };
                                     left_buffer.segments.push(left_buffered);
                                     // Flush pack if full (matches C++ AGC write-as-you-go behavior)
@@ -3500,7 +3543,8 @@ fn worker_thread(
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
                                     let seg_part = if is_degenerate_left { place } else { place + 1 };
-                                    let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, should_reverse, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
+                                    // FIX 27 v4: Use right_should_rc instead of should_reverse
+                                    let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, right_should_rc, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
                                     let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_right_data, is_rev_comp: fixed_right_rc, sample_priority: task.sample_priority };
                                     right_buffer.segments.push(right_buffered);
                                     // Flush pack if full (matches C++ AGC write-as-you-go behavior)
@@ -3533,7 +3577,8 @@ fn worker_thread(
                                         drop(arch);
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
-                                    let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, should_reverse, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
+                                    // FIX 27 v4: Use right_should_rc instead of should_reverse
+                                    let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, right_should_rc, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
                                     let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_right_data, is_rev_comp: fixed_right_rc, sample_priority: task.sample_priority };
                                     right_buffer.segments.push(right_buffered);
                                     // Flush pack if full (matches C++ AGC write-as-you-go behavior)
@@ -3565,7 +3610,8 @@ fn worker_thread(
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
                                     let seg_part = if is_degenerate_right { place } else { place + 1 };
-                                    let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, should_reverse, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
+                                    // FIX 27 v4: Use left_should_rc instead of should_reverse
+                                    let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, left_should_rc, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
                                     let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_left_data, is_rev_comp: fixed_left_rc, sample_priority: task.sample_priority };
                                     left_buffer.segments.push(left_buffered);
                                     // Flush pack if full (matches C++ AGC write-as-you-go behavior)
