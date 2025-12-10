@@ -233,6 +233,124 @@ pub fn determine_splitters_streaming(
     Ok((splitters, candidates, duplicates))
 }
 
+/// Build a splitter set from ONLY the first sample in a PanSN file
+///
+/// This is used for single-file PanSN mode where multiple samples are in one file.
+/// We need to compute splitters from just the reference (first) sample, matching
+/// the behavior of multi-file mode where each file is a separate sample.
+///
+/// # Arguments
+/// * `fasta_path` - Path to PanSN FASTA file (can be gzipped)
+/// * `k` - K-mer length
+/// * `segment_size` - Minimum segment size
+///
+/// # Returns
+/// Tuple of (splitters, singletons, duplicates) HashSets
+pub fn determine_splitters_streaming_first_sample(
+    fasta_path: &Path,
+    k: usize,
+    segment_size: usize,
+) -> Result<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> {
+    // Pass 1a: Stream through file to collect k-mers from FIRST sample only
+    eprintln!("DEBUG: Pass 1 - Collecting k-mers from first sample only (PanSN mode)...");
+    let mut all_kmers = Vec::new();
+    let mut first_sample: Option<String> = None;
+
+    {
+        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
+        while let Some((_full_header, sample_name, _contig_name, sequence)) =
+            reader.read_contig_with_sample()?
+        {
+            // Track the first sample name
+            if first_sample.is_none() {
+                first_sample = Some(sample_name.clone());
+                eprintln!("DEBUG: First sample detected: {}", sample_name);
+            }
+
+            // Stop when we see a different sample
+            if first_sample.as_ref() != Some(&sample_name) {
+                eprintln!("DEBUG: Stopping at sample boundary (saw {})", sample_name);
+                break;
+            }
+
+            if !sequence.is_empty() {
+                let contig_kmers = enumerate_kmers(&sequence, k);
+                all_kmers.extend(contig_kmers);
+            }
+        }
+    }
+
+    eprintln!(
+        "DEBUG: Collected {} k-mers from first sample",
+        all_kmers.len()
+    );
+
+    // Pass 1b: Sort and identify duplicates/singletons
+    all_kmers.radix_sort_unstable();
+
+    // Extract duplicates before removing them
+    let mut duplicates = HashSet::new();
+    let mut i = 0;
+    while i < all_kmers.len() {
+        let kmer = all_kmers[i];
+        let mut count = 1;
+        let mut j = i + 1;
+
+        while j < all_kmers.len() && all_kmers[j] == kmer {
+            count += 1;
+            j += 1;
+        }
+
+        if count > 1 {
+            duplicates.insert(kmer);
+        }
+
+        i = j;
+    }
+
+    eprintln!("DEBUG: Found {} duplicate k-mers", duplicates.len());
+
+    // Remove non-singletons
+    remove_non_singletons(&mut all_kmers, 0);
+    let candidates: HashSet<u64> = all_kmers.into_iter().collect();
+    eprintln!(
+        "DEBUG: Found {} candidate singleton k-mers",
+        candidates.len()
+    );
+
+    // Pass 2: Stream through file again to find actually-used splitters from FIRST sample only
+    eprintln!("DEBUG: Pass 2 - Finding actually-used splitters from first sample...");
+    let mut splitters = HashSet::new();
+
+    {
+        let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
+        let mut first_sample_pass2: Option<String> = None;
+
+        while let Some((_full_header, sample_name, _contig_name, sequence)) =
+            reader.read_contig_with_sample()?
+        {
+            // Track the first sample name
+            if first_sample_pass2.is_none() {
+                first_sample_pass2 = Some(sample_name.clone());
+            }
+
+            // Stop when we see a different sample
+            if first_sample_pass2.as_ref() != Some(&sample_name) {
+                break;
+            }
+
+            if !sequence.is_empty() {
+                let used = find_actual_splitters_in_contig_named(&sequence, &_contig_name, &candidates, k, segment_size);
+                splitters.extend(used);
+            }
+        }
+    }
+
+    eprintln!("DEBUG: {} actually-used splitters from first sample", splitters.len());
+
+    Ok((splitters, candidates, duplicates))
+}
+
 /// Find which candidate k-mers are actually used as splitters in a contig (with name for debugging)
 fn find_actual_splitters_in_contig_named(
     contig: &Contig,

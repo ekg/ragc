@@ -501,8 +501,8 @@ pub use segment_compression::{
     decompress_segment_with_marker,
 };
 pub use splitters::{
-    determine_splitters, determine_splitters_streaming, find_candidate_kmers_multi, is_hard_contig,
-    is_splitter, two_pass_splitter_discovery,
+    determine_splitters, determine_splitters_streaming, determine_splitters_streaming_first_sample,
+    find_candidate_kmers_multi, is_hard_contig, is_splitter, two_pass_splitter_discovery,
 };
 pub use agc_compressor::{QueueStats, StreamingQueueCompressor, StreamingQueueConfig};
 pub use worker::create_agc_archive;

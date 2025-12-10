@@ -543,8 +543,18 @@ fn create_archive(
                 segment_size as usize,
                 verbosity as usize,
             )?
+        } else if inputs.len() == 1 {
+            // Single-file PanSN mode: Use splitters from FIRST SAMPLE only
+            // This matches multi-file behavior where first file = reference sample
+            let (splitters, _singletons, _duplicates) =
+                ragc_core::determine_splitters_streaming_first_sample(
+                    &inputs[0],
+                    kmer_length as usize,
+                    segment_size as usize,
+                )?;
+            splitters
         } else {
-            // Non-adaptive mode: Use splitters from reference file ONLY
+            // Multi-file mode: Use splitters from first file (reference sample)
             // (matches C++ AGC default behavior - agc_compressor.cpp:428-563)
             let (splitters, _singletons, _duplicates) =
                 ragc_core::determine_splitters_streaming(
@@ -564,42 +574,103 @@ fn create_archive(
         let mut compressor =
             StreamingQueueCompressor::with_splitters(output_str, config, splitters)?;
 
-        // CRITICAL: Process reference sample (first file) completely BEFORE other samples
+        // CRITICAL: Process reference sample completely BEFORE other samples
         // This matches C++ AGC architecture and ensures splits work correctly.
         // C++ AGC loads the entire reference sample first, creating all its segment groups
         // and terminators, then processes remaining samples. This allows splits to find
         // target groups that already exist in map_segments.
 
-        if verbosity > 0 {
-            eprintln!("Processing reference sample (first input): {:?}", inputs[0]);
-        }
+        if inputs.len() == 1 {
+            // SINGLE-FILE MODE: Stream through file, treating sample name changes as boundaries
+            // This handles PanSN files with multiple samples (e.g., >sample1#0#chr1, >sample2#0#chr1)
+            // Requires samples to be sorted (all of sample1, then all of sample2, etc.)
+            if verbosity > 0 {
+                eprintln!("Single-file PanSN mode: detecting sample boundaries from headers");
+                eprintln!("Processing input: {:?}", inputs[0]);
+            }
 
-        // Process ONLY the first file (reference sample)
-        let mut ref_iterator = MultiFileIterator::new(vec![inputs[0].clone()])?;
-        while let Some((sample_name, contig_name, sequence)) = ref_iterator.next_contig()? {
-            if !sequence.is_empty() {
+            let mut file_iterator = MultiFileIterator::new(vec![inputs[0].clone()])?;
+            let mut current_sample: Option<String> = None;
+            let mut seen_samples: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut sample_count = 0;
+            let mut is_reference_done = false;
+
+            while let Some((sample_name, contig_name, sequence)) = file_iterator.next_contig()? {
+                if sequence.is_empty() {
+                    continue;
+                }
+
+                // Check if sample changed
+                let sample_changed = current_sample.as_ref() != Some(&sample_name);
+
+                if sample_changed {
+                    // Verify samples are sorted (no revisiting)
+                    if seen_samples.contains(&sample_name) {
+                        anyhow::bail!(
+                            "Single-file PanSN mode requires samples to be sorted by name.\n\
+                             Saw sample '{}' again after seeing other samples.\n\
+                             Please sort your FASTA file by sample name (e.g., using: ragc sort-fasta).",
+                            sample_name
+                        );
+                    }
+
+                    // If we've completed the reference sample, drain before continuing
+                    if !is_reference_done && current_sample.is_some() {
+                        if verbosity > 0 {
+                            eprintln!("Reference sample queued - waiting for processing to complete...");
+                        }
+                        compressor.drain()?;
+                        is_reference_done = true;
+                        if verbosity > 0 {
+                            eprintln!("Reference sample complete!");
+                        }
+                    }
+
+                    // Mark previous sample as seen
+                    if let Some(prev) = current_sample.take() {
+                        seen_samples.insert(prev);
+                    }
+
+                    // Start new sample
+                    sample_count += 1;
+                    if verbosity > 0 {
+                        eprintln!("Processing sample {}: {}", sample_count, sample_name);
+                    }
+                    current_sample = Some(sample_name.clone());
+                }
+
                 compressor.push(sample_name, contig_name, sequence)?;
             }
-        }
 
-        // Wait for reference sample to be completely processed
-        // This ensures all reference groups and terminators are created before
-        // we start processing other samples
-        if verbosity > 0 {
-            eprintln!("Reference sample queued - waiting for processing to complete...");
-        }
-        compressor.drain()?;
+            if verbosity > 0 {
+                eprintln!("Processed {} samples from single file", sample_count);
+            }
+        } else {
+            // MULTI-FILE MODE: Each file is a separate sample
+            if verbosity > 0 {
+                eprintln!("Processing reference sample (first input): {:?}", inputs[0]);
+            }
 
-        if verbosity > 0 {
-            eprintln!("Reference sample complete! Processing remaining {} samples...", inputs.len() - 1);
-            eprintln!();
-        }
+            // Process ONLY the first file (reference sample)
+            let mut ref_iterator = MultiFileIterator::new(vec![inputs[0].clone()])?;
+            while let Some((sample_name, contig_name, sequence)) = ref_iterator.next_contig()? {
+                if !sequence.is_empty() {
+                    compressor.push(sample_name, contig_name, sequence)?;
+                }
+            }
 
-        // Now process remaining samples ONE FILE AT A TIME (matching C++ AGC batch processing)
-        // At this point, all reference groups exist, so splits can happen
-        // CRITICAL: Process each file separately to match C++ AGC's batch boundaries
-        // This ensures segments are added to groups in file order (not interleaved)
-        if inputs.len() > 1 {
+            // Wait for reference sample to be completely processed
+            if verbosity > 0 {
+                eprintln!("Reference sample queued - waiting for processing to complete...");
+            }
+            compressor.drain()?;
+
+            if verbosity > 0 {
+                eprintln!("Reference sample complete! Processing remaining {} samples...", inputs.len() - 1);
+                eprintln!();
+            }
+
+            // Process remaining samples ONE FILE AT A TIME
             for input_file in &inputs[1..] {
                 if verbosity > 0 {
                     eprintln!("Processing sample file: {:?}", input_file);
@@ -611,9 +682,6 @@ fn create_archive(
                         compressor.push(sample_name, contig_name, sequence)?;
                     }
                 }
-
-                // Note: No drain() here - synchronization happens every 50 contigs within streaming queue
-                // to match C++ AGC's max_no_contigs_before_synchronization = pack_cardinality
 
                 if verbosity > 0 {
                     eprintln!("Sample complete!\n");
