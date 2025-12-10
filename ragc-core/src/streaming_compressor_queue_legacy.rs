@@ -1050,8 +1050,10 @@ impl StreamingQueueCompressor {
 
         // Push to queue (BLOCKS if queue is full!)
         // Queue is now a priority queue - highest priority processed first
-        eprintln!("[RAGC PUSH] sample={} contig={} priority={} cost={} sequence={}",
-                  &task.sample_name, &task.contig_name, task.sample_priority, task.cost, task.sequence);
+        if self.config.verbosity > 2 {
+            eprintln!("[RAGC PUSH] sample={} contig={} priority={} cost={} sequence={}",
+                      &task.sample_name, &task.contig_name, task.sample_priority, task.cost, task.sequence);
+        }
         self.queue
             .push(task, task_size)
             .context("Failed to push to queue")?;
@@ -2665,7 +2667,9 @@ fn worker_thread(
             break;
         };
 
-        eprintln!("[RAGC POP] worker={} sample={} contig={}", worker_id, &task.sample_name, &task.contig_name);
+        if config.verbosity > 2 {
+            eprintln!("[RAGC POP] worker={} sample={} contig={}", worker_id, &task.sample_name, &task.contig_name);
+        }
 
         // Handle sync tokens with barrier synchronization (matches C++ AGC registration stage)
         if task.is_sync_token {
@@ -2788,17 +2792,19 @@ fn worker_thread(
             // (agc_compressor.cpp lines 1306-1327)
             use crate::segment::MISSING_KMER;
 
-            // Precompute reverse complement for all cases that might need it
+            // Helper to compute reverse complement lazily (only when needed)
             // Segment data uses numeric encoding: 0=A, 1=C, 2=G, 3=T
-            let segment_data_rc: Vec<u8> = segment.data.iter().rev().map(|&base| {
-                match base {
-                    0 => 3, // A -> T
-                    1 => 2, // C -> G
-                    2 => 1, // G -> C
-                    3 => 0, // T -> A
-                    _ => base, // N or other non-ACGT
-                }
-            }).collect();
+            let compute_rc = |data: &[u8]| -> Vec<u8> {
+                data.iter().rev().map(|&base| {
+                    match base {
+                        0 => 3, // A -> T
+                        1 => 2, // C -> G
+                        2 => 1, // G -> C
+                        3 => 0, // T -> A
+                        _ => base, // N or other non-ACGT
+                    }
+                }).collect()
+            };
 
             let (key_front, key_back, should_reverse) =
                 if segment.front_kmer != MISSING_KMER && segment.back_kmer != MISSING_KMER {
@@ -2839,6 +2845,7 @@ fn worker_thread(
                         eprintln!("RAGC_CASE3A_CALL: contig={} seg_part={} front_kmer={} front_kmer_is_dir={}",
                             task.contig_name, place, segment.front_kmer, segment.front_kmer_is_dir);
                     }
+                    let segment_data_rc = compute_rc(&segment.data);
                     let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
                         segment.front_kmer,
                         segment.front_kmer_is_dir, // Use actual orientation from segment detection
@@ -2891,6 +2898,7 @@ fn worker_thread(
                     // C++ AGC line 1344 passes (segment_rc, segment) to find_cand_segment_with_one_splitter
                     // and then inverts the result: store_rc = !store_dir
                     // So we swap the segment parameters here AND invert sr below
+                    let segment_data_rc = compute_rc(&segment.data);
                     let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
                         segment.back_kmer, // Use original k-mer value
                         kmer_is_dir_after_swap, // Inverted due to swap_dir_rc()
@@ -2938,6 +2946,7 @@ fn worker_thread(
                     let mut sr = false;
 
                     if fallback_filter.is_enabled() {
+                        let segment_data_rc = compute_rc(&segment.data);
                         let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
                             &segment.data,
                             &segment_data_rc,
