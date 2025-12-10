@@ -3,8 +3,8 @@
 
 #![allow(clippy::same_item_push)]
 
+use ahash::AHashMap;
 use ragc_common::{hash::MurMur64Hash, types::Contig};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Debug counters for comparing with C++ AGC
@@ -36,7 +36,7 @@ pub struct LZDiff {
     reference: Vec<u8>,
     reference_len: usize,       // Original length before padding
     // Legacy map used by encode/decode paths (OK if not bit-identical)
-    ht: HashMap<u64, Vec<u32>>, // Hash table: kmer_hash -> list of positions (legacy)
+    ht: AHashMap<u64, Vec<u32>>, // Hash table: kmer_hash -> list of positions (legacy)
     // Linear-probing table for exact coding-cost matching with C++
     ht_lp: Vec<u32>,            // stores (i / HASHING_STEP) or u32::MAX for empty
     ht_mask: u64,
@@ -58,7 +58,7 @@ impl LZDiff {
         LZDiff {
             reference: Vec::new(),
             reference_len: 0,
-            ht: HashMap::new(),
+            ht: AHashMap::new(),
             ht_lp: Vec::new(),
             ht_mask: 0,
             min_match_len,
@@ -82,7 +82,7 @@ impl LZDiff {
         // Each entry in ht corresponds to one k-mer position (every HASHING_STEP bases)
         let expected_entries = (self.reference.len() / HASHING_STEP) + 1;
         if self.ht.capacity() < expected_entries {
-            self.ht = HashMap::with_capacity(expected_entries);
+            self.ht = AHashMap::with_capacity(expected_entries);
         }
 
         self.build_index();

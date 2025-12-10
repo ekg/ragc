@@ -5,7 +5,7 @@
 //!
 //! See docs/INLINE_SEGMENTATION_PATTERN.md for detailed C++ AGC analysis.
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use crate::kmer::{Kmer, KmerMode};
 use crate::segment_buffer::BufferedSegments;
 use std::sync::{Arc, Mutex};
@@ -35,8 +35,8 @@ pub struct CompressionContext {
     pub buffered_segments: Arc<Mutex<BufferedSegments>>,
     pub kmer_length: usize,
     pub adaptive_mode: bool,
-    pub map_segments: Arc<Mutex<std::collections::HashMap<(u64, u64), u32>>>,
-    pub map_segments_terminators: Arc<Mutex<std::collections::HashMap<u64, Vec<u64>>>>,
+    pub map_segments: Arc<Mutex<AHashMap<(u64, u64), u32>>>,
+    pub map_segments_terminators: Arc<Mutex<AHashMap<u64, Vec<u64>>>>,
     pub concatenated_genomes: bool,
 }
 

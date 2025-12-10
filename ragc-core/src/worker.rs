@@ -8,8 +8,7 @@ use crate::segment_compression::compress_reference_segment;
 use crate::task::{ContigProcessingStage, Task};
 use crate::zstd_pool::compress_segment_pooled;
 use ragc_common::{Archive, Contig};
-use ahash::AHashSet;
-use std::collections::HashMap;
+use ahash::{AHashMap, AHashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -146,12 +145,12 @@ pub struct SharedCompressorState {
     /// Map: (kmer1, kmer2) → group_id
     /// Matches C++ AGC's map_segments
     /// Lower group_id wins when same (k1, k2) pair (earlier samples are reference)
-    pub map_segments: Arc<Mutex<HashMap<(u64, u64), u32>>>,
+    pub map_segments: Arc<Mutex<AHashMap<(u64, u64), u32>>>,
 
     /// Map: kmer → Vec<kmer> (sorted terminators)
     /// Matches C++ AGC's map_segments_terminators
     /// Used for split detection: find shared terminators between k1 and k2
-    pub map_segments_terminators: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    pub map_segments_terminators: Arc<Mutex<AHashMap<u64, Vec<u64>>>>,
 
     /// Concatenated genomes mode (treat all contigs as one sample)
     pub concatenated_genomes: bool,
@@ -219,8 +218,8 @@ impl SharedCompressorState {
             v_duplicated_kmers: Vec::new(),
             kmer_length,
             adaptive_mode,
-            map_segments: Arc::new(Mutex::new(HashMap::new())),
-            map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
+            map_segments: Arc::new(Mutex::new(AHashMap::new())),
+            map_segments_terminators: Arc::new(Mutex::new(AHashMap::new())),
             concatenated_genomes,
             no_segments: Arc::new(Mutex::new(0)),
             no_raw_groups,
@@ -1147,8 +1146,8 @@ fn compress_samples_streaming_with_archive(
         v_duplicated_kmers,
         kmer_length,
         adaptive_mode,
-        map_segments: Arc::new(Mutex::new(HashMap::new())),
-        map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
+        map_segments: Arc::new(Mutex::new(AHashMap::new())),
+        map_segments_terminators: Arc::new(Mutex::new(AHashMap::new())),
         concatenated_genomes,
         no_segments: Arc::new(Mutex::new(0)),
         no_raw_groups: 0,

@@ -1,6 +1,7 @@
 // Buffered segment storage matching C++ AGC's CBufferedSegPart
 // Reference: agc_compressor.h lines 27-536
 
+use ahash::AHashMap;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Mutex;
@@ -258,7 +259,7 @@ impl BufferedSegments {
     /// Matches C++ AGC's CBufferedSegPart::process_new (agc_compressor.h:384-415)
     ///
     /// Returns: Number of NEW groups created
-    pub fn process_new(&mut self, map_segments: &std::sync::Mutex<std::collections::HashMap<(u64, u64), u32>>) -> u32 {
+    pub fn process_new(&mut self, map_segments: &std::sync::Mutex<AHashMap<(u64, u64), u32>>) -> u32 {
         let _lock = self.resize_mtx.lock().unwrap();
         let mut s_seg_part = self.s_seg_part.lock().unwrap();
 
@@ -269,7 +270,7 @@ impl BufferedSegments {
         // Assign group IDs to unique (kmer1, kmer2) pairs
         // CRITICAL FIX: Check global map_segments FIRST before assigning new group IDs
         let global_map = map_segments.lock().unwrap();
-        let mut m_kmers = std::collections::HashMap::new();
+        let mut m_kmers = AHashMap::new();
         let mut group_id = self.vl_seg_part.len() as u32;
 
         for part in s_seg_part.iter() {
