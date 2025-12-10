@@ -1325,7 +1325,7 @@ fn flush_pack(
         // Remove first segment (alphabetically first after sorting) to use as reference
         let ref_seg = buffer.segments.remove(0);
 
-        if std::env::var("RAGC_DEBUG_REF_WRITE").is_ok() {
+        if crate::env_cache::debug_ref_write() {
             eprintln!(
                 "DEBUG_REF_WRITE: group={} sample={} contig={} seg={} data_len={} segments_remaining={}",
                 buffer.group_id, ref_seg.sample_name, ref_seg.contig_name,
@@ -1440,7 +1440,7 @@ fn flush_pack(
         compressed.push(0); // Marker 0 = plain ZSTD
 
         // Debug: Log compression sizes at each stage
-        if std::env::var("RAGC_DEBUG_COMPRESSION_SIZES").is_ok() {
+        if crate::env_cache::debug_compression_sizes() {
             eprintln!("COMPRESS_PACK: group={} raw_segments={} lz_encoded={} zstd_compressed={} ratio={:.2}%",
                 buffer.group_id,
                 buffer.segments.iter().map(|s| s.data.len()).sum::<usize>(),
@@ -1482,7 +1482,7 @@ fn flush_pack(
 
             // Compare with C++ AGC encode (TEST HARNESS)
             #[cfg(feature = "cpp_agc")]
-            if std::env::var("RAGC_TEST_LZ_ENCODING").is_ok() {
+            if crate::env_cache::test_lz_encoding() {
                 if let Some(ref_seg) = &buffer.reference_segment {
                     if let Some(cpp_encoded) = crate::ragc_ffi::lzdiff_v2_encode(
                         &ref_seg.data,
@@ -1676,7 +1676,7 @@ fn write_reference_immediately(
 ) -> Result<()> {
     use crate::segment_compression::compress_reference_segment;
 
-    if std::env::var("RAGC_DEBUG_REF_WRITE").is_ok() {
+    if crate::env_cache::debug_ref_write() {
         eprintln!(
             "DEBUG_REF_IMMEDIATE: group={} sample={} contig={} seg={} data_len={}",
             buffer.group_id, segment.sample_name, segment.contig_name,
@@ -1796,7 +1796,7 @@ fn find_group_with_one_kmer(
                 // No connections found - create new group with MISSING
                 // Match C++ AGC lines 1671-1679: check is_dir_oriented()
                 // Debug: log entry to no-connection path
-                if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+                if crate::env_cache::debug_is_dir() {
                     eprintln!("RAGC_FIND_GROUP_NO_CONN: kmer={} kmer_is_dir={}", kmer, kmer_is_dir);
                 }
                 if kmer_is_dir {
@@ -1824,7 +1824,7 @@ fn find_group_with_one_kmer(
             kmer, connected_kmers.len());
     }
     // Debug: log connections found
-    if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+    if crate::env_cache::debug_is_dir() {
         eprintln!("RAGC_FIND_GROUP_FOUND_CONN: kmer={} kmer_is_dir={} connections={:?}",
             kmer, kmer_is_dir, connected_kmers);
     }
@@ -1871,7 +1871,7 @@ fn find_group_with_one_kmer(
                 // CRITICAL FIX: Check BOTH seg_map (global) AND groups (batch-local)
                 // This matches C++ AGC behavior where groups created in same batch are visible
                 // Debug: trace candidate lookup
-                if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+                if crate::env_cache::debug_is_dir() {
                     eprintln!("RAGC_FIND_GROUP_CAND_CHECK: cand_key=({},{}) exists_in_seg_map={} exists_in_groups={}",
                         key_front, key_back, seg_map.contains_key(&cand_key), groups.contains_key(&cand_key));
                 }
@@ -1912,7 +1912,7 @@ fn find_group_with_one_kmer(
     if candidates.is_empty() {
         // No existing groups found - create new with MISSING
         // Must match C++ AGC is_dir_oriented logic (same as no-connections case above)
-        if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+        if crate::env_cache::debug_is_dir() {
             if kmer_is_dir {
                 eprintln!("RAGC_FIND_GROUP_NO_CAND: kmer={} kmer_is_dir={} -> returning ({},MISSING,false)",
                     kmer, kmer_is_dir, kmer);
@@ -2562,7 +2562,7 @@ fn flush_batch(
             let mut global_map = map_segments.lock().unwrap();
             if let Some(&existing_group_id) = global_map.get(&pend.key) {
                 // Use existing group
-                if std::env::var("RAGC_TRACE_GROUP").is_ok() {
+                if crate::env_cache::trace_group() {
                     eprintln!("GROUPING_LOOKUP_HIT: sample={} contig={} place={} front={} back={} found_group={}",
                         pend.sample_name, pend.contig_name, pend.place,
                         pend.key.kmer_front, pend.key.kmer_back, existing_group_id);
@@ -2572,7 +2572,7 @@ fn flush_batch(
             } else {
                 // Create new group
                 let new_group_id = group_counter.fetch_add(1, Ordering::SeqCst);
-                if std::env::var("RAGC_TRACE_GROUP").is_ok() {
+                if crate::env_cache::trace_group() {
                     eprintln!("GROUPING_LOOKUP_MISS: sample={} contig={} place={} front={} back={} creating_group={} (map has {} entries)",
                         pend.sample_name, pend.contig_name, pend.place,
                         pend.key.kmer_front, pend.key.kmer_back, new_group_id, global_map.len());
@@ -2596,7 +2596,7 @@ fn flush_batch(
         }
 
         // TRACE: Log when segments from AAA#0 are registered
-        if std::env::var("RAGC_TRACE_GROUP").is_ok() && pend.sample_name.contains("AAA#0") {
+        if crate::env_cache::trace_group() && pend.sample_name.contains("AAA#0") {
             let global_map = map_segments.lock().unwrap();
             eprintln!("TRACE_REGISTER: sample={} contig={} place={} front={} back={} group_id={} (map_segments now has {} entries)",
                 pend.sample_name, pend.contig_name, pend.place,
@@ -2879,7 +2879,7 @@ fn worker_thread(
         }
 
         // TRACE: Log map_segments state when AAB#0 chrI arrives
-        if std::env::var("RAGC_TRACE_GROUP").is_ok() && task.sample_name.contains("AAB#0") && task.contig_name.contains("chrI") {
+        if crate::env_cache::trace_group() && task.sample_name.contains("AAB#0") && task.contig_name.contains("chrI") {
             let seg_map = map_segments.lock().unwrap();
             eprintln!("TRACE_LOOKUP: Processing {} {} - map_segments has {} entries",
                 task.sample_name, task.contig_name, seg_map.len());
@@ -3016,7 +3016,7 @@ fn worker_thread(
                     eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} front_is_dir={} back=MISSING -> finding best group",
                         task.sample_name, segment.front_kmer, segment.front_kmer_is_dir);
                     // Debug: trace is_dir value before find_group call
-                    if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() {
+                    if crate::env_cache::debug_is_dir() {
                         eprintln!("RAGC_CASE3A_CALL: contig={} seg_part={} front_kmer={} front_kmer_is_dir={}",
                             task.contig_name, place, segment.front_kmer, segment.front_kmer_is_dir);
                     }
@@ -3190,10 +3190,10 @@ fn worker_thread(
                 // CRITICAL: C++ AGC lines 1374-1378 skip segment splitting when front == back!
                 // When front == back, it just sets store_rc based on orientation, does NOT call
                 // find_cand_segment_with_missing_middle_splitter. We must do the same.
-                let split_allowed = if std::env::var("RAGC_SPLIT_ALL").as_deref() == Ok("1") { true } else { !key_exists };
+                let split_allowed = if crate::env_cache::split_all() { true } else { !key_exists };
 
                 // Debug: trace split decision
-                if std::env::var("RAGC_DEBUG_SPLIT").is_ok() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
+                if crate::env_cache::debug_split() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
                     eprintln!("RAGC_SPLIT_CHECK: contig={} seg={} key=({},{}) key_exists={} split_allowed={} front_missing={} back_missing={} front==back={}",
                         task.contig_name, place, key_front, key_back, key_exists, split_allowed,
                         key_front == MISSING_KMER, key_back == MISSING_KMER, key_front == key_back);
@@ -3207,7 +3207,7 @@ fn worker_thread(
                         let terminators = map_segments_terminators.lock().unwrap();
                         let result = find_middle_splitter(key_front, key_back, &terminators);
                         // Debug: trace middle splitter result
-                        if std::env::var("RAGC_DEBUG_SPLIT").is_ok() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
+                        if crate::env_cache::debug_split() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
                             let front_conn = terminators.get(&key_front).map(|v| v.len()).unwrap_or(0);
                             let back_conn = terminators.get(&key_back).map(|v| v.len()).unwrap_or(0);
                             eprintln!("RAGC_SPLIT_MIDDLE: contig={} seg={} key=({},{}) middle={:?} front_conn={} back_conn={}",
@@ -3235,7 +3235,7 @@ fn worker_thread(
                         // (This is the key difference from just checking terminators!)
 
                         // Debug: trace middle found
-                        if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+                        if crate::env_cache::debug_split() {
                             eprintln!("RAGC_SPLIT_FOUND_MIDDLE: contig={} seg={} middle={}", task.contig_name, place, middle_kmer);
                         }
 
@@ -3276,7 +3276,7 @@ fn worker_thread(
                         // Set RAGC_SPLIT_CREATE_GROUPS=1 to enable creating new groups during split
                         // This is needed for streaming mode where non-reference samples may create
                         // new segment groups that the reference sample didn't have.
-                        let allow_create_groups = std::env::var("RAGC_SPLIT_CREATE_GROUPS").as_deref() == Ok("1");
+                        let allow_create_groups = crate::env_cache::split_create_groups();
 
                         if !left_exists || !right_exists {
                             // Skip split - one or both target groups don't exist yet
@@ -3289,7 +3289,7 @@ fn worker_thread(
                                     right_key.kmer_front, right_key.kmer_back, right_exists, allow_create_groups
                                 );
                             }
-                            if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+                            if crate::env_cache::debug_split() {
                                 eprintln!(
                                     "RAGC_SPLIT_SKIP_NO_GROUP: left=({},{}) exists={} right=({},{}) exists={} allow_create={}",
                                     left_key.kmer_front, left_key.kmer_back, left_exists,
@@ -3623,7 +3623,7 @@ fn worker_thread(
                             }
 
                             // Optional: assert lengths vs C++ archive if provided
-                            if let Ok(assert_path) = std::env::var("RAGC_ASSERT_CPP_ARCHIVE") {
+                            if let Some(assert_path) = crate::env_cache::assert_cpp_archive() {
                                 use crate::{Decompressor, DecompressorConfig};
                                 let mut dec = match Decompressor::open(&assert_path, DecompressorConfig{ verbosity: 0 }) {
                                     Ok(d) => d, Err(_) => {
@@ -3661,7 +3661,7 @@ fn worker_thread(
                                                         left_key.kmer_front, left_key.kmer_back,
                                                         right_key.kmer_front, right_key.kmer_back);
                                                     // Extended context (guarded by env to limit noise)
-                                                    if std::env::var("RAGC_ASSERT_VERBOSE").is_ok() {
+                                                    if crate::env_cache::assert_verbose() {
                                                         eprintln!("  CONTEXT: place={} orig_place={} emit_left_first={} should_reverse={}",
                                                             place, original_place, emit_left_first, should_reverse);
                                                         eprintln!("  GEOM: seg_len={} left_len={} right_len={} seg2_start={} left_end={}",
@@ -3704,7 +3704,7 @@ fn worker_thread(
                     };
 
                     // Debug: count how many segments could be eligible for secondary fallback
-                    if std::env::var("RAGC_DEBUG_FALLBACK2").as_deref() == Ok("1") {
+                    if crate::env_cache::debug_fallback2_enabled() {
                         if !key_exists_now && key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
                             eprintln!("SECONDARY_FB_CANDIDATE: sample={} contig={} place={} key=({},{})",
                                 task.sample_name, task.contig_name, place, key.kmer_front, key.kmer_back);
@@ -3734,7 +3734,7 @@ fn worker_thread(
                             &config,
                         );
 
-                        if std::env::var("RAGC_DEBUG_FALLBACK2").as_deref() == Ok("1") {
+                        if crate::env_cache::debug_fallback2_enabled() {
                             if fb_kf == MISSING_KMER || fb_kb == MISSING_KMER {
                                 eprintln!("SECONDARY_FB_NO_MATCH: orig_key=({},{})", key.kmer_front, key.kmer_back);
                             } else {
@@ -3870,7 +3870,7 @@ fn worker_thread(
 
                 // CSV logging for ALL segment grouping decisions (enabled via RAGC_GROUP_LOG=1)
                 // This logs every segment, including those joining existing batch-local groups
-                if std::env::var("RAGC_GROUP_LOG").as_deref() == Ok("1") {
+                if crate::env_cache::group_log() {
                     let source = if key_exists { "global" } else { "batch_or_new" };
                     eprintln!("SEGMENT_GROUP,{},{},{},{},{},{},{},{}",
                         task.sample_name, task.contig_name, place,
@@ -3943,7 +3943,7 @@ fn find_middle_splitter(
         if let Some(m) = crate::ragc_ffi::find_middle(front_connections, back_connections) {
             return Some(m);
         }
-        if std::env::var("RAGC_DEBUG_SPLIT_FIND").is_ok() {
+        if crate::env_cache::debug_split_find() {
             eprintln!(
                 "DEBUG_FIND_MIDDLE_MISS: front={} back={} front_conn={} back_conn={} shared=0",
                 front_kmer, back_kmer, front_connections.len(), back_connections.len()
@@ -3969,7 +3969,7 @@ fn find_middle_splitter(
                 j += 1;
             }
         }
-        if std::env::var("RAGC_DEBUG_SPLIT_FIND").is_ok() {
+        if crate::env_cache::debug_split_find() {
             eprintln!(
                 "DEBUG_FIND_MIDDLE_MISS: front={} back={} front_conn={} back_conn={} shared=0",
                 front_kmer, back_kmer, front_connections.len(), back_connections.len()
@@ -4081,7 +4081,7 @@ fn try_split_segment_with_cost(
     }
 
     // Debug: trace split attempt
-    if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+    if crate::env_cache::debug_split() {
         eprintln!("RAGC_SPLIT_TRY: front={} back={} middle={} left_key=({},{}) right_key=({},{})",
             front_kmer, back_kmer, middle_kmer,
             left_key.kmer_front, left_key.kmer_back,
@@ -4107,7 +4107,7 @@ fn try_split_segment_with_cost(
 
         if let Some(ref_data) = segment_id.and_then(|id| ref_segments_locked.get(&id)) {
             // Reference exists! Prepare LZDiff on-demand
-            if std::env::var("RAGC_DEBUG_SPLIT_REF").is_ok() {
+            if crate::env_cache::debug_split_ref() {
                 eprintln!(
                     "RAGC_SPLIT_REF: {}_key=({},{}) segment_id={:?} ref_size={} (ACTUAL)",
                     label, key.kmer_front, key.kmer_back, segment_id, ref_data.len()
@@ -4122,7 +4122,7 @@ fn try_split_segment_with_cost(
             // C++ AGC uses v_segments[0] which is initialized with empty_ctg = { 0x7f } (1 byte)
             // This gives maximum LZ cost (no compression matches possible)
             // Return LZDiff prepared with empty reference to match C++ AGC behavior
-            if std::env::var("RAGC_DEBUG_SPLIT_REF").is_ok() {
+            if crate::env_cache::debug_split_ref() {
                 eprintln!(
                     "RAGC_SPLIT_REF: {}_key=({},{}) segment_id={:?} ref_size=1 (EMPTY FALLBACK)",
                     label, key.kmer_front, key.kmer_back, segment_id
@@ -4376,7 +4376,7 @@ fn try_split_segment_with_cost(
         }
         } else {
         if config.verbosity > 1 { eprintln!("SPLIT_SKIP: left group has no reference yet"); }
-        if std::env::var("RAGC_DEBUG_SPLIT").is_ok() {
+        if crate::env_cache::debug_split() {
             eprintln!("RAGC_SPLIT_SKIP_LEFT: left_key=({},{}) has no reference", left_key.kmer_front, left_key.kmer_back);
         }
         return None;
@@ -4477,7 +4477,7 @@ fn try_split_segment_with_cost(
     };
 
     #[cfg(feature = "verbose_debug")]
-    if std::env::var("RAGC_DEBUG_SPLIT_MAP").is_ok() && maybe_best.is_none() {
+    if crate::env_cache::debug_split_map() && maybe_best.is_none() {
         let start = best_pos.saturating_sub(3);
         let end = (best_pos + 4).min(v_costs1.len());
         eprintln!("RAGC_COST_WINDOW: len={} best_pos={}", v_costs1.len(), best_pos);

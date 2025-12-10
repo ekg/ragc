@@ -83,7 +83,7 @@ pub fn compress_reference_segment(data: &Contig) -> Result<(PackedBlock, u8)> {
     let repetitiveness = check_repetitiveness(data);
 
     // Debug logging for reference compression decisions
-    let debug_ref = std::env::var("RAGC_DEBUG_REF").is_ok();
+    let debug_ref = crate::env_cache::debug_ref();
     if debug_ref {
         eprintln!("RAGC_REF_COMPRESS: len={} rep={:.4} threshold={:.4}",
             data.len(), repetitiveness, REPETITIVENESS_THRESHOLD);

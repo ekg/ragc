@@ -117,6 +117,7 @@
 //! - SHA256-verified roundtrip testing
 
 pub mod bloom_filter;
+pub mod env_cache;
 pub mod contig_compression;
 pub mod contig_iterator;
 pub mod decompressor;

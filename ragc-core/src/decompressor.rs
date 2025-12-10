@@ -405,7 +405,7 @@ impl Decompressor {
     fn reconstruct_contig(&mut self, segments: &[SegmentDesc]) -> Result<Contig> {
         let mut contig = Contig::new();
         #[cfg(feature = "verbose_debug")]
-        let should_debug = std::env::var("RAGC_DEBUG_RECONSTRUCT").is_ok() && segments.len() > 1;
+        let should_debug = crate::env_cache::debug_reconstruct() && segments.len() > 1;
         #[cfg(not(feature = "verbose_debug"))]
         let should_debug = false;
 
@@ -662,7 +662,7 @@ impl Decompressor {
             };
 
             // Debug: check for corruption pattern (AAAA = zeros)
-            if std::env::var("RAGC_DEBUG_DECODE").is_ok() {
+            if crate::env_cache::debug_decode() {
                 // Critical: check if decoded length mismatches raw_length
                 if decoded.len() as u32 != desc.raw_length {
                     eprintln!("RAGC_DEBUG_DECODE_MISMATCH: group={} in_group={} raw_len={} decoded_len={} ref_len={} lz_encoded_len={}",

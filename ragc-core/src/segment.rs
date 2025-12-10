@@ -79,7 +79,7 @@ pub fn split_at_splitters_with_size(
     k: usize,
     _min_segment_size: usize,
 ) -> Vec<Segment> {
-    let debug = std::env::var("RAGC_DEBUG_SEGMENT_COVERAGE").is_ok();
+    let debug = crate::env_cache::debug_segment_coverage();
     if debug {
         eprintln!("\n=== SEGMENTATION START: contig_len={} k={} ===", contig.len(), k);
     }
@@ -123,7 +123,7 @@ pub fn split_at_splitters_with_size(
                 // During SEGMENTATION, we split at every occurrence without distance check.
 
                 // DEBUG: Trace positions near end of contig
-                if std::env::var("RAGC_DEBUG_ENDPOS").is_ok() && pos + 50 >= contig.len() {
+                if crate::env_cache::debug_endpos() && pos + 50 >= contig.len() {
                     let is_splitter = splitters.contains(&kmer_value);
                     let bytes_left = contig.len() - (pos + 1);
                     eprintln!("ENDPOS_TRACE: pos={} kmer={:#x} is_splitter={} bytes_left={} k={} contig_len={}",
@@ -132,7 +132,7 @@ pub fn split_at_splitters_with_size(
 
                 if splitters.contains(&kmer_value) {
                     // Comprehensive split logging for debugging
-                    if std::env::var("RAGC_TRACE_ALL_SPLITS").is_ok() {
+                    if crate::env_cache::trace_all_splits() {
                         let segment_len = (pos + 1) - segment_start;
                         eprintln!("RAGC_SPLIT: pos={} kmer={} segment_start={} segment_len={} contig_len={}",
                                   pos, kmer_value, segment_start, segment_len, contig.len());
@@ -156,7 +156,7 @@ pub fn split_at_splitters_with_size(
                             eprintln!("  MAIN_LOOP_SPLIT: segment=[{}..{}) len={}", segment_start, segment_end, segment_data.len());
                         }
                         #[cfg(feature = "verbose_debug")]
-                        if std::env::var("RAGC_DEBUG_OVERLAP").is_ok() {
+                        if crate::env_cache::debug_overlap() {
                             let first_5: Vec<u8> = segment_data.iter().take(5).copied().collect();
                             let last_5: Vec<u8> = segment_data.iter().rev().take(5).rev().copied().collect();
                             eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={} first_5={:?} last_5={:?}",
@@ -229,7 +229,7 @@ pub fn split_at_splitters_with_size(
                 if final_front == MISSING_KMER { "MISSING".to_string() } else { final_front.to_string() },
                 if final_back == MISSING_KMER { "MISSING".to_string() } else { final_back.to_string() });
             // Debug logging for Case 3 is_dir investigation
-            if std::env::var("RAGC_DEBUG_IS_DIR").is_ok() && final_back == MISSING_KMER && final_front != MISSING_KMER {
+            if crate::env_cache::debug_is_dir() && final_back == MISSING_KMER && final_front != MISSING_KMER {
                 eprintln!("RAGC_FINAL_SEG_IS_DIR: front_kmer={} front_kmer_is_dir={}", final_front, final_front_is_dir);
             }
             segments.push(Segment::new(segment_data, final_front, final_back, final_front_is_dir, final_back_is_dir));

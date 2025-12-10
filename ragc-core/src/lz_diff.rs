@@ -69,7 +69,7 @@ impl LZDiff {
 
     /// Prepare the encoder with a reference sequence
     pub fn prepare(&mut self, reference: &Contig) {
-        let debug_lz = std::env::var("RAGC_DEBUG_LZ").unwrap_or_default() == "1";
+        let debug_lz = crate::env_cache::debug_lz_enabled();
 
         self.reference = reference.clone();
         self.reference_len = reference.len(); // Store original length before padding
@@ -321,7 +321,7 @@ impl LZDiff {
         max_len: usize,
         no_prev_literals: usize,
     ) -> Option<(u32, u32, u32)> {
-        let debug_lz = std::env::var("RAGC_DEBUG_LZ").unwrap_or_default() == "1";
+        let debug_lz = crate::env_cache::debug_lz_enabled();
         if self.ht_lp.is_empty() { return None; }
 
         let mut best_ref_pos = 0u32;
@@ -434,7 +434,7 @@ impl LZDiff {
         let mut encoded = Vec::with_capacity(target.len() / 2);
 
         // Debug logging (only if RAGC_DEBUG_LZ=1)
-        let debug_lz = std::env::var("RAGC_DEBUG_LZ").unwrap_or_default() == "1";
+        let debug_lz = crate::env_cache::debug_lz_enabled();
         let mut match_count = 0u32;
         let mut literal_count = 0u32;
         let mut bang_count = 0u32;
@@ -637,7 +637,7 @@ impl LZDiff {
 
     /// Decode encoded sequence using reference
     pub fn decode(&self, encoded: &[u8]) -> Vec<u8> {
-        let debug_decode = std::env::var("RAGC_DEBUG_LZ_DECODE").is_ok();
+        let debug_decode = crate::env_cache::debug_lz_decode();
         let mut decoded = Vec::new();
         let mut pred_pos = 0usize;
         let mut i = 0;
@@ -694,7 +694,7 @@ impl LZDiff {
         }
 
         // Debug: trace when decoded is significantly longer than reference
-        if std::env::var("RAGC_DEBUG_LZ_DECODE_FULL").is_ok() && decoded.len() > self.reference_len + 50 {
+        if crate::env_cache::debug_lz_decode_full() && decoded.len() > self.reference_len + 50 {
             eprintln!("  LZ_DECODE_BLOAT: ref_len={} decoded_len={} encoded_len={}", self.reference_len, decoded.len(), encoded.len());
             eprintln!("    Encoded first 100 bytes: {:?}", &encoded[..encoded.len().min(100)]);
         }
