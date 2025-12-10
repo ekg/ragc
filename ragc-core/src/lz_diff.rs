@@ -3,7 +3,6 @@
 
 #![allow(clippy::same_item_push)]
 
-use ahash::AHashMap;
 use ragc_common::{hash::MurMur64Hash, types::Contig};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,8 +34,6 @@ const HASHING_STEP: usize = 4; // USE_SPARSE_HT mode
 pub struct LZDiff {
     reference: Vec<u8>,
     reference_len: usize,       // Original length before padding
-    // Legacy map used by encode/decode paths (OK if not bit-identical)
-    ht: AHashMap<u64, Vec<u32>>, // Hash table: kmer_hash -> list of positions (legacy)
     // Linear-probing table for exact coding-cost matching with C++
     ht_lp: Vec<u32>,            // stores (i / HASHING_STEP) or u32::MAX for empty
     ht_mask: u64,
@@ -58,7 +55,6 @@ impl LZDiff {
         LZDiff {
             reference: Vec::new(),
             reference_len: 0,
-            ht: AHashMap::new(),
             ht_lp: Vec::new(),
             ht_mask: 0,
             min_match_len,
@@ -77,15 +73,6 @@ impl LZDiff {
         self.reference
             .resize(self.reference.len() + self.key_len as usize, 31);
 
-        // Pre-allocate hash table capacity based on reference length
-        // to avoid repeated rehashing (major source of page faults!)
-        // Each entry in ht corresponds to one k-mer position (every HASHING_STEP bases)
-        let expected_entries = (self.reference.len() / HASHING_STEP) + 1;
-        if self.ht.capacity() < expected_entries {
-            self.ht = AHashMap::with_capacity(expected_entries);
-        }
-
-        self.build_index();
         self.build_index_lp();
 
         if debug_lz {
@@ -95,26 +82,6 @@ impl LZDiff {
             let filled = self.ht_lp.iter().filter(|&&x| x != u32::MAX).count();
             eprintln!("RAGC_LZ_PREPARE: ht_lp filled={}/{} ({:.1}%)",
                 filled, self.ht_lp.len(), 100.0 * filled as f64 / self.ht_lp.len() as f64);
-        }
-    }
-
-    /// Build hash table index for k-mers in reference
-    fn build_index(&mut self) {
-        self.ht.clear();
-        let ref_len = self.reference.len();
-
-        let mut i = 0;
-        while i + (self.key_len as usize) < ref_len {
-            if let Some(code) = self.get_code(&self.reference[i..]) {
-                let hash = MurMur64Hash::hash(code);
-                // Store i / HASHING_STEP (like C++ implementation)
-                // Pre-allocate capacity to avoid repeated 0→4→8→16 growths
-                self.ht
-                    .entry(hash)
-                    .or_insert_with(|| Vec::with_capacity(4))
-                    .push((i / HASHING_STEP) as u32);
-            }
-            i += HASHING_STEP;
         }
     }
 
@@ -250,65 +217,6 @@ impl LZDiff {
 
         // Reverse just the digits we added
         text[start_pos..].reverse();
-    }
-
-    /// Find best match using legacy map (used by encode)
-    fn find_best_match(
-        &self,
-        hash: u64,
-        target: &[u8],
-        text_pos: usize,
-        max_len: usize,
-        no_prev_literals: usize,
-    ) -> Option<(u32, u32, u32)> {
-        // Returns (ref_pos, len_bck, len_fwd)
-
-        let positions = self.ht.get(&hash)?;
-
-        let mut best_ref_pos = 0;
-        let mut best_len_bck = 0;
-        let mut best_len_fwd = 0;
-        let mut min_to_update = self.min_match_len as usize;
-
-        for &pos in positions.iter().take(MAX_NO_TRIES) {
-            let h_pos = (pos as usize) * HASHING_STEP;
-
-            // Bounds check
-            if h_pos >= self.reference.len() {
-                continue;
-            }
-
-            let ref_ptr = &self.reference[h_pos..];
-            let text_ptr = &target[text_pos..];
-
-            // Forward match
-            let f_len = Self::matching_length(text_ptr, ref_ptr, max_len);
-
-            if f_len >= self.key_len as usize {
-                // Backward match
-                let mut b_len = 0;
-                let max_back = no_prev_literals.min(h_pos).min(text_pos);
-                while b_len < max_back {
-                    if target[text_pos - b_len - 1] != self.reference[h_pos - b_len - 1] {
-                        break;
-                    }
-                    b_len += 1;
-                }
-
-                if b_len + f_len > min_to_update {
-                    best_len_bck = b_len as u32;
-                    best_len_fwd = f_len as u32;
-                    best_ref_pos = h_pos as u32;
-                    min_to_update = b_len + f_len;
-                }
-            }
-        }
-
-        if (best_len_bck + best_len_fwd) as usize >= self.min_match_len as usize {
-            Some((best_ref_pos, best_len_bck, best_len_fwd))
-        } else {
-            None
-        }
     }
 
     /// Find best match using linear-probing table (exactly like C++ for cost vectors)
@@ -455,8 +363,8 @@ impl LZDiff {
         }
 
         if debug_lz {
-            eprintln!("RAGC_LZ_START: ref_len={} target_len={} min_match={} ht_lp_size={} ht_legacy_size={}",
-                self.reference_len, target.len(), self.min_match_len, self.ht_lp.len(), self.ht.len());
+            eprintln!("RAGC_LZ_START: ref_len={} target_len={} min_match={} ht_lp_size={}",
+                self.reference_len, target.len(), self.min_match_len, self.ht_lp.len());
             eprintln!("RAGC_LZ_ENCODING_TRACE: Starting LZ encoding");
         }
 
@@ -856,11 +764,12 @@ impl LZDiff {
             }
 
             // Try to find match
-            let hash = MurMur64Hash::hash(x.unwrap());
+            let kmer_code = x.unwrap();
+            let hash = MurMur64Hash::hash(kmer_code);
             let max_len = text_size - i;
 
             if let Some((match_pos, len_bck, len_fwd)) =
-                self.find_best_match(hash, target, i, max_len, no_prev_literals)
+                self.find_best_match_lp(kmer_code, hash, target, i, max_len, no_prev_literals)
             {
                 // Handle backward extension
                 if len_bck > 0 {
