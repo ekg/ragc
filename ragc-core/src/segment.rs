@@ -99,23 +99,16 @@ pub fn split_at_splitters_with_size(
     let mut front_kmer = MISSING_KMER;
     let mut front_kmer_is_dir = false;
 
-    // Track recent k-mers for end-of-contig handling
-    // C++ AGC doesn't limit this - it accumulates all k-mers since last split
-    // Store (position, kmer_value, is_dir_oriented) to match C++ AGC's orientation logic
-    let mut recent_kmers: Vec<(usize, u64, bool)> = Vec::new();
-
     for (pos, &base) in contig.iter().enumerate() {
         if base > 3 {
             // Non-ACGT base, reset k-mer
             kmer.reset();
-            recent_kmers.clear();
         } else {
             kmer.insert(base as u64);
 
             if kmer.is_full() {
                 let kmer_value = kmer.data();
                 let is_dir = kmer.is_dir_oriented();
-                recent_kmers.push((pos, kmer_value, is_dir));
 
                 // CRITICAL FIX: C++ AGC splits at EVERY splitter occurrence!
                 // The distance check (current_len >= min_segment_size) only happens
@@ -184,7 +177,6 @@ pub fn split_at_splitters_with_size(
                     segment_start = new_start;
                     front_kmer = kmer_value;
                     front_kmer_is_dir = is_dir;
-                    recent_kmers.clear();
                     kmer.reset();
                 }
             }
