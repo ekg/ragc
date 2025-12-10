@@ -12,7 +12,7 @@ use ahash::AHashSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
 /// MurmurHash64A implementation matching C++ AGC's MurMur64Hash
@@ -433,8 +433,8 @@ pub struct StreamingQueueCompressor {
     raw_group_counter: Arc<AtomicU32>, // Round-robin counter for raw groups (0-15)
     reference_sample_name: Arc<Mutex<Option<String>>>, // First sample becomes reference
     // Segment splitting support (Phase 1)
-    map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id (BTreeMap for deterministic iteration)
-    map_segments_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>, // kmer -> [connected kmers] (BTreeMap for determinism)
+    map_segments: Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>, // (front, back) -> group_id (BTreeMap for deterministic iteration)
+    map_segments_terminators: Arc<RwLock<BTreeMap<u64, Vec<u64>>>>, // kmer -> [connected kmers] (BTreeMap for determinism)
 
     // FFI Grouping Engine - C++ AGC-compatible group assignment
     #[cfg(feature = "cpp_agc")]
@@ -443,12 +443,12 @@ pub struct StreamingQueueCompressor {
     // Persistent reference segment storage (matches C++ AGC v_segments)
     // Stores reference segment data even after groups are flushed, enabling LZ cost estimation
     // for subsequent samples (fixes multi-sample group fragmentation bug)
-    reference_segments: Arc<Mutex<BTreeMap<u32, Vec<u8>>>>, // group_id -> reference segment data (BTreeMap for determinism)
+    reference_segments: Arc<RwLock<BTreeMap<u32, Vec<u8>>>>, // group_id -> reference segment data (BTreeMap for determinism)
 
     // Reference orientation tracking - stores is_rev_comp for each group's reference segment
     // When a delta segment joins an existing group, it MUST use the same orientation as the reference
     // to ensure LZ encoding works correctly (fixes ZERO_MATCH bug in Case 3 terminator segments)
-    reference_orientations: Arc<Mutex<BTreeMap<u32, bool>>>, // group_id -> reference is_rev_comp (BTreeMap for determinism)
+    reference_orientations: Arc<RwLock<BTreeMap<u32, bool>>>, // group_id -> reference is_rev_comp (BTreeMap for determinism)
 
     // Track segment splits for renumbering subsequent segments
     // Maps (sample_name, contig_name, original_place) -> number of splits inserted before this position
@@ -456,7 +456,7 @@ pub struct StreamingQueueCompressor {
 
     // Priority assignment for interleaved processing (matches C++ AGC)
     // Higher priority = processed first (sample1 > sample2 > sample3...)
-    sample_priorities: Arc<Mutex<BTreeMap<String, i32>>>, // sample_name -> priority (BTreeMap for determinism)
+    sample_priorities: Arc<RwLock<BTreeMap<String, i32>>>, // sample_name -> priority (BTreeMap for determinism)
 
     // Track last sample to detect sample boundaries for sync token insertion
     last_sample_name: Arc<Mutex<Option<String>>>, // Last sample that was pushed
@@ -638,15 +638,15 @@ impl StreamingQueueCompressor {
             },
             0,
         );
-        let map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(initial_map_segments));
-        let map_segments_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let map_segments: Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(RwLock::new(initial_map_segments));
+        let map_segments_terminators: Arc<RwLock<BTreeMap<u64, Vec<u64>>>> = Arc::new(RwLock::new(BTreeMap::new()));
         let split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
         // Persistent reference segment storage (matches C++ AGC v_segments)
-        let reference_segments: Arc<Mutex<BTreeMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let reference_segments: Arc<RwLock<BTreeMap<u32, Vec<u8>>>> = Arc::new(RwLock::new(BTreeMap::new()));
 
         // Reference orientation tracking (fixes ZERO_MATCH bug in Case 3 terminator segments)
-        let reference_orientations: Arc<Mutex<BTreeMap<u32, bool>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let reference_orientations: Arc<RwLock<BTreeMap<u32, bool>>> = Arc::new(RwLock::new(BTreeMap::new()));
 
         // FFI Grouping Engine - C++ AGC-compatible group assignment
         #[cfg(feature = "cpp_agc")]
@@ -656,7 +656,7 @@ impl StreamingQueueCompressor {
         )));
 
         // Priority tracking for interleaved processing (matches C++ AGC)
-        let sample_priorities: Arc<Mutex<BTreeMap<String, i32>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let sample_priorities: Arc<RwLock<BTreeMap<String, i32>>> = Arc::new(RwLock::new(BTreeMap::new()));
         let last_sample_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None)); // Track last sample for boundary detection
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
         let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Increases for each contig (FASTA order)
@@ -956,7 +956,7 @@ impl StreamingQueueCompressor {
         // Higher priority = processed first (decreases for each new sample)
         // C++ AGC also decrements priority every 50 contigs WITHIN a sample (max_no_contigs_before_synchronization)
         let sample_priority = {
-            let mut priorities = self.sample_priorities.lock().unwrap();
+            let mut priorities = self.sample_priorities.write().unwrap();
             let current_priority = *priorities.entry(sample_name.clone()).or_insert_with(|| {
                 // First time seeing this sample - assign new priority
                 let mut next_p = self.next_priority.lock().unwrap();
@@ -1302,7 +1302,7 @@ fn flush_pack(
     collection: &Arc<Mutex<CollectionV3>>,
     archive: &Arc<Mutex<Archive>>,
     config: &StreamingQueueConfig,
-    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
 ) -> Result<()> {
     use crate::segment_compression::{compress_reference_segment, compress_segment_configured};
 
@@ -1386,7 +1386,7 @@ fn flush_pack(
         // Store reference in global map for split cost validation
         // This matches C++ AGC's v_segments which keeps all segment data in memory
         {
-            let mut ref_segs = reference_segments.lock().unwrap();
+            let mut ref_segs = reference_segments.write().unwrap();
             ref_segs.insert(buffer.group_id, ref_seg.data.clone());
         }
 
@@ -1671,8 +1671,8 @@ fn write_reference_immediately(
     buffer: &mut SegmentGroupBuffer,
     collection: &Arc<Mutex<CollectionV3>>,
     archive: &Arc<Mutex<Archive>>,
-    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
-    reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
+    reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
+    reference_orientations: &Arc<RwLock<BTreeMap<u32, bool>>>,
     config: &StreamingQueueConfig,
 ) -> Result<()> {
     use crate::segment_compression::compress_reference_segment;
@@ -1739,7 +1739,7 @@ fn write_reference_immediately(
     // 4b. Store reference data persistently (matching C++ AGC v_segments)
     // This enables LZ cost estimation for subsequent samples even after flush
     {
-        let mut ref_segs = reference_segments.lock().unwrap();
+        let mut ref_segs = reference_segments.write().unwrap();
         ref_segs.insert(buffer.group_id, segment.data.clone());
     }
 
@@ -1747,7 +1747,7 @@ fn write_reference_immediately(
     // When a delta segment joins this group later, it MUST use the same orientation
     // as the reference to ensure LZ encoding works correctly
     {
-        let mut ref_orients = reference_orientations.lock().unwrap();
+        let mut ref_orients = reference_orientations.write().unwrap();
         ref_orients.insert(buffer.group_id, segment.is_rev_comp);
     }
 
@@ -1779,10 +1779,10 @@ fn find_group_with_one_kmer(
     kmer_is_dir: bool,
     segment_data: &[u8],      // Segment data in forward orientation
     segment_data_rc: &[u8],   // Segment data in reverse complement
-    map_segments_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
-    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    map_segments_terminators: &Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
+    map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
-    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
 ) -> (u64, u64, bool) {
     let segment_len = segment_data.len();
@@ -1790,7 +1790,7 @@ fn find_group_with_one_kmer(
 
     // Look up kmer in terminators map to find connected k-mers
     let connected_kmers = {
-        let terminators = map_segments_terminators.lock().unwrap();
+        let terminators = map_segments_terminators.read().unwrap();
         match terminators.get(&kmer) {
             Some(vec) => vec.clone(),
             None => {
@@ -1836,8 +1836,8 @@ fn find_group_with_one_kmer(
 
     {
         let groups = segment_groups.lock().unwrap();
-        let seg_map = map_segments.lock().unwrap();
-        let ref_segs = reference_segments.lock().unwrap();
+        let seg_map = map_segments.read().unwrap();
+        let ref_segs = reference_segments.read().unwrap();
 
         for &cand_kmer in &connected_kmers {
             // Create candidate group key normalized (smaller, larger)
@@ -1988,8 +1988,8 @@ fn find_group_with_one_kmer(
 
     {
         let groups = segment_groups.lock().unwrap();
-        let seg_map = map_segments.lock().unwrap();
-        let ref_segs = reference_segments.lock().unwrap();
+        let seg_map = map_segments.read().unwrap();
+        let ref_segs = reference_segments.read().unwrap();
 
         for &(key_front, key_back, needs_rc, ref_size) in &candidates {
             let cand_key = SegmentGroupKey {
@@ -2195,9 +2195,9 @@ fn find_cand_segment_using_fallback_minimizers(
     min_shared_kmers: u64,
     fallback_filter: &FallbackFilter,
     map_fallback_minimizers: &Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
-    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
-    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
 ) -> (u64, u64, bool) {
     use crate::segment::MISSING_KMER;
@@ -2328,8 +2328,8 @@ fn find_cand_segment_using_fallback_minimizers(
 
     {
         let groups = segment_groups.lock().unwrap();
-        let seg_map = map_segments.lock().unwrap();
-        let ref_segs = reference_segments.lock().unwrap();
+        let seg_map = map_segments.read().unwrap();
+        let ref_segs = reference_segments.read().unwrap();
 
         for &(_count, (key_front, key_back)) in &pruned_candidates {
             // Normalize key
@@ -2506,14 +2506,14 @@ fn flush_batch(
     pending_batch_segments: &Arc<Mutex<Vec<PendingSegment>>>,
     batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
-    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
     group_counter: &Arc<AtomicU32>,
     raw_group_counter: &Arc<AtomicU32>, // FIX 17: Round-robin counter for raw groups (0-15)
-    map_segments_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
+    map_segments_terminators: &Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
     archive: &Arc<Mutex<Archive>>,
     collection: &Arc<Mutex<CollectionV3>>,
-    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
-    reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
+    reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
+    reference_orientations: &Arc<RwLock<BTreeMap<u32, bool>>>,
     #[cfg(feature = "cpp_agc")]
     grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     config: &StreamingQueueConfig,
@@ -2560,7 +2560,7 @@ fn flush_batch(
             raw_group_counter.fetch_add(1, Ordering::SeqCst) % NO_RAW_GROUPS
         } else {
             // Check if this k-mer pair already has a group assigned
-            let mut global_map = map_segments.lock().unwrap();
+            let mut global_map = map_segments.write().unwrap();
             if let Some(&existing_group_id) = global_map.get(&pend.key) {
                 // Use existing group
                 if crate::env_cache::trace_group() {
@@ -2592,13 +2592,13 @@ fn flush_batch(
 
         // Register orphan segments to global map (non-orphans already registered above)
         if pend.key.kmer_back == MISSING_KMER && pend.key.kmer_front == MISSING_KMER {
-            let mut global_map = map_segments.lock().unwrap();
+            let mut global_map = map_segments.write().unwrap();
             global_map.insert(pend.key.clone(), group_id);
         }
 
         // TRACE: Log when segments from AAA#0 are registered
         if crate::env_cache::trace_group() && pend.sample_name.contains("AAA#0") {
-            let global_map = map_segments.lock().unwrap();
+            let global_map = map_segments.read().unwrap();
             eprintln!("TRACE_REGISTER: sample={} contig={} place={} front={} back={} group_id={} (map_segments now has {} entries)",
                 pend.sample_name, pend.contig_name, pend.place,
                 pend.key.kmer_front, pend.key.kmer_back, group_id, global_map.len());
@@ -2710,7 +2710,7 @@ fn flush_batch(
     // Update global registry with batch-local groups (from existing group processing)
     {
         let batch_map = batch_local_groups.lock().unwrap();
-        let mut global_map = map_segments.lock().unwrap();
+        let mut global_map = map_segments.write().unwrap();
         for (key, group_id) in batch_map.iter() {
             global_map.entry(key.clone()).or_insert(*group_id);
         }
@@ -2720,7 +2720,7 @@ fn flush_batch(
     // This is where C++ AGC makes terminators visible for find_middle in subsequent samples
     {
         let batch_terms = batch_local_terminators.lock().unwrap();
-        let mut global_terms = map_segments_terminators.lock().unwrap();
+        let mut global_terms = map_segments_terminators.write().unwrap();
         for (kmer, connections) in batch_terms.iter() {
             let entry = global_terms.entry(*kmer).or_insert_with(Vec::new);
             entry.extend(connections.iter().cloned());
@@ -2748,9 +2748,9 @@ fn fix_orientation_for_group(
     data: &[u8],
     should_reverse: bool,
     _key: &SegmentGroupKey,
-    _map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    _map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
     _batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    _reference_orientations: &Arc<Mutex<BTreeMap<u32, bool>>>,
+    _reference_orientations: &Arc<RwLock<BTreeMap<u32, bool>>>,
 ) -> (Vec<u8>, bool) {
     // FIX 18: Do NOT adjust orientation to match reference - C++ AGC stores each segment
     // with its own computed is_rev_comp based on k-mer comparison. Segments in the same
@@ -2771,10 +2771,10 @@ fn worker_thread(
     group_counter: Arc<AtomicU32>,
     raw_group_counter: Arc<AtomicU32>,
     reference_sample_name: Arc<Mutex<Option<String>>>,
-    map_segments: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    map_segments_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
-    reference_segments: Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
-    reference_orientations: Arc<Mutex<BTreeMap<u32, bool>>>,
+    map_segments: Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
+    map_segments_terminators: Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
+    reference_segments: Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
+    reference_orientations: Arc<RwLock<BTreeMap<u32, bool>>>,
     split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>>,
     #[cfg(feature = "cpp_agc")]
     grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
@@ -2881,7 +2881,7 @@ fn worker_thread(
 
         // TRACE: Log map_segments state when AAB#0 chrI arrives
         if crate::env_cache::trace_group() && task.sample_name.contains("AAB#0") && task.contig_name.contains("chrI") {
-            let seg_map = map_segments.lock().unwrap();
+            let seg_map = map_segments.read().unwrap();
             eprintln!("TRACE_LOOKUP: Processing {} {} - map_segments has {} entries",
                 task.sample_name, task.contig_name, seg_map.len());
 
@@ -3180,7 +3180,7 @@ fn worker_thread(
                 // Phase 1: Check if group already exists
                 // (matches C++ AGC: seg_map_mtx.lock() then find at line 1020)
                 let key_exists = {
-                    let seg_map = map_segments.lock().unwrap();
+                    let seg_map = map_segments.read().unwrap();
                     seg_map.contains_key(&key)
                 };
 
@@ -3205,7 +3205,7 @@ fn worker_thread(
                     // Use ONLY global terminators (not batch-local) to match C++ AGC behavior
                     // C++ AGC only sees terminators from previous batches, not the current one
                     let middle_kmer_opt = {
-                        let terminators = map_segments_terminators.lock().unwrap();
+                        let terminators = map_segments_terminators.read().unwrap();
                         let result = find_middle_splitter(key_front, key_back, &terminators);
                         // Debug: trace middle splitter result
                         if crate::env_cache::debug_split() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
@@ -3269,7 +3269,7 @@ fn worker_thread(
                         // If either group doesn't exist, C++ AGC aborts the split.
                         // We must check map_segments (global), not batch_local_groups, to match C++ behavior.
                         let (left_exists, right_exists) = {
-                            let global_map = map_segments.lock().unwrap();
+                            let global_map = map_segments.read().unwrap();
                             (global_map.contains_key(&left_key), global_map.contains_key(&right_key))
                         };
 
@@ -3445,7 +3445,7 @@ fn worker_thread(
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
                                         // Check global map_segments first, create new group if not found
                                         let group_id = {
-                                            let mut global_map = map_segments.lock().unwrap();
+                                            let mut global_map = map_segments.write().unwrap();
                                             if let Some(&existing_id) = global_map.get(&left_key) {
                                                 existing_id
                                             } else {
@@ -3467,7 +3467,7 @@ fn worker_thread(
                                         }
                                         // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC)
                                         if left_key.kmer_front != MISSING_KMER && left_key.kmer_back != MISSING_KMER {
-                                            let mut term_map = map_segments_terminators.lock().unwrap();
+                                            let mut term_map = map_segments_terminators.write().unwrap();
                                             term_map.entry(left_key.kmer_front).or_insert_with(Vec::new).push(left_key.kmer_back);
                                             if left_key.kmer_front != left_key.kmer_back {
                                                 term_map.entry(left_key.kmer_back).or_insert_with(Vec::new).push(left_key.kmer_front);
@@ -3501,7 +3501,7 @@ fn worker_thread(
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
                                         // Check global map_segments first, create new group if not found
                                         let group_id = {
-                                            let mut global_map = map_segments.lock().unwrap();
+                                            let mut global_map = map_segments.write().unwrap();
                                             if let Some(&existing_id) = global_map.get(&right_key) {
                                                 existing_id
                                             } else {
@@ -3523,7 +3523,7 @@ fn worker_thread(
                                         }
                                         // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC)
                                         if right_key.kmer_front != MISSING_KMER && right_key.kmer_back != MISSING_KMER {
-                                            let mut term_map = map_segments_terminators.lock().unwrap();
+                                            let mut term_map = map_segments_terminators.write().unwrap();
                                             term_map.entry(right_key.kmer_front).or_insert_with(Vec::new).push(right_key.kmer_back);
                                             if right_key.kmer_front != right_key.kmer_back {
                                                 term_map.entry(right_key.kmer_back).or_insert_with(Vec::new).push(right_key.kmer_front);
@@ -3560,7 +3560,7 @@ fn worker_thread(
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
                                         // BATCH-LOCAL: Check global first, then batch-local (group must exist from earlier)
                                         let group_id = {
-                                            let global_map = map_segments.lock().unwrap();
+                                            let global_map = map_segments.read().unwrap();
                                             if let Some(&id) = global_map.get(&right_key) {
                                                 id
                                             } else {
@@ -3592,7 +3592,7 @@ fn worker_thread(
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
                                         // BATCH-LOCAL: Check global first, then batch-local (group must exist from earlier)
                                         let group_id = {
-                                            let global_map = map_segments.lock().unwrap();
+                                            let global_map = map_segments.read().unwrap();
                                             if let Some(&id) = global_map.get(&left_key) {
                                                 id
                                             } else {
@@ -3700,7 +3700,7 @@ fn worker_thread(
                 let (key, key_front, key_back, should_reverse) = {
                     // Re-check if key exists (may have changed since split logic ran)
                     let key_exists_now = {
-                        let seg_map = map_segments.lock().unwrap();
+                        let seg_map = map_segments.read().unwrap();
                         seg_map.contains_key(&key)
                     };
 
@@ -3751,7 +3751,7 @@ fn worker_thread(
                                 kmer_back: fb_kb,
                             };
                             let found_exists = {
-                                let seg_map = map_segments.lock().unwrap();
+                                let seg_map = map_segments.read().unwrap();
                                 seg_map.contains_key(&found_key)
                             };
 
@@ -3785,7 +3785,7 @@ fn worker_thread(
                 // Check if this group already exists (global OR batch-local)
                 // If it does NOT exist, defer to pending_batch_segments for sorted group_id assignment
                 let group_exists = {
-                    let global_map = map_segments.lock().unwrap();
+                    let global_map = map_segments.read().unwrap();
                     if global_map.contains_key(&key) {
                         true
                     } else {
@@ -3822,7 +3822,7 @@ fn worker_thread(
                     // Group must exist in one of the registries (checked above)
                     // Retrieve the existing group_id
                     let group_id = {
-                        let global_map = map_segments.lock().unwrap();
+                        let global_map = map_segments.read().unwrap();
                         if let Some(&existing_id) = global_map.get(&key) {
                             existing_id
                         } else {
@@ -4067,9 +4067,9 @@ fn try_split_segment_with_cost(
     middle_kmer: u64,
     left_key: &SegmentGroupKey,
     right_key: &SegmentGroupKey,
-    map_segments: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
-    map_segments_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
-    reference_segments: &Arc<Mutex<BTreeMap<u32, Vec<u8>>>>,
+    map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
+    map_segments_terminators: &Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
+    reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
     config: &StreamingQueueConfig,
     should_reverse: bool,
     force_split_on_empty_refs: bool, // When true, split at middle k-mer position even if FFI says no
@@ -4096,8 +4096,8 @@ fn try_split_segment_with_cost(
 
     // Helper to prepare LZDiff from global reference_segments
     let prepare_on_demand = |key: &SegmentGroupKey, label: &str| -> Option<LZDiff> {
-        let map_segments_locked = map_segments.lock().unwrap();
-        let ref_segments_locked = reference_segments.lock().unwrap();
+        let map_segments_locked = map_segments.read().unwrap();
+        let ref_segments_locked = reference_segments.read().unwrap();
 
         // C++ AGC uses map_segments[key] which returns 0 (default) if key doesn't exist.
         // v_segments[0] is a raw group initialized with empty_ctg = { 0x7f } (1 byte).
@@ -4150,11 +4150,11 @@ fn try_split_segment_with_cost(
     {
         // Inspect availability of left/right references and log keys
         let (left_seg_id_opt, right_seg_id_opt) = {
-            let map_segments_locked = map_segments.lock().unwrap();
+            let map_segments_locked = map_segments.read().unwrap();
             (map_segments_locked.get(left_key).copied(), map_segments_locked.get(right_key).copied())
         };
         let (left_have_ref, right_have_ref) = {
-            let ref_segments_locked = reference_segments.lock().unwrap();
+            let ref_segments_locked = reference_segments.read().unwrap();
             (left_seg_id_opt.and_then(|id| ref_segments_locked.get(&id)).is_some(),
              right_seg_id_opt.and_then(|id| ref_segments_locked.get(&id)).is_some())
         };
@@ -4169,14 +4169,14 @@ fn try_split_segment_with_cost(
 
         // Prepare neighbor lists for FFI decision
         let (front_neighbors, back_neighbors) = {
-            let term_map = map_segments_terminators.lock().unwrap();
+            let term_map = map_segments_terminators.read().unwrap();
             (term_map.get(&front_kmer).cloned().unwrap_or_default(),
              term_map.get(&back_kmer).cloned().unwrap_or_default())
         };
 
         // Always attempt FFI decision; if refs are missing, C++ will decide no-split
         let (ref_left_opt, ref_right_opt) = {
-            let ref_segments_locked = reference_segments.lock().unwrap();
+            let ref_segments_locked = reference_segments.read().unwrap();
             let l = left_seg_id_opt.and_then(|id| ref_segments_locked.get(&id).cloned());
             let r = right_seg_id_opt.and_then(|id| ref_segments_locked.get(&id).cloned());
             (l, r)
@@ -4348,8 +4348,8 @@ fn try_split_segment_with_cost(
         {
             // Unused path when FFI returns best split; kept for completeness
             let ref_left = {
-                let map_segments_locked = map_segments.lock().unwrap();
-                let ref_segments_locked = reference_segments.lock().unwrap();
+                let map_segments_locked = map_segments.read().unwrap();
+                let ref_segments_locked = reference_segments.read().unwrap();
                 let seg_id = map_segments_locked.get(left_key).copied().unwrap_or(0);
                 ref_segments_locked.get(&seg_id).cloned()
             };
@@ -4395,8 +4395,8 @@ fn try_split_segment_with_cost(
         #[cfg(feature = "cpp_agc")]
         {
             let ref_right = {
-                let map_segments_locked = map_segments.lock().unwrap();
-                let ref_segments_locked = reference_segments.lock().unwrap();
+                let map_segments_locked = map_segments.read().unwrap();
+                let ref_segments_locked = reference_segments.read().unwrap();
                 let seg_id = map_segments_locked.get(right_key).copied().unwrap_or(0);
                 ref_segments_locked.get(&seg_id).cloned()
             };
