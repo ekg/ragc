@@ -23,6 +23,7 @@ ragc-common = { path = "../ragc-common", version = "0.1.0" }
 serde = { workspace = true }
 bincode = { workspace = true }
 zstd = { workspace = true }
+zstd-safe = { workspace = true }
 flate2 = { workspace = true }
 ahash = { workspace = true }
 hashbrown = { workspace = true }
