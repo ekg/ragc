@@ -8,7 +8,8 @@ use crate::segment_compression::compress_reference_segment;
 use crate::task::{ContigProcessingStage, Task};
 use crate::zstd_pool::compress_segment_pooled;
 use ragc_common::{Archive, Contig};
-use std::collections::{HashMap, HashSet};
+use ahash::AHashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -115,7 +116,7 @@ pub struct SharedCompressorState {
 
     /// Splitter k-mers (exact set)
     /// Matches C++ AGC's hs_splitters
-    pub splitters: Arc<Mutex<HashSet<u64>>>,
+    pub splitters: Arc<Mutex<AHashSet<u64>>>,
 
     /// Bloom filter for splitters (fast probabilistic check)
     /// Matches C++ AGC's bloom_splitters
@@ -211,7 +212,7 @@ impl SharedCompressorState {
             raw_contigs: Mutex::new(Vec::new()),
             verbosity,
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(no_raw_groups as usize))),
-            splitters: Arc::new(Mutex::new(HashSet::new())),
+            splitters: Arc::new(Mutex::new(AHashSet::new())),
             bloom_splitters: Arc::new(Mutex::new(bloom_filter)),
             vv_splitters: Mutex::new(Vec::new()),
             v_candidate_kmers: Vec::new(),
@@ -913,9 +914,9 @@ fn store_segments(_worker_id: usize, shared: &Arc<SharedCompressorState>) {
 pub fn create_agc_archive(
     output_path: &str,
     sample_files: Vec<(String, String)>,
-    splitters: HashSet<u64>,
-    candidate_kmers: HashSet<u64>,
-    duplicated_kmers: HashSet<u64>,
+    splitters: AHashSet<u64>,
+    candidate_kmers: AHashSet<u64>,
+    duplicated_kmers: AHashSet<u64>,
     kmer_length: usize,
     segment_size: u32,
     num_threads: usize,
@@ -1086,9 +1087,9 @@ pub fn create_agc_archive(
 /// Ok(()) on success, Err on failure
 fn compress_samples_streaming_with_archive(
     sample_files: Vec<(String, String)>,
-    splitters: HashSet<u64>,
-    candidate_kmers: HashSet<u64>,
-    duplicated_kmers: HashSet<u64>,
+    splitters: AHashSet<u64>,
+    candidate_kmers: AHashSet<u64>,
+    duplicated_kmers: AHashSet<u64>,
     kmer_length: usize,
     num_threads: usize,
     adaptive_mode: bool,

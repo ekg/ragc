@@ -7,7 +7,7 @@ use anyhow::Result;
 use ragc_common::Contig;
 use rayon::prelude::*;
 use rdst::RadixSort;
-use std::collections::HashSet;
+use ahash::AHashSet;
 use std::io::Read;
 use std::path::Path;
 
@@ -34,7 +34,7 @@ pub fn determine_splitters(
     contigs: &[Contig],
     k: usize,
     segment_size: usize,
-) -> (HashSet<u64>, HashSet<u64>, HashSet<u64>) {
+) -> (AHashSet<u64>, AHashSet<u64>, AHashSet<u64>) {
     // DEBUG: Check if contigs have data
     let total_bases: usize = contigs.iter().map(|c| c.len()).sum();
     eprintln!(
@@ -61,7 +61,7 @@ pub fn determine_splitters(
 
     // BEFORE removing non-singletons, save duplicates for adaptive mode
     // Duplicates are k-mers that appear MORE than once
-    let mut duplicates = HashSet::new();
+    let mut duplicates = AHashSet::new();
     let mut i = 0;
     while i < all_kmers.len() {
         let kmer = all_kmers[i];
@@ -85,7 +85,7 @@ pub fn determine_splitters(
     // Remove non-singletons to get candidates
     remove_non_singletons(&mut all_kmers, 0);
 
-    let candidates: HashSet<u64> = all_kmers.into_iter().collect();
+    let candidates: AHashSet<u64> = all_kmers.into_iter().collect();
     eprintln!(
         "DEBUG: Found {} candidate singleton k-mers from reference",
         candidates.len()
@@ -102,7 +102,7 @@ pub fn determine_splitters(
         .map(|contig| find_actual_splitters_in_contig(contig, &candidates, k, segment_size))
         .collect();
 
-    let splitters: HashSet<u64> = splitter_vecs.into_iter().flatten().collect();
+    let splitters: AHashSet<u64> = splitter_vecs.into_iter().flatten().collect();
     eprintln!(
         "DEBUG: {} actually-used splitters (after distance check)",
         splitters.len()
@@ -129,7 +129,7 @@ pub fn determine_splitters_streaming(
     fasta_path: &Path,
     k: usize,
     segment_size: usize,
-) -> Result<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> {
+) -> Result<(AHashSet<u64>, AHashSet<u64>, AHashSet<u64>)> {
     // Pass 1a: Stream through file to collect k-mers from ALL contigs (matching C++ AGC)
     #[cfg(feature = "verbose_debug")]
     eprintln!("DEBUG: Pass 1 - Collecting k-mers from reference (streaming)...");
@@ -177,7 +177,7 @@ pub fn determine_splitters_streaming(
     all_kmers.radix_sort_unstable();
 
     // Extract duplicates before removing them
-    let mut duplicates = HashSet::new();
+    let mut duplicates = AHashSet::new();
     let mut i = 0;
     while i < all_kmers.len() {
         let kmer = all_kmers[i];
@@ -201,7 +201,7 @@ pub fn determine_splitters_streaming(
 
     // Remove non-singletons
     remove_non_singletons(&mut all_kmers, 0);
-    let candidates: HashSet<u64> = all_kmers.into_iter().collect();
+    let candidates: AHashSet<u64> = all_kmers.into_iter().collect();
     #[cfg(feature = "verbose_debug")]
     eprintln!(
         "DEBUG: Found {} candidate singleton k-mers",
@@ -211,7 +211,7 @@ pub fn determine_splitters_streaming(
     // Pass 2: Stream through file again to find actually-used splitters from ALL contigs
     #[cfg(feature = "verbose_debug")]
     eprintln!("DEBUG: Pass 2 - Finding actually-used splitters (streaming)...");
-    let mut splitters = HashSet::new();
+    let mut splitters = AHashSet::new();
 
     {
         let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
@@ -250,7 +250,7 @@ pub fn determine_splitters_streaming_first_sample(
     fasta_path: &Path,
     k: usize,
     segment_size: usize,
-) -> Result<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> {
+) -> Result<(AHashSet<u64>, AHashSet<u64>, AHashSet<u64>)> {
     // Pass 1a: Stream through file to collect k-mers from FIRST sample only
     eprintln!("DEBUG: Pass 1 - Collecting k-mers from first sample only (PanSN mode)...");
     let mut all_kmers = Vec::new();
@@ -289,7 +289,7 @@ pub fn determine_splitters_streaming_first_sample(
     all_kmers.radix_sort_unstable();
 
     // Extract duplicates before removing them
-    let mut duplicates = HashSet::new();
+    let mut duplicates = AHashSet::new();
     let mut i = 0;
     while i < all_kmers.len() {
         let kmer = all_kmers[i];
@@ -312,7 +312,7 @@ pub fn determine_splitters_streaming_first_sample(
 
     // Remove non-singletons
     remove_non_singletons(&mut all_kmers, 0);
-    let candidates: HashSet<u64> = all_kmers.into_iter().collect();
+    let candidates: AHashSet<u64> = all_kmers.into_iter().collect();
     eprintln!(
         "DEBUG: Found {} candidate singleton k-mers",
         candidates.len()
@@ -320,7 +320,7 @@ pub fn determine_splitters_streaming_first_sample(
 
     // Pass 2: Stream through file again to find actually-used splitters from FIRST sample only
     eprintln!("DEBUG: Pass 2 - Finding actually-used splitters from first sample...");
-    let mut splitters = HashSet::new();
+    let mut splitters = AHashSet::new();
 
     {
         let mut reader = GenomeIO::<Box<dyn Read>>::open(fasta_path)?;
@@ -355,7 +355,7 @@ pub fn determine_splitters_streaming_first_sample(
 fn find_actual_splitters_in_contig_named(
     contig: &Contig,
     contig_name: &str,
-    candidates: &HashSet<u64>,
+    candidates: &AHashSet<u64>,
     k: usize,
     segment_size: usize,
 ) -> Vec<u64> {
@@ -423,7 +423,7 @@ fn find_actual_splitters_in_contig_named(
 /// This matches C++ AGC's find_splitters_in_contig function
 fn find_actual_splitters_in_contig(
     contig: &Contig,
-    candidates: &HashSet<u64>,
+    candidates: &AHashSet<u64>,
     k: usize,
     segment_size: usize,
 ) -> Vec<u64> {
@@ -519,7 +519,7 @@ pub fn find_candidate_kmers_multi(contigs: &[Contig], k: usize) -> Vec<u64> {
 /// # Returns
 /// true if the k-mer is a splitter, false otherwise
 #[inline]
-pub fn is_splitter(kmer: u64, splitters: &HashSet<u64>) -> bool {
+pub fn is_splitter(kmer: u64, splitters: &AHashSet<u64>) -> bool {
     splitters.contains(&kmer)
 }
 
@@ -535,7 +535,7 @@ pub fn is_splitter(kmer: u64, splitters: &HashSet<u64>) -> bool {
 ///
 /// # Returns
 /// true if the contig has NO splitters from the set, false if at least one splitter is found
-pub fn is_hard_contig(contig: &Contig, k: usize, splitters: &HashSet<u64>) -> bool {
+pub fn is_hard_contig(contig: &Contig, k: usize, splitters: &AHashSet<u64>) -> bool {
     use crate::kmer::{Kmer, KmerMode};
 
     if contig.len() < k {
@@ -593,7 +593,7 @@ pub fn find_new_splitters_for_contig(
     k: usize,
     segment_size: usize,
     ref_singletons: &[u64],
-    ref_duplicates: &HashSet<u64>,
+    ref_duplicates: &AHashSet<u64>,
 ) -> Vec<u64> {
     use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
 
@@ -633,7 +633,7 @@ pub fn find_new_splitters_for_contig(
 
     // Step 5: Use position-based selection (matching C++ AGC's find_splitters_in_contig)
     // The unique k-mers are the CANDIDATE set - only select those at optimal positions
-    let candidates: HashSet<u64> = tmp.into_iter().collect();
+    let candidates: AHashSet<u64> = tmp.into_iter().collect();
 
     // Call find_actual_splitters_in_contig to select properly-positioned splitters
     find_actual_splitters_in_contig(contig, &candidates, k, segment_size)
@@ -663,7 +663,7 @@ pub fn two_pass_splitter_discovery(
     k: usize,
     segment_size: usize,
     verbosity: usize,
-) -> Result<HashSet<u64>> {
+) -> Result<AHashSet<u64>> {
     use crate::genome_io::GenomeIO;
     use std::io::Read;
 
@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_is_splitter() {
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(123);
         splitters.insert(456);
 

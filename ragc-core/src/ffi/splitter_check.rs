@@ -1,7 +1,7 @@
 // FFI helper for splitter checking - micro-function callable from C++
 // Tests that our splitter data structures work correctly
 
-use std::collections::HashSet;
+use ahash::AHashSet;
 
 /// Check if a k-mer is a splitter
 ///
@@ -104,8 +104,8 @@ pub extern "C" fn ragc_check_splitters_batch(
         let kmers = std::slice::from_raw_parts(kmers_ptr, kmers_len);
         let splitters_slice = std::slice::from_raw_parts(splitters_ptr, splitters_len);
 
-        // Build HashSet for O(1) lookups
-        let splitter_set: HashSet<u64> = splitters_slice.iter().copied().collect();
+        // Build AHashSet for O(1) lookups (faster than std HashSet for u64)
+        let splitter_set: AHashSet<u64> = splitters_slice.iter().copied().collect();
 
         // Check each k-mer
         let mut results: Vec<bool> = kmers

@@ -8,6 +8,7 @@ use crate::segment::{split_at_splitters_with_size, MISSING_KMER};
 use crate::splitters::{determine_splitters, find_new_splitters_for_contig};
 use anyhow::{Context, Result};
 use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
+use ahash::AHashSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -424,7 +425,7 @@ pub struct StreamingQueueCompressor {
     workers: Vec<JoinHandle<Result<()>>>,
     barrier: Arc<std::sync::Barrier>, // Synchronization barrier for batch boundaries (matches C++ AGC bar.arrive_and_wait())
     collection: Arc<Mutex<CollectionV3>>,
-    splitters: Arc<HashSet<u64>>,
+    splitters: Arc<AHashSet<u64>>,
     config: StreamingQueueConfig,
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
@@ -482,7 +483,7 @@ pub struct StreamingQueueCompressor {
     // Dynamic splitter discovery for adaptive mode (matches C++ AGC find_new_splitters)
     // Stores reference k-mers to exclude when finding new splitters for non-reference contigs
     ref_singletons: Arc<Vec<u64>>, // Sorted for binary search - reference singleton k-mers (v_candidate_kmers)
-    ref_duplicates: Arc<HashSet<u64>>, // Reference duplicate k-mers (v_duplicated_kmers)
+    ref_duplicates: Arc<AHashSet<u64>>, // Reference duplicate k-mers (v_duplicated_kmers)
 }
 
 impl StreamingQueueCompressor {
@@ -497,7 +498,7 @@ impl StreamingQueueCompressor {
     pub fn with_splitters(
         output_path: impl AsRef<Path>,
         config: StreamingQueueConfig,
-        splitters: HashSet<u64>,
+        splitters: AHashSet<u64>,
     ) -> Result<Self> {
         // Call internal with empty ref data (no dynamic splitter discovery)
         Self::with_splitters_internal(
@@ -505,7 +506,7 @@ impl StreamingQueueCompressor {
             config,
             splitters,
             Arc::new(Vec::new()),
-            Arc::new(HashSet::new()),
+            Arc::new(AHashSet::new()),
         )
     }
 
@@ -513,9 +514,9 @@ impl StreamingQueueCompressor {
     fn with_splitters_internal(
         output_path: impl AsRef<Path>,
         config: StreamingQueueConfig,
-        splitters: HashSet<u64>,
+        splitters: AHashSet<u64>,
         ref_singletons: Arc<Vec<u64>>,
-        ref_duplicates: Arc<HashSet<u64>>,
+        ref_duplicates: Arc<AHashSet<u64>>,
     ) -> Result<Self> {
         let output_path = output_path.as_ref();
         let archive_path = output_path.to_string_lossy().to_string();
@@ -794,9 +795,9 @@ impl StreamingQueueCompressor {
     pub fn with_full_splitter_data(
         output_path: impl AsRef<Path>,
         config: StreamingQueueConfig,
-        splitters: HashSet<u64>,
+        splitters: AHashSet<u64>,
         singletons: Vec<u64>,
-        duplicates: HashSet<u64>,
+        duplicates: AHashSet<u64>,
     ) -> Result<Self> {
         // Sort singletons for binary search before creating compressor
         let mut sorted_singletons = singletons;
@@ -824,7 +825,7 @@ impl StreamingQueueCompressor {
     /// Consider using `with_splitters()` instead if you have a reference genome.
     pub fn new(output_path: impl AsRef<Path>, config: StreamingQueueConfig) -> Result<Self> {
         // Start with empty splitters - will be determined from first push
-        Self::with_splitters(output_path, config, HashSet::new())
+        Self::with_splitters(output_path, config, AHashSet::new())
     }
 
     /// Push a contig to the compression queue
@@ -2762,9 +2763,9 @@ fn worker_thread(
     worker_id: usize,
     queue: Arc<MemoryBoundedQueue<ContigTask>>,
     collection: Arc<Mutex<CollectionV3>>,
-    splitters: Arc<HashSet<u64>>,
+    splitters: Arc<AHashSet<u64>>,
     ref_singletons: Arc<Vec<u64>>,      // For dynamic splitter discovery (sorted)
-    ref_duplicates: Arc<HashSet<u64>>,  // For dynamic splitter discovery
+    ref_duplicates: Arc<AHashSet<u64>>,  // For dynamic splitter discovery
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>,
@@ -4210,8 +4211,7 @@ fn try_split_segment_with_cost(
                 }
 
                 // Build a set of potential middle k-mers from both neighbor lists
-                use std::collections::HashSet;
-                let mut potential_middles: HashSet<u64> = HashSet::new();
+                let mut potential_middles: AHashSet<u64> = AHashSet::new();
                 for &kmer in front_neighbors.iter() {
                     if kmer != MISSING_KMER && kmer != front_kmer && kmer != back_kmer {
                         potential_middles.insert(kmer);

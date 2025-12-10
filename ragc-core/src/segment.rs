@@ -3,7 +3,7 @@
 
 use crate::kmer::{Kmer, KmerMode};
 use ragc_common::Contig;
-use std::collections::HashSet;
+use ahash::AHashSet;
 
 /// Missing k-mer sentinel value (matches C++ AGC's kmer_t(-1) = u64::MAX)
 /// Used when a segment doesn't have a front or back k-mer (e.g., at contig boundaries)
@@ -75,7 +75,7 @@ impl Segment {
 /// difference that was causing 2.3x worse compression!
 pub fn split_at_splitters_with_size(
     contig: &Contig,
-    splitters: &HashSet<u64>,
+    splitters: &AHashSet<u64>,
     k: usize,
     _min_segment_size: usize,
 ) -> Vec<Segment> {
@@ -287,7 +287,7 @@ pub fn split_at_splitters_with_size(
 ///
 /// This is the old behavior - splits at every splitter regardless of segment size.
 /// Kept for backwards compatibility but not recommended for use.
-pub fn split_at_splitters(contig: &Contig, splitters: &HashSet<u64>, k: usize) -> Vec<Segment> {
+pub fn split_at_splitters(contig: &Contig, splitters: &AHashSet<u64>, k: usize) -> Vec<Segment> {
     let mut segments = Vec::new();
 
     if contig.len() < k {
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn test_split_no_splitters() {
         let contig = vec![0, 1, 2, 3, 0, 1, 2, 3];
-        let splitters = HashSet::new();
+        let splitters = AHashSet::new();
         let segments = split_at_splitters(&contig, &splitters, 3);
 
         // Should return entire contig as one segment
@@ -399,7 +399,7 @@ mod tests {
         }
 
         // Use the first k-mer as a splitter
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         if !kmers.is_empty() {
             splitters.insert(kmers[0]);
         }
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn test_split_short_contig() {
         let contig = vec![0, 1]; // Too short for k=3
-        let splitters = HashSet::new();
+        let splitters = AHashSet::new();
         let segments = split_at_splitters(&contig, &splitters, 3);
 
         assert_eq!(segments.len(), 1);
@@ -445,7 +445,7 @@ mod tests {
         kmer.insert(0);
         let aaa_kmer = kmer.data();
 
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(aaa_kmer);
 
         let segments = split_at_splitters(&contig, &splitters, 3);
@@ -459,7 +459,7 @@ mod tests {
         // Contig with N (represented as 4)
         let contig = vec![0, 0, 0, 4, 1, 1, 1];
 
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(12345); // Some random splitter that won't match
 
         let segments = split_at_splitters(&contig, &splitters, 3);

@@ -5,6 +5,7 @@
 //!
 //! See docs/INLINE_SEGMENTATION_PATTERN.md for detailed C++ AGC analysis.
 
+use ahash::AHashSet;
 use crate::kmer::{Kmer, KmerMode};
 use crate::segment_buffer::BufferedSegments;
 use std::sync::{Arc, Mutex};
@@ -29,7 +30,7 @@ pub struct SegmentPart {
 
 /// Shared state for compression (passed from worker threads)
 pub struct CompressionContext {
-    pub splitters: Arc<Mutex<std::collections::HashSet<u64>>>,
+    pub splitters: Arc<Mutex<AHashSet<u64>>>,
     pub bloom_splitters: Arc<Mutex<crate::bloom_filter::BloomFilter>>,
     pub buffered_segments: Arc<Mutex<BufferedSegments>>,
     pub kmer_length: usize,
@@ -453,10 +454,8 @@ mod tests {
 
     #[test]
     fn test_compress_contig_no_splitters() {
-        use std::collections::HashSet;
-
         let ctx = CompressionContext {
-            splitters: Arc::new(Mutex::new(HashSet::new())),
+            splitters: Arc::new(Mutex::new(AHashSet::new())),
             bloom_splitters: Arc::new(Mutex::new(crate::bloom_filter::BloomFilter::new(1024))),
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
             kmer_length: 21,
@@ -481,10 +480,8 @@ mod tests {
 
     #[test]
     fn test_compress_contig_adaptive_failure() {
-        use std::collections::HashSet;
-
         let ctx = CompressionContext {
-            splitters: Arc::new(Mutex::new(HashSet::new())),
+            splitters: Arc::new(Mutex::new(AHashSet::new())),
             bloom_splitters: Arc::new(Mutex::new(crate::bloom_filter::BloomFilter::new(1024))),
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
             kmer_length: 21,
