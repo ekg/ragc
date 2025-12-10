@@ -414,6 +414,14 @@ fn create_archive(
         }
     });
 
+    // Initialize Rayon's global thread pool with the user's thread count
+    // This MUST happen BEFORE any par_iter() is called (e.g., in splitter discovery)
+    // Without this, Rayon initializes with all CPUs on first par_iter(), ignoring -t flag
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok(); // Ignore error if already initialized
+
     // DO NOT SORT: C++ AGC processes files in command-line order
     // The first file in the input list becomes the reference for compression
     // Sorting alphabetically breaks compatibility with C++ AGC
