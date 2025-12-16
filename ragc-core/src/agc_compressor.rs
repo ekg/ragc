@@ -11,7 +11,7 @@ use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
 use ahash::AHashSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
@@ -306,6 +306,500 @@ impl Ord for BufferedSegment {
     }
 }
 
+// =============================================================================
+// RAW segment buffering for parallel Phase 1 (BEFORE classification)
+// =============================================================================
+
+/// Raw segment data buffered BEFORE k-mer classification.
+/// This allows parallel buffering without lock contention from find_group_with_one_kmer.
+/// Classification is deferred to Thread 0 at the barrier.
+#[derive(Clone)]
+struct RawBufferedSegment {
+    /// Raw segment data (numeric encoding: 0=A, 1=C, 2=G, 3=T)
+    data: Vec<u8>,
+    /// Precomputed reverse complement of data
+    data_rc: Vec<u8>,
+    /// Front k-mer from segment detection
+    front_kmer: u64,
+    /// Back k-mer from segment detection
+    back_kmer: u64,
+    /// Is front k-mer in canonical direction?
+    front_kmer_is_dir: bool,
+    /// Is back k-mer in canonical direction?
+    back_kmer_is_dir: bool,
+    /// Sample name for sorting and registration
+    sample_name: String,
+    /// Contig name for sorting and registration
+    contig_name: String,
+    /// Segment index within contig (before split adjustment)
+    original_place: usize,
+    /// Sample processing priority (higher = earlier)
+    sample_priority: i32,
+}
+
+// Implement Ord for deterministic sorting at barrier
+impl PartialEq for RawBufferedSegment {
+    fn eq(&self, other: &Self) -> bool {
+        self.sample_name == other.sample_name
+            && self.contig_name == other.contig_name
+            && self.original_place == other.original_place
+    }
+}
+impl Eq for RawBufferedSegment {}
+
+impl PartialOrd for RawBufferedSegment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RawBufferedSegment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Sort by: sample_name, contig_name, original_place (matches C++ AGC order)
+        match self.sample_name.cmp(&other.sample_name) {
+            std::cmp::Ordering::Equal => {
+                match self.contig_name.cmp(&other.contig_name) {
+                    std::cmp::Ordering::Equal => self.original_place.cmp(&other.original_place),
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+// =============================================================================
+// C++ AGC-style segment buffering for parallel compression (4-phase pattern)
+// =============================================================================
+
+/// Per-group segment buffer with its own mutex (C++ AGC: list_seg_part_t)
+/// Each group has independent locking to allow parallel writes during Phase 1
+struct PerGroupSegments {
+    segments: Vec<BufferedSegment>,
+}
+
+/// Segment waiting to be assigned a group ID (C++ AGC: kk_seg_part_t)
+/// Used during Phase 1 when segment's k-mer pair doesn't exist in map_segments yet
+#[derive(Clone)]
+struct NewSegment {
+    /// K-mer pair (normalized: front <= back)
+    kmer_front: u64,
+    kmer_back: u64,
+    /// Sort key for deterministic processing: (sample_priority, sample_name, contig_name, seg_part_no)
+    sample_priority: i32,
+    sample_name: String,
+    contig_name: String,
+    seg_part_no: usize,
+    /// Segment data
+    data: Contig,
+    should_reverse: bool,
+}
+
+// Implement Ord for NewSegment to match C++ AGC BTreeSet ordering
+impl PartialEq for NewSegment {
+    fn eq(&self, other: &Self) -> bool {
+        self.sample_priority == other.sample_priority
+            && self.sample_name == other.sample_name
+            && self.contig_name == other.contig_name
+            && self.seg_part_no == other.seg_part_no
+    }
+}
+impl Eq for NewSegment {}
+
+impl PartialOrd for NewSegment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NewSegment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Higher sample_priority processes first (descending)
+        match other.sample_priority.cmp(&self.sample_priority) {
+            std::cmp::Ordering::Equal => {
+                // Then by sample_name, contig_name, seg_part_no (ascending)
+                match self.sample_name.cmp(&other.sample_name) {
+                    std::cmp::Ordering::Equal => {
+                        match self.contig_name.cmp(&other.contig_name) {
+                            std::cmp::Ordering::Equal => self.seg_part_no.cmp(&other.seg_part_no),
+                            other => other,
+                        }
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// Two-tier segment buffering for C++ AGC 4-phase pattern (C++ AGC: CBufferedSegPart)
+///
+/// Phase 1 (PARALLEL): Workers add segments using add_known() or add_new()
+/// Phase 2 (SINGLE): Thread 0 calls process_new() to assign group IDs
+/// Phase 3 (PARALLEL): Workers call get_vec_id() + get_part() for atomic work-stealing
+/// Phase 4: Thread 0 calls clear() for cleanup
+struct BufferedSegPart {
+    /// KNOWN segments: indexed by group_id, each has own mutex
+    /// RwLock on Vec allows process_new() to resize while add_known() reads
+    /// C++ AGC: vector<list_seg_part_t> vl_seg_part
+    vl_seg_part: RwLock<Vec<Mutex<PerGroupSegments>>>,
+
+    /// NEW segments: BTreeSet for deterministic iteration
+    /// C++ AGC: set<kk_seg_part_t> s_seg_part
+    s_seg_part: Mutex<std::collections::BTreeSet<NewSegment>>,
+
+    /// Atomic counter for work distribution (descending from num_groups-1 to -1)
+    /// C++ AGC: atomic<int32_t> a_v_part_id
+    a_v_part_id: AtomicI32,
+}
+
+impl BufferedSegPart {
+    fn new(initial_groups: usize) -> Self {
+        Self {
+            vl_seg_part: RwLock::new(
+                (0..initial_groups)
+                    .map(|_| Mutex::new(PerGroupSegments { segments: Vec::new() }))
+                    .collect()
+            ),
+            s_seg_part: Mutex::new(std::collections::BTreeSet::new()),
+            a_v_part_id: AtomicI32::new(-1),
+        }
+    }
+
+    /// Add segment to KNOWN group (has group_id)
+    /// C++ AGC: add_known() - read lock on Vec, per-group lock on Mutex
+    fn add_known(&self, group_id: u32, segment: BufferedSegment) {
+        let groups = self.vl_seg_part.read().unwrap();
+        if (group_id as usize) < groups.len() {
+            groups[group_id as usize]
+                .lock()
+                .unwrap()
+                .segments
+                .push(segment);
+        }
+    }
+
+    /// Add segment with UNKNOWN group (new k-mer pair)
+    /// C++ AGC: add_new() - global s_seg_part lock (but brief)
+    fn add_new(&self, segment: NewSegment) {
+        self.s_seg_part.lock().unwrap().insert(segment);
+    }
+
+    /// Process NEW segments, assign group IDs deterministically
+    /// C++ AGC: process_new() - ONLY called by thread 0 after barrier
+    fn process_new(
+        &self,
+        map_segments: &mut BTreeMap<SegmentGroupKey, u32>,
+        next_group_id: &mut u32,
+    ) -> u32 {
+        let mut s = self.s_seg_part.lock().unwrap();
+        let mut m_kmers: BTreeMap<(u64, u64), u32> = BTreeMap::new();
+        let mut new_count = 0u32;
+
+        // First pass: assign group IDs (deterministic - BTreeSet order)
+        for seg in s.iter() {
+            let key = (seg.kmer_front, seg.kmer_back);
+            if !m_kmers.contains_key(&key) && !map_segments.contains_key(&SegmentGroupKey {
+                kmer_front: seg.kmer_front,
+                kmer_back: seg.kmer_back,
+            }) {
+                m_kmers.insert(key, *next_group_id);
+                *next_group_id += 1;
+                new_count += 1;
+            }
+        }
+
+        // Resize vl_seg_part for new groups (requires write lock)
+        {
+            let mut groups = self.vl_seg_part.write().unwrap();
+            while groups.len() < *next_group_id as usize {
+                groups.push(Mutex::new(PerGroupSegments {
+                    segments: Vec::new(),
+                }));
+            }
+        }
+
+        // Second pass: move segments to vl_seg_part and update map_segments
+        let segments: Vec<NewSegment> = s.iter().cloned().collect();
+        s.clear();
+        drop(s);
+
+        for seg in segments {
+            let key = SegmentGroupKey {
+                kmer_front: seg.kmer_front,
+                kmer_back: seg.kmer_back,
+            };
+
+            // Get group_id from either existing map or newly assigned
+            let group_id = if let Some(&id) = map_segments.get(&key) {
+                id
+            } else if let Some(&id) = m_kmers.get(&(seg.kmer_front, seg.kmer_back)) {
+                // Insert into map_segments
+                map_segments.insert(key, id);
+                id
+            } else {
+                continue; // Should not happen
+            };
+
+            // Add to per-group buffer (uses read lock internally)
+            let buffered = BufferedSegment {
+                sample_name: seg.sample_name,
+                contig_name: seg.contig_name,
+                seg_part_no: seg.seg_part_no,
+                data: seg.data,
+                is_rev_comp: seg.should_reverse,
+                sample_priority: seg.sample_priority,
+            };
+            self.add_known(group_id, buffered);
+        }
+
+        new_count
+    }
+
+    /// Sort known segments within each group for deterministic output
+    fn sort_known(&self) {
+        let groups = self.vl_seg_part.read().unwrap();
+        for group in groups.iter() {
+            group.lock().unwrap().segments.sort();
+        }
+    }
+
+    /// Reset atomic counter for work distribution
+    /// C++ AGC: restart_read_vec()
+    fn restart_read_vec(&self) {
+        let groups = self.vl_seg_part.read().unwrap();
+        self.a_v_part_id.store(
+            groups.len() as i32 - 1,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Get next group_id to process (atomic decrement for work-stealing)
+    /// C++ AGC: get_vec_id() - returns -1 when all groups claimed
+    fn get_vec_id(&self) -> i32 {
+        self.a_v_part_id.fetch_sub(1, Ordering::Relaxed)
+    }
+
+    /// Get and remove one segment from group (for store phase)
+    /// C++ AGC: get_part()
+    fn get_part(&self, group_id: u32) -> Option<BufferedSegment> {
+        let groups = self.vl_seg_part.read().unwrap();
+        if (group_id as usize) < groups.len() {
+            groups[group_id as usize]
+                .lock()
+                .unwrap()
+                .segments
+                .pop()
+        } else {
+            None
+        }
+    }
+
+    /// Get all segments from a group (for batch processing)
+    fn drain_group(&self, group_id: u32) -> Vec<BufferedSegment> {
+        let groups = self.vl_seg_part.read().unwrap();
+        if (group_id as usize) < groups.len() {
+            std::mem::take(&mut groups[group_id as usize].lock().unwrap().segments)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Clear all buffers after batch
+    /// C++ AGC: clear()
+    fn clear(&self) {
+        let groups = self.vl_seg_part.read().unwrap();
+        for group in groups.iter() {
+            group.lock().unwrap().segments.clear();
+        }
+        self.s_seg_part.lock().unwrap().clear();
+    }
+
+    /// Check if any segments are buffered
+    fn has_segments(&self) -> bool {
+        let groups = self.vl_seg_part.read().unwrap();
+        for group in groups.iter() {
+            if !group.lock().unwrap().segments.is_empty() {
+                return true;
+            }
+        }
+        !self.s_seg_part.lock().unwrap().is_empty()
+    }
+
+    /// Total number of groups
+    fn num_groups(&self) -> usize {
+        self.vl_seg_part.read().unwrap().len()
+    }
+}
+
+// =============================================================================
+// Parallel flush coordination for Phase 3 (atomic work-stealing)
+// =============================================================================
+
+/// State for coordinating parallel Phase 3 segment storage
+/// Workers atomically claim buffers via next_idx, then process independently
+struct ParallelFlushState {
+    /// Extracted buffers to flush. Each slot has its own Mutex for independent access.
+    /// RwLock allows parallel read access to the Vec during Phase 3, avoiding serialization.
+    /// Workers only need read access to the Vec to reach their claimed slot's inner Mutex.
+    buffers: RwLock<Vec<Mutex<Option<(SegmentGroupKey, SegmentGroupBuffer)>>>>,
+    /// Compression results from each buffer (stored by workers, written by Thread 0)
+    results: RwLock<Vec<Mutex<Option<FlushPackResult>>>>,
+    /// Atomic index for work-stealing (starts at len-1, decrements to -1)
+    next_idx: AtomicI32,
+}
+
+impl ParallelFlushState {
+    fn new() -> Self {
+        Self {
+            buffers: RwLock::new(Vec::new()),
+            results: RwLock::new(Vec::new()),
+            next_idx: AtomicI32::new(-1),
+        }
+    }
+
+    /// Set up buffers to flush and reset atomic counter (called by Thread 0 in Phase 2)
+    fn prepare(&self, extracted: Vec<(SegmentGroupKey, SegmentGroupBuffer)>) {
+        let len = extracted.len();
+        let mut buffers = self.buffers.write().unwrap();
+        *buffers = extracted
+            .into_iter()
+            .map(|(k, b)| Mutex::new(Some((k, b))))
+            .collect();
+        // Initialize results slots (one per buffer)
+        let mut results = self.results.write().unwrap();
+        *results = (0..len).map(|_| Mutex::new(None)).collect();
+        self.next_idx.store(len as i32 - 1, Ordering::SeqCst);
+    }
+
+    /// Claim next buffer index (returns None when all claimed)
+    /// Called by ALL workers in Phase 3
+    fn claim_next_idx(&self) -> Option<usize> {
+        let idx = self.next_idx.fetch_sub(1, Ordering::Relaxed);
+        if idx < 0 {
+            None
+        } else {
+            Some(idx as usize)
+        }
+    }
+
+    /// Get buffer at claimed index (READ lock on Vec, exclusive on slot)
+    /// Called by workers after claiming an index in Phase 3
+    fn get_buffer_at(&self, idx: usize) -> Option<(SegmentGroupKey, SegmentGroupBuffer)> {
+        let buffers = self.buffers.read().unwrap();
+        if idx < buffers.len() {
+            buffers[idx].lock().unwrap().take()
+        } else {
+            None
+        }
+    }
+
+    /// Put buffer back after processing (READ lock on Vec, exclusive on slot)
+    fn return_buffer(&self, idx: usize, key: SegmentGroupKey, buffer: SegmentGroupBuffer) {
+        let buffers = self.buffers.read().unwrap();
+        if idx < buffers.len() {
+            *buffers[idx].lock().unwrap() = Some((key, buffer));
+        }
+    }
+
+    /// Drain all buffers back (called by Thread 0 in Phase 4 - needs WRITE lock)
+    fn drain_buffers(&self) -> Vec<(SegmentGroupKey, SegmentGroupBuffer)> {
+        let mut buffers = self.buffers.write().unwrap();
+        let result: Vec<_> = buffers
+            .iter_mut()
+            .filter_map(|slot| slot.lock().unwrap().take())
+            .collect();
+        buffers.clear();
+        self.next_idx.store(-1, Ordering::SeqCst);
+        result
+    }
+
+    /// Store compression result at given index (READ lock on Vec, exclusive on slot)
+    fn store_result(&self, idx: usize, result: FlushPackResult) {
+        let results = self.results.read().unwrap();
+        if idx < results.len() {
+            *results[idx].lock().unwrap() = Some(result);
+        }
+    }
+
+    /// Drain all results sorted by group_id (called by Thread 0 for deterministic writes)
+    fn drain_results_sorted(&self) -> Vec<FlushPackResult> {
+        let mut results_lock = self.results.write().unwrap();
+        let mut all_results: Vec<FlushPackResult> = results_lock
+            .iter_mut()
+            .filter_map(|slot| slot.lock().unwrap().take())
+            .collect();
+        results_lock.clear();
+        // Sort by group_id for deterministic write order
+        all_results.sort_by_key(|r| r.group_id);
+        all_results
+    }
+}
+
+/// Parallel write buffer with per-stream mutexes (C++ AGC pattern: per-segment mutex)
+/// Workers operating on different streams don't contend at all.
+/// BTreeMap ensures flush writes in sorted stream_id order for determinism.
+struct ParallelWriteBuffer {
+    /// Per-stream buffers: BTreeMap for sorted iteration, each stream has its own Mutex
+    /// RwLock allows concurrent reader access to find the right stream's Mutex
+    streams: RwLock<BTreeMap<usize, Mutex<Vec<(Vec<u8>, u64)>>>>,
+}
+
+impl ParallelWriteBuffer {
+    fn new() -> Self {
+        Self {
+            streams: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    /// Buffer a write for a specific stream (only locks that stream's mutex)
+    /// Workers on different streams can call this concurrently without contention
+    fn buffer_write(&self, stream_id: usize, data: Vec<u8>, metadata: u64) {
+        // First try with read lock - most common case (stream already exists)
+        {
+            let streams = self.streams.read().unwrap();
+            if let Some(stream_mutex) = streams.get(&stream_id) {
+                stream_mutex.lock().unwrap().push((data, metadata));
+                return;
+            }
+        }
+        // Stream doesn't exist - need write lock to create it
+        {
+            let mut streams = self.streams.write().unwrap();
+            // Double-check (another thread may have created it)
+            streams
+                .entry(stream_id)
+                .or_insert_with(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push((data, metadata));
+        }
+    }
+
+    /// Flush all buffered writes to archive in sorted stream_id order
+    /// Called by Thread 0 after barrier - ensures deterministic output
+    fn flush_to_archive(&self, archive: &mut Archive) -> Result<()> {
+        let streams = self.streams.read().unwrap();
+        // BTreeMap iterates in sorted key order (stream_id)
+        for (stream_id, stream_mutex) in streams.iter() {
+            let parts = stream_mutex.lock().unwrap();
+            for (data, metadata) in parts.iter() {
+                archive.add_part(*stream_id, data, *metadata)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear all buffers (called after flush)
+    fn clear(&self) {
+        let mut streams = self.streams.write().unwrap();
+        for (_, stream_mutex) in streams.iter_mut() {
+            stream_mutex.lock().unwrap().clear();
+        }
+    }
+}
+
 /// Buffer for a segment group (packs 50 segments together)
 struct SegmentGroupBuffer {
     group_id: u32,
@@ -467,6 +961,8 @@ pub struct StreamingQueueCompressor {
     batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>, // Batch-local m_kmers equivalent (BTreeMap for deterministic iteration)
     batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>, // Batch-local terminators (BTreeMap for determinism)
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>, // Buffer segments until batch boundary
+    // Two-tier segment buffering for C++ AGC 4-phase parallel pattern
+    buffered_seg_part: Arc<BufferedSegPart>, // Per-group buffers for parallel Phase 1
     // Fallback minimizers map for segments with no terminator match (matches C++ AGC map_fallback_minimizers)
     map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>, // kmer -> [(front, back)] candidate group keys (BTreeMap for determinism)
     next_priority: Arc<Mutex<i32>>, // Decreases for each new sample (starts at i32::MAX)
@@ -484,6 +980,17 @@ pub struct StreamingQueueCompressor {
     // Stores reference k-mers to exclude when finding new splitters for non-reference contigs
     ref_singletons: Arc<Vec<u64>>, // Sorted for binary search - reference singleton k-mers (v_candidate_kmers)
     ref_duplicates: Arc<AHashSet<u64>>, // Reference duplicate k-mers (v_duplicated_kmers)
+
+    // Parallel Phase 3 state for atomic work-stealing (matches C++ AGC architecture)
+    parallel_state: Arc<ParallelFlushState>,
+
+    // Per-stream write buffer for parallel Phase 3 (C++ AGC pattern: per-segment mutex)
+    // Workers on different streams can buffer writes concurrently without contention
+    write_buffer: Arc<ParallelWriteBuffer>,
+
+    // RAW segment buffer for deferred classification (parallel Phase 1 optimization)
+    // Workers buffer raw segments WITHOUT classification locks, Thread 0 classifies at barrier
+    raw_segment_buffer: Arc<Mutex<Vec<RawBufferedSegment>>>,
 }
 
 impl StreamingQueueCompressor {
@@ -667,11 +1174,24 @@ impl StreamingQueueCompressor {
         let batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
+        // Two-tier segment buffering for C++ AGC 4-phase parallel pattern
+        let buffered_seg_part: Arc<BufferedSegPart> = Arc::new(BufferedSegPart::new(NO_RAW_GROUPS as usize));
         let map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
         // Initialize barrier for sample boundary synchronization (matches C++ AGC barrier)
         // All workers must synchronize at sample boundaries to ensure batch flush completes before processing new samples
         let barrier = Arc::new(std::sync::Barrier::new(config.num_threads));
+
+        // Parallel Phase 3 state for atomic work-stealing (matches C++ AGC architecture)
+        let parallel_state = Arc::new(ParallelFlushState::new());
+
+        // Per-stream write buffer for parallel Phase 3 (C++ AGC pattern: per-segment mutex)
+        // Workers on different streams can buffer writes concurrently without contention
+        let write_buffer = Arc::new(ParallelWriteBuffer::new());
+
+        // RAW segment buffer for deferred classification (parallel Phase 1 optimization)
+        // Workers buffer raw segments WITHOUT classification locks, Thread 0 classifies at barrier
+        let raw_segment_buffer = Arc::new(Mutex::new(Vec::<RawBufferedSegment>::new()));
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -697,8 +1217,12 @@ impl StreamingQueueCompressor {
             let batch_local_groups = Arc::clone(&batch_local_groups);
             let batch_local_terminators = Arc::clone(&batch_local_terminators);
             let pending_batch_segments = Arc::clone(&pending_batch_segments);
+            let buffered_seg_part = Arc::clone(&buffered_seg_part);
             let map_fallback_minimizers = Arc::clone(&map_fallback_minimizers);
             let barrier = Arc::clone(&barrier);
+            let parallel_state = Arc::clone(&parallel_state);
+            let write_buffer = Arc::clone(&write_buffer);
+            let raw_segment_buffer = Arc::clone(&raw_segment_buffer);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
@@ -725,8 +1249,12 @@ impl StreamingQueueCompressor {
                     batch_local_groups,
                     batch_local_terminators,
                     pending_batch_segments,
+                    buffered_seg_part,
                     map_fallback_minimizers,
+                    raw_segment_buffer,
                     barrier,
+                    parallel_state,
+                    write_buffer,
                     config,
                 )
             });
@@ -764,6 +1292,7 @@ impl StreamingQueueCompressor {
             batch_local_groups,
             batch_local_terminators,
             pending_batch_segments,
+            buffered_seg_part,
             map_fallback_minimizers,
             next_sequence,
             global_contig_count,
@@ -776,6 +1305,12 @@ impl StreamingQueueCompressor {
             // (empty by default - populated with_full_splitter_data)
             ref_singletons,
             ref_duplicates,
+            // Parallel Phase 3 state
+            parallel_state,
+            // Per-stream write buffer
+            write_buffer,
+            // Raw segment buffer for deferred classification
+            raw_segment_buffer,
         })
     }
 
@@ -885,8 +1420,12 @@ impl StreamingQueueCompressor {
                 let batch_local_groups = Arc::clone(&self.batch_local_groups);
                 let batch_local_terminators = Arc::clone(&self.batch_local_terminators);
                 let pending_batch_segments = Arc::clone(&self.pending_batch_segments);
+                let buffered_seg_part = Arc::clone(&self.buffered_seg_part);
                 let map_fallback_minimizers = Arc::clone(&self.map_fallback_minimizers);
+                let raw_segment_buffer = Arc::clone(&self.raw_segment_buffer);
                 let barrier = Arc::clone(&self.barrier);
+                let parallel_state = Arc::clone(&self.parallel_state);
+                let write_buffer = Arc::clone(&self.write_buffer);
                 let config = self.config.clone();
 
                 let handle = thread::spawn(move || {
@@ -913,8 +1452,12 @@ impl StreamingQueueCompressor {
                         batch_local_groups,
                         batch_local_terminators,
                         pending_batch_segments,
+                        buffered_seg_part,
                         map_fallback_minimizers,
+                        raw_segment_buffer,
                         barrier,
+                        parallel_state,
+                        write_buffer,
                         config,
                     )
                 });
@@ -1001,7 +1544,10 @@ impl StreamingQueueCompressor {
                         sample_name: sample_name.clone(),
                         contig_name: String::from("<SYNC>"),
                         data: Vec::new(),
-                        sample_priority: new_priority + 1, // Higher priority than subsequent contigs
+                        // Use large priority boost to ensure sync tokens are processed BEFORE any contigs
+                        // With +1, contigs with same priority but higher cost were being popped first
+                        // This caused barrier deadlock when some workers exited before others got sync tokens
+                        sample_priority: new_priority + 1_000_000,
                         cost: 0,
                         sequence,
                         is_sync_token: true,
@@ -1017,35 +1563,48 @@ impl StreamingQueueCompressor {
         };
 
         // Insert sync tokens at sample boundaries (matches C++ AGC registration tokens)
-        // When transitioning to a new sample, insert num_threads sync tokens to trigger barrier synchronization
+        // OPTIMIZATION: In multi-file mode, SKIP per-sample sync tokens for better parallelism
+        // This batches all samples together - sync only happens at finalization
+        // Set RAGC_SYNC_PER_SAMPLE=1 to force per-sample sync (matches old behavior)
         {
             let mut last_sample = self.last_sample_name.lock().unwrap();
             if let Some(ref last) = *last_sample {
                 if last != &sample_name {
-                    // Sample boundary detected - insert sync tokens
-                    if self.config.verbosity > 0 {
-                        eprintln!(
-                            "SAMPLE_BOUNDARY: Inserting {} sync tokens (transitioning from {} to {})",
-                            self.config.num_threads, last, sample_name
-                        );
-                    }
+                    // Sample boundary detected
+                    // Only insert sync tokens if forced by env var (for debugging/compatibility)
+                    let force_sync = std::env::var("RAGC_SYNC_PER_SAMPLE").map(|v| v == "1").unwrap_or(false);
 
-                    // Insert num_threads sync tokens (matches C++ AGC EmplaceManyNoCost)
-                    // All workers must pop a token and synchronize before processing new sample
-                    // CRITICAL: Sync tokens must have HIGHER priority than new sample's contigs
-                    // to ensure they're pulled and processed BEFORE any contigs from new sample.
-                    // Give them priority+1 so they sort before cost-based ordering takes effect.
-                    for _ in 0..self.config.num_threads {
-                        let sync_token = ContigTask {
-                            sample_name: sample_name.clone(),
-                            contig_name: String::from("<SYNC>"),
-                            data: Vec::new(), // Empty data for sync token
-                            sample_priority: sample_priority + 1, // Higher priority than new sample's contigs
-                            cost: 0, // No cost for sync tokens
-                            sequence,
-                            is_sync_token: true,
-                        };
-                        self.queue.push(sync_token, 0)?; // 0 size for sync tokens
+                    if force_sync {
+                        if self.config.verbosity > 0 {
+                            eprintln!(
+                                "SAMPLE_BOUNDARY: Inserting {} sync tokens (transitioning from {} to {})",
+                                self.config.num_threads, last, sample_name
+                            );
+                        }
+
+                        // Insert num_threads sync tokens (matches C++ AGC EmplaceManyNoCost)
+                        // All workers must pop a token and synchronize before processing new sample
+                        // CRITICAL: Sync tokens must have MUCH HIGHER priority than any contigs
+                        // to ensure they're pulled and processed BEFORE any contigs.
+                        // Use large priority boost (+1_000_000) to overcome cost-based tie-breaking
+                        // which was causing contigs to be popped before sync tokens at same priority.
+                        for _ in 0..self.config.num_threads {
+                            let sync_token = ContigTask {
+                                sample_name: sample_name.clone(),
+                                contig_name: String::from("<SYNC>"),
+                                data: Vec::new(), // Empty data for sync token
+                                sample_priority: sample_priority + 1_000_000, // Much higher priority than any contigs
+                                cost: 0, // No cost for sync tokens
+                                sequence,
+                                is_sync_token: true,
+                            };
+                            self.queue.push(sync_token, 0)?; // 0 size for sync tokens
+                        }
+                    } else if self.config.verbosity > 1 {
+                        eprintln!(
+                            "SAMPLE_BOUNDARY: SKIPPING sync tokens (multi-file batching: {} -> {})",
+                            last, sample_name
+                        );
                     }
                 }
             }
@@ -1115,6 +1674,32 @@ impl StreamingQueueCompressor {
     pub fn finalize(self) -> Result<()> {
         if self.config.verbosity > 0 {
             eprintln!("Finalizing compression...");
+        }
+
+        // CRITICAL: Insert FINAL sync tokens before closing queue
+        // This ensures buffered_seg_part data is processed and flushed
+        // (matches C++ AGC line 2236-2244: final sync at end of input)
+        if self.config.verbosity > 0 {
+            eprintln!("  Inserting {} final sync tokens...", self.config.num_threads);
+        }
+
+        // Use sequence 0 and high priority to ensure sync tokens are processed last
+        let sequence = 0;
+
+        for _ in 0..self.config.num_threads {
+            let sync_token = ContigTask {
+                sample_name: String::from("<FINAL>"),
+                contig_name: String::from("<SYNC>"),
+                data: Vec::new(),
+                sample_priority: 1_000_000_i32, // Very high priority = processed after all real contigs
+                cost: 0,
+                sequence,
+                is_sync_token: true,
+            };
+            self.queue.push(sync_token, 0)?;
+        }
+
+        if self.config.verbosity > 0 {
             eprintln!("  Closing queue...");
         }
 
@@ -1297,6 +1882,33 @@ pub struct QueueStats {
 }
 
 /// Flush a complete pack of segments (compress, LZ encode, write to archive)
+/// Pre-compressed data ready for archive write (no locks needed during compression)
+struct PreCompressedPart {
+    stream_id: usize,
+    data: Vec<u8>,
+    metadata: u64,
+}
+
+/// Segment registration data for collection (batched for single lock acquisition)
+struct SegmentRegistration {
+    sample_name: String,
+    contig_name: String,
+    seg_part_no: usize,
+    group_id: u32,
+    in_group_id: u32,
+    is_rev_comp: bool,
+    raw_length: u32,
+}
+
+/// Result of parallel compression phase (for deterministic sequential writes)
+/// Workers produce these in parallel, then Thread 0 writes them in sorted order
+struct FlushPackResult {
+    group_id: u32,
+    archive_writes: Vec<PreCompressedPart>,
+    registrations: Vec<SegmentRegistration>,
+    ref_to_store: Option<(u32, Vec<u8>)>,
+}
+
 fn flush_pack(
     buffer: &mut SegmentGroupBuffer,
     collection: &Arc<Mutex<CollectionV3>>,
@@ -1318,6 +1930,17 @@ fn flush_pack(
     // becomes the reference, matching C++ AGC's behavior.
     // (Previous code sorted AFTER picking reference, causing wrong reference selection)
     buffer.segments.sort();
+
+    // ============================================================
+    // PHASE 1: Compress everything WITHOUT holding any locks
+    // ============================================================
+
+    // Collect all pre-compressed writes for batched archive write
+    let mut archive_writes: Vec<PreCompressedPart> = Vec::new();
+    // Collect all segment registrations for batched collection update
+    let mut registrations: Vec<SegmentRegistration> = Vec::new();
+    // Reference data to store in global map (if any)
+    let mut ref_to_store: Option<(u32, Vec<u8>)> = None;
 
     // Write reference segment if not already written (first pack for this group)
     // Extract reference from sorted segments (matching C++ AGC: first segment after sort becomes reference)
@@ -1341,7 +1964,7 @@ fn flush_pack(
             );
         }
 
-        // Compress reference using adaptive compression
+        // Compress reference using adaptive compression (NO LOCK)
         let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
             .context("Failed to compress reference")?;
         compressed.push(marker);
@@ -1352,43 +1975,39 @@ fn flush_pack(
         // CRITICAL: Check if compression helped (matching C++ AGC segment.h lines 179, 204)
         // C++ AGC: if(packed_size + 1u < (uint32_t) data.size())
         // If compression didn't help, write UNCOMPRESSED raw data with metadata=0
-        {
-            let mut arch = archive.lock().unwrap();
-            if compressed.len() < ref_seg.data.len() {
-                // Compression helped - write compressed data with metadata=original_size
-                arch.add_part(buffer.ref_stream_id, &compressed, ref_size)
-                    .context("Failed to write reference")?;
-            } else {
-                // Compression didn't help - write UNCOMPRESSED data with metadata=0
-                arch.add_part(buffer.ref_stream_id, &ref_seg.data, 0)
-                    .context("Failed to write uncompressed reference")?;
-            }
+        if compressed.len() < ref_seg.data.len() {
+            // Compression helped - write compressed data with metadata=original_size
+            archive_writes.push(PreCompressedPart {
+                stream_id: buffer.ref_stream_id,
+                data: compressed,
+                metadata: ref_size,
+            });
+        } else {
+            // Compression didn't help - write UNCOMPRESSED data with metadata=0
+            archive_writes.push(PreCompressedPart {
+                stream_id: buffer.ref_stream_id,
+                data: ref_seg.data.clone(),
+                metadata: 0,
+            });
         }
 
-        // Register reference in collection with in_group_id = 0
-        {
-            let mut coll = collection.lock().unwrap();
-            coll.add_segment_placed(
-                &ref_seg.sample_name,
-                &ref_seg.contig_name,
-                ref_seg.seg_part_no,
-                buffer.group_id,
-                0, // Reference is always at position 0
-                ref_seg.is_rev_comp,
-                ref_seg.data.len() as u32,
-            )
-            .context("Failed to register reference")?;
-        }
+        // Queue reference registration
+        registrations.push(SegmentRegistration {
+            sample_name: ref_seg.sample_name.clone(),
+            contig_name: ref_seg.contig_name.clone(),
+            seg_part_no: ref_seg.seg_part_no,
+            group_id: buffer.group_id,
+            in_group_id: 0, // Reference is always at position 0
+            is_rev_comp: ref_seg.is_rev_comp,
+            raw_length: ref_seg.data.len() as u32,
+        });
 
         buffer.ref_written = true;
-        buffer.reference_segment = Some(ref_seg.clone()); // Store for LZ encoding
 
-        // Store reference in global map for split cost validation
-        // This matches C++ AGC's v_segments which keeps all segment data in memory
-        {
-            let mut ref_segs = reference_segments.write().unwrap();
-            ref_segs.insert(buffer.group_id, ref_seg.data.clone());
-        }
+        // Queue reference for global map storage
+        ref_to_store = Some((buffer.group_id, ref_seg.data.clone()));
+
+        buffer.reference_segment = Some(ref_seg.clone()); // Store for LZ encoding
 
         // Prepare LZ encoder with reference (matching C++ AGC segment.cpp line 43: lz_diff->Prepare(s))
         // This is done ONCE when the reference is written, then reused for all subsequent segments
@@ -1412,12 +2031,8 @@ fn flush_pack(
 
     let mut segment_in_group_ids: Vec<(usize, u32)> = Vec::new(); // (segment_index, in_group_id) for each segment
 
-    // Helper closure to write a complete pack (exactly 50 entries)
-    let write_complete_pack = |deltas: &[Vec<u8>], needs_raw_placeholder: bool, archive: &Arc<Mutex<Archive>>, stream_id: usize, config: &StreamingQueueConfig| -> Result<()> {
-        if deltas.is_empty() && !needs_raw_placeholder {
-            return Ok(());
-        }
-
+    // Helper function to compress a complete pack (exactly 50 entries) - NO LOCK
+    let compress_pack = |deltas: &[Vec<u8>], needs_raw_placeholder: bool, stream_id: usize, compression_level: i32| -> Result<PreCompressedPart> {
         let mut packed_data = Vec::new();
 
         // CRITICAL: Raw groups need a placeholder segment at position 0
@@ -1431,35 +2046,24 @@ fn flush_pack(
             packed_data.push(CONTIG_SEPARATOR);
         }
 
-        if packed_data.is_empty() {
-            return Ok(());
-        }
-
         let total_raw_size = packed_data.len();
-        let mut compressed = compress_segment_configured(&packed_data, config.compression_level)
+        let mut compressed = compress_segment_configured(&packed_data, compression_level)
             .context("Failed to compress pack")?;
         compressed.push(0); // Marker 0 = plain ZSTD
 
-        // Debug: Log compression sizes at each stage
-        if crate::env_cache::debug_compression_sizes() {
-            eprintln!("COMPRESS_PACK: group={} raw_segments={} lz_encoded={} zstd_compressed={} ratio={:.2}%",
-                buffer.group_id,
-                buffer.segments.iter().map(|s| s.data.len()).sum::<usize>(),
-                total_raw_size,
-                compressed.len(),
-                (compressed.len() as f64 / total_raw_size as f64) * 100.0);
-        }
-
-        let mut arch = archive.lock().unwrap();
         if compressed.len() < total_raw_size {
-            arch.add_part(stream_id, &compressed, total_raw_size as u64)
-                .context("Failed to write compressed pack")?;
+            Ok(PreCompressedPart {
+                stream_id,
+                data: compressed,
+                metadata: total_raw_size as u64,
+            })
         } else {
-            arch.add_part(stream_id, &packed_data, 0)
-                .context("Failed to write uncompressed pack")?;
+            Ok(PreCompressedPart {
+                stream_id,
+                data: packed_data,
+                metadata: 0,
+            })
         }
-
-        Ok(())
     };
 
     for (seg_idx, seg) in buffer.segments.iter().enumerate() {
@@ -1626,9 +2230,10 @@ fn flush_pack(
             // CRITICAL: Flush when pending_deltas reaches PACK_CARDINALITY (matching C++ AGC segment.cpp lines 51-54)
             // C++ AGC: if (v_lzp.size() == contigs_in_pack) { store_in_archive(v_lzp); v_lzp.clear(); }
             if buffer.pending_deltas.len() == PACK_CARDINALITY {
-                // Write complete pack with raw placeholder only if this is the first pack of a raw group
+                // Compress pack WITHOUT holding any lock
                 let needs_placeholder = !use_lz_encoding && !buffer.raw_placeholder_written;
-                write_complete_pack(&buffer.pending_deltas, needs_placeholder, archive, buffer.stream_id, config)?;
+                let pack = compress_pack(&buffer.pending_deltas, needs_placeholder, buffer.stream_id, config.compression_level)?;
+                archive_writes.push(pack);
                 buffer.raw_placeholder_written = true;
 
                 // Clear for next pack - deduplication starts fresh
@@ -1641,26 +2246,229 @@ fn flush_pack(
     // DO NOT write partial pack here - leave it in buffer.pending_deltas for next flush_pack call
     // Partial packs are only written in finalize() to ensure pack boundaries align with decompression
 
-    // Register ALL segments in collection with their in_group_ids
+    // Queue segment registrations (batched for single lock acquisition)
     for &(seg_idx, in_group_id) in segment_in_group_ids.iter() {
         let seg = &buffer.segments[seg_idx];
-        let mut coll = collection.lock().unwrap();
-        coll.add_segment_placed(
-            &seg.sample_name,
-            &seg.contig_name,
-            seg.seg_part_no,
-            buffer.group_id,
+        registrations.push(SegmentRegistration {
+            sample_name: seg.sample_name.clone(),
+            contig_name: seg.contig_name.clone(),
+            seg_part_no: seg.seg_part_no,
+            group_id: buffer.group_id,
             in_group_id,
-            seg.is_rev_comp,
-            seg.data.len() as u32,
-        )
-        .context("Failed to register segment")?;
+            is_rev_comp: seg.is_rev_comp,
+            raw_length: seg.data.len() as u32,
+        });
+    }
+
+    // ============================================================
+    // PHASE 2: Batched writes with minimal lock duration
+    // ============================================================
+
+    // Write all pre-compressed data to archive (SINGLE lock acquisition)
+    if !archive_writes.is_empty() {
+        let mut arch = archive.lock().unwrap();
+        for part in archive_writes {
+            arch.add_part(part.stream_id, &part.data, part.metadata)
+                .context("Failed to write to archive")?;
+        }
+    }
+
+    // Store reference in global map (if any)
+    if let Some((group_id, ref_data)) = ref_to_store {
+        let mut ref_segs = reference_segments.write().unwrap();
+        ref_segs.insert(group_id, ref_data);
+    }
+
+    // Register all segments in collection (SINGLE lock acquisition)
+    if !registrations.is_empty() {
+        let mut coll = collection.lock().unwrap();
+        for reg in registrations {
+            coll.add_segment_placed(
+                &reg.sample_name,
+                &reg.contig_name,
+                reg.seg_part_no,
+                reg.group_id,
+                reg.in_group_id,
+                reg.is_rev_comp,
+                reg.raw_length,
+            )
+            .context("Failed to register segment")?;
+        }
     }
 
     // Clear segments for next batch (but keep pending_deltas!)
     buffer.segments.clear();
 
     Ok(())
+}
+
+/// Compress-only version of flush_pack for deterministic parallel compression.
+/// Workers call this in parallel to produce FlushPackResult, then Thread 0
+/// writes all results in sorted group_id order for deterministic archives.
+fn flush_pack_compress_only(
+    buffer: &mut SegmentGroupBuffer,
+    config: &StreamingQueueConfig,
+) -> Result<FlushPackResult> {
+    use crate::segment_compression::{compress_reference_segment, compress_segment_configured};
+
+    let mut archive_writes: Vec<PreCompressedPart> = Vec::new();
+    let mut registrations: Vec<SegmentRegistration> = Vec::new();
+    let mut ref_to_store: Option<(u32, Vec<u8>)> = None;
+
+    // Skip if no segments to write (but still write reference if present)
+    if buffer.segments.is_empty() && buffer.ref_written {
+        return Ok(FlushPackResult {
+            group_id: buffer.group_id,
+            archive_writes,
+            registrations,
+            ref_to_store,
+        });
+    }
+
+    let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
+
+    // Sort segments for deterministic reference selection
+    buffer.segments.sort();
+
+    // Write reference segment if not already written
+    if use_lz_encoding && !buffer.ref_written && !buffer.segments.is_empty() {
+        let ref_seg = buffer.segments.remove(0);
+
+        // Compress reference
+        let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
+            .context("Failed to compress reference")?;
+        compressed.push(marker);
+
+        let ref_size = ref_seg.data.len() as u64;
+
+        if compressed.len() < ref_seg.data.len() {
+            archive_writes.push(PreCompressedPart {
+                stream_id: buffer.ref_stream_id,
+                data: compressed,
+                metadata: ref_size,
+            });
+        } else {
+            archive_writes.push(PreCompressedPart {
+                stream_id: buffer.ref_stream_id,
+                data: ref_seg.data.clone(),
+                metadata: 0,
+            });
+        }
+
+        registrations.push(SegmentRegistration {
+            sample_name: ref_seg.sample_name.clone(),
+            contig_name: ref_seg.contig_name.clone(),
+            seg_part_no: ref_seg.seg_part_no,
+            group_id: buffer.group_id,
+            in_group_id: 0,
+            is_rev_comp: ref_seg.is_rev_comp,
+            raw_length: ref_seg.data.len() as u32,
+        });
+
+        buffer.ref_written = true;
+        ref_to_store = Some((buffer.group_id, ref_seg.data.clone()));
+        buffer.reference_segment = Some(ref_seg.clone());
+
+        if use_lz_encoding {
+            let mut lz = LZDiff::new(config.min_match_len as u32);
+            lz.prepare(&ref_seg.data);
+            buffer.lz_diff = Some(lz);
+        }
+    }
+
+    // Compress pack helper (same as flush_pack)
+    let compress_pack = |deltas: &[Vec<u8>], needs_raw_placeholder: bool, stream_id: usize, compression_level: i32| -> Result<PreCompressedPart> {
+        let mut packed_data = Vec::new();
+
+        if needs_raw_placeholder {
+            packed_data.push(0x7f);
+            packed_data.push(CONTIG_SEPARATOR);
+        }
+
+        for delta in deltas.iter() {
+            packed_data.extend_from_slice(delta);
+            packed_data.push(CONTIG_SEPARATOR);
+        }
+
+        let total_raw_size = packed_data.len();
+        let mut compressed = compress_segment_configured(&packed_data, compression_level)
+            .context("Failed to compress pack")?;
+        compressed.push(0);
+
+        if compressed.len() < total_raw_size {
+            Ok(PreCompressedPart {
+                stream_id,
+                data: compressed,
+                metadata: total_raw_size as u64,
+            })
+        } else {
+            Ok(PreCompressedPart {
+                stream_id,
+                data: packed_data,
+                metadata: 0,
+            })
+        }
+    };
+
+    let mut segment_in_group_ids: Vec<(usize, u32)> = Vec::new();
+
+    for (seg_idx, seg) in buffer.segments.iter().enumerate() {
+        let contig_data = if !use_lz_encoding || buffer.reference_segment.is_none() {
+            seg.data.clone()
+        } else {
+            buffer.lz_diff.as_mut()
+                .expect("lz_diff should be prepared")
+                .encode(&seg.data)
+        };
+
+        if use_lz_encoding && contig_data.is_empty() {
+            segment_in_group_ids.push((seg_idx, 0));
+            continue;
+        }
+
+        if let Some(existing_idx) = buffer.pending_deltas.iter().position(|d| d == &contig_data) {
+            let reused_id = buffer.pending_delta_ids[existing_idx];
+            segment_in_group_ids.push((seg_idx, reused_id));
+        } else {
+            buffer.segments_written = buffer.segments_written.max(1);
+            let in_group_id = buffer.segments_written;
+            buffer.segments_written += 1;
+            buffer.pending_delta_ids.push(in_group_id);
+            segment_in_group_ids.push((seg_idx, in_group_id));
+            buffer.pending_deltas.push(contig_data);
+
+            if buffer.pending_deltas.len() == PACK_CARDINALITY {
+                let needs_placeholder = !use_lz_encoding && !buffer.raw_placeholder_written;
+                let pack = compress_pack(&buffer.pending_deltas, needs_placeholder, buffer.stream_id, config.compression_level)?;
+                archive_writes.push(pack);
+                buffer.raw_placeholder_written = true;
+                buffer.pending_deltas.clear();
+                buffer.pending_delta_ids.clear();
+            }
+        }
+    }
+
+    for &(seg_idx, in_group_id) in segment_in_group_ids.iter() {
+        let seg = &buffer.segments[seg_idx];
+        registrations.push(SegmentRegistration {
+            sample_name: seg.sample_name.clone(),
+            contig_name: seg.contig_name.clone(),
+            seg_part_no: seg.seg_part_no,
+            group_id: buffer.group_id,
+            in_group_id,
+            is_rev_comp: seg.is_rev_comp,
+            raw_length: seg.data.len() as u32,
+        });
+    }
+
+    buffer.segments.clear();
+
+    Ok(FlushPackResult {
+        group_id: buffer.group_id,
+        archive_writes,
+        registrations,
+        ref_to_store,
+    })
 }
 
 /// Write reference segment immediately when first segment arrives in group
@@ -1834,81 +2642,118 @@ fn find_group_with_one_kmer(
     // Each candidate: (key_front, key_back, needs_rc, ref_segment_size)
     let mut candidates: Vec<(u64, u64, bool, usize)> = Vec::new();
 
-    {
-        let groups = segment_groups.lock().unwrap();
-        let seg_map = map_segments.read().unwrap();
-        let ref_segs = reference_segments.read().unwrap();
+    // OPTIMIZATION: Reduce lock scope - first collect candidate keys, then look up ref sizes
+    // This minimizes the time segment_groups.lock() is held
 
-        for &cand_kmer in &connected_kmers {
-            // Create candidate group key normalized (smaller, larger)
-            // C++ AGC lines 1691-1704
-            //
-            // IMPORTANT: When cand_kmer is MISSING, we need to try BOTH orderings!
-            // Groups with MISSING k-mers can be stored as either (MISSING, kmer) or (kmer, MISSING)
-            // depending on kmer_is_dir when they were created. We must match the actual stored key.
-            let candidate_orderings: Vec<(u64, u64, bool)> = if cand_kmer == MISSING_KMER {
-                // MISSING is involved - try both orderings to find the group
-                vec![
-                    (MISSING_KMER, kmer, true),   // (MISSING, kmer) with RC
-                    (kmer, MISSING_KMER, false),  // (kmer, MISSING) without RC
-                ]
-            } else if cand_kmer < kmer {
-                // cand_kmer is smaller - it goes first
-                // This means we need to RC (C++ AGC line 1696: get<2>(ck) = true)
-                vec![(cand_kmer, kmer, true)]
-            } else {
-                // kmer is smaller - it goes first
-                // No RC needed (C++ AGC line 1703: get<2>(ck) = false)
-                vec![(kmer, cand_kmer, false)]
+    // Phase 1: Build candidate orderings (no locks needed)
+    let mut candidate_keys: Vec<(u64, u64, bool, SegmentGroupKey)> = Vec::new();
+    for &cand_kmer in &connected_kmers {
+        // Create candidate group key normalized (smaller, larger)
+        // C++ AGC lines 1691-1704
+        //
+        // IMPORTANT: When cand_kmer is MISSING, we need to try BOTH orderings!
+        // Groups with MISSING k-mers can be stored as either (MISSING, kmer) or (kmer, MISSING)
+        // depending on kmer_is_dir when they were created. We must match the actual stored key.
+        let orderings: Vec<(u64, u64, bool)> = if cand_kmer == MISSING_KMER {
+            // MISSING is involved - try both orderings to find the group
+            vec![
+                (MISSING_KMER, kmer, true),   // (MISSING, kmer) with RC
+                (kmer, MISSING_KMER, false),  // (kmer, MISSING) without RC
+            ]
+        } else if cand_kmer < kmer {
+            // cand_kmer is smaller - it goes first
+            // This means we need to RC (C++ AGC line 1696: get<2>(ck) = true)
+            vec![(cand_kmer, kmer, true)]
+        } else {
+            // kmer is smaller - it goes first
+            // No RC needed (C++ AGC line 1703: get<2>(ck) = false)
+            vec![(kmer, cand_kmer, false)]
+        };
+
+        for (key_front, key_back, needs_rc) in orderings {
+            let cand_key = SegmentGroupKey {
+                kmer_front: key_front,
+                kmer_back: key_back,
             };
+            candidate_keys.push((key_front, key_back, needs_rc, cand_key));
+        }
+    }
 
-            for (key_front, key_back, needs_rc) in candidate_orderings {
-                let cand_key = SegmentGroupKey {
-                    kmer_front: key_front,
-                    kmer_back: key_back,
-                };
+    // Phase 2: Quick check which candidates exist (brief locks)
+    // First pass: check global registry (RwLock - can be concurrent)
+    let mut existing_candidates: Vec<(u64, u64, bool, Option<u32>)> = Vec::new();
+    {
+        let seg_map = map_segments.read().unwrap();
+        for (key_front, key_back, needs_rc, cand_key) in &candidate_keys {
+            if let Some(&group_id) = seg_map.get(cand_key) {
+                existing_candidates.push((*key_front, *key_back, *needs_rc, Some(group_id)));
+            }
+        }
+    } // seg_map lock released
 
-                // Check if this group exists in global registry OR batch-local buffer
-                // CRITICAL FIX: Check BOTH seg_map (global) AND groups (batch-local)
-                // This matches C++ AGC behavior where groups created in same batch are visible
-                // Debug: trace candidate lookup
-                if crate::env_cache::debug_is_dir() {
-                    eprintln!("RAGC_FIND_GROUP_CAND_CHECK: cand_key=({},{}) exists_in_seg_map={} exists_in_groups={}",
-                        key_front, key_back, seg_map.contains_key(&cand_key), groups.contains_key(&cand_key));
-                }
-
-                // Check global registry first
-                let in_global = seg_map.get(&cand_key);
-                // Also check batch-local buffer
-                let in_batch_local = groups.get(&cand_key);
-
-                if in_global.is_some() || in_batch_local.is_some() {
-                    // Get reference segment size from buffer OR persistent storage
-                    let ref_size = if let Some(group_buffer) = in_batch_local {
-                        // Group in buffer - get size from buffer
-                        if let Some(ref_seg) = &group_buffer.reference_segment {
-                            ref_seg.data.len()
-                        } else {
-                            segment_len // No reference yet, use current segment size
-                        }
-                    } else if let Some(&group_id) = in_global {
-                        // Group flushed - get size from persistent storage
-                        if let Some(ref_data) = ref_segs.get(&group_id) {
-                            ref_data.len()
-                        } else {
-                            // Group exists but no reference data yet
-                            segment_len
-                        }
+    // Second pass: check batch-local buffer for remaining candidates (Mutex - exclusive)
+    // Only if we didn't find candidates in global registry
+    if existing_candidates.is_empty() {
+        let groups = segment_groups.lock().unwrap();
+        let mut already_found = std::collections::HashSet::new();
+        for (key_front, key_back, needs_rc, cand_key) in &candidate_keys {
+            if groups.contains_key(cand_key) {
+                // Get ref size from buffer
+                let ref_size = if let Some(group_buffer) = groups.get(cand_key) {
+                    if let Some(ref_seg) = &group_buffer.reference_segment {
+                        ref_seg.data.len()
                     } else {
                         segment_len
-                    };
+                    }
+                } else {
+                    segment_len
+                };
 
-                    candidates.push((key_front, key_back, needs_rc, ref_size));
-                    break; // Found a match for this cand_kmer, move to next
+                // Debug trace
+                if crate::env_cache::debug_is_dir() {
+                    eprintln!("RAGC_FIND_GROUP_CAND_CHECK: cand_key=({},{}) exists_in_groups=true ref_size={}",
+                        key_front, key_back, ref_size);
+                }
+
+                // Use cand_kmer as key to deduplicate (only one match per connected_kmer)
+                let connected = if *key_front == kmer { *key_back } else { *key_front };
+                if !already_found.contains(&connected) {
+                    candidates.push((*key_front, *key_back, *needs_rc, ref_size));
+                    already_found.insert(connected);
                 }
             }
         }
-    }
+    } // groups lock released
+
+    // Phase 3: Get ref sizes for global candidates (brief RwLock)
+    if !existing_candidates.is_empty() {
+        let ref_segs = reference_segments.read().unwrap();
+        let mut already_found = std::collections::HashSet::new();
+        for (key_front, key_back, needs_rc, group_id_opt) in existing_candidates {
+            let ref_size = if let Some(group_id) = group_id_opt {
+                if let Some(ref_data) = ref_segs.get(&group_id) {
+                    ref_data.len()
+                } else {
+                    segment_len
+                }
+            } else {
+                segment_len
+            };
+
+            // Debug trace
+            if crate::env_cache::debug_is_dir() {
+                eprintln!("RAGC_FIND_GROUP_CAND_CHECK: cand_key=({},{}) exists_in_seg_map=true ref_size={}",
+                    key_front, key_back, ref_size);
+            }
+
+            // Use cand_kmer as key to deduplicate (only one match per connected_kmer)
+            let connected = if key_front == kmer { key_back } else { key_front };
+            if !already_found.contains(&connected) {
+                candidates.push((key_front, key_back, needs_rc, ref_size));
+                already_found.insert(connected);
+            }
+        }
+    } // ref_segs lock released
 
     if candidates.is_empty() {
         // No existing groups found - create new with MISSING
@@ -2498,6 +3343,221 @@ fn add_fallback_mapping(
     }
 }
 
+// =============================================================================
+// Parallel batch processing functions (C++ AGC 4-phase pattern)
+// =============================================================================
+
+/// Phase 2: Prepare batch for parallel processing
+/// - Processes NEW segments from buffered_seg_part (assigns group_ids)
+/// - Drains segments from buffered_seg_part into SegmentGroupBuffer entries
+/// - Extracts buffers that need flushing into ParallelFlushState
+/// Returns true if there are buffers to flush, false otherwise
+#[allow(clippy::too_many_arguments)]
+fn prepare_batch_parallel(
+    segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    buffered_seg_part: &Arc<BufferedSegPart>,
+    batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    batch_local_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
+    map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
+    group_counter: &Arc<AtomicU32>,
+    raw_group_counter: &Arc<AtomicU32>,
+    archive: &Arc<Mutex<Archive>>,
+    collection: &Arc<Mutex<CollectionV3>>,
+    reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
+    reference_orientations: &Arc<RwLock<BTreeMap<u32, bool>>>,
+    #[cfg(feature = "cpp_agc")]
+    grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
+    parallel_state: &ParallelFlushState,
+    config: &StreamingQueueConfig,
+) -> Result<bool> {
+    use crate::segment::MISSING_KMER;
+
+    // Check if there's anything to process
+    let batch_map_len = batch_local_groups.lock().unwrap().len();
+    let batch_terms_len = batch_local_terminators.lock().unwrap().len();
+    let has_buffered_segments = buffered_seg_part.has_segments();
+
+    if batch_map_len == 0 && batch_terms_len == 0 && !has_buffered_segments {
+        return Ok(false);
+    }
+
+    if config.verbosity > 0 {
+        eprintln!("PREPARE_BATCH_PARALLEL: Processing {} batch-local groups, buffered segments: {}, {} terminator keys",
+            batch_map_len, has_buffered_segments, batch_terms_len);
+    }
+
+    // Phase 2a: Process NEW segments - assign group_ids deterministically
+    // Get current group counter and update after process_new
+    let mut next_group_id = group_counter.load(Ordering::SeqCst);
+    {
+        let mut global_map = map_segments.write().unwrap();
+        let new_count = buffered_seg_part.process_new(&mut global_map, &mut next_group_id);
+        if config.verbosity > 0 && new_count > 0 {
+            eprintln!("PREPARE_BATCH_PARALLEL: Assigned {} new group IDs", new_count);
+        }
+    }
+    // Update the shared counter
+    group_counter.store(next_group_id, Ordering::SeqCst);
+
+    // Phase 2b: Sort segments within each group for determinism
+    buffered_seg_part.sort_known();
+
+    // Phase 2c: Drain segments from buffered_seg_part into SegmentGroupBuffer entries
+    let mut groups_map = segment_groups.lock().unwrap();
+
+    // Get the read lock on vl_seg_part to iterate groups
+    let num_groups = buffered_seg_part.num_groups();
+    for group_id in 0..num_groups as u32 {
+        // Drain all segments from this group
+        while let Some(seg) = buffered_seg_part.get_part(group_id) {
+            // Get the key for this segment by looking it up in map_segments
+            // We need to find the key that maps to this group_id
+            let key = {
+                let global_map = map_segments.read().unwrap();
+                global_map.iter()
+                    .find(|(_, &gid)| gid == group_id)
+                    .map(|(k, _)| k.clone())
+            };
+
+            let key = match key {
+                Some(k) => k,
+                None => {
+                    // Create a placeholder key for orphan groups (MISSING_KMER)
+                    SegmentGroupKey {
+                        kmer_front: MISSING_KMER,
+                        kmer_back: MISSING_KMER,
+                    }
+                }
+            };
+
+            // Register to batch-local map
+            {
+                let mut batch_map = batch_local_groups.lock().unwrap();
+                batch_map.insert(key.clone(), group_id);
+            }
+
+            // Register with FFI engine
+            #[cfg(feature = "cpp_agc")]
+            if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                let mut eng = grouping_engine.lock().unwrap();
+                eng.register_group(key.kmer_front, key.kmer_back, group_id);
+            }
+
+            // Update batch-local terminators
+            if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                let mut term_map = batch_local_terminators.lock().unwrap();
+                term_map.entry(key.kmer_front)
+                    .or_insert_with(Vec::new)
+                    .push(key.kmer_back);
+                if key.kmer_front != key.kmer_back {
+                    term_map.entry(key.kmer_back)
+                        .or_insert_with(Vec::new)
+                        .push(key.kmer_front);
+                }
+            }
+
+            // Get or create SegmentGroupBuffer for this group
+            let buffer = groups_map.entry(key.clone()).or_insert_with(|| {
+                let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+                let mut arch = archive.lock().unwrap();
+                let stream_id = arch.register_stream(&delta_stream_name);
+                let ref_stream_id = arch.register_stream(&ref_stream_name);
+                drop(arch);
+                SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+            });
+
+            // Add segment to buffer
+            buffer.segments.push(seg);
+        }
+    }
+
+    // Clear the buffered_seg_part after draining
+    buffered_seg_part.clear();
+
+    // Extract buffers that need flushing
+    let mut extracted: Vec<(SegmentGroupKey, SegmentGroupBuffer)> = Vec::new();
+    let keys_to_remove: Vec<SegmentGroupKey> = groups_map
+        .iter()
+        .filter(|(_, buffer)| !buffer.segments.is_empty() || !buffer.ref_written)
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    // Sort keys for deterministic processing order
+    let mut sorted_keys = keys_to_remove;
+    sorted_keys.sort();
+
+    for key in sorted_keys {
+        if let Some(buffer) = groups_map.remove(&key) {
+            extracted.push((key, buffer));
+        }
+    }
+
+    let has_work = !extracted.is_empty();
+
+    if config.verbosity > 0 {
+        eprintln!("PREPARE_BATCH_PARALLEL: Extracted {} buffers for parallel flush", extracted.len());
+    }
+
+    // Populate ParallelFlushState
+    parallel_state.prepare(extracted);
+
+    Ok(has_work)
+}
+
+/// Phase 4: Cleanup after parallel processing
+/// - Re-inserts processed buffers
+/// - Updates global maps
+/// - Clears batch-local state
+fn cleanup_batch_parallel(
+    segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
+    batch_local_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
+    map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
+    map_segments_terminators: &Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
+    parallel_state: &ParallelFlushState,
+    config: &StreamingQueueConfig,
+) {
+    // Re-insert processed buffers
+    let processed = parallel_state.drain_buffers();
+    {
+        let mut groups_map = segment_groups.lock().unwrap();
+        for (key, buffer) in processed {
+            groups_map.insert(key, buffer);
+        }
+    }
+
+    // Update global registry with batch-local groups
+    {
+        let batch_map = batch_local_groups.lock().unwrap();
+        let mut global_map = map_segments.write().unwrap();
+        for (key, group_id) in batch_map.iter() {
+            global_map.entry(key.clone()).or_insert(*group_id);
+        }
+    }
+
+    // Merge batch-local terminators into global terminators
+    {
+        let batch_terms = batch_local_terminators.lock().unwrap();
+        let mut global_terms = map_segments_terminators.write().unwrap();
+        for (kmer, connections) in batch_terms.iter() {
+            let entry = global_terms.entry(*kmer).or_insert_with(Vec::new);
+            entry.extend(connections.iter().cloned());
+            entry.sort_unstable();
+            entry.dedup();
+        }
+    }
+
+    // Clear batch-local state
+    batch_local_groups.lock().unwrap().clear();
+    batch_local_terminators.lock().unwrap().clear();
+
+    if config.verbosity > 0 {
+        eprintln!("CLEANUP_BATCH_PARALLEL: Batch cleanup complete");
+    }
+}
+
 /// Flush batch-local groups to global state (matches C++ AGC batch boundary)
 /// This updates the global map_segments registry with batch-local groups,
 /// then clears the batch-local state (like C++ AGC destroying m_kmers at batch end)
@@ -2782,8 +3842,12 @@ fn worker_thread(
     batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
+    buffered_seg_part: Arc<BufferedSegPart>, // Per-group buffers for parallel Phase 1
     map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
+    raw_segment_buffer: Arc<Mutex<Vec<RawBufferedSegment>>>, // Raw segments for deferred classification
     barrier: Arc<std::sync::Barrier>, // Synchronization barrier for batch boundaries
+    parallel_state: Arc<ParallelFlushState>, // Shared state for parallel Phase 3
+    write_buffer: Arc<ParallelWriteBuffer>, // Per-stream buffers for parallel writes
     config: StreamingQueueConfig,
 ) -> Result<()> {
     let mut processed_count = 0;
@@ -2833,40 +3897,138 @@ fn worker_thread(
                 eprintln!("Worker {} hit sync token for sample {}", worker_id, task.sample_name);
             }
 
+            // =================================================================
+            // C++ AGC 4-Phase Parallel Pattern
+            // =================================================================
+
             // Barrier 1: All workers arrive at sample boundary
             barrier.wait();
 
-            // Only worker 0 performs the flush (matches C++ AGC thread_id == 0 check)
+            // Phase 2 (Thread 0 only): Prepare batch and extract buffers
             if worker_id == 0 {
                 if config.verbosity > 0 {
-                    eprintln!("Worker 0 flushing batch at sample boundary for {}", task.sample_name);
+                    eprintln!("Worker 0 preparing batch at sample boundary for {}", task.sample_name);
                 }
 
-                flush_batch(
+                prepare_batch_parallel(
                     &segment_groups,
-                    &pending_batch_segments,
+                    &buffered_seg_part,
                     &batch_local_groups,
                     &batch_local_terminators,
                     &map_segments,
                     &group_counter,
-                    &raw_group_counter, // FIX 17: Pass raw_group_counter for round-robin distribution
-                    &map_segments_terminators,
+                    &raw_group_counter,
                     &archive,
                     &collection,
                     &reference_segments,
                     &reference_orientations,
                     #[cfg(feature = "cpp_agc")]
                     &grouping_engine,
+                    &parallel_state,
                     &config,
                 )?;
+            }
+
+            // Barrier 2: All workers see prepared buffers
+            barrier.wait();
+
+            // Phase 3a (ALL workers): Atomic work-stealing to COMPRESS and BUFFER writes
+            // Workers compress segments and buffer archive writes (C++ AGC: AddPartBuffered)
+            // Buffering is fast (memory only), flush happens after barrier
+            loop {
+                let Some(idx) = parallel_state.claim_next_idx() else {
+                    break;
+                };
+
+                if let Some((key, mut buffer)) = parallel_state.get_buffer_at(idx) {
+                    // Compress this buffer
+                    if !buffer.segments.is_empty() || !buffer.ref_written {
+                        match flush_pack_compress_only(&mut buffer, &config) {
+                            Ok(mut result) => {
+                                // Buffer archive writes using per-stream mutexes (NO global lock!)
+                                // Workers on different streams can buffer concurrently
+                                for part in result.archive_writes.drain(..) {
+                                    write_buffer.buffer_write(part.stream_id, part.data, part.metadata);
+                                }
+                                // Store result (now without archive_writes)
+                                parallel_state.store_result(idx, result);
+                            }
+                            Err(e) => {
+                                eprintln!("Worker {} error compressing group {}: {}", worker_id, buffer.group_id, e);
+                            }
+                        }
+                    }
+                    // Return buffer
+                    parallel_state.return_buffer(idx, key, buffer);
+                }
+            }
+
+            // Barrier 3: All workers done with compression and buffering
+            barrier.wait();
+
+            // Phase 3b + Phase 4 (Thread 0 only): Flush writes, registrations, and cleanup
+            // Combined to reduce barrier overhead (was 2 separate barriers)
+            if worker_id == 0 {
+                // Phase 3b: Flush buffered writes and process registrations
+                let sorted_results = parallel_state.drain_results_sorted();
+
+                // Take all locks once at the start
+                let mut arch = archive.lock().unwrap();
+                let mut ref_segs = reference_segments.write().unwrap();
+                let mut coll = collection.lock().unwrap();
+
+                // Flush all buffered writes from per-stream buffer to archive
+                // BTreeMap ensures sorted stream_id order for determinism
+                if let Err(e) = write_buffer.flush_to_archive(&mut *arch) {
+                    eprintln!("Thread 0 error flushing archive buffers: {}", e);
+                }
+                // Clear write buffer for next batch
+                write_buffer.clear();
+
+                // Process ref_to_store and registrations in sorted group_id order
+                for result in sorted_results {
+                    // Store reference in global map
+                    if let Some((group_id, ref_data)) = result.ref_to_store {
+                        ref_segs.insert(group_id, ref_data);
+                    }
+
+                    // Register segments in collection
+                    for reg in result.registrations {
+                        if let Err(e) = coll.add_segment_placed(
+                            &reg.sample_name,
+                            &reg.contig_name,
+                            reg.seg_part_no,
+                            reg.group_id,
+                            reg.in_group_id,
+                            reg.is_rev_comp,
+                            reg.raw_length,
+                        ) {
+                            eprintln!("Thread 0 error registering segment: {}", e);
+                        }
+                    }
+                }
+                // Locks released here when guards go out of scope
+                drop(arch);
+                drop(ref_segs);
+                drop(coll);
+
+                // Phase 4: Cleanup
+                cleanup_batch_parallel(
+                    &segment_groups,
+                    &batch_local_groups,
+                    &batch_local_terminators,
+                    &map_segments,
+                    &map_segments_terminators,
+                    &parallel_state,
+                    &config,
+                );
 
                 // Clear batch-local state after flush (start fresh for new sample)
                 let mut samples = batch_samples.lock().unwrap();
                 samples.clear();
             }
 
-            // Barrier 2: Wait for flush to complete before all workers proceed
-            // This ensures all workers see the updated map_segments state
+            // Barrier 4: All workers ready for next batch (reduced from 2 barriers)
             barrier.wait();
 
             // Sync token processed - continue to next task
@@ -2944,21 +4106,27 @@ fn worker_thread(
             );
         }
 
+        // OPTIMIZATION: Pre-read split offsets for this contig to avoid O(n²) lock contention
+        // Build a set of split positions for this (sample, contig) pair once
+        // Note: splits from prior workers are in the global map, splits from THIS task
+        // are tracked locally in local_splits
+        let prior_contig_splits: std::collections::BTreeSet<usize> = {
+            let offsets = split_offsets.lock().unwrap();
+            offsets.iter()
+                .filter(|((s, c, _), _)| s == &task.sample_name && c == &task.contig_name)
+                .map(|((_, _, pos), _)| *pos)
+                .collect()
+        };
+        let mut local_splits: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+
         // Buffer segments for packing (matching batch mode)
         for (original_place, segment) in segments.iter().enumerate() {
             // Calculate adjusted place based on prior splits in this contig
             // (matches C++ AGC lines 2033-2036: increment seg_part_no twice when split occurs)
-            let place = {
-                let offsets = split_offsets.lock().unwrap();
-                let mut adjusted = original_place;
-                // Count how many splits occurred before this position
-                for pos in 0..original_place {
-                    if offsets.contains_key(&(task.sample_name.clone(), task.contig_name.clone(), pos)) {
-                        adjusted += 1;
-                    }
-                }
-                adjusted
-            };
+            // OPTIMIZATION: Count splits before current position from both prior and local sets
+            let prior_count = prior_contig_splits.range(..original_place).count();
+            let local_count = local_splits.range(..original_place).count();
+            let place = original_place + prior_count + local_count;
 
             // DEBUG: Output every segment for comparison with C++ AGC
             #[cfg(feature = "verbose_debug")]
@@ -3171,12 +4339,10 @@ fn worker_thread(
                 segment.data.clone()
             };
 
-            // Lock segment groups and add segment to buffer
             // NOTE: Split check must happen BEFORE creating BufferedSegment
             // to avoid moving segment_data prematurely
+            // PERF: Lock deferred - normal path doesn't need segment_groups lock
             {
-                let mut groups = segment_groups.lock().unwrap();
-
                 // Phase 1: Check if group already exists
                 // (matches C++ AGC: seg_map_mtx.lock() then find at line 1020)
                 let key_exists = {
@@ -3327,6 +4493,10 @@ fn worker_thread(
                         );
 
                         if let Some((left_data, right_data, _mid)) = split_result {
+                            // PERF: Acquire lock only for split path (rare case)
+                            // Normal segments bypass this entirely for better parallelism
+                            let mut groups = segment_groups.lock().unwrap();
+
                             // FIX 27 v4: Compute separate orientations for left and right parts
                             // C++ AGC lines 1526-1536 and 1540-1550:
                             //   store_rc = (kmer_front.data() >= split_match.first)  -- for left
@@ -3443,20 +4613,29 @@ fn worker_thread(
                                 // left first
                                 if !is_degenerate_left {
                                     let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
-                                        // Check global map_segments first, create new group if not found
+                                        // OPTIMIZATION: Read-check-write pattern to reduce lock contention
+                                        // First check with read lock (fast path - most groups already exist)
                                         let group_id = {
-                                            let mut global_map = map_segments.write().unwrap();
+                                            let global_map = map_segments.read().unwrap();
                                             if let Some(&existing_id) = global_map.get(&left_key) {
                                                 existing_id
                                             } else {
-                                                // Create new group ID and register IMMEDIATELY to global map
-                                                let new_id = group_counter.fetch_add(1, Ordering::SeqCst);
-                                                global_map.insert(left_key.clone(), new_id);
                                                 drop(global_map);
-                                                // Also register to batch-local for flush tracking
-                                                let mut batch_map = batch_local_groups.lock().unwrap();
-                                                batch_map.insert(left_key.clone(), new_id);
-                                                new_id
+                                                // Group doesn't exist - upgrade to write lock
+                                                let mut global_map = map_segments.write().unwrap();
+                                                // Double-check after acquiring write lock (race condition)
+                                                if let Some(&existing_id) = global_map.get(&left_key) {
+                                                    existing_id
+                                                } else {
+                                                    // Create new group ID and register IMMEDIATELY to global map
+                                                    let new_id = group_counter.fetch_add(1, Ordering::SeqCst);
+                                                    global_map.insert(left_key.clone(), new_id);
+                                                    drop(global_map);
+                                                    // Also register to batch-local for flush tracking
+                                                    let mut batch_map = batch_local_groups.lock().unwrap();
+                                                    batch_map.insert(left_key.clone(), new_id);
+                                                    new_id
+                                                }
                                             }
                                         };
                                         // Register with FFI engine
@@ -3499,20 +4678,29 @@ fn worker_thread(
                                 }
                                 if !is_degenerate_right {
                                     let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
-                                        // Check global map_segments first, create new group if not found
+                                        // OPTIMIZATION: Read-check-write pattern to reduce lock contention
+                                        // First check with read lock (fast path - most groups already exist)
                                         let group_id = {
-                                            let mut global_map = map_segments.write().unwrap();
+                                            let global_map = map_segments.read().unwrap();
                                             if let Some(&existing_id) = global_map.get(&right_key) {
                                                 existing_id
                                             } else {
-                                                // Create new group ID and register IMMEDIATELY to global map
-                                                let new_id = group_counter.fetch_add(1, Ordering::SeqCst);
-                                                global_map.insert(right_key.clone(), new_id);
                                                 drop(global_map);
-                                                // Also register to batch-local for flush tracking
-                                                let mut batch_map = batch_local_groups.lock().unwrap();
-                                                batch_map.insert(right_key.clone(), new_id);
-                                                new_id
+                                                // Group doesn't exist - upgrade to write lock
+                                                let mut global_map = map_segments.write().unwrap();
+                                                // Double-check after acquiring write lock (race condition)
+                                                if let Some(&existing_id) = global_map.get(&right_key) {
+                                                    existing_id
+                                                } else {
+                                                    // Create new group ID and register IMMEDIATELY to global map
+                                                    let new_id = group_counter.fetch_add(1, Ordering::SeqCst);
+                                                    global_map.insert(right_key.clone(), new_id);
+                                                    drop(global_map);
+                                                    // Also register to batch-local for flush tracking
+                                                    let mut batch_map = batch_local_groups.lock().unwrap();
+                                                    batch_map.insert(right_key.clone(), new_id);
+                                                    new_id
+                                                }
                                             }
                                         };
                                         // Register with FFI engine
@@ -3682,6 +4870,8 @@ fn worker_thread(
                             // (matches C++ AGC lines 2033-2036: ++seg_part_no twice when split)
                             // For degenerate splits, only increment once (no actual split)
                             if !is_degenerate_left && !is_degenerate_right {
+                                // OPTIMIZATION: Track locally for this task AND globally for other workers
+                                local_splits.insert(original_place);
                                 let mut offsets = split_offsets.lock().unwrap();
                                 offsets.insert((task.sample_name.clone(), task.contig_name.clone(), original_place), 1);
                             }
@@ -3782,140 +4972,43 @@ fn worker_thread(
                 // group can have different is_rev_comp values.
                 let (final_should_reverse, final_segment_data) = (should_reverse, segment_data);
 
-                // Check if this group already exists (global OR batch-local)
-                // If it does NOT exist, defer to pending_batch_segments for sorted group_id assignment
-                let group_exists = {
-                    let global_map = map_segments.read().unwrap();
-                    if global_map.contains_key(&key) {
-                        true
-                    } else {
-                        let batch_map = batch_local_groups.lock().unwrap();
-                        batch_map.contains_key(&key)
-                    }
+                if config.verbosity > 2 {
+                    eprintln!("DEFER_SEGMENT: front={} back={} sample={} contig={} place={}",
+                        key_front, key_back, task.sample_name, task.contig_name, place);
+                }
+
+                // PHASE 1 (PARALLEL): Add segment to buffered_seg_part
+                // Check if group exists (brief read lock on map_segments)
+                let group_id_opt = {
+                    let seg_map = map_segments.read().unwrap();
+                    seg_map.get(&key).copied()
                 };
 
-                if !group_exists {
-                    // NEW GROUP: Defer to pending_batch_segments for sorted processing in flush_batch
-                    // This ensures group_ids are assigned in sorted order (by sample, contig, place)
-                    // matching C++ AGC's sorted BTreeSet iteration
-                    if config.verbosity > 2 {
-                        eprintln!("DEFER_NEW_GROUP: front={} back={} sample={} contig={} place={}",
-                            key_front, key_back, task.sample_name, task.contig_name, place);
-                    }
-
-                    pending_batch_segments.lock().unwrap().push(PendingSegment {
-                        key: key.clone(),
-                        segment_data: final_segment_data,
-                        should_reverse: final_should_reverse,
+                if let Some(group_id) = group_id_opt {
+                    // KNOWN: add to per-group buffer (per-group lock only - PARALLEL)
+                    buffered_seg_part.add_known(group_id, BufferedSegment {
                         sample_name: task.sample_name.clone(),
                         contig_name: task.contig_name.clone(),
-                        place,
+                        seg_part_no: place,
+                        data: final_segment_data,
+                        is_rev_comp: final_should_reverse,
                         sample_priority: task.sample_priority,
                     });
-
-                    // Skip immediate processing - segment will be handled in flush_batch
-                    continue;
-                }
-
-                // EXISTING GROUP: Process immediately as before
-                let buffer = groups.entry(key.clone()).or_insert_with(|| {
-                    // Group must exist in one of the registries (checked above)
-                    // Retrieve the existing group_id
-                    let group_id = {
-                        let global_map = map_segments.read().unwrap();
-                        if let Some(&existing_id) = global_map.get(&key) {
-                            existing_id
-                        } else {
-                            // Must be in batch_local (we checked above)
-                            let batch_map = batch_local_groups.lock().unwrap();
-                            *batch_map.get(&key).expect("Group must exist in batch_local")
-                        }
-                    };
-
-                    if config.verbosity > 2 {
-                        eprintln!("REUSE_EXISTING_GROUP: group_id={} front={} back={} sample={}",
-                            group_id, key_front, key_back, task.sample_name);
-                    }
-
-                    // Register streams for this group (needed for worker-local buffer)
-                    let archive_version =
-                        ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                    let delta_stream_name =
-                        ragc_common::stream_delta_name(archive_version, group_id);
-                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-
-                    let mut arch = archive.lock().unwrap();
-                    let stream_id = arch.register_stream(&delta_stream_name);
-                    let ref_stream_id = arch.register_stream(&ref_stream_name);
-                    drop(arch);
-
-                    SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
-                });
-
-                // Create buffered segment for EXISTING group
-                let buffered = BufferedSegment {
-                    sample_name: task.sample_name.clone(),
-                    contig_name: task.contig_name.clone(),
-                    seg_part_no: place,
-                    data: final_segment_data,
-                    is_rev_comp: final_should_reverse,
-                    sample_priority: task.sample_priority,
-                };
-
-                // DEBUG: Print data for degenerate k-mer reference segments
-                if key_front == 1244212049458757632 && key_back == 1244212049458757632 && config.verbosity > 1 {
-                    let data_first5: Vec<u8> = buffered.data.iter().take(5).cloned().collect();
-                    eprintln!("RAGC_DEGENERATE_BUFFERED: sample={} contig={} part={} key=({},{}) should_reverse={} len={} data[0..5]={:?}",
-                        task.sample_name, task.contig_name, place, key_front, key_back, should_reverse, buffered.data.len(), data_first5);
-                }
-
-                // CSV logging for ALL segment grouping decisions (enabled via RAGC_GROUP_LOG=1)
-                // This logs every segment, including those joining existing batch-local groups
-                if crate::env_cache::group_log() {
-                    let source = if key_exists { "global" } else { "batch_or_new" };
-                    eprintln!("SEGMENT_GROUP,{},{},{},{},{},{},{},{}",
-                        task.sample_name, task.contig_name, place,
-                        key.kmer_front, key.kmer_back, final_should_reverse, source, buffer.group_id);
-                }
-
-                // Add fallback mapping for this segment (matches C++ AGC add_fallback_mapping)
-                // This populates the fallback minimizers map for use by find_cand_segment_using_fallback_minimizers
-                add_fallback_mapping(
-                    &buffered.data,
-                    config.k,
-                    key.kmer_front,
-                    key.kmer_back,
-                    &fallback_filter,
-                    &map_fallback_minimizers,
-                );
-
-                if key_exists && config.verbosity > 1 {
-                    eprintln!("REUSE_GROUP: group_id={} front={} back={} sample={}",
-                        buffer.group_id, key_front, key_back, task.sample_name);
-                }
-
-                // CRITICAL: Match C++ AGC behavior - write reference IMMEDIATELY for LZ groups
-                // (C++ AGC segment.cpp lines 41-48: if (no_seqs == 0) writes reference right away)
-                // BUT: Raw groups 0-15 (orphan segments) don't have references - they skip position 0
-                let is_raw_group = buffer.group_id < NO_RAW_GROUPS;  // Groups 0-15 are raw groups (match C++ AGC)
-                if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
-                    // This is the FIRST segment in an LZ group - make it the reference NOW
-                    // (matches C++ AGC: lz_diff->Prepare(s); store_in_archive(s, zstd_cctx);)
-                    if let Err(e) = write_reference_immediately(&buffered, buffer, &collection, &archive, &reference_segments, &reference_orientations, &config) {
-                        eprintln!("ERROR: Failed to write immediate reference: {}", e);
-                        // Fall back to buffering
-                        buffer.segments.push(buffered);
-                    }
                 } else {
-                    // Buffer segment: either raw group, or subsequent LZ segment
-                    buffer.segments.push(buffered);
+                    // NEW: add to s_seg_part (brief global lock on BTreeSet)
+                    buffered_seg_part.add_new(NewSegment {
+                        kmer_front: key.kmer_front,
+                        kmer_back: key.kmer_back,
+                        sample_priority: task.sample_priority,
+                        sample_name: task.sample_name.clone(),
+                        contig_name: task.contig_name.clone(),
+                        seg_part_no: place,
+                        data: final_segment_data,
+                        should_reverse: final_should_reverse,
+                    });
                 }
 
-                // Flush pack if buffer is full (matches C++ AGC write-as-you-go behavior)
-                if buffer.should_flush_pack(config.pack_size) {
-                    flush_pack(buffer, &collection, &archive, &config, &reference_segments)
-                        .context("Failed to flush pack")?;
-                }
+                // Segment will be handled in flush_batch at barrier synchronization point
             }
         }
 

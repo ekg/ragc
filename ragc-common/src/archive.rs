@@ -3,7 +3,7 @@
 
 use crate::varint::{read_varint, write_varint};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -54,6 +54,10 @@ pub struct Archive {
     f_offset: u64,
     streams: Vec<Stream>,
     stream_map: HashMap<String, usize>,
+    /// Write buffer for parallel Phase 3 (C++ AGC: m_buffer)
+    /// Maps stream_id -> Vec of (data, metadata) tuples
+    /// BTreeMap ensures writes are flushed in sorted stream_id order for determinism
+    write_buffer: BTreeMap<usize, Vec<(Vec<u8>, u64)>>,
 }
 
 impl Archive {
@@ -67,6 +71,7 @@ impl Archive {
             f_offset: 0,
             streams: Vec::new(),
             stream_map: HashMap::new(),
+            write_buffer: BTreeMap::new(),
         }
     }
 
@@ -80,6 +85,7 @@ impl Archive {
             f_offset: 0,
             streams: Vec::new(),
             stream_map: HashMap::new(),
+            write_buffer: BTreeMap::new(),
         }
     }
 
@@ -171,6 +177,30 @@ impl Archive {
         self.streams[stream_id].packed_size += total_size;
         self.streams[stream_id].packed_data_size += data.len() as u64;
 
+        Ok(())
+    }
+
+    /// Buffer a part for later writing (C++ AGC: AddPartBuffered)
+    /// This allows parallel compression while maintaining deterministic write order.
+    /// Call flush_buffers() after all parts are buffered to write in sorted stream_id order.
+    pub fn add_part_buffered(&mut self, stream_id: usize, data: Vec<u8>, metadata: u64) {
+        self.write_buffer
+            .entry(stream_id)
+            .or_insert_with(Vec::new)
+            .push((data, metadata));
+    }
+
+    /// Flush all buffered parts to disk in sorted stream_id order (C++ AGC: flush_out_buffers)
+    /// This ensures deterministic output regardless of which thread buffered the data.
+    pub fn flush_buffers(&mut self) -> Result<()> {
+        // BTreeMap iterates in sorted key order (stream_id)
+        // This matches C++ AGC's flush_out_buffers() which iterates m_buffer (std::map)
+        let buffer = std::mem::take(&mut self.write_buffer);
+        for (stream_id, parts) in buffer {
+            for (data, metadata) in parts {
+                self.add_part(stream_id, &data, metadata)?;
+            }
+        }
         Ok(())
     }
 
