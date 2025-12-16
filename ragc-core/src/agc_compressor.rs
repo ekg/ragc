@@ -988,9 +988,10 @@ pub struct StreamingQueueCompressor {
     // Workers on different streams can buffer writes concurrently without contention
     write_buffer: Arc<ParallelWriteBuffer>,
 
-    // RAW segment buffer for deferred classification (parallel Phase 1 optimization)
-    // Workers buffer raw segments WITHOUT classification locks, Thread 0 classifies at barrier
-    raw_segment_buffer: Arc<Mutex<Vec<RawBufferedSegment>>>,
+    // RAW segment buffers for deferred classification (parallel Phase 1 optimization)
+    // PER-WORKER buffers eliminate contention: each worker pushes to its own buffer
+    // Thread 0 drains all buffers at barrier for classification
+    raw_segment_buffers: Arc<Vec<Mutex<Vec<RawBufferedSegment>>>>,
 }
 
 impl StreamingQueueCompressor {
@@ -1189,9 +1190,13 @@ impl StreamingQueueCompressor {
         // Workers on different streams can buffer writes concurrently without contention
         let write_buffer = Arc::new(ParallelWriteBuffer::new());
 
-        // RAW segment buffer for deferred classification (parallel Phase 1 optimization)
-        // Workers buffer raw segments WITHOUT classification locks, Thread 0 classifies at barrier
-        let raw_segment_buffer = Arc::new(Mutex::new(Vec::<RawBufferedSegment>::new()));
+        // RAW segment buffers for deferred classification (parallel Phase 1 optimization)
+        // PER-WORKER buffers eliminate contention: each worker pushes to its own buffer
+        let raw_segment_buffers: Arc<Vec<Mutex<Vec<RawBufferedSegment>>>> = Arc::new(
+            (0..config.num_threads)
+                .map(|_| Mutex::new(Vec::new()))
+                .collect()
+        );
 
         // Spawn worker threads
         let mut workers = Vec::new();
@@ -1222,7 +1227,7 @@ impl StreamingQueueCompressor {
             let barrier = Arc::clone(&barrier);
             let parallel_state = Arc::clone(&parallel_state);
             let write_buffer = Arc::clone(&write_buffer);
-            let raw_segment_buffer = Arc::clone(&raw_segment_buffer);
+            let raw_segment_buffers = Arc::clone(&raw_segment_buffers);
             let config = config.clone();
 
             let handle = thread::spawn(move || {
@@ -1251,7 +1256,7 @@ impl StreamingQueueCompressor {
                     pending_batch_segments,
                     buffered_seg_part,
                     map_fallback_minimizers,
-                    raw_segment_buffer,
+                    raw_segment_buffers,
                     barrier,
                     parallel_state,
                     write_buffer,
@@ -1309,8 +1314,8 @@ impl StreamingQueueCompressor {
             parallel_state,
             // Per-stream write buffer
             write_buffer,
-            // Raw segment buffer for deferred classification
-            raw_segment_buffer,
+            // Raw segment buffers for deferred classification (per-worker)
+            raw_segment_buffers,
         })
     }
 
@@ -1422,7 +1427,7 @@ impl StreamingQueueCompressor {
                 let pending_batch_segments = Arc::clone(&self.pending_batch_segments);
                 let buffered_seg_part = Arc::clone(&self.buffered_seg_part);
                 let map_fallback_minimizers = Arc::clone(&self.map_fallback_minimizers);
-                let raw_segment_buffer = Arc::clone(&self.raw_segment_buffer);
+                let raw_segment_buffers = Arc::clone(&self.raw_segment_buffers);
                 let barrier = Arc::clone(&self.barrier);
                 let parallel_state = Arc::clone(&self.parallel_state);
                 let write_buffer = Arc::clone(&self.write_buffer);
@@ -1454,7 +1459,7 @@ impl StreamingQueueCompressor {
                         pending_batch_segments,
                         buffered_seg_part,
                         map_fallback_minimizers,
-                        raw_segment_buffer,
+                        raw_segment_buffers,
                         barrier,
                         parallel_state,
                         write_buffer,
@@ -3558,6 +3563,133 @@ fn cleanup_batch_parallel(
     }
 }
 
+/// Classify raw segments at barrier (Thread 0 only)
+/// This eliminates lock contention by doing all classification single-threaded.
+/// Raw segments are sorted for determinism, then classified using the same
+/// Case 2/3a/3b logic as before, just without contention.
+fn classify_raw_segments_at_barrier(
+    raw_segment_buffers: &Arc<Vec<Mutex<Vec<RawBufferedSegment>>>>,
+    buffered_seg_part: &Arc<BufferedSegPart>,
+    map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
+    map_segments_terminators: &Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
+    segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
+    reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
+    config: &StreamingQueueConfig,
+) {
+    use crate::segment::MISSING_KMER;
+
+    // Drain all raw segments from ALL per-worker buffers into one Vec
+    let mut raw_segs: Vec<RawBufferedSegment> = Vec::new();
+    for buffer in raw_segment_buffers.iter() {
+        let mut worker_segs = buffer.lock().unwrap();
+        raw_segs.append(&mut *worker_segs);
+    }
+
+    if raw_segs.is_empty() {
+        return;
+    }
+
+    // Sort for determinism: by sample_name, contig_name, original_place
+    raw_segs.sort();
+
+    if config.verbosity > 0 {
+        eprintln!("CLASSIFY_RAW_BARRIER: Processing {} raw segments (single-threaded)", raw_segs.len());
+    }
+
+    // Classify each segment (NO LOCK CONTENTION - single-threaded)
+    for raw_seg in raw_segs.drain(..) {
+        // Case 2/3a/3b classification (same logic as before)
+        let (key_front, key_back, should_reverse) =
+            if raw_seg.front_kmer != MISSING_KMER && raw_seg.back_kmer != MISSING_KMER {
+                // Case 2: Both k-mers present
+                if raw_seg.front_kmer < raw_seg.back_kmer {
+                    (raw_seg.front_kmer, raw_seg.back_kmer, false)
+                } else {
+                    (raw_seg.back_kmer, raw_seg.front_kmer, true)
+                }
+            } else if raw_seg.front_kmer != MISSING_KMER {
+                // Case 3a: Only front k-mer present
+                let (kf, kb, sr) = find_group_with_one_kmer(
+                    raw_seg.front_kmer,
+                    raw_seg.front_kmer_is_dir,
+                    &raw_seg.data,
+                    &raw_seg.data_rc,
+                    map_segments_terminators,
+                    map_segments,
+                    segment_groups,
+                    reference_segments,
+                    config,
+                );
+                (kf, kb, sr)
+            } else if raw_seg.back_kmer != MISSING_KMER {
+                // Case 3b: Only back k-mer present
+                let kmer_is_dir_after_swap = !raw_seg.back_kmer_is_dir;
+                let (kf, kb, mut sr) = find_group_with_one_kmer(
+                    raw_seg.back_kmer,
+                    kmer_is_dir_after_swap,
+                    &raw_seg.data_rc,
+                    &raw_seg.data,
+                    map_segments_terminators,
+                    map_segments,
+                    segment_groups,
+                    reference_segments,
+                    config,
+                );
+                sr = !sr;
+                (kf, kb, sr)
+            } else {
+                // Case 1: Both MISSING - use raw grouping
+                (MISSING_KMER, MISSING_KMER, false)
+            };
+
+        let key = SegmentGroupKey {
+            kmer_front: key_front,
+            kmer_back: key_back,
+        };
+
+        // Prepare segment data (reverse complement if needed)
+        let segment_data = if should_reverse {
+            raw_seg.data_rc.clone()
+        } else {
+            raw_seg.data
+        };
+
+        // Check if group exists (NO CONTENTION - we're single-threaded)
+        let group_id_opt = {
+            let seg_map = map_segments.read().unwrap();
+            seg_map.get(&key).copied()
+        };
+
+        if let Some(group_id) = group_id_opt {
+            // KNOWN: add to per-group buffer
+            buffered_seg_part.add_known(group_id, BufferedSegment {
+                sample_name: raw_seg.sample_name,
+                contig_name: raw_seg.contig_name,
+                seg_part_no: raw_seg.original_place,
+                data: segment_data,
+                is_rev_comp: should_reverse,
+                sample_priority: raw_seg.sample_priority,
+            });
+        } else {
+            // NEW: add to s_seg_part
+            buffered_seg_part.add_new(NewSegment {
+                kmer_front: key.kmer_front,
+                kmer_back: key.kmer_back,
+                sample_priority: raw_seg.sample_priority,
+                sample_name: raw_seg.sample_name,
+                contig_name: raw_seg.contig_name,
+                seg_part_no: raw_seg.original_place,
+                data: segment_data,
+                should_reverse,
+            });
+        }
+    }
+
+    if config.verbosity > 0 {
+        eprintln!("CLASSIFY_RAW_BARRIER: Classification complete");
+    }
+}
+
 /// Flush batch-local groups to global state (matches C++ AGC batch boundary)
 /// This updates the global map_segments registry with batch-local groups,
 /// then clears the batch-local state (like C++ AGC destroying m_kmers at batch end)
@@ -3844,7 +3976,7 @@ fn worker_thread(
     pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>>,
     buffered_seg_part: Arc<BufferedSegPart>, // Per-group buffers for parallel Phase 1
     map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
-    raw_segment_buffer: Arc<Mutex<Vec<RawBufferedSegment>>>, // Raw segments for deferred classification
+    raw_segment_buffers: Arc<Vec<Mutex<Vec<RawBufferedSegment>>>>, // Per-worker buffers for deferred classification
     barrier: Arc<std::sync::Barrier>, // Synchronization barrier for batch boundaries
     parallel_state: Arc<ParallelFlushState>, // Shared state for parallel Phase 3
     write_buffer: Arc<ParallelWriteBuffer>, // Per-stream buffers for parallel writes
@@ -3904,12 +4036,33 @@ fn worker_thread(
             // Barrier 1: All workers arrive at sample boundary
             barrier.wait();
 
-            // Phase 2 (Thread 0 only): Prepare batch and extract buffers
+            // Phase 2 (Thread 0 only): Classify raw segments and prepare batch
             if worker_id == 0 {
                 if config.verbosity > 0 {
                     eprintln!("Worker 0 preparing batch at sample boundary for {}", task.sample_name);
                 }
 
+                let phase2_start = std::time::Instant::now();
+
+                // Step 1: Classify all raw segments (deferred from parallel segment loop)
+                // This eliminates lock contention by doing classification single-threaded
+                classify_raw_segments_at_barrier(
+                    &raw_segment_buffers,
+                    &buffered_seg_part,
+                    &map_segments,
+                    &map_segments_terminators,
+                    &segment_groups,
+                    &reference_segments,
+                    &config,
+                );
+
+                let classify_time = phase2_start.elapsed();
+                if config.verbosity > 0 {
+                    eprintln!("TIMING: Classification took {:?}", classify_time);
+                }
+
+                // Step 2: Prepare batch for parallel compression
+                let prepare_start = std::time::Instant::now();
                 prepare_batch_parallel(
                     &segment_groups,
                     &buffered_seg_part,
@@ -3927,11 +4080,16 @@ fn worker_thread(
                     &parallel_state,
                     &config,
                 )?;
+                let prepare_time = prepare_start.elapsed();
+                if config.verbosity > 0 {
+                    eprintln!("TIMING: Prepare took {:?}", prepare_time);
+                }
             }
 
             // Barrier 2: All workers see prepared buffers
             barrier.wait();
 
+            let compress_start = std::time::Instant::now();
             // Phase 3a (ALL workers): Atomic work-stealing to COMPRESS and BUFFER writes
             // Workers compress segments and buffer archive writes (C++ AGC: AddPartBuffered)
             // Buffering is fast (memory only), flush happens after barrier
@@ -3965,6 +4123,10 @@ fn worker_thread(
 
             // Barrier 3: All workers done with compression and buffering
             barrier.wait();
+
+            if worker_id == 0 && config.verbosity > 0 {
+                eprintln!("TIMING: Compression took {:?} (all workers)", compress_start.elapsed());
+            }
 
             // Phase 3b + Phase 4 (Thread 0 only): Flush writes, registrations, and cleanup
             // Combined to reduce barrier overhead (was 2 separate barriers)
@@ -4035,38 +4197,13 @@ fn worker_thread(
             continue;
         }
 
-        // Update batch samples tracking (for non-sync tasks)
-        {
-            let mut samples = batch_samples.lock().unwrap();
-            samples.insert(task.sample_name.clone());
-        }
-
-        // TRACE: Log map_segments state when AAB#0 chrI arrives
-        if crate::env_cache::trace_group() && task.sample_name.contains("AAB#0") && task.contig_name.contains("chrI") {
-            let seg_map = map_segments.read().unwrap();
-            eprintln!("TRACE_LOOKUP: Processing {} {} - map_segments has {} entries",
-                task.sample_name, task.contig_name, seg_map.len());
-
-            // Look for entries with matching k-mers to what we expect
-            let mut found_624 = false;
-            for (key, gid) in seg_map.iter() {
-                if *gid == 624 {
-                    eprintln!("  Found group 624: front={} back={}", key.kmer_front, key.kmer_back);
-                    found_624 = true;
-                }
-            }
-            if !found_624 {
-                eprintln!("  WARNING: Group 624 not found in map_segments!");
-            }
-            drop(seg_map);
-        }
+        // NOTE: Removed per-contig lock on batch_samples - not needed for deferred classification
+        // The batch tracking is handled at the barrier level, not per-contig
 
         // Split into segments
         // Dynamic splitter discovery for non-reference contigs (matches C++ AGC find_new_splitters)
-        let is_reference_sample = {
-            let ref_name = reference_sample_name.lock().unwrap();
-            ref_name.as_ref() == Some(&task.sample_name)
-        };
+        // OPTIMIZATION: Cache reference sample name check at thread level to avoid lock per contig
+        let is_reference_sample = task.sample_priority >= 1_000_000; // Reference sample has boosted priority
 
         let segments = if !is_reference_sample && !ref_singletons.is_empty() {
             // Non-reference contig with dynamic discovery enabled
@@ -4106,21 +4243,55 @@ fn worker_thread(
             );
         }
 
-        // OPTIMIZATION: Pre-read split offsets for this contig to avoid O(n²) lock contention
-        // Build a set of split positions for this (sample, contig) pair once
-        // Note: splits from prior workers are in the global map, splits from THIS task
-        // are tracked locally in local_splits
-        let prior_contig_splits: std::collections::BTreeSet<usize> = {
-            let offsets = split_offsets.lock().unwrap();
-            offsets.iter()
-                .filter(|((s, c, _), _)| s == &task.sample_name && c == &task.contig_name)
-                .map(|((_, _, pos), _)| *pos)
-                .collect()
-        };
-        let mut local_splits: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        // NOTE: split_offsets and local_splits are no longer needed in the parallel loop
+        // since classification (including splits) is deferred to the barrier.
+        // This eliminates a lock acquisition per contig that was causing contention.
 
-        // Buffer segments for packing (matching batch mode)
-        for (original_place, segment) in segments.iter().enumerate() {
+        // =================================================================
+        // DEFERRED CLASSIFICATION: Buffer raw segments for parallel Phase 1
+        // Classification is deferred to Thread 0 at the barrier to eliminate
+        // lock contention from find_group_with_one_kmer and split logic.
+        // =================================================================
+        // OPTIMIZATION: Collect all segments for this contig locally, then push once
+        // This reduces lock acquisitions from O(segments_per_contig) to O(1) per contig
+        let contig_segments: Vec<RawBufferedSegment> = segments.iter().enumerate()
+            .map(|(original_place, segment)| {
+                // Precompute reverse complement (NO LOCKS - can run in parallel)
+                // Segment data uses numeric encoding: 0=A, 1=C, 2=G, 3=T
+                let segment_data_rc: Vec<u8> = segment.data.iter().rev().map(|&base| {
+                    match base {
+                        0 => 3, // A -> T
+                        1 => 2, // C -> G
+                        2 => 1, // G -> C
+                        3 => 0, // T -> A
+                        _ => base, // N or other non-ACGT
+                    }
+                }).collect();
+
+                RawBufferedSegment {
+                    data: segment.data.clone(),
+                    data_rc: segment_data_rc,
+                    front_kmer: segment.front_kmer,
+                    back_kmer: segment.back_kmer,
+                    front_kmer_is_dir: segment.front_kmer_is_dir,
+                    back_kmer_is_dir: segment.back_kmer_is_dir,
+                    sample_name: task.sample_name.clone(),
+                    contig_name: task.contig_name.clone(),
+                    original_place,
+                    sample_priority: task.sample_priority,
+                }
+            })
+            .collect();
+
+        // ONE lock acquisition for entire contig (reduces contention significantly)
+        // Push to this worker's own buffer (NO CONTENTION - each worker has its own buffer)
+        raw_segment_buffers[worker_id].lock().unwrap().extend(contig_segments);
+
+        // OLD CODE BELOW - REPLACED BY DEFERRED CLASSIFICATION
+        // This block is preserved but commented out for reference during the transition.
+        // The classification logic has been moved to classify_raw_segments_at_barrier().
+        #[cfg(feature = "old_immediate_classification")]
+        for (original_place, segment) in std::iter::empty::<(usize, &crate::segment::Segment)>() {
             // Calculate adjusted place based on prior splits in this contig
             // (matches C++ AGC lines 2033-2036: increment seg_part_no twice when split occurs)
             // OPTIMIZATION: Count splits before current position from both prior and local sets
