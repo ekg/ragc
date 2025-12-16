@@ -542,6 +542,7 @@ fn create_archive(
             anyhow::bail!("No input files provided");
         }
 
+        let phase_start = std::time::Instant::now();
         let splitters = if adaptive {
             // Adaptive mode: Discover splitters from hard contigs across ALL files
             // (matches C++ AGC with -a flag)
@@ -575,9 +576,11 @@ fn create_archive(
 
         if verbosity > 0 {
             eprintln!("Final splitter count: {}", splitters.len());
+            eprintln!("CLI_TIMING: Splitter discovery took {:?}", phase_start.elapsed());
             eprintln!();
         }
 
+        let phase_start = std::time::Instant::now();
         // Create compressor with combined splitter set
         let mut compressor =
             StreamingQueueCompressor::with_splitters(output_str, config, splitters)?;
@@ -656,9 +659,11 @@ fn create_archive(
         } else {
             // MULTI-FILE MODE: Each file is a separate sample
             if verbosity > 0 {
+                eprintln!("CLI_TIMING: Compressor init took {:?}", phase_start.elapsed());
                 eprintln!("Processing reference sample (first input): {:?}", inputs[0]);
             }
 
+            let phase_start = std::time::Instant::now();
             // Process ONLY the first file (reference sample)
             let mut ref_iterator = MultiFileIterator::new(vec![inputs[0].clone()])?;
             while let Some((sample_name, contig_name, sequence)) = ref_iterator.next_contig()? {
@@ -674,10 +679,12 @@ fn create_archive(
             compressor.drain()?;
 
             if verbosity > 0 {
+                eprintln!("CLI_TIMING: Reference sample took {:?}", phase_start.elapsed());
                 eprintln!("Reference sample complete! Processing remaining {} samples...", inputs.len() - 1);
                 eprintln!();
             }
 
+            let phase_start = std::time::Instant::now();
             // Process remaining samples ONE FILE AT A TIME
             for input_file in &inputs[1..] {
                 if verbosity > 0 {
@@ -695,9 +702,16 @@ fn create_archive(
                     eprintln!("Sample complete!\n");
                 }
             }
+            if verbosity > 0 {
+                eprintln!("CLI_TIMING: Remaining samples took {:?}", phase_start.elapsed());
+            }
         }
 
+        let phase_start = std::time::Instant::now();
         compressor.finalize()?;
+        if verbosity > 0 {
+            eprintln!("CLI_TIMING: Finalize took {:?}", phase_start.elapsed());
+        }
 
         if verbosity > 0 {
             eprintln!("\nArchive created successfully: {output:?}");

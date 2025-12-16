@@ -1715,6 +1715,7 @@ impl StreamingQueueCompressor {
             eprintln!("  Waiting for {} workers to finish...", self.workers.len());
         }
 
+        let wait_start = std::time::Instant::now();
         // Wait for all workers to finish
         for (i, handle) in self.workers.into_iter().enumerate() {
             handle
@@ -1724,17 +1725,22 @@ impl StreamingQueueCompressor {
         }
 
         if self.config.verbosity > 0 {
+            eprintln!("FINALIZE_TIMING: Wait for workers took {:?}", wait_start.elapsed());
             eprintln!("All workers finished!");
             eprintln!("Flushing remaining segment packs...");
         }
 
-        // Flush all remaining partial packs
+        // Flush all remaining partial packs using PARALLEL compression
+        let flush_start = std::time::Instant::now();
         {
+            use crate::segment_compression::compress_segment_configured;
+            use rayon::prelude::*;
+
             let mut groups = self.segment_groups.lock().unwrap();
             let num_groups = groups.len();
 
+            // Phase 1: Flush any groups with pending segments (rare, usually 0-1)
             for (key, buffer) in groups.iter_mut() {
-                // Flush if there are delta segments OR if reference hasn't been written
                 if !buffer.segments.is_empty() || !buffer.ref_written {
                     if self.config.verbosity > 1 {
                         eprintln!(
@@ -1748,17 +1754,28 @@ impl StreamingQueueCompressor {
                     flush_pack(buffer, &self.collection, &self.archive, &self.config, &self.reference_segments)
                         .context("Failed to flush remaining pack")?;
                 }
+            }
 
-                // CRITICAL: Write any remaining pending_deltas as final partial pack
-                // This is where partial packs (< 50 entries) are written, ensuring
-                // pack boundaries align with decompression expectations
-                if !buffer.pending_deltas.is_empty() {
-                    use crate::segment_compression::compress_segment_configured;
+            // Phase 2: Collect and PARALLEL compress pending_deltas
+            // Each entry: (stream_id, raw_data, compressed_data, raw_size)
+            struct PartialPackData {
+                stream_id: usize,
+                raw_data: Vec<u8>,
+                compressed: Vec<u8>,
+                raw_size: usize,
+                use_compressed: bool,
+            }
 
-                    let use_lz_encoding = buffer.group_id > 0;  // group 0 = orphan/raw, group 1+ = LZ
+            let compression_level = self.config.compression_level;
+            let verbosity = self.config.verbosity;
+
+            // Extract work items from groups
+            let work_items: Vec<_> = groups.iter_mut()
+                .filter(|(_, buffer)| !buffer.pending_deltas.is_empty())
+                .map(|(_, buffer)| {
+                    let use_lz_encoding = buffer.group_id > 0;
                     let mut packed_data = Vec::new();
 
-                    // Raw groups need placeholder if this is the first pack
                     if !use_lz_encoding && !buffer.raw_placeholder_written {
                         packed_data.push(0x7f);
                         packed_data.push(CONTIG_SEPARATOR);
@@ -1769,36 +1786,73 @@ impl StreamingQueueCompressor {
                         packed_data.push(CONTIG_SEPARATOR);
                     }
 
-                    if !packed_data.is_empty() {
-                        let total_raw_size = packed_data.len();
-                        let mut compressed = compress_segment_configured(&packed_data, self.config.compression_level)
-                            .context("Failed to compress final partial pack")?;
-                        compressed.push(0); // Marker 0 = plain ZSTD
-
-                        let mut arch = self.archive.lock().unwrap();
-                        if compressed.len() < total_raw_size {
-                            arch.add_part(buffer.stream_id, &compressed, total_raw_size as u64)
-                                .context("Failed to write compressed final partial pack")?;
-                        } else {
-                            arch.add_part(buffer.stream_id, &packed_data, 0)
-                                .context("Failed to write uncompressed final partial pack")?;
-                        }
-                    }
-
-                    if self.config.verbosity > 1 {
-                        eprintln!(
-                            "  Wrote final partial pack for group {} with {} deltas",
-                            buffer.group_id, buffer.pending_deltas.len()
-                        );
-                    }
+                    let stream_id = buffer.stream_id as usize;
+                    let group_id = buffer.group_id;
+                    let delta_count = buffer.pending_deltas.len();
 
                     buffer.pending_deltas.clear();
                     buffer.pending_delta_ids.clear();
+
+                    (stream_id, packed_data, group_id, delta_count)
+                })
+                .collect();
+
+            // Parallel compression using rayon
+            let compressed_packs: Vec<PartialPackData> = work_items
+                .into_par_iter()
+                .filter_map(|(stream_id, packed_data, group_id, delta_count)| {
+                    if packed_data.is_empty() {
+                        return None;
+                    }
+
+                    let raw_size = packed_data.len();
+                    let mut compressed = match compress_segment_configured(&packed_data, compression_level) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("Error compressing final partial pack for group {}: {}", group_id, e);
+                            return None;
+                        }
+                    };
+                    compressed.push(0); // Marker 0 = plain ZSTD
+
+                    let use_compressed = compressed.len() < raw_size;
+
+                    if verbosity > 1 {
+                        eprintln!(
+                            "  Compressed final partial pack for group {} with {} deltas",
+                            group_id, delta_count
+                        );
+                    }
+
+                    Some(PartialPackData {
+                        stream_id,
+                        raw_data: packed_data,
+                        compressed,
+                        raw_size,
+                        use_compressed,
+                    })
+                })
+                .collect();
+
+            // Phase 3: Sequential writes to archive (sorted by stream_id for determinism)
+            let mut sorted_packs = compressed_packs;
+            sorted_packs.sort_by_key(|p| p.stream_id);
+
+            let mut arch = self.archive.lock().unwrap();
+            for pack in sorted_packs {
+                if pack.use_compressed {
+                    arch.add_part(pack.stream_id, &pack.compressed, pack.raw_size as u64)
+                        .context("Failed to write compressed final partial pack")?;
+                } else {
+                    arch.add_part(pack.stream_id, &pack.raw_data, 0)
+                        .context("Failed to write uncompressed final partial pack")?;
                 }
             }
+            drop(arch);
 
             if self.config.verbosity > 0 {
                 eprintln!("Flushed {} segment groups", num_groups);
+                eprintln!("FINALIZE_TIMING: Flush took {:?}", flush_start.elapsed());
             }
         }
 
@@ -3987,9 +4041,23 @@ fn worker_thread(
     // Create fallback filter from config
     let fallback_filter = FallbackFilter::new(config.fallback_frac);
 
+    // Timing accumulators for performance analysis
+    let mut total_queue_wait = std::time::Duration::ZERO;
+    let mut total_segment_processing = std::time::Duration::ZERO;
+    let mut total_barrier_wait = std::time::Duration::ZERO;
+    let mut total_sync_processing = std::time::Duration::ZERO;
+    let mut contig_count = 0usize;
+    let mut sync_count = 0usize;
+
     loop {
         // Pull from queue (blocks if empty, returns None when closed)
+        let queue_start = std::time::Instant::now();
         let Some(task) = queue.pull() else {
+            // Print timing summary on exit
+            if config.verbosity > 0 {
+                eprintln!("Worker {} TIMING: queue_wait={:?} segment_proc={:?} barrier_wait={:?} sync_proc={:?} contigs={} syncs={}",
+                    worker_id, total_queue_wait, total_segment_processing, total_barrier_wait, total_sync_processing, contig_count, sync_count);
+            }
             // Queue is closed and empty - flush any pending batch before exiting
             if config.verbosity > 0 {
                 eprintln!("Worker {} flushing final batch before exit", worker_id);
@@ -4021,10 +4089,13 @@ fn worker_thread(
             break;
         };
 
-        // eprintln!("[RAGC POP] worker={} sample={} contig={}", worker_id, &task.sample_name, &task.contig_name);
+        let queue_wait = queue_start.elapsed();
+        total_queue_wait += queue_wait;
 
         // Handle sync tokens with barrier synchronization (matches C++ AGC registration stage)
         if task.is_sync_token {
+            let sync_start = std::time::Instant::now();
+            sync_count += 1;
             if config.verbosity > 0 {
                 eprintln!("Worker {} hit sync token for sample {}", worker_id, task.sample_name);
             }
@@ -4034,7 +4105,9 @@ fn worker_thread(
             // =================================================================
 
             // Barrier 1: All workers arrive at sample boundary
+            let barrier_start = std::time::Instant::now();
             barrier.wait();
+            total_barrier_wait += barrier_start.elapsed();
 
             // Phase 2 (Thread 0 only): Classify raw segments and prepare batch
             if worker_id == 0 {
@@ -4087,7 +4160,9 @@ fn worker_thread(
             }
 
             // Barrier 2: All workers see prepared buffers
+            let barrier_start = std::time::Instant::now();
             barrier.wait();
+            total_barrier_wait += barrier_start.elapsed();
 
             let compress_start = std::time::Instant::now();
             // Phase 3a (ALL workers): Atomic work-stealing to COMPRESS and BUFFER writes
@@ -4122,7 +4197,9 @@ fn worker_thread(
             }
 
             // Barrier 3: All workers done with compression and buffering
+            let barrier_start = std::time::Instant::now();
             barrier.wait();
+            total_barrier_wait += barrier_start.elapsed();
 
             if worker_id == 0 && config.verbosity > 0 {
                 eprintln!("TIMING: Compression took {:?} (all workers)", compress_start.elapsed());
@@ -4191,11 +4268,20 @@ fn worker_thread(
             }
 
             // Barrier 4: All workers ready for next batch (reduced from 2 barriers)
+            let barrier_start = std::time::Instant::now();
             barrier.wait();
+            total_barrier_wait += barrier_start.elapsed();
+
+            // Track total sync token processing time
+            total_sync_processing += sync_start.elapsed();
 
             // Sync token processed - continue to next task
             continue;
         }
+
+        // Start timing for segment processing
+        let segment_start = std::time::Instant::now();
+        contig_count += 1;
 
         // NOTE: Removed per-contig lock on batch_samples - not needed for deferred classification
         // The batch tracking is handled at the barrier level, not per-contig
@@ -4286,6 +4372,9 @@ fn worker_thread(
         // ONE lock acquisition for entire contig (reduces contention significantly)
         // Push to this worker's own buffer (NO CONTENTION - each worker has its own buffer)
         raw_segment_buffers[worker_id].lock().unwrap().extend(contig_segments);
+
+        // End timing for segment processing
+        total_segment_processing += segment_start.elapsed();
 
         // OLD CODE BELOW - REPLACED BY DEFERRED CLASSIFICATION
         // This block is preserved but commented out for reference during the transition.
