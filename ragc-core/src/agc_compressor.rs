@@ -3498,36 +3498,45 @@ fn prepare_batch_parallel(
         global_map.iter().map(|(k, &gid)| (gid, k.clone())).collect()
     };
 
-    // Get the read lock on vl_seg_part to iterate groups
+    // Phase 2c-1: Collect all segments with their keys (no locks needed)
     let num_groups = buffered_seg_part.num_groups();
+    let mut collected_segments: Vec<(u32, SegmentGroupKey, BufferedSegment)> = Vec::new();
     for group_id in 0..num_groups as u32 {
-        // Drain all segments from this group
         while let Some(seg) = buffered_seg_part.get_part(group_id) {
-            // Get the key for this segment using O(1) lookup
             let key = group_id_to_key.get(&group_id).cloned().unwrap_or_else(|| {
-                // Create a placeholder key for orphan groups (MISSING_KMER)
                 SegmentGroupKey {
                     kmer_front: MISSING_KMER,
                     kmer_back: MISSING_KMER,
                 }
             });
+            collected_segments.push((group_id, key, seg));
+        }
+    }
 
-            // Register to batch-local map
-            {
-                let mut batch_map = batch_local_groups.lock().unwrap();
-                batch_map.insert(key.clone(), group_id);
-            }
+    // Phase 2c-2: Batch update batch_local_groups (ONE lock acquisition)
+    {
+        let mut batch_map = batch_local_groups.lock().unwrap();
+        for (group_id, key, _) in &collected_segments {
+            batch_map.insert(key.clone(), *group_id);
+        }
+    }
 
-            // Register with FFI engine
-            #[cfg(feature = "cpp_agc")]
+    // Phase 2c-3: Register with FFI engine (ONE lock acquisition)
+    #[cfg(feature = "cpp_agc")]
+    {
+        let mut eng = grouping_engine.lock().unwrap();
+        for (group_id, key, _) in &collected_segments {
             if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                let mut eng = grouping_engine.lock().unwrap();
-                eng.register_group(key.kmer_front, key.kmer_back, group_id);
+                eng.register_group(key.kmer_front, key.kmer_back, *group_id);
             }
+        }
+    }
 
-            // Update batch-local terminators
+    // Phase 2c-4: Batch update terminators (ONE lock acquisition)
+    {
+        let mut term_map = batch_local_terminators.lock().unwrap();
+        for (_, key, _) in &collected_segments {
             if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                let mut term_map = batch_local_terminators.lock().unwrap();
                 term_map.entry(key.kmer_front)
                     .or_insert_with(Vec::new)
                     .push(key.kmer_back);
@@ -3537,22 +3546,55 @@ fn prepare_batch_parallel(
                         .push(key.kmer_front);
                 }
             }
-
-            // Get or create SegmentGroupBuffer for this group
-            let buffer = groups_map.entry(key.clone()).or_insert_with(|| {
-                let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
-                let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-                let mut arch = archive.lock().unwrap();
-                let stream_id = arch.register_stream(&delta_stream_name);
-                let ref_stream_id = arch.register_stream(&ref_stream_name);
-                drop(arch);
-                SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
-            });
-
-            // Add segment to buffer
-            buffer.segments.push(seg);
         }
+    }
+
+    // Phase 2c-5: Pre-register all streams for new groups (ONE lock acquisition)
+    // Build a set of existing group_ids first for O(1) lookup
+    let existing_group_ids: std::collections::HashSet<u32> = groups_map
+        .values()
+        .map(|b| b.group_id)
+        .collect();
+
+    // Collect unique new group_ids (O(n) instead of O(n×m))
+    let new_group_ids: std::collections::HashSet<u32> = collected_segments.iter()
+        .map(|(gid, _, _)| *gid)
+        .filter(|gid| !existing_group_ids.contains(gid))
+        .collect();
+
+    // Pre-register all streams in one lock acquisition
+    let stream_registrations: std::collections::HashMap<u32, (usize, usize)> = if !new_group_ids.is_empty() {
+        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+        let mut arch = archive.lock().unwrap();
+        new_group_ids.iter().map(|&group_id| {
+            let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+            let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+            let stream_id = arch.register_stream(&delta_stream_name);
+            let ref_stream_id = arch.register_stream(&ref_stream_name);
+            (group_id, (stream_id, ref_stream_id))
+        }).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Phase 2c-6: Add segments to buffers (groups_map already locked)
+    for (group_id, key, seg) in collected_segments {
+        let buffer = groups_map.entry(key.clone()).or_insert_with(|| {
+            let (stream_id, ref_stream_id) = stream_registrations.get(&group_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    // Fallback: register now (shouldn't happen if logic is correct)
+                    let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                    let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+                    let mut arch = archive.lock().unwrap();
+                    let sid = arch.register_stream(&delta_stream_name);
+                    let rsid = arch.register_stream(&ref_stream_name);
+                    (sid, rsid)
+                });
+            SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
+        });
+        buffer.segments.push(seg);
     }
 
     // Clear the buffered_seg_part after draining
