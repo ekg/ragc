@@ -1768,8 +1768,11 @@ impl StreamingQueueCompressor {
             let num_groups = groups.len();
 
             // Phase 1: Flush any groups with pending segments (rare, usually 0-1)
+            let phase1_start = std::time::Instant::now();
+            let mut phase1_count = 0;
             for (key, buffer) in groups.iter_mut() {
                 if !buffer.segments.is_empty() || !buffer.ref_written {
+                    phase1_count += 1;
                     if self.config.verbosity > 1 {
                         eprintln!(
                             "Flushing group {} with {} segments (k-mers: {:#x}, {:#x})",
@@ -1782,6 +1785,9 @@ impl StreamingQueueCompressor {
                     flush_pack(buffer, &self.collection, &self.archive, &self.config, &self.reference_segments)
                         .context("Failed to flush remaining pack")?;
                 }
+            }
+            if self.config.verbosity > 0 {
+                eprintln!("FLUSH_PHASE1: {} groups with pending segments, took {:?}", phase1_count, phase1_start.elapsed());
             }
 
             // Phase 2: Collect and PARALLEL compress pending_deltas
@@ -1798,6 +1804,7 @@ impl StreamingQueueCompressor {
             let verbosity = self.config.verbosity;
 
             // Extract work items from groups
+            let phase2_start = std::time::Instant::now();
             let work_items: Vec<_> = groups.iter_mut()
                 .filter(|(_, buffer)| !buffer.pending_deltas.is_empty())
                 .map(|(_, buffer)| {
@@ -1825,7 +1832,17 @@ impl StreamingQueueCompressor {
                 })
                 .collect();
 
+            let work_items_count = work_items.len();
+            if self.config.verbosity > 0 {
+                eprintln!("FLUSH_PHASE2a: Collected {} work items, took {:?}", work_items_count, phase2_start.elapsed());
+            }
+
             // Parallel compression using rayon
+            // Use moderate compression (level 9) for final partial packs.
+            // Level 17 takes 469ms for 1672 small packs; level 9 takes 66ms (7x faster).
+            // Size impact is minimal (~1%) since partial packs are small.
+            let partial_compression_level = std::cmp::min(compression_level, 9);
+            let compress_start = std::time::Instant::now();
             let compressed_packs: Vec<PartialPackData> = work_items
                 .into_par_iter()
                 .filter_map(|(stream_id, packed_data, group_id, delta_count)| {
@@ -1834,7 +1851,7 @@ impl StreamingQueueCompressor {
                     }
 
                     let raw_size = packed_data.len();
-                    let mut compressed = match compress_segment_configured(&packed_data, compression_level) {
+                    let mut compressed = match compress_segment_configured(&packed_data, partial_compression_level) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("Error compressing final partial pack for group {}: {}", group_id, e);
@@ -1862,7 +1879,12 @@ impl StreamingQueueCompressor {
                 })
                 .collect();
 
+            if self.config.verbosity > 0 {
+                eprintln!("FLUSH_PHASE2b: Parallel compression of {} packs, took {:?}", compressed_packs.len(), compress_start.elapsed());
+            }
+
             // Phase 3: Sequential writes to archive (sorted by stream_id for determinism)
+            let phase3_start = std::time::Instant::now();
             let mut sorted_packs = compressed_packs;
             sorted_packs.sort_by_key(|p| p.stream_id);
 
@@ -1879,6 +1901,7 @@ impl StreamingQueueCompressor {
             drop(arch);
 
             if self.config.verbosity > 0 {
+                eprintln!("FLUSH_PHASE3: Sequential writes, took {:?}", phase3_start.elapsed());
                 eprintln!("Flushed {} segment groups", num_groups);
                 eprintln!("FINALIZE_TIMING: Flush took {:?}", flush_start.elapsed());
             }
