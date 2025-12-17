@@ -1676,6 +1676,34 @@ impl StreamingQueueCompressor {
         Ok(())
     }
 
+    /// Insert sync tokens to trigger incremental compression of buffered segments.
+    /// Call this after pushing a batch of samples to process them incrementally
+    /// instead of waiting for finalize().
+    pub fn sync_and_flush(&self, sample_name: &str) -> Result<()> {
+        // Insert sync tokens for each worker
+        let sequence = self.next_sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        for _ in 0..self.config.num_threads {
+            let sync_token = ContigTask {
+                sample_name: format!("<SYNC:{}>", sample_name),
+                contig_name: String::from("<SYNC>"),
+                data: Vec::new(),
+                sample_priority: 1_000_000_i32, // High priority = processed after pending contigs
+                cost: 0,
+                sequence,
+                is_sync_token: true,
+            };
+            self.queue.push(sync_token, 0)?;
+        }
+
+        // Wait for sync tokens to be processed (queue empty)
+        while self.queue.len() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        Ok(())
+    }
+
     pub fn finalize(self) -> Result<()> {
         if self.config.verbosity > 0 {
             eprintln!("Finalizing compression...");
