@@ -3492,30 +3492,25 @@ fn prepare_batch_parallel(
     // Phase 2c: Drain segments from buffered_seg_part into SegmentGroupBuffer entries
     let mut groups_map = segment_groups.lock().unwrap();
 
+    // Build reverse lookup map (group_id -> key) ONCE to avoid O(n²) lookups
+    let group_id_to_key: std::collections::HashMap<u32, SegmentGroupKey> = {
+        let global_map = map_segments.read().unwrap();
+        global_map.iter().map(|(k, &gid)| (gid, k.clone())).collect()
+    };
+
     // Get the read lock on vl_seg_part to iterate groups
     let num_groups = buffered_seg_part.num_groups();
     for group_id in 0..num_groups as u32 {
         // Drain all segments from this group
         while let Some(seg) = buffered_seg_part.get_part(group_id) {
-            // Get the key for this segment by looking it up in map_segments
-            // We need to find the key that maps to this group_id
-            let key = {
-                let global_map = map_segments.read().unwrap();
-                global_map.iter()
-                    .find(|(_, &gid)| gid == group_id)
-                    .map(|(k, _)| k.clone())
-            };
-
-            let key = match key {
-                Some(k) => k,
-                None => {
-                    // Create a placeholder key for orphan groups (MISSING_KMER)
-                    SegmentGroupKey {
-                        kmer_front: MISSING_KMER,
-                        kmer_back: MISSING_KMER,
-                    }
+            // Get the key for this segment using O(1) lookup
+            let key = group_id_to_key.get(&group_id).cloned().unwrap_or_else(|| {
+                // Create a placeholder key for orphan groups (MISSING_KMER)
+                SegmentGroupKey {
+                    kmer_front: MISSING_KMER,
+                    kmer_back: MISSING_KMER,
                 }
-            };
+            });
 
             // Register to batch-local map
             {
