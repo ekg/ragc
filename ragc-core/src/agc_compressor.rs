@@ -3745,8 +3745,16 @@ fn classify_raw_segments_at_barrier(
         eprintln!("CLASSIFY_RAW_BARRIER: Processing {} raw segments (single-threaded)", raw_segs.len());
     }
 
+    // Track output seg_part_no per (sample, contig) - C++ AGC increments by 2 when split
+    // This ensures unique seg_part_no values within each contig
+    let mut contig_seg_part_counters: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+
     // Classify each segment (NO LOCK CONTENTION - single-threaded)
     for raw_seg in raw_segs.drain(..) {
+        // Get current output seg_part_no for this contig (will be incremented after use)
+        let contig_key = (raw_seg.sample_name.clone(), raw_seg.contig_name.clone());
+        let output_seg_part_no = *contig_seg_part_counters.get(&contig_key).unwrap_or(&0);
         // Case 2/3a/3b classification (same logic as before)
         let (key_front, key_back, should_reverse) =
             if raw_seg.front_kmer != MISSING_KMER && raw_seg.back_kmer != MISSING_KMER {
@@ -3889,11 +3897,13 @@ fn classify_raw_segments_at_barrier(
             buffered_seg_part.add_known(group_id, BufferedSegment {
                 sample_name: raw_seg.sample_name.clone(),
                 contig_name: raw_seg.contig_name.clone(),
-                seg_part_no: raw_seg.original_place,
+                seg_part_no: output_seg_part_no,
                 data: segment_data,
                 is_rev_comp: should_reverse,
                 sample_priority: raw_seg.sample_priority,
             });
+            // Increment counter by 1 for non-split segment
+            *contig_seg_part_counters.entry(contig_key.clone()).or_insert(0) += 1;
         } else {
             // NEW: Try segment splitting before adding as new group
             // C++ AGC only attempts splits when key doesn't exist and both k-mers valid
@@ -4001,25 +4011,28 @@ fn classify_raw_segments_at_barrier(
                             let left_should_reverse = key_front > middle_kmer;
                             let right_should_reverse = middle_kmer > key_back;
 
-                            // Add left part to its group
+                            // Add left part to its group (C++ AGC: seg_part_no stays same)
                             buffered_seg_part.add_known(left_gid, BufferedSegment {
                                 sample_name: raw_seg.sample_name.clone(),
                                 contig_name: raw_seg.contig_name.clone(),
-                                seg_part_no: raw_seg.original_place,
+                                seg_part_no: output_seg_part_no,
                                 data: if left_should_reverse { reverse_complement_sequence(&left_data) } else { left_data },
                                 is_rev_comp: left_should_reverse,
                                 sample_priority: raw_seg.sample_priority,
                             });
 
-                            // Add right part to its group (use same seg_part_no - archive orders by other means)
+                            // Add right part to its group (C++ AGC: seg_part_no + 1)
                             buffered_seg_part.add_known(right_gid, BufferedSegment {
                                 sample_name: raw_seg.sample_name.clone(),
                                 contig_name: raw_seg.contig_name.clone(),
-                                seg_part_no: raw_seg.original_place,
+                                seg_part_no: output_seg_part_no + 1,
                                 data: if right_should_reverse { reverse_complement_sequence(&right_data) } else { right_data },
                                 is_rev_comp: right_should_reverse,
                                 sample_priority: raw_seg.sample_priority,
                             });
+
+                            // Increment counter by 2 for split segment (C++ AGC: ++seg_part_no twice)
+                            *contig_seg_part_counters.entry(contig_key.clone()).or_insert(0) += 2;
 
                             was_split = true;
                             if config.verbosity > 0 {
@@ -4044,10 +4057,12 @@ fn classify_raw_segments_at_barrier(
                     sample_priority: raw_seg.sample_priority,
                     sample_name: raw_seg.sample_name,
                     contig_name: raw_seg.contig_name,
-                    seg_part_no: raw_seg.original_place,
+                    seg_part_no: output_seg_part_no,
                     data: segment_data,
                     should_reverse,
                 });
+                // Increment counter by 1 for new segment
+                *contig_seg_part_counters.entry(contig_key).or_insert(0) += 1;
             }
         }
     }
