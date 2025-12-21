@@ -5904,7 +5904,7 @@ fn try_split_segment_with_cost(
 
     // Calculate compression costs and best split position using C++ FFI if enabled
     // Falls back to Rust implementation otherwise
-    let maybe_best: Option<(usize, usize)> = None; // (best_pos, seg2_start)
+    let mut maybe_best: Option<(usize, usize)> = None; // (best_pos, seg2_start)
     #[cfg(feature = "cpp_agc")]
     {
         // Inspect availability of left/right references and log keys
