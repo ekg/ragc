@@ -678,6 +678,10 @@ fn create_archive(
             }
             compressor.drain()?;
 
+            // CRITICAL: Flush reference sample's terminators so they're available for segment splitting
+            // in subsequent samples. Without this, segment splitting can't find middle splitters.
+            compressor.sync_and_flush("AAA#0_REF")?;
+
             if verbosity > 0 {
                 eprintln!("CLI_TIMING: Reference sample took {:?}", phase_start.elapsed());
                 eprintln!("Reference sample complete! Processing remaining {} samples...", inputs.len() - 1);

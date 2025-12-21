@@ -477,6 +477,10 @@ impl BufferedSegPart {
                 .unwrap()
                 .segments
                 .push(segment);
+        } else {
+            // This should NOT happen - indicates a bug in group management
+            eprintln!("WARNING: add_known dropping segment! group_id={} >= groups.len()={} sample={} contig={}",
+                group_id, groups.len(), segment.sample_name, segment.contig_name);
         }
     }
 
@@ -3709,6 +3713,7 @@ fn cleanup_batch_parallel(
 /// This eliminates lock contention by doing all classification single-threaded.
 /// Raw segments are sorted for determinism, then classified using the same
 /// Case 2/3a/3b logic as before, just without contention.
+/// Includes fallback minimizer support to match C++ AGC grouping quality.
 fn classify_raw_segments_at_barrier(
     raw_segment_buffers: &Arc<Vec<Mutex<Vec<RawBufferedSegment>>>>,
     buffered_seg_part: &Arc<BufferedSegPart>,
@@ -3716,6 +3721,8 @@ fn classify_raw_segments_at_barrier(
     map_segments_terminators: &Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
+    fallback_filter: &FallbackFilter,
+    map_fallback_minimizers: &Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
     config: &StreamingQueueConfig,
 ) {
     use crate::segment::MISSING_KMER;
@@ -3751,7 +3758,7 @@ fn classify_raw_segments_at_barrier(
                 }
             } else if raw_seg.front_kmer != MISSING_KMER {
                 // Case 3a: Only front k-mer present
-                let (kf, kb, sr) = find_group_with_one_kmer(
+                let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
                     raw_seg.front_kmer,
                     raw_seg.front_kmer_is_dir,
                     &raw_seg.data,
@@ -3762,11 +3769,31 @@ fn classify_raw_segments_at_barrier(
                     reference_segments,
                     config,
                 );
+                // Fallback: If Case 3a returned MISSING, try fallback minimizers
+                if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
+                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                        &raw_seg.data,
+                        &raw_seg.data_rc,
+                        config.k,
+                        5, // min_shared_kmers = 5 for Case 3
+                        fallback_filter,
+                        map_fallback_minimizers,
+                        map_segments,
+                        segment_groups,
+                        reference_segments,
+                        config,
+                    );
+                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                        kf = fb_kf;
+                        kb = fb_kb;
+                        sr = fb_sr;
+                    }
+                }
                 (kf, kb, sr)
             } else if raw_seg.back_kmer != MISSING_KMER {
                 // Case 3b: Only back k-mer present
                 let kmer_is_dir_after_swap = !raw_seg.back_kmer_is_dir;
-                let (kf, kb, mut sr) = find_group_with_one_kmer(
+                let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
                     raw_seg.back_kmer,
                     kmer_is_dir_after_swap,
                     &raw_seg.data_rc,
@@ -3778,10 +3805,54 @@ fn classify_raw_segments_at_barrier(
                     config,
                 );
                 sr = !sr;
+                // Fallback: If Case 3b returned MISSING, try fallback minimizers
+                // Note: C++ AGC uses segment_rc for fallback in Case 3b
+                if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
+                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                        &raw_seg.data_rc, // Use RC for Case 3b (matches C++ AGC)
+                        &raw_seg.data,
+                        config.k,
+                        5, // min_shared_kmers = 5 for Case 3
+                        fallback_filter,
+                        map_fallback_minimizers,
+                        map_segments,
+                        segment_groups,
+                        reference_segments,
+                        config,
+                    );
+                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                        kf = fb_kf;
+                        kb = fb_kb;
+                        sr = !fb_sr; // C++ AGC: store_rc = !store_dir_alt
+                    }
+                }
                 (kf, kb, sr)
             } else {
-                // Case 1: Both MISSING - use raw grouping
-                (MISSING_KMER, MISSING_KMER, false)
+                // Case 1: Both MISSING - try fallback minimizers
+                let mut kf = MISSING_KMER;
+                let mut kb = MISSING_KMER;
+                let mut sr = false;
+
+                if fallback_filter.is_enabled() {
+                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                        &raw_seg.data,
+                        &raw_seg.data_rc,
+                        config.k,
+                        1, // min_shared_kmers = 1 for Case 1 (matches C++ AGC)
+                        fallback_filter,
+                        map_fallback_minimizers,
+                        map_segments,
+                        segment_groups,
+                        reference_segments,
+                        config,
+                    );
+                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                        kf = fb_kf;
+                        kb = fb_kb;
+                        sr = fb_sr;
+                    }
+                }
+                (kf, kb, sr)
             };
 
         let key = SegmentGroupKey {
@@ -3793,8 +3864,19 @@ fn classify_raw_segments_at_barrier(
         let segment_data = if should_reverse {
             raw_seg.data_rc.clone()
         } else {
-            raw_seg.data
+            raw_seg.data.clone()
         };
+
+        // Add fallback mapping for this segment (matches C++ AGC add_fallback_mapping)
+        // This populates the fallback minimizers map for use by later segments
+        add_fallback_mapping(
+            &segment_data,
+            config.k,
+            key.kmer_front,
+            key.kmer_back,
+            fallback_filter,
+            map_fallback_minimizers,
+        );
 
         // Check if group exists (NO CONTENTION - we're single-threaded)
         let group_id_opt = {
@@ -3805,25 +3887,168 @@ fn classify_raw_segments_at_barrier(
         if let Some(group_id) = group_id_opt {
             // KNOWN: add to per-group buffer
             buffered_seg_part.add_known(group_id, BufferedSegment {
-                sample_name: raw_seg.sample_name,
-                contig_name: raw_seg.contig_name,
+                sample_name: raw_seg.sample_name.clone(),
+                contig_name: raw_seg.contig_name.clone(),
                 seg_part_no: raw_seg.original_place,
                 data: segment_data,
                 is_rev_comp: should_reverse,
                 sample_priority: raw_seg.sample_priority,
             });
         } else {
-            // NEW: add to s_seg_part
-            buffered_seg_part.add_new(NewSegment {
-                kmer_front: key.kmer_front,
-                kmer_back: key.kmer_back,
-                sample_priority: raw_seg.sample_priority,
-                sample_name: raw_seg.sample_name,
-                contig_name: raw_seg.contig_name,
-                seg_part_no: raw_seg.original_place,
-                data: segment_data,
-                should_reverse,
-            });
+            // NEW: Try segment splitting before adding as new group
+            // C++ AGC only attempts splits when key doesn't exist and both k-mers valid
+            if config.verbosity > 0 {
+                eprintln!("BARRIER_NEW_SEGMENT: key=({},{}) sample={}", key_front, key_back, raw_seg.sample_name);
+            }
+            let mut was_split = false;
+
+            if key_front != MISSING_KMER && key_back != MISSING_KMER && key_front != key_back {
+                // Try to find a middle splitter
+                let middle_kmer_opt = {
+                    let terminators = map_segments_terminators.read().unwrap();
+                    let front_conn = terminators.get(&key_front).map(|v| v.len()).unwrap_or(0);
+                    let back_conn = terminators.get(&key_back).map(|v| v.len()).unwrap_or(0);
+                    if config.verbosity > 0 {
+                        // Always print the first few, then only when connections exist
+                        eprintln!("BARRIER_SPLIT_TRY: key=({},{}) term_size={} front_conn={} back_conn={} sample={}",
+                            key_front, key_back, terminators.len(), front_conn, back_conn, raw_seg.sample_name);
+                    }
+                    find_middle_splitter(key_front, key_back, &terminators)
+                };
+
+                if let Some(middle_kmer) = middle_kmer_opt {
+                    if config.verbosity > 0 {
+                        eprintln!("BARRIER_SPLIT_FOUND_MIDDLE: key=({},{}) middle={}", key_front, key_back, middle_kmer);
+                    }
+                    // Found potential middle k-mer - check if both target groups exist
+                    let left_key = if key_front <= middle_kmer {
+                        SegmentGroupKey { kmer_front: key_front, kmer_back: middle_kmer }
+                    } else {
+                        SegmentGroupKey { kmer_front: middle_kmer, kmer_back: key_front }
+                    };
+                    let right_key = if middle_kmer <= key_back {
+                        SegmentGroupKey { kmer_front: middle_kmer, kmer_back: key_back }
+                    } else {
+                        SegmentGroupKey { kmer_front: key_back, kmer_back: middle_kmer }
+                    };
+
+                    let (left_group_id, right_group_id) = {
+                        let seg_map = map_segments.read().unwrap();
+                        (seg_map.get(&left_key).copied(), seg_map.get(&right_key).copied())
+                    };
+
+                    // Only split if BOTH target groups already exist
+                    if left_group_id.is_none() || right_group_id.is_none() {
+                        if config.verbosity > 0 {
+                            eprintln!("BARRIER_SPLIT_MISSING_GROUP: left={:?} right={:?} left_key=({},{}) right_key=({},{})",
+                                left_group_id, right_group_id, left_key.kmer_front, left_key.kmer_back, right_key.kmer_front, right_key.kmer_back);
+                        }
+                    }
+                    if let (Some(left_gid), Some(right_gid)) = (left_group_id, right_group_id) {
+                        // Get reference segment data and lengths
+                        let (right_ref_data, left_ref_len, right_ref_len) = {
+                            let refs = reference_segments.read().unwrap();
+                            let left_len = refs.get(&left_gid).map(|v| v.len()).unwrap_or(0);
+                            let right = refs.get(&right_gid).cloned().unwrap_or_default();
+                            let right_len = right.len();
+                            (right, left_len, right_len)
+                        };
+
+                        if config.verbosity > 1 {
+                            eprintln!("BARRIER_SPLIT_GROUPS_EXIST: left_gid={} right_gid={} left_ref_len={} right_ref_len={} seg_len={}",
+                                left_gid, right_gid, left_ref_len, right_ref_len, raw_seg.data.len());
+                        }
+
+                        // Find split position using k-mer matching from right reference
+                        // This finds where the right part of the segment begins by looking for
+                        // k-mers from the right reference segment
+                        let split_pos_opt = if right_ref_len > config.k {
+                            // Try k-mer matching first
+                            find_split_by_kmer_match(
+                                &raw_seg.data,
+                                &right_ref_data,
+                                config.k,
+                            ).or_else(|| {
+                                // Fallback to proportional split if k-mer matching fails
+                                if left_ref_len > 0 && right_ref_len > 0 {
+                                    let total_ref = left_ref_len + right_ref_len;
+                                    let seg_len = raw_seg.data.len();
+                                    let estimated_pos = (left_ref_len as f64 / total_ref as f64 * seg_len as f64) as usize;
+                                    let min_pos = 500; // Minimum 500 bytes per part
+                                    let max_pos = seg_len.saturating_sub(500);
+                                    if estimated_pos >= min_pos && estimated_pos <= max_pos {
+                                        Some(estimated_pos)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        };
+
+                        if let Some(split_pos) = split_pos_opt {
+                            // Use the data appropriate for the segment orientation
+                            // Since we're using proportional split, use original data
+                            let (left_data, right_data) = split_segment_at_position(&raw_seg.data, split_pos, config.k);
+                            let left_len = left_data.len();
+                            let right_len = right_data.len();
+
+                            // Determine orientations for split parts based on k-mer ordering
+                            // C++ AGC: orientation is based on which k-mer is smaller
+                            let left_should_reverse = key_front > middle_kmer;
+                            let right_should_reverse = middle_kmer > key_back;
+
+                            // Add left part to its group
+                            buffered_seg_part.add_known(left_gid, BufferedSegment {
+                                sample_name: raw_seg.sample_name.clone(),
+                                contig_name: raw_seg.contig_name.clone(),
+                                seg_part_no: raw_seg.original_place,
+                                data: if left_should_reverse { reverse_complement_sequence(&left_data) } else { left_data },
+                                is_rev_comp: left_should_reverse,
+                                sample_priority: raw_seg.sample_priority,
+                            });
+
+                            // Add right part to its group (use same seg_part_no - archive orders by other means)
+                            buffered_seg_part.add_known(right_gid, BufferedSegment {
+                                sample_name: raw_seg.sample_name.clone(),
+                                contig_name: raw_seg.contig_name.clone(),
+                                seg_part_no: raw_seg.original_place,
+                                data: if right_should_reverse { reverse_complement_sequence(&right_data) } else { right_data },
+                                is_rev_comp: right_should_reverse,
+                                sample_priority: raw_seg.sample_priority,
+                            });
+
+                            was_split = true;
+                            if config.verbosity > 0 {
+                                eprintln!("BARRIER_SPLIT_SUCCESS: sample={} contig={} place={} split_pos={} left_len={} right_len={}",
+                                    raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, split_pos, left_len, right_len);
+                            }
+                        } else {
+                            if config.verbosity > 0 {
+                                eprintln!("BARRIER_SPLIT_SKIPPED: sample={} contig={} place={} left_ref={} right_ref={}",
+                                    raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, left_ref_len, right_ref_len);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !was_split {
+                // NEW: add to s_seg_part
+                buffered_seg_part.add_new(NewSegment {
+                    kmer_front: key.kmer_front,
+                    kmer_back: key.kmer_back,
+                    sample_priority: raw_seg.sample_priority,
+                    sample_name: raw_seg.sample_name,
+                    contig_name: raw_seg.contig_name,
+                    seg_part_no: raw_seg.original_place,
+                    data: segment_data,
+                    should_reverse,
+                });
+            }
         }
     }
 
@@ -4214,6 +4439,8 @@ fn worker_thread(
                     &map_segments_terminators,
                     &segment_groups,
                     &reference_segments,
+                    &fallback_filter,
+                    &map_fallback_minimizers,
                     &config,
                 );
 
@@ -5423,9 +5650,83 @@ fn find_middle_splitter(
     }
 }
 
+/// Find split position by searching for k-mers from the right reference segment
+/// This is more robust than searching for a single middle k-mer, as mutations
+/// may eliminate that specific k-mer but preserve nearby ones.
+///
+/// The algorithm:
+/// 1. Extract the first few k-mers from the right reference segment
+/// 2. Search for these k-mers in the MIDDLE portion of the current segment
+/// 3. Return the position closest to the expected split (based on reference proportions)
+fn find_split_by_kmer_match(
+    segment_data: &[u8],
+    right_ref_data: &[u8],
+    k: usize,
+) -> Option<usize> {
+    use crate::kmer::{Kmer, KmerMode};
+    use ahash::AHashSet;
+
+    let seg_len = segment_data.len();
+
+    // Both parts must be at least this size for a valid split
+    let min_segment_size = 500; // Minimum 500 bytes per part
+
+    if seg_len < 2 * min_segment_size || right_ref_data.len() < k {
+        return None;
+    }
+
+    // Valid split range: ensure both parts are >= min_segment_size
+    let min_pos = min_segment_size;
+    let max_pos = seg_len.saturating_sub(min_segment_size);
+
+    if max_pos <= min_pos {
+        return None;
+    }
+
+    // Extract first N k-mers from the right reference segment
+    // These are k-mers that should appear at the START of the right part
+    let num_ref_kmers = 50.min(right_ref_data.len() / 2); // First 50 k-mers or half of ref
+    let mut ref_kmers: AHashSet<u64> = AHashSet::new();
+    let mut ref_kmer = Kmer::new(k as u32, KmerMode::Canonical);
+
+    for &base in right_ref_data.iter().take(num_ref_kmers + k) {
+        ref_kmer.insert(base as u64);
+        if ref_kmer.is_full() {
+            ref_kmers.insert(ref_kmer.data());
+        }
+    }
+
+    if ref_kmers.is_empty() {
+        return None;
+    }
+
+    // Search for k-mers only in the VALID RANGE of the segment
+    // This ensures we don't create tiny segments
+    let mut seg_kmer = Kmer::new(k as u32, KmerMode::Canonical);
+    let mut best_match: Option<usize> = None;
+
+    for (pos, &base) in segment_data.iter().enumerate() {
+        seg_kmer.insert(base as u64);
+
+        if seg_kmer.is_full() {
+            let current_kmer = seg_kmer.data();
+            let split_pos = pos + 1;
+
+            if split_pos >= min_pos && split_pos <= max_pos && ref_kmers.contains(&current_kmer) {
+                // Found a valid match - return the first one (earliest valid split)
+                best_match = Some(split_pos);
+                break;
+            }
+        }
+    }
+
+    best_match
+}
+
 /// Phase 4: Find split position by scanning for middle k-mer
 /// Scans the segment to find where the middle k-mer actually occurs
 /// Returns the split position (in bytes) at the END of the middle k-mer
+#[allow(dead_code)]
 fn find_split_position(segment_data: &[u8], middle_kmer: u64, segment_len: usize, k: usize) -> Option<usize> {
     use crate::kmer::{Kmer, KmerMode};
 
@@ -5436,13 +5737,15 @@ fn find_split_position(segment_data: &[u8], middle_kmer: u64, segment_len: usize
     }
 
     // Scan segment to find where middle_kmer occurs
+    // Use data() to get canonical k-mer (matching how segment boundaries are computed)
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
 
     for (pos, &base) in segment_data.iter().enumerate() {
         kmer.insert(base as u64);
 
         if kmer.is_full() {
-            let current_kmer = kmer.data_canonical();
+            let current_kmer = kmer.data();
+
             if current_kmer == middle_kmer {
                 // Found the middle k-mer! Position is at the end of the k-mer
                 let split_pos = pos + 1;
@@ -5458,7 +5761,7 @@ fn find_split_position(segment_data: &[u8], middle_kmer: u64, segment_len: usize
         }
     }
 
-    // Middle k-mer not found in segment - shouldn't happen but handle gracefully
+    // Not found - that's OK, the middle k-mer may not exist in this sample due to mutations
     None
 }
 
