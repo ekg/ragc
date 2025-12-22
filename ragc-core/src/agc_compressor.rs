@@ -3756,20 +3756,40 @@ fn classify_raw_segments_at_barrier(
     // Sort for determinism: by sample_name, contig_name, original_place
     raw_segs.sort();
 
-    if config.verbosity > 0 {
-        eprintln!("CLASSIFY_RAW_BARRIER: Processing {} raw segments (single-threaded)", raw_segs.len());
+    // Group segments by (sample, contig) for parallel processing
+    // Each contig's segments will be processed sequentially for determinism,
+    // but different contigs can be processed in parallel
+    use std::collections::BTreeMap;
+    let mut contig_groups: BTreeMap<(String, String), Vec<RawBufferedSegment>> = BTreeMap::new();
+    for raw_seg in raw_segs.drain(..) {
+        let key = (raw_seg.sample_name.clone(), raw_seg.contig_name.clone());
+        contig_groups.entry(key).or_default().push(raw_seg);
     }
 
-    // Track output seg_part_no per (sample, contig) - C++ AGC increments by 2 when split
-    // This ensures unique seg_part_no values within each contig
-    let mut contig_seg_part_counters: std::collections::HashMap<(String, String), usize> =
-        std::collections::HashMap::new();
+    // Sort segments within each contig by original_place (should already be sorted, but ensure)
+    for segs in contig_groups.values_mut() {
+        segs.sort_by_key(|s| s.original_place);
+    }
 
-    // Classify each segment (NO LOCK CONTENTION - single-threaded)
-    for raw_seg in raw_segs.drain(..) {
-        // Get current output seg_part_no for this contig (will be incremented after use)
-        let contig_key = (raw_seg.sample_name.clone(), raw_seg.contig_name.clone());
-        let output_seg_part_no = *contig_seg_part_counters.get(&contig_key).unwrap_or(&0);
+    let num_contigs = contig_groups.len();
+    let total_segments: usize = contig_groups.values().map(|v| v.len()).sum();
+
+    if config.verbosity > 0 {
+        eprintln!("CLASSIFY_RAW_BARRIER: Processing {} raw segments across {} contigs (parallel)",
+            total_segments, num_contigs);
+    }
+
+    // Process contigs in parallel using Rayon
+    use rayon::prelude::*;
+    let contig_vec: Vec<_> = contig_groups.into_iter().collect();
+
+    contig_vec.into_par_iter().for_each(|((sample_name, contig_name), contig_segs)| {
+        // Track seg_part_no for this contig (local to this parallel task)
+        let mut seg_part_no: usize = 0;
+
+        for raw_seg in contig_segs {
+            // Use local seg_part_no for this contig
+            let output_seg_part_no = seg_part_no;
         // Case 2/3a/3b classification (same logic as before)
         let (key_front, key_back, should_reverse) =
             if raw_seg.front_kmer != MISSING_KMER && raw_seg.back_kmer != MISSING_KMER {
@@ -3918,7 +3938,7 @@ fn classify_raw_segments_at_barrier(
                 sample_priority: raw_seg.sample_priority,
             });
             // Increment counter by 1 for non-split segment
-            *contig_seg_part_counters.entry(contig_key.clone()).or_insert(0) += 1;
+            seg_part_no += 1;
         } else {
             // NEW: Try segment splitting before adding as new group
             // C++ AGC only attempts splits when key doesn't exist and both k-mers valid
@@ -4047,7 +4067,7 @@ fn classify_raw_segments_at_barrier(
                             });
 
                             // Increment counter by 2 for split segment (C++ AGC: ++seg_part_no twice)
-                            *contig_seg_part_counters.entry(contig_key.clone()).or_insert(0) += 2;
+                            seg_part_no += 2;
 
                             was_split = true;
                             if config.verbosity > 0 {
@@ -4132,10 +4152,11 @@ fn classify_raw_segments_at_barrier(
                     should_reverse,
                 });
                 // Increment counter by 1 for new segment
-                *contig_seg_part_counters.entry(contig_key).or_insert(0) += 1;
+                seg_part_no += 1;
             }
         }
-    }
+        } // end for raw_seg
+    }); // end par_iter
 
     if config.verbosity > 0 {
         eprintln!("CLASSIFY_RAW_BARRIER: Classification complete");
