@@ -484,6 +484,20 @@ impl BufferedSegPart {
         }
     }
 
+    /// Ensure capacity for group_id (grow vl_seg_part if needed)
+    /// Called when immediately registering groups during barrier classification
+    fn ensure_capacity(&self, min_group_id: u32) {
+        let current_len = self.vl_seg_part.read().unwrap().len();
+        if (min_group_id as usize) >= current_len {
+            let mut groups = self.vl_seg_part.write().unwrap();
+            while groups.len() <= min_group_id as usize {
+                groups.push(Mutex::new(PerGroupSegments {
+                    segments: Vec::new(),
+                }));
+            }
+        }
+    }
+
     /// Add segment with UNKNOWN group (new k-mer pair)
     /// C++ AGC: add_new() - global s_seg_part lock (but brief)
     fn add_new(&self, segment: NewSegment) {
@@ -1842,10 +1856,10 @@ impl StreamingQueueCompressor {
             }
 
             // Parallel compression using rayon
-            // Use moderate compression (level 9) for final partial packs.
-            // Level 17 takes 469ms for 1672 small packs; level 9 takes 66ms (7x faster).
-            // Size impact is minimal (~1%) since partial packs are small.
-            let partial_compression_level = std::cmp::min(compression_level, 9);
+            // Use full compression level for final partial packs to match C++ AGC output.
+            // Previously capped at level 9 for speed, but this caused 15% larger archives
+            // when most compression happens in finalize (e.g., with per-sample sync).
+            let partial_compression_level = compression_level;
             let compress_start = std::time::Instant::now();
             let compressed_packs: Vec<PartialPackData> = work_items
                 .into_par_iter()
@@ -3723,6 +3737,7 @@ fn classify_raw_segments_at_barrier(
     reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
     fallback_filter: &FallbackFilter,
     map_fallback_minimizers: &Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
+    group_counter: &Arc<AtomicU32>,
     config: &StreamingQueueConfig,
 ) {
     use crate::segment::MISSING_KMER;
@@ -4050,6 +4065,61 @@ fn classify_raw_segments_at_barrier(
             }
 
             if !was_split {
+                // CRITICAL FIX: Register group IMMEDIATELY so later segments can split into it
+                // C++ AGC store_segments() updates map_segments at barrier, but segments within
+                // the same barrier batch can still reference groups from PREVIOUS batches.
+                // By registering immediately, segment N+1 can split into segment N's group.
+                let new_group_id = {
+                    let mut seg_map = map_segments.write().unwrap();
+                    if let Some(&existing_gid) = seg_map.get(&key) {
+                        // Group already exists (race condition prevention)
+                        existing_gid
+                    } else {
+                        // Allocate new group ID (matches C++ AGC no_segments++)
+                        let gid = group_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        seg_map.insert(key.clone(), gid);
+                        gid
+                    }
+                };
+
+                // Ensure buffered_seg_part has capacity for this group ID
+                // so later segments can split into it via add_known()
+                buffered_seg_part.ensure_capacity(new_group_id);
+
+                // CRITICAL FIX 2: Store reference data IMMEDIATELY for new groups
+                // C++ AGC: first segment becomes reference for LZ encoding
+                // Without this, cost-based splitting has no reference to compare against
+                {
+                    let mut ref_segs = reference_segments.write().unwrap();
+                    // Only insert if not already present (first segment wins)
+                    ref_segs.entry(new_group_id).or_insert_with(|| segment_data.clone());
+                }
+
+                // CRITICAL FIX 3: Update terminators IMMEDIATELY (C++ AGC lines 1015-1025)
+                // This allows find_middle_splitter to find shared k-mers for splitting
+                if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                    let mut term_map = map_segments_terminators.write().unwrap();
+                    // Add kmer_front -> kmer_back
+                    let front_vec = term_map.entry(key.kmer_front).or_insert_with(Vec::new);
+                    if !front_vec.contains(&key.kmer_back) {
+                        front_vec.push(key.kmer_back);
+                        front_vec.sort(); // C++ AGC sorts for set_intersection
+                    }
+                    // Add kmer_back -> kmer_front (if different)
+                    if key.kmer_front != key.kmer_back {
+                        let back_vec = term_map.entry(key.kmer_back).or_insert_with(Vec::new);
+                        if !back_vec.contains(&key.kmer_front) {
+                            back_vec.push(key.kmer_front);
+                            back_vec.sort();
+                        }
+                    }
+                }
+
+                if config.verbosity > 0 {
+                    eprintln!("BARRIER_IMMEDIATE_REG: key=({},{}) group_id={}",
+                        key.kmer_front, key.kmer_back, new_group_id);
+                }
+
                 // NEW: add to s_seg_part
                 buffered_seg_part.add_new(NewSegment {
                     kmer_front: key.kmer_front,
@@ -4456,6 +4526,7 @@ fn worker_thread(
                     &reference_segments,
                     &fallback_filter,
                     &map_fallback_minimizers,
+                    &group_counter,
                     &config,
                 );
 
