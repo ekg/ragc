@@ -1050,7 +1050,7 @@ impl CollectionV3 {
             .collection_samples_id
             .context("collection-samples stream not registered")?;
 
-        archive.add_part(stream_id, &v_data, v_tmp.len() as u64)?;
+        archive.add_part_buffered(stream_id, v_data, v_tmp.len() as u64);
 
         Ok(())
     }
@@ -1162,7 +1162,7 @@ impl CollectionV3 {
             .collection_contigs_id
             .context("collection-contigs stream not registered")?;
 
-        archive.add_part(contig_stream_id, &v_data_names, v_tmp_names.len() as u64)?;
+        archive.add_part_buffered(contig_stream_id, v_data_names, v_tmp_names.len() as u64);
 
         // Store contig details (5 streams)
         let v_data_details_raw = self.serialize_contig_details(id_from, id_to);
@@ -1187,7 +1187,7 @@ impl CollectionV3 {
             .collection_details_id
             .context("collection-details stream not registered")?;
 
-        archive.add_part(details_stream_id, &v_stream, 0)?;
+        archive.add_part_buffered(details_stream_id, v_stream, 0);
 
         // Clear contigs from memory (for large datasets)
         for sample in &mut self.sample_desc[id_from..id_to] {

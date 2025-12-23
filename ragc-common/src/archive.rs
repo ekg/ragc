@@ -98,7 +98,9 @@ impl Archive {
             self.deserialize()?;
         } else {
             let file = File::create(path).context("Failed to create archive for writing")?;
-            self.writer = Some(BufWriter::new(file.try_clone()?));
+            // Use 4MB buffer to batch writes and minimize syscalls
+            // Default 8KB buffer causes ~200 syscalls for typical archives
+            self.writer = Some(BufWriter::with_capacity(4 * 1024 * 1024, file.try_clone()?));
             self.file = Some(file);
         }
         self.f_offset = 0;

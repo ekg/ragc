@@ -803,7 +803,8 @@ impl ParallelWriteBuffer {
         for (stream_id, stream_mutex) in streams.iter() {
             let parts = stream_mutex.lock().unwrap();
             for (data, metadata) in parts.iter() {
-                archive.add_part(*stream_id, data, *metadata)?;
+                // Use buffered writes to reduce syscalls
+                archive.add_part_buffered(*stream_id, data.clone(), *metadata);
             }
         }
         Ok(())
@@ -1909,11 +1910,10 @@ impl StreamingQueueCompressor {
             let mut arch = self.archive.lock().unwrap();
             for pack in sorted_packs {
                 if pack.use_compressed {
-                    arch.add_part(pack.stream_id, &pack.compressed, pack.raw_size as u64)
-                        .context("Failed to write compressed final partial pack")?;
+                    // Use buffered writes to reduce syscalls
+                    arch.add_part_buffered(pack.stream_id, pack.compressed.clone(), pack.raw_size as u64);
                 } else {
-                    arch.add_part(pack.stream_id, &pack.raw_data, 0)
-                        .context("Failed to write uncompressed final partial pack")?;
+                    arch.add_part_buffered(pack.stream_id, pack.raw_data.clone(), 0);
                 }
             }
             drop(arch);
@@ -1948,16 +1948,13 @@ impl StreamingQueueCompressor {
             // 4. collection metadata (samples, contigs, details)
             // 5. file_type_info
             let (params_stream_id, params_data) = &self.deferred_params;
-            archive.add_part(*params_stream_id, params_data, 0)
-                .context("Failed to write params")?;
+            archive.add_part_buffered(*params_stream_id, params_data.clone(), 0);
 
             let (splitters_stream_id, splitters_data) = &self.deferred_splitters;
-            archive.add_part(*splitters_stream_id, splitters_data, 0)
-                .context("Failed to write splitters")?;
+            archive.add_part_buffered(*splitters_stream_id, splitters_data.clone(), 0);
 
             let (seg_splitters_stream_id, seg_splitters_data) = &self.deferred_segment_splitters;
-            archive.add_part(*seg_splitters_stream_id, seg_splitters_data, 0)
-                .context("Failed to write segment-splitters")?;
+            archive.add_part_buffered(*seg_splitters_stream_id, seg_splitters_data.clone(), 0);
 
             // Write sample names
             collection
@@ -1971,8 +1968,10 @@ impl StreamingQueueCompressor {
 
             // Write file_type_info LAST (matches C++ AGC store_file_type_info order)
             let (file_type_info_stream_id, file_type_info_data) = &self.deferred_file_type_info;
-            archive.add_part(*file_type_info_stream_id, file_type_info_data, 7)
-                .context("Failed to write file_type_info")?;
+            archive.add_part_buffered(*file_type_info_stream_id, file_type_info_data.clone(), 7);
+
+            // Flush all buffered writes to disk in one batch (reduces syscalls from ~200 to ~1)
+            archive.flush_buffers().context("Failed to flush archive buffers")?;
 
             if self.config.verbosity > 0 {
                 eprintln!("Collection metadata written successfully");
@@ -2392,12 +2391,12 @@ fn flush_pack(
     // PHASE 2: Batched writes with minimal lock duration
     // ============================================================
 
-    // Write all pre-compressed data to archive (SINGLE lock acquisition)
+    // Buffer all pre-compressed data for archive (SINGLE lock acquisition)
+    // Actual writes happen via flush_buffers() at end for fewer syscalls
     if !archive_writes.is_empty() {
         let mut arch = archive.lock().unwrap();
         for part in archive_writes {
-            arch.add_part(part.stream_id, &part.data, part.metadata)
-                .context("Failed to write to archive")?;
+            arch.add_part_buffered(part.stream_id, part.data, part.metadata);
         }
     }
 
@@ -2641,13 +2640,11 @@ fn write_reference_immediately(
     {
         let mut arch = archive.lock().unwrap();
         if compressed.len() < ref_size {
-            // Compression helped - write compressed data with metadata=original_size
-            arch.add_part(buffer.ref_stream_id, &compressed, ref_size as u64)
-                .context("Failed to write compressed reference")?;
+            // Compression helped - buffer compressed data with metadata=original_size
+            arch.add_part_buffered(buffer.ref_stream_id, compressed, ref_size as u64);
         } else {
-            // Compression didn't help - write UNCOMPRESSED data with metadata=0
-            arch.add_part(buffer.ref_stream_id, &segment.data, 0)
-                .context("Failed to write uncompressed reference")?;
+            // Compression didn't help - buffer UNCOMPRESSED data with metadata=0
+            arch.add_part_buffered(buffer.ref_stream_id, segment.data.clone(), 0);
         }
     }
 
