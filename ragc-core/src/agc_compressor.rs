@@ -4032,23 +4032,44 @@ fn classify_raw_segments_at_barrier(
                         };
 
                         if let Some(split_pos) = split_pos_opt {
-                            // Use the data appropriate for the segment orientation
-                            // Since we're using proportional split, use original data
-                            let (left_data, right_data) = split_segment_at_position(&raw_seg.data, split_pos, config.k);
+                            // Use the ORIENTED data (segment_data is already RC'd if should_reverse=true)
+                            let (left_data, right_data) = split_segment_at_position(&segment_data, split_pos, config.k);
                             let left_len = left_data.len();
                             let right_len = right_data.len();
 
-                            // Determine orientations for split parts based on k-mer ordering
-                            // C++ AGC: orientation is based on which k-mer is smaller
-                            let left_should_reverse = key_front > middle_kmer;
-                            let right_should_reverse = middle_kmer > key_back;
+                            // FIX 27 v4: Compute orientations using ORIGINAL k-mers and should_reverse
+                            // C++ AGC uses segment's original front/back k-mers, not normalized key
+                            let (left_should_reverse, right_should_reverse) = if should_reverse {
+                                // Segment was RC'd: left is from original right, right is from original left
+                                let left_rc = middle_kmer >= raw_seg.back_kmer;
+                                let right_rc = raw_seg.front_kmer >= middle_kmer;
+                                (left_rc, right_rc)
+                            } else {
+                                // Normal: left is from original left, right is from original right
+                                let left_rc = raw_seg.front_kmer >= middle_kmer;
+                                let right_rc = middle_kmer >= raw_seg.back_kmer;
+                                (left_rc, right_rc)
+                            };
+
+                            // Transform data if needed: current state is `should_reverse`
+                            // If target state differs, we RC the data
+                            let left_final = if left_should_reverse != should_reverse {
+                                reverse_complement_sequence(&left_data)
+                            } else {
+                                left_data
+                            };
+                            let right_final = if right_should_reverse != should_reverse {
+                                reverse_complement_sequence(&right_data)
+                            } else {
+                                right_data
+                            };
 
                             // Add left part to its group (C++ AGC: seg_part_no stays same)
                             buffered_seg_part.add_known(left_gid, BufferedSegment {
                                 sample_name: raw_seg.sample_name.clone(),
                                 contig_name: raw_seg.contig_name.clone(),
                                 seg_part_no: output_seg_part_no,
-                                data: if left_should_reverse { reverse_complement_sequence(&left_data) } else { left_data },
+                                data: left_final,
                                 is_rev_comp: left_should_reverse,
                                 sample_priority: raw_seg.sample_priority,
                             });
@@ -4058,7 +4079,7 @@ fn classify_raw_segments_at_barrier(
                                 sample_name: raw_seg.sample_name.clone(),
                                 contig_name: raw_seg.contig_name.clone(),
                                 seg_part_no: output_seg_part_no + 1,
-                                data: if right_should_reverse { reverse_complement_sequence(&right_data) } else { right_data },
+                                data: right_final,
                                 is_rev_comp: right_should_reverse,
                                 sample_priority: raw_seg.sample_priority,
                             });
