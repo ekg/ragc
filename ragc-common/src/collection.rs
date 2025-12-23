@@ -281,6 +281,8 @@ pub struct CollectionV3 {
     #[allow(dead_code)]
     placing_sample_id: usize,
     no_samples_in_last_batch: usize,
+    /// Cumulative count of samples loaded from batches (for multi-batch archives)
+    samples_loaded: usize,
 
     // For in_group_id delta encoding
     in_group_ids: Vec<i32>,
@@ -307,6 +309,7 @@ impl CollectionV3 {
             placing_sample_name: String::new(),
             placing_sample_id: 0,
             no_samples_in_last_batch: 0,
+            samples_loaded: 0,
             in_group_ids: Vec::new(),
         }
     }
@@ -1083,6 +1086,10 @@ impl CollectionV3 {
     /// Load a batch of contigs (names + details)
     #[allow(clippy::needless_range_loop)]
     pub fn load_contig_batch(&mut self, archive: &mut Archive, id_batch: usize) -> Result<()> {
+        // Use cumulative samples_loaded counter, NOT id_batch * batch_size
+        // C++ AGC creates batches of ~50 samples, but batch_size defaults to 1M which is wrong
+        let i_sample = self.samples_loaded;
+
         // Load contig names
         let contig_stream_id = self
             .collection_contigs_id
@@ -1100,7 +1107,7 @@ impl CollectionV3 {
             );
         }
 
-        self.deserialize_contig_names(&v_data_names, id_batch * self.batch_size)?;
+        self.deserialize_contig_names(&v_data_names, i_sample)?;
 
         // Load contig details
         let details_stream_id = self
@@ -1140,7 +1147,10 @@ impl CollectionV3 {
             }
         }
 
-        self.deserialize_contig_details(&v_data_details, id_batch * self.batch_size)?;
+        self.deserialize_contig_details(&v_data_details, i_sample)?;
+
+        // Update cumulative counter for next batch
+        self.samples_loaded += self.no_samples_in_last_batch;
 
         Ok(())
     }

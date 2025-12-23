@@ -1961,10 +1961,17 @@ impl StreamingQueueCompressor {
                 .store_batch_sample_names(&mut archive)
                 .context("Failed to write sample names")?;
 
-            // Write contig names and segment details
-            collection
-                .store_contig_batch(&mut archive, 0, num_samples)
-                .context("Failed to write contig batch")?;
+            // Write contig names and segment details in batches of 50
+            // (matches C++ AGC pack_cardinality default)
+            const PACK_CARDINALITY: usize = 50;
+            let mut i = 0;
+            while i < num_samples {
+                let batch_end = (i + PACK_CARDINALITY).min(num_samples);
+                collection
+                    .store_contig_batch(&mut archive, i, batch_end)
+                    .context("Failed to write contig batch")?;
+                i = batch_end;
+            }
 
             // Write file_type_info LAST (matches C++ AGC store_file_type_info order)
             let (file_type_info_stream_id, file_type_info_data) = &self.deferred_file_type_info;
