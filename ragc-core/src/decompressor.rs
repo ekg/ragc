@@ -683,56 +683,20 @@ impl Decompressor {
 
             Ok(decoded)
         } else {
-            // Raw group (0-15): uses two-stream architecture like LZ groups
-            // - Reference (in_group_id=0) in ref stream
-            // - Deltas (in_group_id=1+) in delta stream at position (in_group_id - 1)
+            // Raw group (0-15): NO reference stream, ALL data in delta stream
+            // This matches C++ AGC's segment.cpp get_raw() function:
+            // - part_id = id_seq / contigs_in_pack
+            // - seq_in_part_id = id_seq % contigs_in_pack
+            // Data is stored raw (not LZ-encoded), separated by contig_separator (0x7f)
 
-            // If this IS the reference (in_group_id == 0), load from ref stream
-            if desc.in_group_id == 0 {
-                let ref_stream_name = stream_ref_name(archive_version, desc.group_id);
-                let ref_stream_id = self
-                    .archive
-                    .get_stream_id(&ref_stream_name)
-                    .ok_or_else(|| anyhow!("Reference stream not found: {ref_stream_name}"))?;
-
-                let (mut ref_data, ref_metadata) = self.archive.get_part_by_id(ref_stream_id, 0)?;
-
-                // Decompress if needed
-                let decompressed_ref = if ref_metadata == 0 {
-                    ref_data
-                } else {
-                    if ref_data.is_empty() {
-                        anyhow::bail!("Empty compressed reference data");
-                    }
-                    let marker = ref_data.pop().unwrap();
-                    decompress_segment_with_marker(&ref_data, marker)?
-                };
-
-                if self.config.verbosity > 1 {
-                    eprintln!("Loaded raw reference for group {}: length={}", desc.group_id, decompressed_ref.len());
-                }
-
-                return Ok(decompressed_ref);
-            }
-
-            // Otherwise, load delta from delta stream
-            // CRITICAL: Raw groups have a placeholder {0x7f} at position 0 in the first pack
-            // So for in_group_id=1, we need to read position 1 (not 0) to skip the placeholder
-            // For subsequent packs, the placeholder is only in pack 0, so we need to adjust
-            let delta_position = desc.in_group_id as usize; // Don't subtract 1 - placeholder takes slot 0
-            let pack_id = delta_position / (PACK_CARDINALITY + 1); // +1 for placeholder in pack 0
-            // Position within pack: for pack 0, position = in_group_id; for later packs, no placeholder
-            let position_in_pack = if pack_id == 0 {
-                delta_position
-            } else {
-                // Segments after pack 0 don't have placeholder
-                // Pack 0 holds: placeholder + PACK_CARDINALITY segments (indices 1 to PACK_CARDINALITY)
-                // Pack 1 holds: segments PACK_CARDINALITY+1 onwards
-                (delta_position - (PACK_CARDINALITY + 1)) % PACK_CARDINALITY
-            };
+            let pack_id = desc.in_group_id as usize / PACK_CARDINALITY;
+            let position_in_pack = desc.in_group_id as usize % PACK_CARDINALITY;
 
             if self.config.verbosity > 1 {
-                eprintln!("  Raw group: delta_position={delta_position}, pack_id={pack_id}, position_in_pack={position_in_pack}");
+                eprintln!(
+                    "  Raw group {}: in_group_id={}, pack_id={}, position_in_pack={}",
+                    desc.group_id, desc.in_group_id, pack_id, position_in_pack
+                );
             }
 
             let stream_name = stream_delta_name(archive_version, desc.group_id);
@@ -748,13 +712,13 @@ impl Decompressor {
                 data
             } else {
                 if data.is_empty() {
-                    anyhow::bail!("Empty compressed data");
+                    anyhow::bail!("Empty compressed data for raw group");
                 }
                 let marker = data.pop().unwrap();
                 decompress_segment_with_marker(&data, marker)?
             };
 
-            // Unpack the raw segment
+            // Unpack the raw segment (segments separated by 0x7f)
             let contig_data = Self::unpack_contig(&decompressed_pack, position_in_pack)?;
 
             if self.config.verbosity > 1 {
