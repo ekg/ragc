@@ -191,16 +191,19 @@ impl Decompressor {
             );
         }
 
-        // Load contig batch if not already loaded (either None or Some(0))
+        // Load ALL contig batches if sample not found (samples may be in any batch)
         if self
             .collection
             .get_no_contigs(sample_name)
             .is_none_or(|count| count == 0)
         {
             if self.config.verbosity > 1 {
-                eprintln!("Loading contig batch for sample: {sample_name}");
+                eprintln!("Loading all contig batches for sample: {sample_name}");
             }
-            self.collection.load_contig_batch(&mut self.archive, 0)?;
+            let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
+            for batch_id in 0..num_batches {
+                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+            }
 
             if self.config.verbosity > 1 {
                 eprintln!(
@@ -225,14 +228,16 @@ impl Decompressor {
 
     /// Extract a specific contig from a sample
     pub fn get_contig(&mut self, sample_name: &str, contig_name: &str) -> Result<Contig> {
-        // Load contig batch if needed (either None or Some(0))
+        // Load ALL contig batches if sample not found (samples may be in any batch)
         if self
             .collection
             .get_no_contigs(sample_name)
             .is_none_or(|count| count == 0)
         {
-            let _num_samples = self.collection.get_no_samples();
-            self.collection.load_contig_batch(&mut self.archive, 0)?;
+            let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
+            for batch_id in 0..num_batches {
+                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+            }
         }
 
         // Get contig segment descriptors
