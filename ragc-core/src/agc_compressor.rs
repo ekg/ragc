@@ -3544,16 +3544,31 @@ fn prepare_batch_parallel(
     };
 
     // Phase 2c-1: Collect all segments with their keys (no locks needed)
+    // FIX 18: For raw groups (0-15), use unique keys (raw_group_id, MISSING) instead of (MISSING, MISSING)
+    // This ensures each raw group has its own buffer, matching C++ AGC's distribute_segments() behavior
     let num_groups = buffered_seg_part.num_groups();
     let mut collected_segments: Vec<(u32, SegmentGroupKey, BufferedSegment)> = Vec::new();
     for group_id in 0..num_groups as u32 {
         while let Some(seg) = buffered_seg_part.get_part(group_id) {
-            let key = group_id_to_key.get(&group_id).cloned().unwrap_or_else(|| {
+            // FIX 18: Raw groups (0-15) need unique keys to have separate buffers
+            // The global map has (MISSING, MISSING) -> 0, but we need each raw group
+            // to have its own buffer for proper distribution (matching C++ AGC)
+            let key = if group_id < NO_RAW_GROUPS {
+                // Raw group: use unique key (group_id, MISSING) to distinguish buffers
                 SegmentGroupKey {
-                    kmer_front: MISSING_KMER,
+                    kmer_front: group_id as u64,
                     kmer_back: MISSING_KMER,
                 }
-            });
+            } else {
+                // LZ group: use the actual key from the map
+                group_id_to_key.get(&group_id).cloned().unwrap_or_else(|| {
+                    // Fallback - shouldn't happen for LZ groups
+                    SegmentGroupKey {
+                        kmer_front: MISSING_KMER,
+                        kmer_back: MISSING_KMER,
+                    }
+                })
+            };
             collected_segments.push((group_id, key, seg));
         }
     }
@@ -3742,6 +3757,7 @@ fn classify_raw_segments_at_barrier(
     fallback_filter: &FallbackFilter,
     map_fallback_minimizers: &Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
     group_counter: &Arc<AtomicU32>,
+    raw_group_counter: &Arc<AtomicU32>,  // FIX 18: For round-robin distribution of orphan segments
     config: &StreamingQueueConfig,
 ) {
     use crate::segment::MISSING_KMER;
@@ -3933,7 +3949,15 @@ fn classify_raw_segments_at_barrier(
 
         if let Some(group_id) = group_id_opt {
             // KNOWN: add to per-group buffer
-            buffered_seg_part.add_known(group_id, BufferedSegment {
+            // FIX 18: For orphan segments (key = MISSING, MISSING), use round-robin across groups 0-15
+            // instead of always using group 0. This matches C++ AGC's distribute_segments() behavior.
+            let actual_group_id = if key.kmer_front == MISSING_KMER && key.kmer_back == MISSING_KMER {
+                // Orphan segment - distribute across raw groups 0-15 via round-robin
+                raw_group_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % NO_RAW_GROUPS
+            } else {
+                group_id
+            };
+            buffered_seg_part.add_known(actual_group_id, BufferedSegment {
                 sample_name: raw_seg.sample_name.clone(),
                 contig_name: raw_seg.contig_name.clone(),
                 seg_part_no: output_seg_part_no,
@@ -4245,13 +4269,28 @@ fn flush_batch(
         // For segments with k-mers: lookup existing group, or create new group if not found
         // FIX 17: Distribute orphan segments across groups 0-15 (round-robin) to match C++ AGC's
         // distribute_segments(0, 0, no_raw_groups) behavior (agc_compressor.cpp line 986)
-        let group_id = if pend.key.kmer_back == MISSING_KMER && pend.key.kmer_front == MISSING_KMER {
+        //
+        // FIX 18: Create unique buffer keys for each raw group (0-15)
+        // Previously all orphans used key (MISSING, MISSING), causing them to share one buffer.
+        // Now orphans use key (raw_group_id, MISSING) so each raw group has its own buffer.
+        let (group_id, buffer_key) = if pend.key.kmer_back == MISSING_KMER && pend.key.kmer_front == MISSING_KMER {
             // Round-robin distribution across raw groups 0-15
-            raw_group_counter.fetch_add(1, Ordering::SeqCst) % NO_RAW_GROUPS
+            let raw_group_id = raw_group_counter.fetch_add(1, Ordering::SeqCst) % NO_RAW_GROUPS;
+            // Create unique buffer key for this raw group
+            let unique_key = SegmentGroupKey {
+                kmer_front: raw_group_id as u64,  // Use raw_group_id to distinguish buffers
+                kmer_back: MISSING_KMER,
+            };
+            // DEBUG: Trace orphan segment distribution
+            if crate::env_cache::trace_group() {
+                eprintln!("ORPHAN_SEGMENT: sample={} contig={} place={} raw_group_id={} buffer_key=({}, MISSING)",
+                    pend.sample_name, pend.contig_name, pend.place, raw_group_id, raw_group_id);
+            }
+            (raw_group_id, unique_key)
         } else {
             // Check if this k-mer pair already has a group assigned
             let mut global_map = map_segments.write().unwrap();
-            if let Some(&existing_group_id) = global_map.get(&pend.key) {
+            let gid = if let Some(&existing_group_id) = global_map.get(&pend.key) {
                 // Use existing group
                 if crate::env_cache::trace_group() {
                     eprintln!("GROUPING_LOOKUP_HIT: sample={} contig={} place={} front={} back={} found_group={}",
@@ -4271,7 +4310,9 @@ fn flush_batch(
                 global_map.insert(pend.key.clone(), new_group_id);
                 drop(global_map);
                 new_group_id
-            }
+            };
+            // For non-orphan segments, use pend.key as the buffer key
+            (gid, pend.key.clone())
         };
 
         if config.verbosity > 2 {
@@ -4324,7 +4365,8 @@ fn flush_batch(
         }
 
         // Get or create SegmentGroupBuffer for this group
-        let buffer = groups_map.entry(pend.key.clone()).or_insert_with(|| {
+        // FIX 18: Use buffer_key (unique per raw group for orphans) instead of pend.key
+        let buffer = groups_map.entry(buffer_key.clone()).or_insert_with(|| {
             // Register streams
             let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
             let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
@@ -4573,6 +4615,7 @@ fn worker_thread(
                     &fallback_filter,
                     &map_fallback_minimizers,
                     &group_counter,
+                    &raw_group_counter,  // FIX 18: Pass raw_group_counter for orphan distribution
                     &config,
                 );
 
