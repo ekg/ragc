@@ -152,3 +152,9 @@ pub fn assert_cpp_archive() -> Option<&'static str> {
     ASSERT_CPP_ARCHIVE_CACHE.get_or_init(|| std::env::var("RAGC_ASSERT_CPP_ARCHIVE").ok())
         .as_deref()
 }
+
+// Disable barrier split feature (for testing C++ AGC parity)
+static DISABLE_BARRIER_SPLIT_CACHE: OnceLock<bool> = OnceLock::new();
+pub fn disable_barrier_split() -> bool {
+    *DISABLE_BARRIER_SPLIT_CACHE.get_or_init(|| std::env::var("RAGC_DISABLE_BARRIER_SPLIT").is_ok())
+}

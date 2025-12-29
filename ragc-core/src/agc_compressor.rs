@@ -3975,7 +3975,11 @@ fn classify_raw_segments_at_barrier(
             }
             let mut was_split = false;
 
-            if key_front != MISSING_KMER && key_back != MISSING_KMER && key_front != key_back {
+            // Skip barrier splitting if disabled (for C++ AGC parity testing)
+            let try_split = !crate::env_cache::disable_barrier_split()
+                && key_front != MISSING_KMER && key_back != MISSING_KMER && key_front != key_back;
+
+            if try_split {
                 // Try to find a middle splitter
                 let middle_kmer_opt = {
                     let terminators = map_segments_terminators.read().unwrap();
@@ -4018,115 +4022,150 @@ fn classify_raw_segments_at_barrier(
                         }
                     }
                     if let (Some(left_gid), Some(right_gid)) = (left_group_id, right_group_id) {
-                        // Get reference segment data and lengths
-                        let (right_ref_data, left_ref_len, right_ref_len) = {
+                        // Get reference segment data for BOTH left and right
+                        let (left_ref_data, right_ref_data) = {
                             let refs = reference_segments.read().unwrap();
-                            let left_len = refs.get(&left_gid).map(|v| v.len()).unwrap_or(0);
+                            let left = refs.get(&left_gid).cloned().unwrap_or_default();
                             let right = refs.get(&right_gid).cloned().unwrap_or_default();
-                            let right_len = right.len();
-                            (right, left_len, right_len)
+                            (left, right)
                         };
 
                         if config.verbosity > 1 {
                             eprintln!("BARRIER_SPLIT_GROUPS_EXIST: left_gid={} right_gid={} left_ref_len={} right_ref_len={} seg_len={}",
-                                left_gid, right_gid, left_ref_len, right_ref_len, raw_seg.data.len());
+                                left_gid, right_gid, left_ref_data.len(), right_ref_data.len(), raw_seg.data.len());
                         }
 
-                        // Find split position using k-mer matching from right reference
-                        // This finds where the right part of the segment begins by looking for
-                        // k-mers from the right reference segment
-                        let split_pos_opt = if right_ref_len > config.k {
-                            // Try k-mer matching first
-                            find_split_by_kmer_match(
-                                &raw_seg.data,
-                                &right_ref_data,
-                                config.k,
-                            ).or_else(|| {
-                                // Fallback to proportional split if k-mer matching fails
-                                if left_ref_len > 0 && right_ref_len > 0 {
-                                    let total_ref = left_ref_len + right_ref_len;
-                                    let seg_len = raw_seg.data.len();
-                                    let estimated_pos = (left_ref_len as f64 / total_ref as f64 * seg_len as f64) as usize;
-                                    let min_pos = 500; // Minimum 500 bytes per part
-                                    let max_pos = seg_len.saturating_sub(500);
-                                    if estimated_pos >= min_pos && estimated_pos <= max_pos {
-                                        Some(estimated_pos)
-                                    } else {
-                                        None
-                                    }
+                        // Find split decision using cost-based optimization
+                        // This matches C++ AGC's find_cand_segment_with_missing_middle_splitter
+                        // which computes LZ encoding cost at every position and decides:
+                        // - AssignToLeft: entire segment goes to (front, middle) group
+                        // - AssignToRight: entire segment goes to (middle, back) group
+                        // - SplitAt(pos): actually split the segment
+                        let split_decision = find_split_by_cost(
+                            &segment_data,  // Use oriented data
+                            &left_ref_data,
+                            &right_ref_data,
+                            config.k,
+                            config.min_match_len as u32,
+                        );
+
+                        match split_decision {
+                            SplitDecision::SplitAt(split_pos) => {
+                                // Actually split the segment into two parts
+                                let (left_data, right_data) = split_segment_at_position(&segment_data, split_pos, config.k);
+                                let left_len = left_data.len();
+                                let right_len = right_data.len();
+
+                                // FIX 27 v4: Compute orientations using ORIGINAL k-mers and should_reverse
+                                let (left_should_reverse, right_should_reverse) = if should_reverse {
+                                    let left_rc = middle_kmer >= raw_seg.back_kmer;
+                                    let right_rc = raw_seg.front_kmer >= middle_kmer;
+                                    (left_rc, right_rc)
                                 } else {
-                                    None
+                                    let left_rc = raw_seg.front_kmer >= middle_kmer;
+                                    let right_rc = middle_kmer >= raw_seg.back_kmer;
+                                    (left_rc, right_rc)
+                                };
+
+                                let left_final = if left_should_reverse != should_reverse {
+                                    reverse_complement_sequence(&left_data)
+                                } else {
+                                    left_data
+                                };
+                                let right_final = if right_should_reverse != should_reverse {
+                                    reverse_complement_sequence(&right_data)
+                                } else {
+                                    right_data
+                                };
+
+                                buffered_seg_part.add_known(left_gid, BufferedSegment {
+                                    sample_name: raw_seg.sample_name.clone(),
+                                    contig_name: raw_seg.contig_name.clone(),
+                                    seg_part_no: output_seg_part_no,
+                                    data: left_final,
+                                    is_rev_comp: left_should_reverse,
+                                    sample_priority: raw_seg.sample_priority,
+                                });
+
+                                buffered_seg_part.add_known(right_gid, BufferedSegment {
+                                    sample_name: raw_seg.sample_name.clone(),
+                                    contig_name: raw_seg.contig_name.clone(),
+                                    seg_part_no: output_seg_part_no + 1,
+                                    data: right_final,
+                                    is_rev_comp: right_should_reverse,
+                                    sample_priority: raw_seg.sample_priority,
+                                });
+
+                                seg_part_no += 2;
+                                was_split = true;
+                                if config.verbosity > 0 {
+                                    eprintln!("BARRIER_SPLIT_SUCCESS: sample={} contig={} place={} split_pos={} left_len={} right_len={}",
+                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, split_pos, left_len, right_len);
                                 }
-                            })
-                        } else {
-                            None
-                        };
-
-                        if let Some(split_pos) = split_pos_opt {
-                            // Use the ORIENTED data (segment_data is already RC'd if should_reverse=true)
-                            let (left_data, right_data) = split_segment_at_position(&segment_data, split_pos, config.k);
-                            let left_len = left_data.len();
-                            let right_len = right_data.len();
-
-                            // FIX 27 v4: Compute orientations using ORIGINAL k-mers and should_reverse
-                            // C++ AGC uses segment's original front/back k-mers, not normalized key
-                            let (left_should_reverse, right_should_reverse) = if should_reverse {
-                                // Segment was RC'd: left is from original right, right is from original left
-                                let left_rc = middle_kmer >= raw_seg.back_kmer;
-                                let right_rc = raw_seg.front_kmer >= middle_kmer;
-                                (left_rc, right_rc)
-                            } else {
-                                // Normal: left is from original left, right is from original right
-                                let left_rc = raw_seg.front_kmer >= middle_kmer;
-                                let right_rc = middle_kmer >= raw_seg.back_kmer;
-                                (left_rc, right_rc)
-                            };
-
-                            // Transform data if needed: current state is `should_reverse`
-                            // If target state differs, we RC the data
-                            let left_final = if left_should_reverse != should_reverse {
-                                reverse_complement_sequence(&left_data)
-                            } else {
-                                left_data
-                            };
-                            let right_final = if right_should_reverse != should_reverse {
-                                reverse_complement_sequence(&right_data)
-                            } else {
-                                right_data
-                            };
-
-                            // Add left part to its group (C++ AGC: seg_part_no stays same)
-                            buffered_seg_part.add_known(left_gid, BufferedSegment {
-                                sample_name: raw_seg.sample_name.clone(),
-                                contig_name: raw_seg.contig_name.clone(),
-                                seg_part_no: output_seg_part_no,
-                                data: left_final,
-                                is_rev_comp: left_should_reverse,
-                                sample_priority: raw_seg.sample_priority,
-                            });
-
-                            // Add right part to its group (C++ AGC: seg_part_no + 1)
-                            buffered_seg_part.add_known(right_gid, BufferedSegment {
-                                sample_name: raw_seg.sample_name.clone(),
-                                contig_name: raw_seg.contig_name.clone(),
-                                seg_part_no: output_seg_part_no + 1,
-                                data: right_final,
-                                is_rev_comp: right_should_reverse,
-                                sample_priority: raw_seg.sample_priority,
-                            });
-
-                            // Increment counter by 2 for split segment (C++ AGC: ++seg_part_no twice)
-                            seg_part_no += 2;
-
-                            was_split = true;
-                            if config.verbosity > 0 {
-                                eprintln!("BARRIER_SPLIT_SUCCESS: sample={} contig={} place={} split_pos={} left_len={} right_len={}",
-                                    raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, split_pos, left_len, right_len);
                             }
-                        } else {
-                            if config.verbosity > 0 {
-                                eprintln!("BARRIER_SPLIT_SKIPPED: sample={} contig={} place={} left_ref={} right_ref={}",
-                                    raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, left_ref_len, right_ref_len);
+                            SplitDecision::AssignToLeft => {
+                                // Assign entire segment to left group (front -> middle)
+                                // C++ AGC lines 1408-1414: right_size == 0 case
+                                let assign_rc = if should_reverse {
+                                    middle_kmer >= raw_seg.back_kmer
+                                } else {
+                                    raw_seg.front_kmer >= middle_kmer
+                                };
+                                let assign_data = if assign_rc != should_reverse {
+                                    reverse_complement_sequence(&segment_data)
+                                } else {
+                                    segment_data.clone()
+                                };
+
+                                buffered_seg_part.add_known(left_gid, BufferedSegment {
+                                    sample_name: raw_seg.sample_name.clone(),
+                                    contig_name: raw_seg.contig_name.clone(),
+                                    seg_part_no: output_seg_part_no,
+                                    data: assign_data,
+                                    is_rev_comp: assign_rc,
+                                    sample_priority: raw_seg.sample_priority,
+                                });
+                                seg_part_no += 1;
+                                was_split = true;
+                                if config.verbosity > 0 {
+                                    eprintln!("BARRIER_ASSIGN_LEFT: sample={} contig={} place={} group={}",
+                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, left_gid);
+                                }
+                            }
+                            SplitDecision::AssignToRight => {
+                                // Assign entire segment to right group (middle -> back)
+                                // C++ AGC lines 1400-1406: left_size == 0 case
+                                let assign_rc = if should_reverse {
+                                    raw_seg.front_kmer >= middle_kmer
+                                } else {
+                                    middle_kmer >= raw_seg.back_kmer
+                                };
+                                let assign_data = if assign_rc != should_reverse {
+                                    reverse_complement_sequence(&segment_data)
+                                } else {
+                                    segment_data.clone()
+                                };
+
+                                buffered_seg_part.add_known(right_gid, BufferedSegment {
+                                    sample_name: raw_seg.sample_name.clone(),
+                                    contig_name: raw_seg.contig_name.clone(),
+                                    seg_part_no: output_seg_part_no,
+                                    data: assign_data,
+                                    is_rev_comp: assign_rc,
+                                    sample_priority: raw_seg.sample_priority,
+                                });
+                                seg_part_no += 1;
+                                was_split = true;
+                                if config.verbosity > 0 {
+                                    eprintln!("BARRIER_ASSIGN_RIGHT: sample={} contig={} place={} group={}",
+                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, right_gid);
+                                }
+                            }
+                            SplitDecision::NoDecision => {
+                                if config.verbosity > 0 {
+                                    eprintln!("BARRIER_SPLIT_SKIPPED: sample={} contig={} place={} left_ref={} right_ref={}",
+                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, left_ref_data.len(), right_ref_data.len());
+                                }
                             }
                         }
                     }
@@ -5896,6 +5935,121 @@ fn find_split_by_kmer_match(
     }
 
     best_match
+}
+
+/// Result of cost-based split analysis
+/// Matches C++ AGC's find_cand_segment_with_missing_middle_splitter behavior (lines 1400-1454)
+#[derive(Debug, Clone, Copy)]
+enum SplitDecision {
+    /// Assign entire segment to left group (best_pos == 0)
+    AssignToLeft,
+    /// Assign entire segment to right group (best_pos == seg_len)
+    AssignToRight,
+    /// Actually split at this position
+    SplitAt(usize),
+    /// Cannot determine (refs empty or segment too small)
+    NoDecision,
+}
+
+/// Find optimal split position using LZ encoding cost
+/// Matches C++ AGC's find_cand_segment_with_missing_middle_splitter (lines 1502-1621)
+///
+/// This computes the LZ encoding cost at every position for both the left and right
+/// reference segments, then finds the position where the total cost is minimized.
+///
+/// # Arguments
+/// * `segment_data` - The segment to split
+/// * `left_ref` - Reference data for the left segment (front_kmer -> middle_kmer)
+/// * `right_ref` - Reference data for the right segment (middle_kmer -> back_kmer)
+/// * `k` - K-mer length
+/// * `min_match_len` - Minimum match length for LZ encoding
+///
+/// # Returns
+/// SplitDecision indicating whether to assign to left, right, or split at position
+fn find_split_by_cost(
+    segment_data: &[u8],
+    left_ref: &[u8],
+    right_ref: &[u8],
+    k: usize,
+    min_match_len: u32,
+) -> SplitDecision {
+    use crate::lz_diff::LZDiff;
+
+    let seg_len = segment_data.len();
+
+    // C++ AGC uses kmer_length + 1 as minimum split size
+    let min_size = k + 1;
+
+    // Need enough data on both sides
+    if seg_len < 2 * min_size || left_ref.is_empty() || right_ref.is_empty() {
+        return SplitDecision::NoDecision;
+    }
+
+    // Compute left costs: cost of encoding segment[0..i] against left reference
+    // C++ AGC: seg1->get_coding_cost(segment_dir, v_costs1, true, zstd_dctx)
+    // prefix_costs=true means cost is placed at first byte of match
+    let mut lz_left = LZDiff::new(min_match_len);
+    lz_left.prepare(&left_ref.to_vec());
+    let left_costs = lz_left.get_coding_cost_vector(&segment_data.to_vec(), true);
+
+    // Apply partial_sum to get cumulative costs from left
+    let mut left_cumsum: Vec<u32> = Vec::with_capacity(left_costs.len());
+    let mut cumsum = 0u32;
+    for &cost in &left_costs {
+        cumsum = cumsum.saturating_add(cost);
+        left_cumsum.push(cumsum);
+    }
+
+    // Compute right costs: cost of encoding segment[i..end] against right reference
+    // C++ AGC: seg2->get_coding_cost(segment_dir, v_costs2, false, nullptr)
+    // prefix_costs=false means cost is placed at last byte of match
+    let mut lz_right = LZDiff::new(min_match_len);
+    lz_right.prepare(&right_ref.to_vec());
+    let right_costs = lz_right.get_coding_cost_vector(&segment_data.to_vec(), false);
+
+    // Apply partial_sum from the right (reverse direction)
+    // C++ AGC: partial_sum(v_costs2.rbegin(), v_costs2.rend(), v_costs2.rbegin())
+    let mut right_cumsum: Vec<u32> = vec![0; right_costs.len()];
+    let mut cumsum = 0u32;
+    for (i, &cost) in right_costs.iter().enumerate().rev() {
+        cumsum = cumsum.saturating_add(cost);
+        right_cumsum[i] = cumsum;
+    }
+
+    // Find position with minimum combined cost
+    // C++ AGC lines 1606-1614: loop over ALL positions, not just valid split range
+    let mut best_sum = u32::MAX;
+    let mut best_pos = 0usize;
+
+    // IMPORTANT: C++ AGC loops from 0 to size(), then post-processes
+    // We must do the same to get equivalent AssignToLeft/AssignToRight decisions
+    let cost_len = left_cumsum.len().min(right_cumsum.len());
+    for i in 0..cost_len {
+        let cs = left_cumsum[i].saturating_add(right_cumsum[i]);
+        if cs < best_sum {
+            best_sum = cs;
+            best_pos = i;
+        }
+    }
+
+    // Post-process: if best_pos is too close to edges, set to 0 or seg_len
+    // C++ AGC lines 1616-1619
+    if best_pos < min_size {
+        best_pos = 0;
+    }
+    if best_pos + min_size > seg_len {
+        best_pos = seg_len;
+    }
+
+    // Return decision based on best_pos
+    // C++ AGC lines 1400-1454: left_size==0 means assign to right, right_size==0 means assign to left
+    if best_pos == 0 {
+        SplitDecision::AssignToRight
+    } else if best_pos >= seg_len {
+        SplitDecision::AssignToLeft
+    } else {
+        SplitDecision::SplitAt(best_pos)
+    }
 }
 
 /// Phase 4: Find split position by scanning for middle k-mer
