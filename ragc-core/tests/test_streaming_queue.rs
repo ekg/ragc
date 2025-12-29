@@ -2,8 +2,8 @@
 // Integration test for StreamingQueueCompressor
 // Verifies basic push() API and worker thread operation
 
+use ahash::AHashSet;
 use ragc_core::{StreamingQueueCompressor, StreamingQueueConfig};
-use std::collections::HashSet;
 
 #[test]
 fn test_streaming_queue_basic_flow() {
@@ -22,7 +22,7 @@ fn test_streaming_queue_basic_flow() {
         ..Default::default()
     };
 
-    let splitters = HashSet::new(); // Will be determined from first contig
+    let splitters = AHashSet::new(); // Will be determined from first contig
     let mut compressor = StreamingQueueCompressor::with_splitters(
         "/tmp/test_streaming_queue.agc",
         config,
@@ -57,7 +57,7 @@ fn test_streaming_queue_stats() {
     let compressor = StreamingQueueCompressor::with_splitters(
         "/tmp/test_queue_stats.agc",
         config,
-        HashSet::new(),
+        AHashSet::new(),
     )
     .expect("Failed to create compressor");
 

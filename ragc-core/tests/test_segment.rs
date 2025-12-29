@@ -2,8 +2,8 @@
 // Integration test for segmentation
 // Should produce output identical to C++ test_segment
 
+use ahash::AHashSet;
 use ragc_core::{split_at_splitters, Kmer, KmerMode};
-use std::collections::HashSet;
 
 fn print_segment(seg: &ragc_core::Segment, max_data_len: usize) {
     print!("front_kmer:{:x}", seg.front_kmer);
@@ -27,7 +27,7 @@ fn main() {
     println!("# Test 1: No splitters (entire contig)");
     {
         let contig = vec![0, 1, 2, 3, 0, 1, 2, 3];
-        let splitters = HashSet::new();
+        let splitters = AHashSet::new();
         let segments = split_at_splitters(&contig, &splitters, 3);
 
         println!("num_segments:{}", segments.len());
@@ -49,7 +49,7 @@ fn main() {
         kmer.insert(0);
         let first_kmer = kmer.data();
 
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(first_kmer);
 
         let segments = split_at_splitters(&contig, &splitters, 3);
@@ -77,7 +77,7 @@ fn main() {
         kmer_ccc.insert(1);
         kmer_ccc.insert(1);
 
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(kmer_aaa.data());
         splitters.insert(kmer_ccc.data());
 
@@ -94,7 +94,7 @@ fn main() {
     println!("\n# Test 4: Short contig");
     {
         let contig = vec![0, 1];
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(12345);
 
         let segments = split_at_splitters(&contig, &splitters, 3);
@@ -116,7 +116,7 @@ fn main() {
         kmer.insert(0);
         kmer.insert(0);
 
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(kmer.data());
 
         let segments = split_at_splitters(&contig, &splitters, 3);
@@ -138,7 +138,7 @@ fn main() {
         kmer.insert(0);
         kmer.insert(0);
 
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(kmer.data());
 
         let segments = split_at_splitters(&contig, &splitters, 3);
@@ -155,7 +155,7 @@ fn main() {
     {
         let contig = vec![0, 0, 0, 4, 1, 1, 1];
 
-        let mut splitters = HashSet::new();
+        let mut splitters = AHashSet::new();
         splitters.insert(12345); // Some random splitter
 
         let segments = split_at_splitters(&contig, &splitters, 3);

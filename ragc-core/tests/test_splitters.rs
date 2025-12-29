@@ -2,9 +2,10 @@
 // Integration test for splitter identification
 // Should produce output identical to C++ test_splitters
 
+use ahash::AHashSet;
 use ragc_core::determine_splitters;
 
-fn print_splitters(splitters: &std::collections::HashSet<u64>, max_count: usize) {
+fn print_splitters(splitters: &AHashSet<u64>, max_count: usize) {
     println!("Count: {}", splitters.len());
     print!("Splitters: ");
 

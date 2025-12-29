@@ -458,14 +458,14 @@ mod tests {
             splitters: Arc::new(Mutex::new(AHashSet::new())),
             bloom_splitters: Arc::new(Mutex::new(crate::bloom_filter::BloomFilter::new(1024))),
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
-            kmer_length: 21,
+            kmer_length: 3, // Use short k-mer to work with small test contig
             adaptive_mode: false,
-            map_segments: Arc::new(Mutex::new(HashMap::new())),
-            map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
+            map_segments: Arc::new(Mutex::new(AHashMap::new())),
+            map_segments_terminators: Arc::new(Mutex::new(AHashMap::new())),
             concatenated_genomes: false,
         };
 
-        // Simple contig with no splitters
+        // Simple contig with no splitters (must be longer than kmer_length)
         let contig = vec![0, 1, 2, 3, 0, 1, 2, 3]; // ACGTACGT
 
         let result = compress_contig("sample1", "chr1", &contig, &ctx);
@@ -484,10 +484,10 @@ mod tests {
             splitters: Arc::new(Mutex::new(AHashSet::new())),
             bloom_splitters: Arc::new(Mutex::new(crate::bloom_filter::BloomFilter::new(1024))),
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
-            kmer_length: 21,
+            kmer_length: 3, // Use short k-mer to work with small test contig
             adaptive_mode: true, // Adaptive mode enabled
-            map_segments: Arc::new(Mutex::new(HashMap::new())),
-            map_segments_terminators: Arc::new(Mutex::new(HashMap::new())),
+            map_segments: Arc::new(Mutex::new(AHashMap::new())),
+            map_segments_terminators: Arc::new(Mutex::new(AHashMap::new())),
             concatenated_genomes: false,
         };
 

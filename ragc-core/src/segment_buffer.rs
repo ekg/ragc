@@ -491,7 +491,8 @@ mod tests {
         );
 
         // Process NEW segments
-        let no_new = buf.process_new();
+        let map_segments = std::sync::Mutex::new(AHashMap::new());
+        let no_new = buf.process_new(&map_segments);
         assert_eq!(no_new, 1); // One new group created
 
         // New group should be at index 10 (after initial 10)

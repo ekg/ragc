@@ -911,11 +911,11 @@ const NO_RAW_GROUPS: u32 = 16;
 /// # Example
 /// ```no_run
 /// use ragc_core::{StreamingQueueCompressor, StreamingQueueConfig};
-/// use std::collections::HashSet;
+/// use ahash::AHashSet;
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// let config = StreamingQueueConfig::default();
-/// let splitters = HashSet::new(); // Normally from reference
+/// let splitters = AHashSet::new(); // Normally from reference
 /// let mut compressor = StreamingQueueCompressor::with_splitters(
 ///     "output.agc",
 ///     config,
@@ -1399,8 +1399,8 @@ impl StreamingQueueCompressor {
     /// # Example
     /// ```no_run
     /// # use ragc_core::{StreamingQueueCompressor, StreamingQueueConfig};
-    /// # use std::collections::HashSet;
-    /// # let mut compressor = StreamingQueueCompressor::with_splitters("out.agc", StreamingQueueConfig::default(), HashSet::new())?;
+    /// # use ahash::AHashSet;
+    /// # let mut compressor = StreamingQueueCompressor::with_splitters("out.agc", StreamingQueueConfig::default(), AHashSet::new())?;
     /// compressor.push("sample1".to_string(), "chr1".to_string(), vec![b'A', b'T', b'G', b'C'])?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
@@ -1671,8 +1671,8 @@ impl StreamingQueueCompressor {
     /// # Example
     /// ```no_run
     /// # use ragc_core::{StreamingQueueCompressor, StreamingQueueConfig};
-    /// # use std::collections::HashSet;
-    /// # let mut compressor = StreamingQueueCompressor::with_splitters("out.agc", StreamingQueueConfig::default(), HashSet::new())?;
+    /// # use ahash::AHashSet;
+    /// # let mut compressor = StreamingQueueCompressor::with_splitters("out.agc", StreamingQueueConfig::default(), AHashSet::new())?;
     /// // ... push sequences ...
     /// compressor.finalize()?;
     /// # Ok::<(), anyhow::Error>(())
@@ -6458,7 +6458,7 @@ mod tests {
     #[test]
     fn test_create_compressor() {
         let config = StreamingQueueConfig::default();
-        let splitters = HashSet::new();
+        let splitters = AHashSet::new();
         let compressor =
             StreamingQueueCompressor::with_splitters("/tmp/test_stream.agc", config, splitters);
         assert!(compressor.is_ok());
@@ -6467,7 +6467,7 @@ mod tests {
     #[test]
     fn test_queue_stats() {
         let config = StreamingQueueConfig::default();
-        let splitters = HashSet::new();
+        let splitters = AHashSet::new();
         let compressor =
             StreamingQueueCompressor::with_splitters("/tmp/test_stats.agc", config, splitters)
                 .unwrap();
@@ -6485,7 +6485,7 @@ mod tests {
             verbosity: 0, // Quiet for tests
             ..Default::default()
         };
-        let splitters = HashSet::new();
+        let splitters = AHashSet::new();
         let mut compressor =
             StreamingQueueCompressor::with_splitters("/tmp/test_push.agc", config, splitters)
                 .unwrap();
