@@ -506,11 +506,17 @@ impl BufferedSegPart {
 
     /// Process NEW segments, assign group IDs deterministically
     /// C++ AGC: process_new() - ONLY called by thread 0 after barrier
+    /// DETERMINISM FIX: This is the ONLY place where group IDs are assigned.
+    /// The parallel classification phase only determines k-mer pairs.
     fn process_new(
         &self,
         map_segments: &mut BTreeMap<SegmentGroupKey, u32>,
         next_group_id: &mut u32,
+        reference_segments: &mut BTreeMap<u32, Vec<u8>>,
+        terminators: &mut BTreeMap<u64, Vec<u64>>,
     ) -> u32 {
+        use crate::segment::MISSING_KMER;
+
         let mut s = self.s_seg_part.lock().unwrap();
         let mut m_kmers: BTreeMap<(u64, u64), u32> = BTreeMap::new();
         let mut new_count = 0u32;
@@ -539,9 +545,13 @@ impl BufferedSegPart {
         }
 
         // Second pass: move segments to vl_seg_part and update map_segments
+        // Also update reference_segments and terminators for new groups
         let segments: Vec<NewSegment> = s.iter().cloned().collect();
         s.clear();
         drop(s);
+
+        // Track which groups have had their reference set (first segment wins)
+        let mut refs_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         for seg in segments {
             let key = SegmentGroupKey {
@@ -550,15 +560,39 @@ impl BufferedSegPart {
             };
 
             // Get group_id from either existing map or newly assigned
-            let group_id = if let Some(&id) = map_segments.get(&key) {
-                id
+            let (group_id, is_new_group) = if let Some(&id) = map_segments.get(&key) {
+                (id, false)
             } else if let Some(&id) = m_kmers.get(&(seg.kmer_front, seg.kmer_back)) {
                 // Insert into map_segments
-                map_segments.insert(key, id);
-                id
+                map_segments.insert(key.clone(), id);
+                (id, true)
             } else {
                 continue; // Should not happen
             };
+
+            // Store reference data for new groups (first segment in sorted order wins)
+            if is_new_group && !refs_set.contains(&group_id) {
+                reference_segments.insert(group_id, seg.data.clone());
+                refs_set.insert(group_id);
+
+                // Update terminators for new groups (C++ AGC lines 1015-1025)
+                if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                    // Add kmer_front -> kmer_back
+                    let front_vec = terminators.entry(key.kmer_front).or_insert_with(Vec::new);
+                    if !front_vec.contains(&key.kmer_back) {
+                        front_vec.push(key.kmer_back);
+                        front_vec.sort();
+                    }
+                    // Add kmer_back -> kmer_front (if different)
+                    if key.kmer_front != key.kmer_back {
+                        let back_vec = terminators.entry(key.kmer_back).or_insert_with(Vec::new);
+                        if !back_vec.contains(&key.kmer_front) {
+                            back_vec.push(key.kmer_front);
+                            back_vec.sort();
+                        }
+                    }
+                }
+            }
 
             // Add to per-group buffer (uses read lock internally)
             let buffered = BufferedSegment {
@@ -3491,6 +3525,7 @@ fn prepare_batch_parallel(
     batch_local_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: &Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
     map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
+    map_segments_terminators: &Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
     group_counter: &Arc<AtomicU32>,
     raw_group_counter: &Arc<AtomicU32>,
     archive: &Arc<Mutex<Archive>>,
@@ -3523,7 +3558,14 @@ fn prepare_batch_parallel(
     let mut next_group_id = group_counter.load(Ordering::SeqCst);
     {
         let mut global_map = map_segments.write().unwrap();
-        let new_count = buffered_seg_part.process_new(&mut global_map, &mut next_group_id);
+        let mut ref_seg = reference_segments.write().unwrap();
+        let mut term_map = map_segments_terminators.write().unwrap();
+        let new_count = buffered_seg_part.process_new(
+            &mut global_map,
+            &mut next_group_id,
+            &mut ref_seg,
+            &mut term_map,
+        );
         if config.verbosity > 0 && new_count > 0 {
             eprintln!("PREPARE_BATCH_PARALLEL: Assigned {} new group IDs", new_count);
         }
@@ -3617,12 +3659,14 @@ fn prepare_batch_parallel(
         .collect();
 
     // Collect unique new group_ids (O(n) instead of O(n×m))
-    let new_group_ids: std::collections::HashSet<u32> = collected_segments.iter()
+    // DETERMINISM FIX: Use BTreeSet instead of HashSet to ensure deterministic iteration order
+    let new_group_ids: std::collections::BTreeSet<u32> = collected_segments.iter()
         .map(|(gid, _, _)| *gid)
         .filter(|gid| !existing_group_ids.contains(gid))
         .collect();
 
     // Pre-register all streams in one lock acquisition
+    // BTreeSet iteration is sorted, so stream registration order is deterministic
     let stream_registrations: std::collections::HashMap<u32, (usize, usize)> = if !new_group_ids.is_empty() {
         let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
         let mut arch = archive.lock().unwrap();
@@ -3799,11 +3843,13 @@ fn classify_raw_segments_at_barrier(
             total_segments, num_contigs);
     }
 
-    // Process contigs in parallel using Rayon
-    use rayon::prelude::*;
+    // DETERMINISM FIX: Process contigs SEQUENTIALLY to ensure deterministic group creation order.
+    // Parallelism caused non-deterministic group IDs because different threads created groups
+    // in unpredictable order, affecting which segments could split into which groups.
+    // The compression phase is still parallel - only classification needs to be sequential.
     let contig_vec: Vec<_> = contig_groups.into_iter().collect();
 
-    contig_vec.into_par_iter().for_each(|((sample_name, contig_name), contig_segs)| {
+    for ((sample_name, contig_name), contig_segs) in contig_vec.into_iter() {
         // Track seg_part_no for this contig (local to this parallel task)
         let mut seg_part_no: usize = 0;
 
@@ -4173,14 +4219,13 @@ fn classify_raw_segments_at_barrier(
             }
 
             if !was_split {
-                // CRITICAL FIX: Register group IMMEDIATELY so later segments can split into it
-                // C++ AGC store_segments() updates map_segments at barrier, but segments within
-                // the same barrier batch can still reference groups from PREVIOUS batches.
-                // By registering immediately, segment N+1 can split into segment N's group.
+                // Register group IMMEDIATELY so later segments can split into it.
+                // With SEQUENTIAL processing (not parallel), this is now DETERMINISTIC.
+                // C++ AGC store_segments() updates map_segments at barrier, and segments
+                // within the same barrier batch CAN reference groups from earlier segments.
                 let new_group_id = {
                     let mut seg_map = map_segments.write().unwrap();
                     if let Some(&existing_gid) = seg_map.get(&key) {
-                        // Group already exists (race condition prevention)
                         existing_gid
                     } else {
                         // Allocate new group ID (matches C++ AGC no_segments++)
@@ -4191,29 +4236,24 @@ fn classify_raw_segments_at_barrier(
                 };
 
                 // Ensure buffered_seg_part has capacity for this group ID
-                // so later segments can split into it via add_known()
                 buffered_seg_part.ensure_capacity(new_group_id);
 
-                // CRITICAL FIX 2: Store reference data IMMEDIATELY for new groups
+                // Store reference data IMMEDIATELY for new groups
                 // C++ AGC: first segment becomes reference for LZ encoding
-                // Without this, cost-based splitting has no reference to compare against
                 {
                     let mut ref_segs = reference_segments.write().unwrap();
-                    // Only insert if not already present (first segment wins)
                     ref_segs.entry(new_group_id).or_insert_with(|| segment_data.clone());
                 }
 
-                // CRITICAL FIX 3: Update terminators IMMEDIATELY (C++ AGC lines 1015-1025)
+                // Update terminators IMMEDIATELY (C++ AGC lines 1015-1025)
                 // This allows find_middle_splitter to find shared k-mers for splitting
                 if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
                     let mut term_map = map_segments_terminators.write().unwrap();
-                    // Add kmer_front -> kmer_back
                     let front_vec = term_map.entry(key.kmer_front).or_insert_with(Vec::new);
                     if !front_vec.contains(&key.kmer_back) {
                         front_vec.push(key.kmer_back);
-                        front_vec.sort(); // C++ AGC sorts for set_intersection
+                        front_vec.sort();
                     }
-                    // Add kmer_back -> kmer_front (if different)
                     if key.kmer_front != key.kmer_back {
                         let back_vec = term_map.entry(key.kmer_back).or_insert_with(Vec::new);
                         if !back_vec.contains(&key.kmer_front) {
@@ -4223,12 +4263,7 @@ fn classify_raw_segments_at_barrier(
                     }
                 }
 
-                if config.verbosity > 0 {
-                    eprintln!("BARRIER_IMMEDIATE_REG: key=({},{}) group_id={}",
-                        key.kmer_front, key.kmer_back, new_group_id);
-                }
-
-                // NEW: add to s_seg_part
+                // Add segment to buffer
                 buffered_seg_part.add_new(NewSegment {
                     kmer_front: key.kmer_front,
                     kmer_back: key.kmer_back,
@@ -4239,12 +4274,35 @@ fn classify_raw_segments_at_barrier(
                     data: segment_data,
                     should_reverse,
                 });
-                // Increment counter by 1 for new segment
                 seg_part_no += 1;
             }
         }
         } // end for raw_seg
-    }); // end par_iter
+    } // end for contig (sequential)
+
+    // DETERMINISM FIX: Process all new segments sequentially after parallel classification
+    // This ensures group IDs are assigned in deterministic BTreeSet order (by k-mer pair)
+    // regardless of how many threads were used during classification.
+    {
+        let mut map_seg = map_segments.write().unwrap();
+        let mut ref_seg = reference_segments.write().unwrap();
+        let mut term_map = map_segments_terminators.write().unwrap();
+        let mut next_gid = group_counter.load(std::sync::atomic::Ordering::SeqCst);
+
+        let new_groups = buffered_seg_part.process_new(
+            &mut map_seg,
+            &mut next_gid,
+            &mut ref_seg,
+            &mut term_map,
+        );
+
+        // Update the atomic counter with the final value
+        group_counter.store(next_gid, std::sync::atomic::Ordering::SeqCst);
+
+        if config.verbosity > 0 && new_groups > 0 {
+            eprintln!("CLASSIFY_RAW_BARRIER: Registered {} new groups deterministically", new_groups);
+        }
+    }
 
     if config.verbosity > 0 {
         eprintln!("CLASSIFY_RAW_BARRIER: Classification complete");
@@ -4671,6 +4729,7 @@ fn worker_thread(
                     &batch_local_groups,
                     &batch_local_terminators,
                     &map_segments,
+                    &map_segments_terminators,
                     &group_counter,
                     &raw_group_counter,
                     &archive,
