@@ -4124,10 +4124,21 @@ fn classify_raw_segments_at_barrier(
                                     right_data
                                 };
 
+                                // FIX: When should_reverse=true, left_data is the RIGHT part of
+                                // the original and right_data is the LEFT part. C++ AGC swaps
+                                // left_size/right_size when use_rc=true (line 1419), so the
+                                // first segment stored is always the LEFT part of the original.
+                                // We need to swap seg_part_no assignments to match.
+                                let (left_seg_part, right_seg_part) = if should_reverse {
+                                    (output_seg_part_no + 1, output_seg_part_no)
+                                } else {
+                                    (output_seg_part_no, output_seg_part_no + 1)
+                                };
+
                                 buffered_seg_part.add_known(left_gid, BufferedSegment {
                                     sample_name: raw_seg.sample_name.clone(),
                                     contig_name: raw_seg.contig_name.clone(),
-                                    seg_part_no: output_seg_part_no,
+                                    seg_part_no: left_seg_part,
                                     data: left_final,
                                     is_rev_comp: left_should_reverse,
                                     sample_priority: raw_seg.sample_priority,
@@ -4136,7 +4147,7 @@ fn classify_raw_segments_at_barrier(
                                 buffered_seg_part.add_known(right_gid, BufferedSegment {
                                     sample_name: raw_seg.sample_name.clone(),
                                     contig_name: raw_seg.contig_name.clone(),
-                                    seg_part_no: output_seg_part_no + 1,
+                                    seg_part_no: right_seg_part,
                                     data: right_final,
                                     is_rev_comp: right_should_reverse,
                                     sample_priority: raw_seg.sample_priority,
