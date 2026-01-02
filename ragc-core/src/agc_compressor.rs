@@ -4087,10 +4087,24 @@ fn classify_raw_segments_at_barrier(
                         // - AssignToLeft: entire segment goes to (front, middle) group
                         // - AssignToRight: entire segment goes to (middle, back) group
                         // - SplitAt(pos): actually split the segment
+                        //
+                        // C++ AGC line 1393: passes (kmer1, kmer2) after normalization swap,
+                        // and swaps segment_dir/segment_rc based on use_rc flag.
+                        // When should_reverse=true (i.e., original front > back), we need to
+                        // swap the segments to match C++ AGC's behavior.
+                        let (seg_dir, seg_rc) = if should_reverse {
+                            (&raw_seg.data_rc, &raw_seg.data)  // Swap when use_rc=true
+                        } else {
+                            (&raw_seg.data, &raw_seg.data_rc)
+                        };
                         let split_decision = find_split_by_cost(
-                            &segment_data,  // Use oriented data
+                            seg_dir,
+                            seg_rc,
                             &left_ref_data,
                             &right_ref_data,
+                            key_front,    // normalized k-mers (key_front < key_back)
+                            key_back,
+                            middle_kmer,
                             config.k,
                             config.min_match_len as u32,
                         );
@@ -6028,24 +6042,32 @@ enum SplitDecision {
 /// reference segments, then finds the position where the total cost is minimized.
 ///
 /// # Arguments
-/// * `segment_data` - The segment to split
+/// * `segment_dir` - The segment in original (forward) orientation
+/// * `segment_rc` - The segment in reverse complement orientation
 /// * `left_ref` - Reference data for the left segment (front_kmer -> middle_kmer)
 /// * `right_ref` - Reference data for the right segment (middle_kmer -> back_kmer)
+/// * `kmer_front` - Original front k-mer (not normalized)
+/// * `kmer_back` - Original back k-mer (not normalized)
+/// * `middle` - The middle splitter k-mer
 /// * `k` - K-mer length
 /// * `min_match_len` - Minimum match length for LZ encoding
 ///
 /// # Returns
 /// SplitDecision indicating whether to assign to left, right, or split at position
 fn find_split_by_cost(
-    segment_data: &[u8],
+    segment_dir: &[u8],
+    segment_rc: &[u8],
     left_ref: &[u8],
     right_ref: &[u8],
+    kmer_front: u64,
+    kmer_back: u64,
+    middle: u64,
     k: usize,
     min_match_len: u32,
 ) -> SplitDecision {
     use crate::lz_diff::LZDiff;
 
-    let seg_len = segment_data.len();
+    let seg_len = segment_dir.len();
 
     // C++ AGC uses kmer_length + 1 as minimum split size
     let min_size = k + 1;
@@ -6055,36 +6077,70 @@ fn find_split_by_cost(
         return SplitDecision::NoDecision;
     }
 
-    // Compute left costs: cost of encoding segment[0..i] against left reference
-    // C++ AGC: seg1->get_coding_cost(segment_dir, v_costs1, true, zstd_dctx)
-    // prefix_costs=true means cost is placed at first byte of match
+    // Compute left costs (seg1): cost of encoding segment against left reference
+    // C++ AGC lines 1539-1548: choose orientation based on kmer_front vs middle
     let mut lz_left = LZDiff::new(min_match_len);
     lz_left.prepare(&left_ref.to_vec());
-    let left_costs = lz_left.get_coding_cost_vector(&segment_data.to_vec(), true);
 
-    // Apply partial_sum to get cumulative costs from left
-    let mut left_cumsum: Vec<u32> = Vec::with_capacity(left_costs.len());
-    let mut cumsum = 0u32;
-    for &cost in &left_costs {
-        cumsum = cumsum.saturating_add(cost);
-        left_cumsum.push(cumsum);
-    }
+    let left_cumsum: Vec<u32> = if kmer_front < middle {
+        // C++ AGC line 1540: use segment_dir with prefix_costs=true
+        let left_costs = lz_left.get_coding_cost_vector(&segment_dir.to_vec(), true);
+        // Apply partial_sum forward
+        let mut cumsum_vec = Vec::with_capacity(left_costs.len());
+        let mut cumsum = 0u32;
+        for &cost in &left_costs {
+            cumsum = cumsum.saturating_add(cost);
+            cumsum_vec.push(cumsum);
+        }
+        cumsum_vec
+    } else {
+        // C++ AGC lines 1543-1545: use segment_rc with prefix_costs=false
+        // IMPORTANT: reverse the COSTS first, then partial_sum
+        let mut left_costs = lz_left.get_coding_cost_vector(&segment_rc.to_vec(), false);
+        // Reverse the costs BEFORE partial_sum (C++ line 1544)
+        left_costs.reverse();
+        // Apply partial_sum forward (C++ line 1547)
+        let mut cumsum_vec = Vec::with_capacity(left_costs.len());
+        let mut cumsum = 0u32;
+        for &cost in &left_costs {
+            cumsum = cumsum.saturating_add(cost);
+            cumsum_vec.push(cumsum);
+        }
+        cumsum_vec
+    };
 
-    // Compute right costs: cost of encoding segment[i..end] against right reference
-    // C++ AGC: seg2->get_coding_cost(segment_dir, v_costs2, false, nullptr)
-    // prefix_costs=false means cost is placed at last byte of match
+    // Compute right costs (seg2): cost of encoding segment against right reference
+    // C++ AGC lines 1563-1573: choose orientation based on middle vs kmer_back
     let mut lz_right = LZDiff::new(min_match_len);
     lz_right.prepare(&right_ref.to_vec());
-    let right_costs = lz_right.get_coding_cost_vector(&segment_data.to_vec(), false);
 
-    // Apply partial_sum from the right (reverse direction)
-    // C++ AGC: partial_sum(v_costs2.rbegin(), v_costs2.rend(), v_costs2.rbegin())
-    let mut right_cumsum: Vec<u32> = vec![0; right_costs.len()];
-    let mut cumsum = 0u32;
-    for (i, &cost) in right_costs.iter().enumerate().rev() {
-        cumsum = cumsum.saturating_add(cost);
-        right_cumsum[i] = cumsum;
-    }
+    let mut right_cumsum: Vec<u32> = if middle < kmer_back {
+        // C++ AGC lines 1565-1566: use segment_dir with prefix_costs=false
+        // then partial_sum in reverse direction
+        let right_costs = lz_right.get_coding_cost_vector(&segment_dir.to_vec(), false);
+        // Apply partial_sum from the right (reverse direction)
+        let mut cumsum_vec = vec![0u32; right_costs.len()];
+        let mut cumsum = 0u32;
+        for (i, &cost) in right_costs.iter().enumerate().rev() {
+            cumsum = cumsum.saturating_add(cost);
+            cumsum_vec[i] = cumsum;
+        }
+        cumsum_vec
+    } else {
+        // C++ AGC lines 1570-1572: use segment_rc with prefix_costs=true
+        // partial_sum forward, then reverse
+        let right_costs = lz_right.get_coding_cost_vector(&segment_rc.to_vec(), true);
+        // Apply partial_sum forward
+        let mut cumsum_vec = Vec::with_capacity(right_costs.len());
+        let mut cumsum = 0u32;
+        for &cost in &right_costs {
+            cumsum = cumsum.saturating_add(cost);
+            cumsum_vec.push(cumsum);
+        }
+        // Reverse the cumulative sums
+        cumsum_vec.reverse();
+        cumsum_vec
+    };
 
     // Find position with minimum combined cost
     // C++ AGC lines 1606-1614: loop over ALL positions, not just valid split range
