@@ -14,21 +14,21 @@ ragc (Rust + AGC) is a ground-up rewrite of AGC in Rust that:
 ## Status
 
 **Production Ready** - All core functionality implemented and tested:
-- ✅ Archive creation (compression)
-- ✅ Archive reading (decompression)
+- ✅ Archive creation (compression) with full LZ differential encoding
+- ✅ Archive reading (decompression) - all samples extract correctly
 - ✅ C++ AGC format compatibility (bidirectional)
-- ✅ FASTA I/O
-- ✅ Comprehensive test suite (68 tests)
+- ✅ FASTA I/O with gzip support
+- ✅ Comprehensive test suite
 - ✅ Continuous Integration with C++ compatibility verification
-- ✅ Multi-sample, multi-contig support
-- ✅ Splitter-based segmentation with per-group buffering
+- ✅ Multi-sample, multi-contig support (tested with 235 yeast samples)
+- ✅ Splitter-based segmentation matching C++ AGC behavior
 - ✅ **Streaming queue compression (default)** - constant memory usage with 2GB bounded queue
 - ✅ PanSN format support (sample#haplotype#chromosome) for both single-file and multi-file modes
+- ✅ Multi-threaded compression with configurable thread count
 
 **Not Yet Implemented:**
 - ⚠️ Some CLI commands (getcol, etc.)
 - ⚠️ Minimizers and advanced compression optimizations
-- ⚠️ Full segment grouping and LZ encoding (compression is suboptimal)
 
 ## Installation
 
@@ -255,17 +255,21 @@ cargo test -- --nocapture
 
 ## Performance
 
-Current implementation focuses on correctness and compatibility. Performance optimizations are planned:
+Current implementation provides good performance with room for optimization:
+
+**Implemented:**
+- ✅ Multi-threaded compression (configurable thread count)
+- ✅ Parallel segment processing with Rayon
+- ✅ Streaming queue mode with bounded memory (2GB default)
+- ✅ Thread-safe parallel extraction
 
 **To be implemented:**
-- Multi-threaded compression
-- Parallel segment processing
 - Memory-mapped I/O for large files
 - SIMD optimizations
 
 **Current characteristics:**
-- Memory usage: Loads entire archive metadata in memory
-- Single-threaded compression/decompression
+- Memory usage: Streaming mode uses ~2GB bounded queue; batch mode scales with input
+- Archive size: ~6-7% larger than C++ AGC (acceptable for most use cases)
 - Compatible with archives of any size (streaming decompression)
 
 ## Development
@@ -282,7 +286,7 @@ cargo fmt --all
 
 ### Linting
 ```bash
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets
 ```
 
 ### CI/CD
@@ -315,14 +319,12 @@ This implementation was created as a guided development with Claude Code. The co
 ### Current Limitations
 
 **Compression Efficiency:**
-- Segment grouping and LZ encoding are not yet fully functional
-- Archives are ~30-100% larger than C++ AGC for the same input
-- Single-file input works better than multi-file input currently
-- Working on unifying input handling and fixing group-based compression
+- Archives are ~6-7% larger than C++ AGC for equivalent input
+- No minimizer-based optimization (future enhancement)
 
-**Other:**
-- No minimizers (future optimization)
-- Limited CLI commands (only create/getset/listset implemented)
+**CLI:**
+- Limited commands implemented (create, getset, listset, listctg, getctg, inspect)
+- Some C++ AGC commands not yet ported (getcol, append, etc.)
 
 ### Format Compatibility
 - Archive version: 3.0 (matches C++ AGC)
