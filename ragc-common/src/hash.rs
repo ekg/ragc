@@ -67,7 +67,7 @@ impl MurMurStringsHash {
 
     #[inline]
     fn rotl64(x: u64, r: i8) -> u64 {
-        (x << r) | (x >> (64 - r))
+        x.rotate_left(r as u32)
     }
 
     #[inline]

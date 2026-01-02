@@ -1,3 +1,4 @@
+#![allow(unexpected_cfgs)]
 #![cfg(feature = "ffi_cost")]
 
 use ragc_core::{ragc_ffi, LZDiff};

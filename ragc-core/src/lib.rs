@@ -3,6 +3,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 #![allow(private_interfaces)]
+#![allow(unexpected_cfgs)]
 //! Core compression and decompression algorithms for the AGC genome compression format.
 //!
 //! This crate implements the complete AGC compression pipeline with full C++ AGC

@@ -1,3 +1,9 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::redundant_field_names)]
+#![allow(clippy::single_match)]
+#![allow(clippy::redundant_locals)]
+#![allow(unexpected_cfgs)]
+
 // AGC CLI - Rust implementation
 // Compatible with C++ AGC format
 

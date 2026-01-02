@@ -6903,7 +6903,7 @@ fn find_split_by_cost(
     let mut lz_right = LZDiff::new(min_match_len);
     lz_right.prepare(&right_ref.to_vec());
 
-    let mut right_cumsum: Vec<u32> = if middle < kmer_back {
+    let right_cumsum: Vec<u32> = if middle < kmer_back {
         // C++ AGC lines 1565-1566: use segment_dir with prefix_costs=false
         // then partial_sum in reverse direction
         let right_costs = lz_right.get_coding_cost_vector(&segment_dir.to_vec(), false);
@@ -7152,7 +7152,7 @@ fn try_split_segment_with_cost(
 
     // Calculate compression costs and best split position using C++ FFI if enabled
     // Falls back to Rust implementation otherwise
-    let mut maybe_best: Option<(usize, usize)> = None; // (best_pos, seg2_start)
+    let maybe_best: Option<(usize, usize)> = None; // (best_pos, seg2_start)
     #[cfg(feature = "cpp_agc")]
     {
         // Inspect availability of left/right references and log keys

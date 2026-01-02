@@ -188,7 +188,7 @@ impl Archive {
     pub fn add_part_buffered(&mut self, stream_id: usize, data: Vec<u8>, metadata: u64) {
         self.write_buffer
             .entry(stream_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push((data, metadata));
     }
 

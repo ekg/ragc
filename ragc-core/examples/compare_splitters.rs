@@ -1,3 +1,7 @@
+#![allow(unexpected_cfgs)]
+#![allow(unused_imports)]
+#![allow(clippy::len_zero)]
+
 // Compare RAGC splitter detection vs C++ AGC splitter detection
 use ragc_core::{determine_splitters, GenomeIO};
 use std::collections::HashSet;

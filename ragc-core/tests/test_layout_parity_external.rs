@@ -1,3 +1,6 @@
+#![allow(clippy::len_zero)]
+#![allow(clippy::redundant_closure)]
+
 //! External layout parity test against a C++ AGC archive.
 //!
 //! This test is ignored by default. To run:

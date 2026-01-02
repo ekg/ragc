@@ -1,4 +1,6 @@
 #![allow(clippy::all)]
+#![allow(unexpected_cfgs)]
+#![allow(unused_imports)]
 #[cfg(feature = "indexed-fasta")]
 #[cfg(test)]
 mod tests {

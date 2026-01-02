@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_else_if)]
+
 use ragc_common::archive::Archive;
 use ragc_core::decompress_segment_with_marker;
 use sha2::{Digest, Sha256};
