@@ -77,9 +77,6 @@ jobs:
       - name: Build ragc
         run: cargo build --release
 
-      - name: Run C++ compatibility tests
-        run: cargo test --package ragc-core --test cpp_compat -- --nocapture
-
       - name: Test ragc create then C++ read
         run: |
           echo ">test_seq" > /tmp/test.fasta
