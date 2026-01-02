@@ -3,11 +3,11 @@
 
 use crate::genome_io::GenomeIO;
 use crate::kmer_extract::{enumerate_kmers, remove_non_singletons};
+use ahash::AHashSet;
 use anyhow::Result;
 use ragc_common::Contig;
 use rayon::prelude::*;
 use rdst::RadixSort;
-use ahash::AHashSet;
 use std::io::Read;
 use std::path::Path;
 
@@ -221,7 +221,13 @@ pub fn determine_splitters_streaming(
             // FIXED: Process ALL contigs (matching C++ AGC)
             // C++ AGC's determine_splitters() processes all contigs in reference file
             if !sequence.is_empty() {
-                let used = find_actual_splitters_in_contig_named(&sequence, &_contig_name, &candidates, k, segment_size);
+                let used = find_actual_splitters_in_contig_named(
+                    &sequence,
+                    &_contig_name,
+                    &candidates,
+                    k,
+                    segment_size,
+                );
                 splitters.extend(used);
             }
         }
@@ -340,13 +346,22 @@ pub fn determine_splitters_streaming_first_sample(
             }
 
             if !sequence.is_empty() {
-                let used = find_actual_splitters_in_contig_named(&sequence, &_contig_name, &candidates, k, segment_size);
+                let used = find_actual_splitters_in_contig_named(
+                    &sequence,
+                    &_contig_name,
+                    &candidates,
+                    k,
+                    segment_size,
+                );
                 splitters.extend(used);
             }
         }
     }
 
-    eprintln!("DEBUG: {} actually-used splitters from first sample", splitters.len());
+    eprintln!(
+        "DEBUG: {} actually-used splitters from first sample",
+        splitters.len()
+    );
 
     Ok((splitters, candidates, duplicates))
 }
@@ -391,7 +406,10 @@ fn find_actual_splitters_in_contig_named(
                 if current_len >= segment_size && candidates.contains(&kmer_value) {
                     // This candidate is actually used!
                     #[cfg(feature = "verbose_debug")]
-                    eprintln!("DEBUG_RAGC_SPLITTER_USED: contig={} pos={} kmer={} current_len={}", contig_name, current_pos, kmer_value, current_len);
+                    eprintln!(
+                        "DEBUG_RAGC_SPLITTER_USED: contig={} pos={} kmer={} current_len={}",
+                        contig_name, current_pos, kmer_value, current_len
+                    );
                     used_splitters.push(kmer_value);
                     current_len = 0;
                     kmer.reset();
@@ -408,8 +426,13 @@ fn find_actual_splitters_in_contig_named(
     for &kmer_value in recent_kmers.iter().rev() {
         if candidates.contains(&kmer_value) {
             // ALWAYS log end-of-contig splitters (not just in verbose mode)
-            eprintln!("RAGC_END_SPLITTER: contig={} kmer={} recent_kmers_len={} pos={}",
-                     contig_name, kmer_value, recent_kmers.len(), pos);
+            eprintln!(
+                "RAGC_END_SPLITTER: contig={} kmer={} recent_kmers_len={} pos={}",
+                contig_name,
+                kmer_value,
+                recent_kmers.len(),
+                pos
+            );
             used_splitters.push(kmer_value);
             break;
         }
@@ -458,7 +481,10 @@ fn find_actual_splitters_in_contig(
                 if current_len >= segment_size && candidates.contains(&kmer_value) {
                     // This candidate is actually used!
                     #[cfg(feature = "verbose_debug")]
-                    eprintln!("DEBUG_RAGC_SPLITTER_USED: pos={} kmer={} current_len={}", current_pos, kmer_value, current_len);
+                    eprintln!(
+                        "DEBUG_RAGC_SPLITTER_USED: pos={} kmer={} current_len={}",
+                        current_pos, kmer_value, current_len
+                    );
                     used_splitters.push(kmer_value);
                     current_len = 0;
                     kmer.reset();
@@ -677,19 +703,20 @@ pub fn two_pass_splitter_discovery(
     }
 
     // Step 1: Get initial splitters, singletons, and duplicates from reference file
-    let (initial_splitters, ref_singletons_set, ref_duplicates) = determine_splitters_streaming(
-        &input_files[0],
-        k,
-        segment_size,
-    )?;
+    let (initial_splitters, ref_singletons_set, ref_duplicates) =
+        determine_splitters_streaming(&input_files[0], k, segment_size)?;
 
     // Convert singletons to sorted Vec for set_difference operations
     let mut ref_singletons: Vec<u64> = ref_singletons_set.into_iter().collect();
     ref_singletons.sort_unstable();
 
     if verbosity > 0 {
-        eprintln!("  Reference: {} initial splitters, {} singletons, {} duplicates",
-                 initial_splitters.len(), ref_singletons.len(), ref_duplicates.len());
+        eprintln!(
+            "  Reference: {} initial splitters, {} singletons, {} duplicates",
+            initial_splitters.len(),
+            ref_singletons.len(),
+            ref_duplicates.len()
+        );
     }
 
     // Start with initial splitters as our combined set
@@ -716,8 +743,12 @@ pub fn two_pass_splitter_discovery(
                 hard_contigs_found += 1;
 
                 if verbosity > 1 {
-                    eprintln!("    Found hard contig: {} ({} bp, file {})",
-                             contig_name, sequence.len(), input_file.display());
+                    eprintln!(
+                        "    Found hard contig: {} ({} bp, file {})",
+                        contig_name,
+                        sequence.len(),
+                        input_file.display()
+                    );
                 }
 
                 // Discover new splitters for this hard contig
@@ -739,8 +770,10 @@ pub fn two_pass_splitter_discovery(
         }
 
         if verbosity > 0 && !is_reference {
-            eprintln!("  File {}: {} hard contigs so far, {} new splitters",
-                     file_idx, hard_contigs_found, new_splitters_found);
+            eprintln!(
+                "  File {}: {} hard contigs so far, {} new splitters",
+                file_idx, hard_contigs_found, new_splitters_found
+            );
         }
     }
 
@@ -748,9 +781,11 @@ pub fn two_pass_splitter_discovery(
         eprintln!("Pass 1 complete:");
         eprintln!("  Total hard contigs: {}", hard_contigs_found);
         eprintln!("  New splitters discovered: {}", new_splitters_found);
-        eprintln!("  Final splitter count: {} (was {})",
-                 combined_splitters.len(),
-                 combined_splitters.len() - new_splitters_found);
+        eprintln!(
+            "  Final splitter count: {} (was {})",
+            combined_splitters.len(),
+            combined_splitters.len() - new_splitters_found
+        );
         eprintln!();
     }
 

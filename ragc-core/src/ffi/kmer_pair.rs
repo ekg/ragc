@@ -1,7 +1,7 @@
 // FFI helper for k-mer pair operations
 // Used for grouping segments by their terminal k-mers
 
-use std::cmp::{min, max};
+use std::cmp::{max, min};
 
 /// Create an ordered k-mer pair (min, max)
 ///
@@ -52,7 +52,7 @@ pub extern "C" fn ragc_kmer_pair_equals(
 /// Matches C++ AGC: if (pk.first == ~0ull || pk.second == ~0ull)
 #[no_mangle]
 pub extern "C" fn ragc_is_empty_kmer(kmer: u64) -> bool {
-    kmer == u64::MAX  // ~0ull in C++ = u64::MAX in Rust
+    kmer == u64::MAX // ~0ull in C++ = u64::MAX in Rust
 }
 
 /// Check if a k-mer pair is valid (neither value is empty marker)

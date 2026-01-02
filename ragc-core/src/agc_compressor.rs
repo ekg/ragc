@@ -6,9 +6,9 @@ use crate::lz_diff::LZDiff;
 use crate::memory_bounded_queue::MemoryBoundedQueue;
 use crate::segment::{split_at_splitters_with_size, MISSING_KMER};
 use crate::splitters::{determine_splitters, find_new_splitters_for_contig};
+use ahash::AHashSet;
 use anyhow::{Context, Result};
 use ragc_common::{Archive, CollectionV3, Contig, CONTIG_SEPARATOR};
-use ahash::AHashSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
@@ -157,10 +157,10 @@ impl Default for StreamingQueueConfig {
 struct ContigTask {
     sample_name: String,
     contig_name: String,
-    data: Contig, // Vec<u8>
+    data: Contig,         // Vec<u8>
     sample_priority: i32, // Higher = process first (decreases for each sample)
-    cost: usize, // Contig size in bytes (matches C++ AGC cost calculation)
-    sequence: u64, // Insertion order within sample - lower = processed first (FASTA order)
+    cost: usize,          // Contig size in bytes (matches C++ AGC cost calculation)
+    sequence: u64,        // Insertion order within sample - lower = processed first (FASTA order)
     is_sync_token: bool, // True if this is a synchronization token (matches C++ AGC registration tokens)
 }
 
@@ -357,12 +357,10 @@ impl Ord for RawBufferedSegment {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Sort by: sample_name, contig_name, original_place (matches C++ AGC order)
         match self.sample_name.cmp(&other.sample_name) {
-            std::cmp::Ordering::Equal => {
-                match self.contig_name.cmp(&other.contig_name) {
-                    std::cmp::Ordering::Equal => self.original_place.cmp(&other.original_place),
-                    other => other,
-                }
-            }
+            std::cmp::Ordering::Equal => match self.contig_name.cmp(&other.contig_name) {
+                std::cmp::Ordering::Equal => self.original_place.cmp(&other.original_place),
+                other => other,
+            },
             other => other,
         }
     }
@@ -419,12 +417,10 @@ impl Ord for NewSegment {
             std::cmp::Ordering::Equal => {
                 // Then by sample_name, contig_name, seg_part_no (ascending)
                 match self.sample_name.cmp(&other.sample_name) {
-                    std::cmp::Ordering::Equal => {
-                        match self.contig_name.cmp(&other.contig_name) {
-                            std::cmp::Ordering::Equal => self.seg_part_no.cmp(&other.seg_part_no),
-                            other => other,
-                        }
-                    }
+                    std::cmp::Ordering::Equal => match self.contig_name.cmp(&other.contig_name) {
+                        std::cmp::Ordering::Equal => self.seg_part_no.cmp(&other.seg_part_no),
+                        other => other,
+                    },
                     other => other,
                 }
             }
@@ -459,8 +455,12 @@ impl BufferedSegPart {
         Self {
             vl_seg_part: RwLock::new(
                 (0..initial_groups)
-                    .map(|_| Mutex::new(PerGroupSegments { segments: Vec::new() }))
-                    .collect()
+                    .map(|_| {
+                        Mutex::new(PerGroupSegments {
+                            segments: Vec::new(),
+                        })
+                    })
+                    .collect(),
             ),
             s_seg_part: Mutex::new(std::collections::BTreeSet::new()),
             a_v_part_id: AtomicI32::new(-1),
@@ -524,10 +524,12 @@ impl BufferedSegPart {
         // First pass: assign group IDs (deterministic - BTreeSet order)
         for seg in s.iter() {
             let key = (seg.kmer_front, seg.kmer_back);
-            if !m_kmers.contains_key(&key) && !map_segments.contains_key(&SegmentGroupKey {
-                kmer_front: seg.kmer_front,
-                kmer_back: seg.kmer_back,
-            }) {
+            if !m_kmers.contains_key(&key)
+                && !map_segments.contains_key(&SegmentGroupKey {
+                    kmer_front: seg.kmer_front,
+                    kmer_back: seg.kmer_back,
+                })
+            {
                 m_kmers.insert(key, *next_group_id);
                 *next_group_id += 1;
                 new_count += 1;
@@ -621,10 +623,8 @@ impl BufferedSegPart {
     /// C++ AGC: restart_read_vec()
     fn restart_read_vec(&self) {
         let groups = self.vl_seg_part.read().unwrap();
-        self.a_v_part_id.store(
-            groups.len() as i32 - 1,
-            Ordering::SeqCst,
-        );
+        self.a_v_part_id
+            .store(groups.len() as i32 - 1, Ordering::SeqCst);
     }
 
     /// Get next group_id to process (atomic decrement for work-stealing)
@@ -638,11 +638,7 @@ impl BufferedSegPart {
     fn get_part(&self, group_id: u32) -> Option<BufferedSegment> {
         let groups = self.vl_seg_part.read().unwrap();
         if (group_id as usize) < groups.len() {
-            groups[group_id as usize]
-                .lock()
-                .unwrap()
-                .segments
-                .pop()
+            groups[group_id as usize].lock().unwrap().segments.pop()
         } else {
             None
         }
@@ -862,13 +858,13 @@ struct SegmentGroupBuffer {
     segments: Vec<BufferedSegment>, // Up to PACK_CARDINALITY segments (EXCLUDING reference)
     ref_written: bool,              // Whether reference has been written
     segments_written: u32,          // Counter for delta segments written (NOT including reference)
-    lz_diff: Option<LZDiff>,        // LZ encoder prepared once with reference, reused for all segments (matches C++ AGC CSegment::lz_diff)
+    lz_diff: Option<LZDiff>, // LZ encoder prepared once with reference, reused for all segments (matches C++ AGC CSegment::lz_diff)
     // CRITICAL: Partial pack persistence to ensure pack alignment with decompression expectations
     // Pack N must contain entries for in_group_ids (N*50)+1 to (N+1)*50
     // These fields persist unique deltas until we have exactly 50 for a complete pack
-    pending_deltas: Vec<Vec<u8>>,   // Unique deltas waiting to be written (< 50)
-    pending_delta_ids: Vec<u32>,    // in_group_ids for pending deltas (for deduplication)
-    raw_placeholder_written: bool,  // Whether raw group placeholder has been written
+    pending_deltas: Vec<Vec<u8>>, // Unique deltas waiting to be written (< 50)
+    pending_delta_ids: Vec<u32>,  // in_group_ids for pending deltas (for deduplication)
+    raw_placeholder_written: bool, // Whether raw group placeholder has been written
 }
 
 impl SegmentGroupBuffer {
@@ -881,7 +877,7 @@ impl SegmentGroupBuffer {
             segments: Vec::new(),
             ref_written: false,
             segments_written: 0,
-            lz_diff: None,  // Prepared when reference is written (matches C++ AGC segment.cpp line 43)
+            lz_diff: None, // Prepared when reference is written (matches C++ AGC segment.cpp line 43)
             pending_deltas: Vec::new(),
             pending_delta_ids: Vec::new(),
             raw_placeholder_written: false,
@@ -931,7 +927,10 @@ impl BatchState {
 
     /// Add a new segment to this batch
     fn add_segment(&mut self, key: (u64, u64), segment: PendingSegment) {
-        self.new_segments.entry(key).or_insert_with(Vec::new).push(segment);
+        self.new_segments
+            .entry(key)
+            .or_insert_with(Vec::new)
+            .push(segment);
     }
 }
 
@@ -976,7 +975,7 @@ pub struct StreamingQueueCompressor {
     config: StreamingQueueConfig,
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
-    group_counter: Arc<AtomicU32>, // Starts at 16 for LZ groups
+    group_counter: Arc<AtomicU32>,     // Starts at 16 for LZ groups
     raw_group_counter: Arc<AtomicU32>, // Round-robin counter for raw groups (0-15)
     reference_sample_name: Arc<Mutex<Option<String>>>, // First sample becomes reference
     // Segment splitting support (Phase 1)
@@ -1024,9 +1023,9 @@ pub struct StreamingQueueCompressor {
 
     // Deferred metadata streams - written AFTER segment data (C++ AGC compatibility)
     // C++ AGC writes segment data first, then metadata streams at the end
-    deferred_file_type_info: (usize, Vec<u8>),    // (stream_id, data)
-    deferred_params: (usize, Vec<u8>),            // (stream_id, data)
-    deferred_splitters: (usize, Vec<u8>),         // (stream_id, data)
+    deferred_file_type_info: (usize, Vec<u8>), // (stream_id, data)
+    deferred_params: (usize, Vec<u8>),         // (stream_id, data)
+    deferred_splitters: (usize, Vec<u8>),      // (stream_id, data)
     deferred_segment_splitters: (usize, Vec<u8>), // (stream_id, data)
 
     // Dynamic splitter discovery for adaptive mode (matches C++ AGC find_new_splitters)
@@ -1199,25 +1198,31 @@ impl StreamingQueueCompressor {
             },
             0,
         );
-        let map_segments: Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(RwLock::new(initial_map_segments));
-        let map_segments_terminators: Arc<RwLock<BTreeMap<u64, Vec<u64>>>> = Arc::new(RwLock::new(BTreeMap::new()));
-        let split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let map_segments: Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>> =
+            Arc::new(RwLock::new(initial_map_segments));
+        let map_segments_terminators: Arc<RwLock<BTreeMap<u64, Vec<u64>>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+        let split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
 
         // Persistent reference segment storage (matches C++ AGC v_segments)
-        let reference_segments: Arc<RwLock<BTreeMap<u32, Vec<u8>>>> = Arc::new(RwLock::new(BTreeMap::new()));
+        let reference_segments: Arc<RwLock<BTreeMap<u32, Vec<u8>>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
 
         // Reference orientation tracking (fixes ZERO_MATCH bug in Case 3 terminator segments)
-        let reference_orientations: Arc<RwLock<BTreeMap<u32, bool>>> = Arc::new(RwLock::new(BTreeMap::new()));
+        let reference_orientations: Arc<RwLock<BTreeMap<u32, bool>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
 
         // FFI Grouping Engine - C++ AGC-compatible group assignment
         #[cfg(feature = "cpp_agc")]
         let grouping_engine = Arc::new(Mutex::new(crate::ragc_ffi::GroupingEngine::new(
             config.k as u32,
-            NO_RAW_GROUPS,  // Start group IDs at 16 (group 0 reserved for orphan segments)
+            NO_RAW_GROUPS, // Start group IDs at 16 (group 0 reserved for orphan segments)
         )));
 
         // Priority tracking for interleaved processing (matches C++ AGC)
-        let sample_priorities: Arc<RwLock<BTreeMap<String, i32>>> = Arc::new(RwLock::new(BTreeMap::new()));
+        let sample_priorities: Arc<RwLock<BTreeMap<String, i32>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
         let last_sample_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None)); // Track last sample for boundary detection
         let next_priority = Arc::new(Mutex::new(i32::MAX)); // Start high, decrease for each sample
         let next_sequence = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Increases for each contig (FASTA order)
@@ -1225,12 +1230,17 @@ impl StreamingQueueCompressor {
 
         // Batch-local group assignment (matches C++ AGC m_kmers per-batch behavior)
         let batch_samples: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
-        let batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>> = Arc::new(Mutex::new(BTreeMap::new()));
-        let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> = Arc::new(Mutex::new(Vec::new()));
+        let batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let pending_batch_segments: Arc<Mutex<Vec<PendingSegment>>> =
+            Arc::new(Mutex::new(Vec::new()));
         // Two-tier segment buffering for C++ AGC 4-phase parallel pattern
-        let buffered_seg_part: Arc<BufferedSegPart> = Arc::new(BufferedSegPart::new(NO_RAW_GROUPS as usize));
-        let map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let buffered_seg_part: Arc<BufferedSegPart> =
+            Arc::new(BufferedSegPart::new(NO_RAW_GROUPS as usize));
+        let map_fallback_minimizers: Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
 
         // Initialize barrier for sample boundary synchronization (matches C++ AGC barrier)
         // All workers must synchronize at sample boundaries to ensure batch flush completes before processing new samples
@@ -1248,7 +1258,7 @@ impl StreamingQueueCompressor {
         let raw_segment_buffers: Arc<Vec<Mutex<Vec<RawBufferedSegment>>>> = Arc::new(
             (0..config.num_threads)
                 .map(|_| Mutex::new(Vec::new()))
-                .collect()
+                .collect(),
         );
 
         // Spawn worker threads
@@ -1409,7 +1419,13 @@ impl StreamingQueueCompressor {
         }
 
         // Call internal constructor with ref data so workers get the correct Arcs
-        Self::with_splitters_internal(output_path, config, splitters, ref_singletons, ref_duplicates)
+        Self::with_splitters_internal(
+            output_path,
+            config,
+            splitters,
+            ref_singletons,
+            ref_duplicates,
+        )
     }
 
     /// Create compressor and determine splitters from first contig
@@ -1551,7 +1567,9 @@ impl StreamingQueueCompressor {
         let task_size = data.len();
 
         // Get sequence number for FASTA ordering (lower = earlier = higher priority)
-        let sequence = self.next_sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sequence = self
+            .next_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Get or assign priority for this sample (matches C++ AGC priority queue)
         // Higher priority = processed first (decreases for each new sample)
@@ -1571,8 +1589,11 @@ impl StreamingQueueCompressor {
             // NOTE: Despite the name, C++ AGC's cnt_contigs_in_sample is GLOBAL, not per-sample!
             // FIX 5: Only send PACK_BOUNDARY sync tokens in concatenated mode (single file)
             // In non-concatenated mode (multiple files), only SAMPLE_BOUNDARY sync tokens are sent
-            let count = self.global_contig_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let need_sync = self.config.concatenated_genomes && (count + 1) % self.config.pack_size == 0;
+            let count = self
+                .global_contig_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let need_sync =
+                self.config.concatenated_genomes && (count + 1) % self.config.pack_size == 0;
 
             if need_sync {
                 // Reached synchronization point (every 50 contigs GLOBALLY)
@@ -1593,7 +1614,8 @@ impl StreamingQueueCompressor {
                 if self.config.verbosity > 0 {
                     eprintln!(
                         "PACK_BOUNDARY: Inserting {} sync tokens after {} contigs (global count)",
-                        self.config.num_threads, count + 1
+                        self.config.num_threads,
+                        count + 1
                     );
                 }
 
@@ -1616,7 +1638,7 @@ impl StreamingQueueCompressor {
                 // Return NEW priority for subsequent contigs
                 new_priority
             } else {
-                current_priority  // Use priority BEFORE potential decrement (this contig uses current priority)
+                current_priority // Use priority BEFORE potential decrement (this contig uses current priority)
             }
         };
 
@@ -1630,7 +1652,9 @@ impl StreamingQueueCompressor {
                 if last != &sample_name {
                     // Sample boundary detected
                     // Only insert sync tokens if forced by env var (for debugging/compatibility)
-                    let force_sync = std::env::var("RAGC_SYNC_PER_SAMPLE").map(|v| v == "1").unwrap_or(false);
+                    let force_sync = std::env::var("RAGC_SYNC_PER_SAMPLE")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
 
                     if force_sync {
                         if self.config.verbosity > 0 {
@@ -1713,7 +1737,10 @@ impl StreamingQueueCompressor {
     /// ```
     pub fn drain(&self) -> Result<()> {
         if self.config.verbosity > 0 {
-            eprintln!("Draining queue (waiting for {} items to be processed)...", self.queue.len());
+            eprintln!(
+                "Draining queue (waiting for {} items to be processed)...",
+                self.queue.len()
+            );
         }
 
         // Wait for queue to empty
@@ -1734,7 +1761,9 @@ impl StreamingQueueCompressor {
     /// instead of waiting for finalize().
     pub fn sync_and_flush(&self, sample_name: &str) -> Result<()> {
         // Insert sync tokens for each worker
-        let sequence = self.next_sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sequence = self
+            .next_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         for _ in 0..self.config.num_threads {
             let sync_token = ContigTask {
@@ -1766,7 +1795,10 @@ impl StreamingQueueCompressor {
         // This ensures buffered_seg_part data is processed and flushed
         // (matches C++ AGC line 2236-2244: final sync at end of input)
         if self.config.verbosity > 0 {
-            eprintln!("  Inserting {} final sync tokens...", self.config.num_threads);
+            eprintln!(
+                "  Inserting {} final sync tokens...",
+                self.config.num_threads
+            );
         }
 
         // Use sequence 0 and high priority to ensure sync tokens are processed last
@@ -1806,7 +1838,10 @@ impl StreamingQueueCompressor {
         }
 
         if self.config.verbosity > 0 {
-            eprintln!("FINALIZE_TIMING: Wait for workers took {:?}", wait_start.elapsed());
+            eprintln!(
+                "FINALIZE_TIMING: Wait for workers took {:?}",
+                wait_start.elapsed()
+            );
             eprintln!("All workers finished!");
             eprintln!("Flushing remaining segment packs...");
         }
@@ -1835,12 +1870,22 @@ impl StreamingQueueCompressor {
                             key.kmer_back
                         );
                     }
-                    flush_pack(buffer, &self.collection, &self.archive, &self.config, &self.reference_segments)
-                        .context("Failed to flush remaining pack")?;
+                    flush_pack(
+                        buffer,
+                        &self.collection,
+                        &self.archive,
+                        &self.config,
+                        &self.reference_segments,
+                    )
+                    .context("Failed to flush remaining pack")?;
                 }
             }
             if self.config.verbosity > 0 {
-                eprintln!("FLUSH_PHASE1: {} groups with pending segments, took {:?}", phase1_count, phase1_start.elapsed());
+                eprintln!(
+                    "FLUSH_PHASE1: {} groups with pending segments, took {:?}",
+                    phase1_count,
+                    phase1_start.elapsed()
+                );
             }
 
             // Phase 2: Collect and PARALLEL compress pending_deltas
@@ -1858,7 +1903,8 @@ impl StreamingQueueCompressor {
 
             // Extract work items from groups
             let phase2_start = std::time::Instant::now();
-            let work_items: Vec<_> = groups.iter_mut()
+            let work_items: Vec<_> = groups
+                .iter_mut()
                 .filter(|(_, buffer)| !buffer.pending_deltas.is_empty())
                 .map(|(_, buffer)| {
                     // FIX: Raw groups are 0-15 (group_id < 16), not just group 0
@@ -1888,7 +1934,11 @@ impl StreamingQueueCompressor {
 
             let work_items_count = work_items.len();
             if self.config.verbosity > 0 {
-                eprintln!("FLUSH_PHASE2a: Collected {} work items, took {:?}", work_items_count, phase2_start.elapsed());
+                eprintln!(
+                    "FLUSH_PHASE2a: Collected {} work items, took {:?}",
+                    work_items_count,
+                    phase2_start.elapsed()
+                );
             }
 
             // Parallel compression using rayon
@@ -1905,10 +1955,16 @@ impl StreamingQueueCompressor {
                     }
 
                     let raw_size = packed_data.len();
-                    let mut compressed = match compress_segment_configured(&packed_data, partial_compression_level) {
+                    let mut compressed = match compress_segment_configured(
+                        &packed_data,
+                        partial_compression_level,
+                    ) {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("Error compressing final partial pack for group {}: {}", group_id, e);
+                            eprintln!(
+                                "Error compressing final partial pack for group {}: {}",
+                                group_id, e
+                            );
                             return None;
                         }
                     };
@@ -1934,7 +1990,11 @@ impl StreamingQueueCompressor {
                 .collect();
 
             if self.config.verbosity > 0 {
-                eprintln!("FLUSH_PHASE2b: Parallel compression of {} packs, took {:?}", compressed_packs.len(), compress_start.elapsed());
+                eprintln!(
+                    "FLUSH_PHASE2b: Parallel compression of {} packs, took {:?}",
+                    compressed_packs.len(),
+                    compress_start.elapsed()
+                );
             }
 
             // Phase 3: Sequential writes to archive (sorted by stream_id for determinism)
@@ -1946,7 +2006,11 @@ impl StreamingQueueCompressor {
             for pack in sorted_packs {
                 if pack.use_compressed {
                     // Use buffered writes to reduce syscalls
-                    arch.add_part_buffered(pack.stream_id, pack.compressed.clone(), pack.raw_size as u64);
+                    arch.add_part_buffered(
+                        pack.stream_id,
+                        pack.compressed.clone(),
+                        pack.raw_size as u64,
+                    );
                 } else {
                     arch.add_part_buffered(pack.stream_id, pack.raw_data.clone(), 0);
                 }
@@ -1954,7 +2018,10 @@ impl StreamingQueueCompressor {
             drop(arch);
 
             if self.config.verbosity > 0 {
-                eprintln!("FLUSH_PHASE3: Sequential writes, took {:?}", phase3_start.elapsed());
+                eprintln!(
+                    "FLUSH_PHASE3: Sequential writes, took {:?}",
+                    phase3_start.elapsed()
+                );
                 eprintln!("Flushed {} segment groups", num_groups);
                 eprintln!("FINALIZE_TIMING: Flush took {:?}", flush_start.elapsed());
             }
@@ -2013,7 +2080,9 @@ impl StreamingQueueCompressor {
             archive.add_part_buffered(*file_type_info_stream_id, file_type_info_data.clone(), 7);
 
             // Flush all buffered writes to disk in one batch (reduces syscalls from ~200 to ~1)
-            archive.flush_buffers().context("Failed to flush archive buffers")?;
+            archive
+                .flush_buffers()
+                .context("Failed to flush archive buffers")?;
 
             if self.config.verbosity > 0 {
                 eprintln!("Collection metadata written successfully");
@@ -2129,13 +2198,15 @@ fn flush_pack(
         if config.verbosity > 1 {
             eprintln!(
                 "  Flushing group {}: reference from {} (chosen from {} sorted segments)",
-                buffer.group_id, ref_seg.sample_name, buffer.segments.len() + 1
+                buffer.group_id,
+                ref_seg.sample_name,
+                buffer.segments.len() + 1
             );
         }
 
         // Compress reference using adaptive compression (NO LOCK)
-        let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
-            .context("Failed to compress reference")?;
+        let (mut compressed, marker) =
+            compress_reference_segment(&ref_seg.data).context("Failed to compress reference")?;
         compressed.push(marker);
 
         // Metadata stores the uncompressed size
@@ -2201,7 +2272,11 @@ fn flush_pack(
     let mut segment_in_group_ids: Vec<(usize, u32)> = Vec::new(); // (segment_index, in_group_id) for each segment
 
     // Helper function to compress a complete pack (exactly 50 entries) - NO LOCK
-    let compress_pack = |deltas: &[Vec<u8>], needs_raw_placeholder: bool, stream_id: usize, compression_level: i32| -> Result<PreCompressedPart> {
+    let compress_pack = |deltas: &[Vec<u8>],
+                         needs_raw_placeholder: bool,
+                         stream_id: usize,
+                         compression_level: i32|
+     -> Result<PreCompressedPart> {
         let mut packed_data = Vec::new();
 
         // CRITICAL: Raw groups need a placeholder segment at position 0
@@ -2250,7 +2325,9 @@ fn flush_pack(
                 }
             }
             // Reuse prepared lz_diff (matching C++ AGC segment.cpp line 59: lz_diff->Encode(s, delta))
-            let ragc_encoded = buffer.lz_diff.as_mut()
+            let ragc_encoded = buffer
+                .lz_diff
+                .as_mut()
                 .expect("lz_diff should be prepared when reference is written")
                 .encode(&seg.data);
 
@@ -2275,12 +2352,17 @@ fn flush_pack(
                             eprintln!("Target len:     {}", seg.data.len());
                             eprintln!("RAGC encoded:   {} bytes", ragc_encoded.len());
                             eprintln!("C++ AGC encoded: {} bytes", cpp_encoded.len());
-                            eprintln!("Difference:     {} bytes", (ragc_encoded.len() as i64 - cpp_encoded.len() as i64).abs());
+                            eprintln!(
+                                "Difference:     {} bytes",
+                                (ragc_encoded.len() as i64 - cpp_encoded.len() as i64).abs()
+                            );
                             eprintln!();
 
                             // Find first difference
                             let mut first_diff_byte = None;
-                            for (i, (r, c)) in ragc_encoded.iter().zip(cpp_encoded.iter()).enumerate() {
+                            for (i, (r, c)) in
+                                ragc_encoded.iter().zip(cpp_encoded.iter()).enumerate()
+                            {
                                 if r != c {
                                     first_diff_byte = Some(i);
                                     break;
@@ -2293,45 +2375,87 @@ fn flush_pack(
                                 let end = (i + 30).min(ragc_encoded.len()).min(cpp_encoded.len());
 
                                 eprintln!("\nRAGC output around difference:");
-                                let ragc_hex: Vec<_> = ragc_encoded[start..end].iter().map(|b| format!("{:02x}", b)).collect();
-                                let ragc_ascii: String = ragc_encoded[start..end].iter().map(|&b| {
-                                    if b >= 32 && b < 127 { b as char } else { '.' }
-                                }).collect();
+                                let ragc_hex: Vec<_> = ragc_encoded[start..end]
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect();
+                                let ragc_ascii: String = ragc_encoded[start..end]
+                                    .iter()
+                                    .map(|&b| if b >= 32 && b < 127 { b as char } else { '.' })
+                                    .collect();
                                 eprintln!("  Hex:   {}", ragc_hex.join(" "));
                                 eprintln!("  ASCII: {}", ragc_ascii);
 
                                 eprintln!("\nC++ AGC output around difference:");
-                                let cpp_hex: Vec<_> = cpp_encoded[start..end].iter().map(|b| format!("{:02x}", b)).collect();
-                                let cpp_ascii: String = cpp_encoded[start..end].iter().map(|&b| {
-                                    if b >= 32 && b < 127 { b as char } else { '.' }
-                                }).collect();
+                                let cpp_hex: Vec<_> = cpp_encoded[start..end]
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect();
+                                let cpp_ascii: String = cpp_encoded[start..end]
+                                    .iter()
+                                    .map(|&b| if b >= 32 && b < 127 { b as char } else { '.' })
+                                    .collect();
                                 eprintln!("  Hex:   {}", cpp_hex.join(" "));
                                 eprintln!("  ASCII: {}", cpp_ascii);
 
                                 eprintln!("\nByte at position {}:", i);
-                                eprintln!("  RAGC:    0x{:02x} ('{}')", ragc_encoded[i],
-                                    if ragc_encoded[i] >= 32 && ragc_encoded[i] < 127 { ragc_encoded[i] as char } else { '?' });
-                                eprintln!("  C++ AGC: 0x{:02x} ('{}')", cpp_encoded[i],
-                                    if cpp_encoded[i] >= 32 && cpp_encoded[i] < 127 { cpp_encoded[i] as char } else { '?' });
+                                eprintln!(
+                                    "  RAGC:    0x{:02x} ('{}')",
+                                    ragc_encoded[i],
+                                    if ragc_encoded[i] >= 32 && ragc_encoded[i] < 127 {
+                                        ragc_encoded[i] as char
+                                    } else {
+                                        '?'
+                                    }
+                                );
+                                eprintln!(
+                                    "  C++ AGC: 0x{:02x} ('{}')",
+                                    cpp_encoded[i],
+                                    if cpp_encoded[i] >= 32 && cpp_encoded[i] < 127 {
+                                        cpp_encoded[i] as char
+                                    } else {
+                                        '?'
+                                    }
+                                );
                             } else if ragc_encoded.len() != cpp_encoded.len() {
-                                eprintln!("Encodings match for first {} bytes, but lengths differ",
-                                    ragc_encoded.len().min(cpp_encoded.len()));
+                                eprintln!(
+                                    "Encodings match for first {} bytes, but lengths differ",
+                                    ragc_encoded.len().min(cpp_encoded.len())
+                                );
                                 if ragc_encoded.len() > cpp_encoded.len() {
                                     let extra_start = cpp_encoded.len();
-                                    let extra_hex: Vec<_> = ragc_encoded[extra_start..].iter().take(40).map(|b| format!("{:02x}", b)).collect();
-                                    let extra_ascii: String = ragc_encoded[extra_start..].iter().take(40).map(|&b| {
-                                        if b >= 32 && b < 127 { b as char } else { '.' }
-                                    }).collect();
-                                    eprintln!("RAGC has {} extra bytes:", ragc_encoded.len() - cpp_encoded.len());
+                                    let extra_hex: Vec<_> = ragc_encoded[extra_start..]
+                                        .iter()
+                                        .take(40)
+                                        .map(|b| format!("{:02x}", b))
+                                        .collect();
+                                    let extra_ascii: String = ragc_encoded[extra_start..]
+                                        .iter()
+                                        .take(40)
+                                        .map(|&b| if b >= 32 && b < 127 { b as char } else { '.' })
+                                        .collect();
+                                    eprintln!(
+                                        "RAGC has {} extra bytes:",
+                                        ragc_encoded.len() - cpp_encoded.len()
+                                    );
                                     eprintln!("  Hex:   {}", extra_hex.join(" "));
                                     eprintln!("  ASCII: {}", extra_ascii);
                                 } else {
                                     let extra_start = ragc_encoded.len();
-                                    let extra_hex: Vec<_> = cpp_encoded[extra_start..].iter().take(40).map(|b| format!("{:02x}", b)).collect();
-                                    let extra_ascii: String = cpp_encoded[extra_start..].iter().take(40).map(|&b| {
-                                        if b >= 32 && b < 127 { b as char } else { '.' }
-                                    }).collect();
-                                    eprintln!("C++ AGC has {} extra bytes:", cpp_encoded.len() - ragc_encoded.len());
+                                    let extra_hex: Vec<_> = cpp_encoded[extra_start..]
+                                        .iter()
+                                        .take(40)
+                                        .map(|b| format!("{:02x}", b))
+                                        .collect();
+                                    let extra_ascii: String = cpp_encoded[extra_start..]
+                                        .iter()
+                                        .take(40)
+                                        .map(|&b| if b >= 32 && b < 127 { b as char } else { '.' })
+                                        .collect();
+                                    eprintln!(
+                                        "C++ AGC has {} extra bytes:",
+                                        cpp_encoded.len() - ragc_encoded.len()
+                                    );
                                     eprintln!("  Hex:   {}", extra_hex.join(" "));
                                     eprintln!("  ASCII: {}", extra_ascii);
                                 }
@@ -2339,21 +2463,45 @@ fn flush_pack(
 
                             // Show last 10 bytes of each
                             eprintln!("\nLast 10 bytes of each encoding:");
-                            let ragc_tail_start = if ragc_encoded.len() > 10 { ragc_encoded.len() - 10 } else { 0 };
-                            let ragc_tail_hex: Vec<_> = ragc_encoded[ragc_tail_start..].iter().map(|b| format!("{:02x}", b)).collect();
-                            let ragc_tail_ascii: String = ragc_encoded[ragc_tail_start..].iter().map(|&b| {
-                                if b >= 32 && b < 127 { b as char } else { '.' }
-                            }).collect();
-                            eprintln!("RAGC    (bytes {}-{}):", ragc_tail_start, ragc_encoded.len()-1);
+                            let ragc_tail_start = if ragc_encoded.len() > 10 {
+                                ragc_encoded.len() - 10
+                            } else {
+                                0
+                            };
+                            let ragc_tail_hex: Vec<_> = ragc_encoded[ragc_tail_start..]
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect();
+                            let ragc_tail_ascii: String = ragc_encoded[ragc_tail_start..]
+                                .iter()
+                                .map(|&b| if b >= 32 && b < 127 { b as char } else { '.' })
+                                .collect();
+                            eprintln!(
+                                "RAGC    (bytes {}-{}):",
+                                ragc_tail_start,
+                                ragc_encoded.len() - 1
+                            );
                             eprintln!("  Hex:   {}", ragc_tail_hex.join(" "));
                             eprintln!("  ASCII: {}", ragc_tail_ascii);
 
-                            let cpp_tail_start = if cpp_encoded.len() > 10 { cpp_encoded.len() - 10 } else { 0 };
-                            let cpp_tail_hex: Vec<_> = cpp_encoded[cpp_tail_start..].iter().map(|b| format!("{:02x}", b)).collect();
-                            let cpp_tail_ascii: String = cpp_encoded[cpp_tail_start..].iter().map(|&b| {
-                                if b >= 32 && b < 127 { b as char } else { '.' }
-                            }).collect();
-                            eprintln!("C++ AGC (bytes {}-{}):", cpp_tail_start, cpp_encoded.len()-1);
+                            let cpp_tail_start = if cpp_encoded.len() > 10 {
+                                cpp_encoded.len() - 10
+                            } else {
+                                0
+                            };
+                            let cpp_tail_hex: Vec<_> = cpp_encoded[cpp_tail_start..]
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect();
+                            let cpp_tail_ascii: String = cpp_encoded[cpp_tail_start..]
+                                .iter()
+                                .map(|&b| if b >= 32 && b < 127 { b as char } else { '.' })
+                                .collect();
+                            eprintln!(
+                                "C++ AGC (bytes {}-{}):",
+                                cpp_tail_start,
+                                cpp_encoded.len() - 1
+                            );
                             eprintln!("  Hex:   {}", cpp_tail_hex.join(" "));
                             eprintln!("  ASCII: {}", cpp_tail_ascii);
 
@@ -2412,7 +2560,12 @@ fn flush_pack(
             if buffer.pending_deltas.len() == flush_threshold {
                 // Compress pack WITHOUT holding any lock
                 let needs_placeholder = !use_lz_encoding && !buffer.raw_placeholder_written;
-                let pack = compress_pack(&buffer.pending_deltas, needs_placeholder, buffer.stream_id, config.compression_level)?;
+                let pack = compress_pack(
+                    &buffer.pending_deltas,
+                    needs_placeholder,
+                    buffer.stream_id,
+                    config.compression_level,
+                )?;
                 archive_writes.push(pack);
                 buffer.raw_placeholder_written = true;
 
@@ -2515,8 +2668,8 @@ fn flush_pack_compress_only(
         let ref_seg = buffer.segments.remove(0);
 
         // Compress reference
-        let (mut compressed, marker) = compress_reference_segment(&ref_seg.data)
-            .context("Failed to compress reference")?;
+        let (mut compressed, marker) =
+            compress_reference_segment(&ref_seg.data).context("Failed to compress reference")?;
         compressed.push(marker);
 
         let ref_size = ref_seg.data.len() as u64;
@@ -2557,7 +2710,11 @@ fn flush_pack_compress_only(
     }
 
     // Compress pack helper (same as flush_pack)
-    let compress_pack = |deltas: &[Vec<u8>], needs_raw_placeholder: bool, stream_id: usize, compression_level: i32| -> Result<PreCompressedPart> {
+    let compress_pack = |deltas: &[Vec<u8>],
+                         needs_raw_placeholder: bool,
+                         stream_id: usize,
+                         compression_level: i32|
+     -> Result<PreCompressedPart> {
         let mut packed_data = Vec::new();
 
         if needs_raw_placeholder {
@@ -2596,7 +2753,9 @@ fn flush_pack_compress_only(
         let contig_data = if !use_lz_encoding || buffer.reference_segment.is_none() {
             seg.data.clone()
         } else {
-            buffer.lz_diff.as_mut()
+            buffer
+                .lz_diff
+                .as_mut()
                 .expect("lz_diff should be prepared")
                 .encode(&seg.data)
         };
@@ -2628,7 +2787,12 @@ fn flush_pack_compress_only(
 
             if buffer.pending_deltas.len() == flush_threshold {
                 let needs_placeholder = !use_lz_encoding && !buffer.raw_placeholder_written;
-                let pack = compress_pack(&buffer.pending_deltas, needs_placeholder, buffer.stream_id, config.compression_level)?;
+                let pack = compress_pack(
+                    &buffer.pending_deltas,
+                    needs_placeholder,
+                    buffer.stream_id,
+                    config.compression_level,
+                )?;
                 archive_writes.push(pack);
                 buffer.raw_placeholder_written = true;
                 buffer.pending_deltas.clear();
@@ -2677,22 +2841,28 @@ fn write_reference_immediately(
     if crate::env_cache::debug_ref_write() {
         eprintln!(
             "DEBUG_REF_IMMEDIATE: group={} sample={} contig={} seg={} data_len={}",
-            buffer.group_id, segment.sample_name, segment.contig_name,
-            segment.seg_part_no, segment.data.len()
+            buffer.group_id,
+            segment.sample_name,
+            segment.contig_name,
+            segment.seg_part_no,
+            segment.data.len()
         );
     }
 
     if config.verbosity > 1 {
         eprintln!(
             "  Writing immediate reference for group {}: {} {}:{} (part {})",
-            buffer.group_id, segment.sample_name, segment.contig_name,
-            segment.seg_part_no, segment.seg_part_no
+            buffer.group_id,
+            segment.sample_name,
+            segment.contig_name,
+            segment.seg_part_no,
+            segment.seg_part_no
         );
     }
 
     // 1. Compress reference using adaptive compression (matching flush_pack lines 635-637)
-    let (mut compressed, marker) = compress_reference_segment(&segment.data)
-        .context("Failed to compress reference")?;
+    let (mut compressed, marker) =
+        compress_reference_segment(&segment.data).context("Failed to compress reference")?;
     compressed.push(marker);
 
     let ref_size = segment.data.len();
@@ -2772,8 +2942,8 @@ fn reverse_complement_sequence(seq: &[u8]) -> Vec<u8> {
 fn find_group_with_one_kmer(
     kmer: u64,
     kmer_is_dir: bool,
-    segment_data: &[u8],      // Segment data in forward orientation
-    segment_data_rc: &[u8],   // Segment data in reverse complement
+    segment_data: &[u8],    // Segment data in forward orientation
+    segment_data_rc: &[u8], // Segment data in reverse complement
     map_segments_terminators: &Arc<RwLock<BTreeMap<u64, Vec<u64>>>>,
     map_segments: &Arc<RwLock<BTreeMap<SegmentGroupKey, u32>>>,
     segment_groups: &Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
@@ -2793,7 +2963,10 @@ fn find_group_with_one_kmer(
                 // Match C++ AGC lines 1671-1679: check is_dir_oriented()
                 // Debug: log entry to no-connection path
                 if crate::env_cache::debug_is_dir() {
-                    eprintln!("RAGC_FIND_GROUP_NO_CONN: kmer={} kmer_is_dir={}", kmer, kmer_is_dir);
+                    eprintln!(
+                        "RAGC_FIND_GROUP_NO_CONN: kmer={} kmer_is_dir={}",
+                        kmer, kmer_is_dir
+                    );
                 }
                 if kmer_is_dir {
                     // Dir-oriented: (kmer, MISSING) with rc=false
@@ -2816,13 +2989,18 @@ fn find_group_with_one_kmer(
 
     if config.verbosity > 1 {
         #[cfg(feature = "verbose_debug")]
-        eprintln!("RAGC_CASE3_FOUND_CONNECTIONS: kmer={} connections={}",
-            kmer, connected_kmers.len());
+        eprintln!(
+            "RAGC_CASE3_FOUND_CONNECTIONS: kmer={} connections={}",
+            kmer,
+            connected_kmers.len()
+        );
     }
     // Debug: log connections found
     if crate::env_cache::debug_is_dir() {
-        eprintln!("RAGC_FIND_GROUP_FOUND_CONN: kmer={} kmer_is_dir={} connections={:?}",
-            kmer, kmer_is_dir, connected_kmers);
+        eprintln!(
+            "RAGC_FIND_GROUP_FOUND_CONN: kmer={} kmer_is_dir={} connections={:?}",
+            kmer, kmer_is_dir, connected_kmers
+        );
     }
 
     // Build list of candidate groups
@@ -2844,8 +3022,8 @@ fn find_group_with_one_kmer(
         let orderings: Vec<(u64, u64, bool)> = if cand_kmer == MISSING_KMER {
             // MISSING is involved - try both orderings to find the group
             vec![
-                (MISSING_KMER, kmer, true),   // (MISSING, kmer) with RC
-                (kmer, MISSING_KMER, false),  // (kmer, MISSING) without RC
+                (MISSING_KMER, kmer, true),  // (MISSING, kmer) with RC
+                (kmer, MISSING_KMER, false), // (kmer, MISSING) without RC
             ]
         } else if cand_kmer < kmer {
             // cand_kmer is smaller - it goes first
@@ -2903,7 +3081,11 @@ fn find_group_with_one_kmer(
                 }
 
                 // Use cand_kmer as key to deduplicate (only one match per connected_kmer)
-                let connected = if *key_front == kmer { *key_back } else { *key_front };
+                let connected = if *key_front == kmer {
+                    *key_back
+                } else {
+                    *key_front
+                };
                 if !already_found.contains(&connected) {
                     candidates.push((*key_front, *key_back, *needs_rc, ref_size));
                     already_found.insert(connected);
@@ -2934,7 +3116,11 @@ fn find_group_with_one_kmer(
             }
 
             // Use cand_kmer as key to deduplicate (only one match per connected_kmer)
-            let connected = if key_front == kmer { key_back } else { key_front };
+            let connected = if key_front == kmer {
+                key_back
+            } else {
+                key_front
+            };
             if !already_found.contains(&connected) {
                 candidates.push((key_front, key_back, needs_rc, ref_size));
                 already_found.insert(connected);
@@ -2958,14 +3144,20 @@ fn find_group_with_one_kmer(
             // Dir-oriented: (kmer, MISSING) with rc=false
             if config.verbosity > 1 {
                 #[cfg(feature = "verbose_debug")]
-                eprintln!("RAGC_CASE3_NO_CANDIDATES: kmer={} is_dir=true -> ({}, MISSING) rc=false", kmer, kmer);
+                eprintln!(
+                    "RAGC_CASE3_NO_CANDIDATES: kmer={} is_dir=true -> ({}, MISSING) rc=false",
+                    kmer, kmer
+                );
             }
             return (kmer, MISSING_KMER, false);
         } else {
             // NOT dir-oriented: (MISSING, kmer) with rc=true
             if config.verbosity > 1 {
                 #[cfg(feature = "verbose_debug")]
-                eprintln!("RAGC_CASE3_NO_CANDIDATES: kmer={} is_dir=false -> (MISSING, {}) rc=true", kmer, kmer);
+                eprintln!(
+                    "RAGC_CASE3_NO_CANDIDATES: kmer={} is_dir=false -> (MISSING, {}) rc=true",
+                    kmer, kmer
+                );
             }
             return (MISSING_KMER, kmer, true);
         }
@@ -2988,7 +3180,9 @@ fn find_group_with_one_kmer(
     if config.verbosity > 2 {
         eprintln!(
             "RAGC_CASE3_SORTED_CANDIDATES: kmer={} segment_len={} n_candidates={}",
-            kmer, segment_len, candidates.len()
+            kmer,
+            segment_len,
+            candidates.len()
         );
         for (i, &(kf, kb, rc, rs)) in candidates.iter().enumerate() {
             let size_diff = (rs as i64 - segment_len as i64).abs();
@@ -3005,8 +3199,8 @@ fn find_group_with_one_kmer(
     //   Pass 2: Pick candidate with minimum estimate (lines 1775-1787)
     //
     // CRITICAL: Initialize best_pk to (~0ull, ~0ull) like C++ AGC (line 1628)
-    let mut best_key_front = u64::MAX;  // ~0ull in C++
-    let mut best_key_back = u64::MAX;   // ~0ull in C++
+    let mut best_key_front = u64::MAX; // ~0ull in C++
+    let mut best_key_back = u64::MAX; // ~0ull in C++
     let mut best_needs_rc = false;
     let mut best_estim_size = if segment_len < 16 {
         segment_len
@@ -3030,24 +3224,45 @@ fn find_group_with_one_kmer(
             };
 
             // Get the reference segment for this candidate from buffer OR persistent storage
-            let (ref_data_opt, ref_source): (Option<&[u8]>, &str) = if let Some(group_buffer) = groups.get(&cand_key) {
-                if config.verbosity > 2 && key_front == 1244212049458757632 && key_back == 1244212049458757632 {
+            let (ref_data_opt, ref_source): (Option<&[u8]>, &str) = if let Some(group_buffer) =
+                groups.get(&cand_key)
+            {
+                if config.verbosity > 2
+                    && key_front == 1244212049458757632
+                    && key_back == 1244212049458757632
+                {
                     let ref_seg = group_buffer.reference_segment.as_ref();
                     let ref_len = ref_seg.map(|s| s.data.len()).unwrap_or(0);
-                    let ref_first5: Vec<u8> = ref_seg.map(|s| s.data.iter().take(5).cloned().collect()).unwrap_or_default();
+                    let ref_first5: Vec<u8> = ref_seg
+                        .map(|s| s.data.iter().take(5).cloned().collect())
+                        .unwrap_or_default();
                     eprintln!("RAGC_REF_LOOKUP_BUFFER: degenerate key ({},{}) buffer ref_len={} ref[0..5]={:?}",
                         key_front, key_back, ref_len, ref_first5);
                 }
-                (group_buffer.reference_segment.as_ref().map(|seg| seg.data.as_slice()), "buffer")
+                (
+                    group_buffer
+                        .reference_segment
+                        .as_ref()
+                        .map(|seg| seg.data.as_slice()),
+                    "buffer",
+                )
             } else if let Some(&group_id) = seg_map.get(&cand_key) {
-                if config.verbosity > 2 && key_front == 1244212049458757632 && key_back == 1244212049458757632 {
+                if config.verbosity > 2
+                    && key_front == 1244212049458757632
+                    && key_back == 1244212049458757632
+                {
                     let ref_data = ref_segs.get(&group_id);
                     let ref_len = ref_data.map(|d| d.len()).unwrap_or(0);
-                    let ref_first5: Vec<u8> = ref_data.map(|d| d.iter().take(5).cloned().collect()).unwrap_or_default();
+                    let ref_first5: Vec<u8> = ref_data
+                        .map(|d| d.iter().take(5).cloned().collect())
+                        .unwrap_or_default();
                     eprintln!("RAGC_REF_LOOKUP_PERSISTENT: degenerate key ({},{}) -> group_id={} ref_len={} ref[0..5]={:?}",
                         key_front, key_back, group_id, ref_len, ref_first5);
                 }
-                (ref_segs.get(&group_id).map(|data| data.as_slice()), "persistent")
+                (
+                    ref_segs.get(&group_id).map(|data| data.as_slice()),
+                    "persistent",
+                )
             } else {
                 (None, "none")
             };
@@ -3080,8 +3295,14 @@ fn find_group_with_one_kmer(
 
                 #[cfg(feature = "cpp_agc")]
                 if estim_size != cpp_estim_size && config.verbosity > 0 {
-                    eprintln!("ESTIMATE_MISMATCH: ragc={} cpp={} ref_len={} tgt_len={} bound={}",
-                        estim_size, cpp_estim_size, ref_data.len(), target_data.len(), best_estim_size);
+                    eprintln!(
+                        "ESTIMATE_MISMATCH: ragc={} cpp={} ref_len={} tgt_len={} bound={}",
+                        estim_size,
+                        cpp_estim_size,
+                        ref_data.len(),
+                        target_data.len(),
+                        best_estim_size
+                    );
                 }
 
                 // DEBUG: Also compute estimate with initial threshold to check if tie would occur
@@ -3090,7 +3311,9 @@ fn find_group_with_one_kmer(
                     let mut lz2 = LZDiff::new(config.min_match_len as u32);
                     lz2.prepare(&ref_data.to_vec());
                     lz2.estimate(&target_data.to_vec(), (segment_len - 16) as u32) as usize
-                } else { 0 };
+                } else {
+                    0
+                };
 
                 if config.verbosity > 2 {
                     // Print detailed debug info including bound and first/last bytes
@@ -3155,7 +3378,11 @@ fn find_group_with_one_kmer(
 
     // Debug: Print Pass 2 results
     if config.verbosity > 2 && !candidate_estimates.is_empty() {
-        let threshold = if segment_len < 16 { segment_len } else { segment_len - 16 };
+        let threshold = if segment_len < 16 {
+            segment_len
+        } else {
+            segment_len - 16
+        };
         eprintln!(
             "RAGC_CASE3_PASS2_RESULTS: threshold={} best=({},{}) best_estim={}",
             threshold, best_key_front, best_key_back, best_estim_size
@@ -3177,14 +3404,20 @@ fn find_group_with_one_kmer(
             // Dir-oriented: (kmer, MISSING) with rc=false
             if config.verbosity > 1 {
                 #[cfg(feature = "verbose_debug")]
-                eprintln!("RAGC_CASE3_NO_WINNER: kmer={} is_dir=true -> ({}, MISSING) rc=false", kmer, kmer);
+                eprintln!(
+                    "RAGC_CASE3_NO_WINNER: kmer={} is_dir=true -> ({}, MISSING) rc=false",
+                    kmer, kmer
+                );
             }
             return (kmer, MISSING_KMER, false);
         } else {
             // NOT dir-oriented: (MISSING, kmer) with rc=true
             if config.verbosity > 1 {
                 #[cfg(feature = "verbose_debug")]
-                eprintln!("RAGC_CASE3_NO_WINNER: kmer={} is_dir=false -> (MISSING, {}) rc=true", kmer, kmer);
+                eprintln!(
+                    "RAGC_CASE3_NO_WINNER: kmer={} is_dir=false -> (MISSING, {}) rc=true",
+                    kmer, kmer
+                );
             }
             return (MISSING_KMER, kmer, true);
         }
@@ -3192,8 +3425,10 @@ fn find_group_with_one_kmer(
 
     if config.verbosity > 1 {
         #[cfg(feature = "verbose_debug")]
-        eprintln!("RAGC_CASE3_PICKED: kmer={} best=({},{}) rc={} estim_size={} segment_size={}",
-            kmer, best_key_front, best_key_back, best_needs_rc, best_estim_size, segment_len);
+        eprintln!(
+            "RAGC_CASE3_PICKED: kmer={} best=({},{}) rc={} estim_size={} segment_size={}",
+            kmer, best_key_front, best_key_back, best_needs_rc, best_estim_size, segment_len
+        );
     }
 
     (best_key_front, best_key_back, best_needs_rc)
@@ -3294,7 +3529,8 @@ fn find_cand_segment_using_fallback_minimizers(
                             (key1, key2)
                         };
 
-                        cand_seg_counts.entry(cand_key)
+                        cand_seg_counts
+                            .entry(cand_key)
                             .or_insert_with(Vec::new)
                             .push(canonical);
                     }
@@ -3317,7 +3553,10 @@ fn find_cand_segment_using_fallback_minimizers(
     if pruned_candidates.is_empty() {
         if config.verbosity > 1 {
             #[cfg(feature = "verbose_debug")]
-            eprintln!("RAGC_FALLBACK_NO_CANDIDATES: min_shared={}", min_shared_kmers);
+            eprintln!(
+                "RAGC_FALLBACK_NO_CANDIDATES: min_shared={}",
+                min_shared_kmers
+            );
         }
         return (MISSING_KMER, MISSING_KMER, false);
     }
@@ -3334,8 +3573,12 @@ fn find_cand_segment_using_fallback_minimizers(
 
     if config.verbosity > 1 {
         #[cfg(feature = "verbose_debug")]
-        eprintln!("RAGC_FALLBACK_CANDIDATES: count={} best_shared={} min_shared={}",
-            pruned_candidates.len(), best_count, min_shared_kmers);
+        eprintln!(
+            "RAGC_FALLBACK_CANDIDATES: count={} best_shared={} min_shared={}",
+            pruned_candidates.len(),
+            best_count,
+            min_shared_kmers
+        );
     }
 
     // For short segments, use fast decision based on shared k-mer count
@@ -3343,7 +3586,10 @@ fn find_cand_segment_using_fallback_minimizers(
         let (count, (key_front, key_back)) = pruned_candidates[0];
         if config.verbosity > 1 {
             #[cfg(feature = "verbose_debug")]
-            eprintln!("RAGC_FALLBACK_SHORT_SEGMENT: key=({},{}) shared_kmers={}", key_front, key_back, count);
+            eprintln!(
+                "RAGC_FALLBACK_SHORT_SEGMENT: key=({},{}) shared_kmers={}",
+                key_front, key_back, count
+            );
         }
         // Normalize: ensure front <= back
         if key_front <= key_back {
@@ -3378,7 +3624,10 @@ fn find_cand_segment_using_fallback_minimizers(
 
             // Get reference segment for this candidate
             let ref_data_opt: Option<&[u8]> = if let Some(group_buffer) = groups.get(&cand_key) {
-                group_buffer.reference_segment.as_ref().map(|seg| seg.data.as_slice())
+                group_buffer
+                    .reference_segment
+                    .as_ref()
+                    .map(|seg| seg.data.as_slice())
             } else if let Some(&group_id) = seg_map.get(&cand_key) {
                 ref_segs.get(&group_id).map(|data| data.as_slice())
             } else {
@@ -3386,7 +3635,11 @@ fn find_cand_segment_using_fallback_minimizers(
             };
 
             if let Some(ref_data) = ref_data_opt {
-                let target_data = if is_seg_rc { segment_data_rc } else { segment_data };
+                let target_data = if is_seg_rc {
+                    segment_data_rc
+                } else {
+                    segment_data
+                };
 
                 // Estimate compression cost
                 #[cfg(feature = "cpp_agc")]
@@ -3407,8 +3660,10 @@ fn find_cand_segment_using_fallback_minimizers(
 
                 if config.verbosity > 2 {
                     #[cfg(feature = "verbose_debug")]
-                    eprintln!("RAGC_FALLBACK_ESTIMATE: key=({},{}) rc={} estimate={}",
-                        norm_front, norm_back, is_seg_rc, estimate);
+                    eprintln!(
+                        "RAGC_FALLBACK_ESTIMATE: key=({},{}) rc={} estimate={}",
+                        norm_front, norm_back, is_seg_rc, estimate
+                    );
                 }
 
                 // Track best (lowest estimate)
@@ -3432,7 +3687,10 @@ fn find_cand_segment_using_fallback_minimizers(
         if best_estimate >= threshold {
             if config.verbosity > 1 {
                 #[cfg(feature = "verbose_debug")]
-                eprintln!("RAGC_FALLBACK_ADAPTIVE_REJECT: estimate={} threshold={}", best_estimate, threshold);
+                eprintln!(
+                    "RAGC_FALLBACK_ADAPTIVE_REJECT: estimate={} threshold={}",
+                    best_estimate, threshold
+                );
             }
             return (MISSING_KMER, MISSING_KMER, false);
         }
@@ -3444,13 +3702,19 @@ fn find_cand_segment_using_fallback_minimizers(
             if front <= back {
                 if config.verbosity > 1 {
                     #[cfg(feature = "verbose_debug")]
-                    eprintln!("RAGC_FALLBACK_PICKED: key=({},{}) rc=false estimate={}", front, back, best_estimate);
+                    eprintln!(
+                        "RAGC_FALLBACK_PICKED: key=({},{}) rc=false estimate={}",
+                        front, back, best_estimate
+                    );
                 }
                 (front, back, false)
             } else {
                 if config.verbosity > 1 {
                     #[cfg(feature = "verbose_debug")]
-                    eprintln!("RAGC_FALLBACK_PICKED: key=({},{}) rc=true estimate={}", back, front, best_estimate);
+                    eprintln!(
+                        "RAGC_FALLBACK_PICKED: key=({},{}) rc=true estimate={}",
+                        back, front, best_estimate
+                    );
                 }
                 (back, front, true)
             }
@@ -3518,7 +3782,11 @@ fn add_fallback_mapping(
 
             // Check filter and skip symmetric k-mers
             if fallback_filter.passes(canonical) && kmer_data != kmer_rc {
-                let to_add = if is_dir_oriented { splitter_dir } else { splitter_rev };
+                let to_add = if is_dir_oriented {
+                    splitter_dir
+                } else {
+                    splitter_rev
+                };
                 let entry = fb_map.entry(canonical).or_insert_with(Vec::new);
 
                 // Only add if not already present
@@ -3553,8 +3821,7 @@ fn prepare_batch_parallel(
     collection: &Arc<Mutex<CollectionV3>>,
     reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
     reference_orientations: &Arc<RwLock<BTreeMap<u32, bool>>>,
-    #[cfg(feature = "cpp_agc")]
-    grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
+    #[cfg(feature = "cpp_agc")] grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     parallel_state: &ParallelFlushState,
     config: &StreamingQueueConfig,
 ) -> Result<bool> {
@@ -3588,7 +3855,10 @@ fn prepare_batch_parallel(
             &mut term_map,
         );
         if config.verbosity > 0 && new_count > 0 {
-            eprintln!("PREPARE_BATCH_PARALLEL: Assigned {} new group IDs", new_count);
+            eprintln!(
+                "PREPARE_BATCH_PARALLEL: Assigned {} new group IDs",
+                new_count
+            );
         }
     }
     // Update the shared counter
@@ -3603,7 +3873,10 @@ fn prepare_batch_parallel(
     // Build reverse lookup map (group_id -> key) ONCE to avoid O(n²) lookups
     let group_id_to_key: std::collections::HashMap<u32, SegmentGroupKey> = {
         let global_map = map_segments.read().unwrap();
-        global_map.iter().map(|(k, &gid)| (gid, k.clone())).collect()
+        global_map
+            .iter()
+            .map(|(k, &gid)| (gid, k.clone()))
+            .collect()
     };
 
     // Phase 2c-1: Collect all segments with their keys (no locks needed)
@@ -3660,11 +3933,13 @@ fn prepare_batch_parallel(
         let mut term_map = batch_local_terminators.lock().unwrap();
         for (_, key, _) in &collected_segments {
             if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                term_map.entry(key.kmer_front)
+                term_map
+                    .entry(key.kmer_front)
                     .or_insert_with(Vec::new)
                     .push(key.kmer_back);
                 if key.kmer_front != key.kmer_back {
-                    term_map.entry(key.kmer_back)
+                    term_map
+                        .entry(key.kmer_back)
                         .or_insert_with(Vec::new)
                         .push(key.kmer_front);
                 }
@@ -3674,30 +3949,34 @@ fn prepare_batch_parallel(
 
     // Phase 2c-5: Pre-register all streams for new groups (ONE lock acquisition)
     // Build a set of existing group_ids first for O(1) lookup
-    let existing_group_ids: std::collections::HashSet<u32> = groups_map
-        .values()
-        .map(|b| b.group_id)
-        .collect();
+    let existing_group_ids: std::collections::HashSet<u32> =
+        groups_map.values().map(|b| b.group_id).collect();
 
     // Collect unique new group_ids (O(n) instead of O(n×m))
     // DETERMINISM FIX: Use BTreeSet instead of HashSet to ensure deterministic iteration order
-    let new_group_ids: std::collections::BTreeSet<u32> = collected_segments.iter()
+    let new_group_ids: std::collections::BTreeSet<u32> = collected_segments
+        .iter()
         .map(|(gid, _, _)| *gid)
         .filter(|gid| !existing_group_ids.contains(gid))
         .collect();
 
     // Pre-register all streams in one lock acquisition
     // BTreeSet iteration is sorted, so stream registration order is deterministic
-    let stream_registrations: std::collections::HashMap<u32, (usize, usize)> = if !new_group_ids.is_empty() {
+    let stream_registrations: std::collections::HashMap<u32, (usize, usize)> = if !new_group_ids
+        .is_empty()
+    {
         let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
         let mut arch = archive.lock().unwrap();
-        new_group_ids.iter().map(|&group_id| {
-            let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
-            let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-            let stream_id = arch.register_stream(&delta_stream_name);
-            let ref_stream_id = arch.register_stream(&ref_stream_name);
-            (group_id, (stream_id, ref_stream_id))
-        }).collect()
+        new_group_ids
+            .iter()
+            .map(|&group_id| {
+                let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
+                let stream_id = arch.register_stream(&delta_stream_name);
+                let ref_stream_id = arch.register_stream(&ref_stream_name);
+                (group_id, (stream_id, ref_stream_id))
+            })
+            .collect()
     } else {
         std::collections::HashMap::new()
     };
@@ -3705,12 +3984,15 @@ fn prepare_batch_parallel(
     // Phase 2c-6: Add segments to buffers (groups_map already locked)
     for (group_id, key, seg) in collected_segments {
         let buffer = groups_map.entry(key.clone()).or_insert_with(|| {
-            let (stream_id, ref_stream_id) = stream_registrations.get(&group_id)
+            let (stream_id, ref_stream_id) = stream_registrations
+                .get(&group_id)
                 .copied()
                 .unwrap_or_else(|| {
                     // Fallback: register now (shouldn't happen if logic is correct)
-                    let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                    let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
+                    let archive_version =
+                        ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
+                    let delta_stream_name =
+                        ragc_common::stream_delta_name(archive_version, group_id);
                     let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
                     let mut arch = archive.lock().unwrap();
                     let sid = arch.register_stream(&delta_stream_name);
@@ -3746,7 +4028,10 @@ fn prepare_batch_parallel(
     let has_work = !extracted.is_empty();
 
     if config.verbosity > 0 {
-        eprintln!("PREPARE_BATCH_PARALLEL: Extracted {} buffers for parallel flush", extracted.len());
+        eprintln!(
+            "PREPARE_BATCH_PARALLEL: Extracted {} buffers for parallel flush",
+            extracted.len()
+        );
     }
 
     // Populate ParallelFlushState
@@ -3822,7 +4107,7 @@ fn classify_raw_segments_at_barrier(
     fallback_filter: &FallbackFilter,
     map_fallback_minimizers: &Arc<Mutex<BTreeMap<u64, Vec<(u64, u64)>>>>,
     group_counter: &Arc<AtomicU32>,
-    raw_group_counter: &Arc<AtomicU32>,  // FIX 18: For round-robin distribution of orphan segments
+    raw_group_counter: &Arc<AtomicU32>, // FIX 18: For round-robin distribution of orphan segments
     config: &StreamingQueueConfig,
 ) {
     use crate::segment::MISSING_KMER;
@@ -3860,8 +4145,10 @@ fn classify_raw_segments_at_barrier(
     let total_segments: usize = contig_groups.values().map(|v| v.len()).sum();
 
     if config.verbosity > 0 {
-        eprintln!("CLASSIFY_RAW_BARRIER: Processing {} raw segments across {} contigs (parallel)",
-            total_segments, num_contigs);
+        eprintln!(
+            "CLASSIFY_RAW_BARRIER: Processing {} raw segments across {} contigs (parallel)",
+            total_segments, num_contigs
+        );
     }
 
     // DETERMINISM FIX: Process contigs SEQUENTIALLY to ensure deterministic group creation order.
@@ -3877,452 +4164,500 @@ fn classify_raw_segments_at_barrier(
         for raw_seg in contig_segs {
             // Use local seg_part_no for this contig
             let output_seg_part_no = seg_part_no;
-        // Case 2/3a/3b classification (same logic as before)
-        let (key_front, key_back, should_reverse) =
-            if raw_seg.front_kmer != MISSING_KMER && raw_seg.back_kmer != MISSING_KMER {
-                // Case 2: Both k-mers present
-                if raw_seg.front_kmer < raw_seg.back_kmer {
-                    (raw_seg.front_kmer, raw_seg.back_kmer, false)
-                } else {
-                    (raw_seg.back_kmer, raw_seg.front_kmer, true)
-                }
-            } else if raw_seg.front_kmer != MISSING_KMER {
-                // Case 3a: Only front k-mer present
-                let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
-                    raw_seg.front_kmer,
-                    raw_seg.front_kmer_is_dir,
-                    &raw_seg.data,
-                    &raw_seg.data_rc,
-                    map_segments_terminators,
-                    map_segments,
-                    segment_groups,
-                    reference_segments,
-                    config,
-                );
-                // Fallback: If Case 3a returned MISSING, try fallback minimizers
-                if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
-                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+            // Case 2/3a/3b classification (same logic as before)
+            let (key_front, key_back, should_reverse) =
+                if raw_seg.front_kmer != MISSING_KMER && raw_seg.back_kmer != MISSING_KMER {
+                    // Case 2: Both k-mers present
+                    if raw_seg.front_kmer < raw_seg.back_kmer {
+                        (raw_seg.front_kmer, raw_seg.back_kmer, false)
+                    } else {
+                        (raw_seg.back_kmer, raw_seg.front_kmer, true)
+                    }
+                } else if raw_seg.front_kmer != MISSING_KMER {
+                    // Case 3a: Only front k-mer present
+                    let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
+                        raw_seg.front_kmer,
+                        raw_seg.front_kmer_is_dir,
                         &raw_seg.data,
                         &raw_seg.data_rc,
-                        config.k,
-                        5, // min_shared_kmers = 5 for Case 3
-                        fallback_filter,
-                        map_fallback_minimizers,
+                        map_segments_terminators,
                         map_segments,
                         segment_groups,
                         reference_segments,
                         config,
                     );
-                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
-                        kf = fb_kf;
-                        kb = fb_kb;
-                        sr = fb_sr;
-                    }
-                }
-                (kf, kb, sr)
-            } else if raw_seg.back_kmer != MISSING_KMER {
-                // Case 3b: Only back k-mer present
-                let kmer_is_dir_after_swap = !raw_seg.back_kmer_is_dir;
-                let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
-                    raw_seg.back_kmer,
-                    kmer_is_dir_after_swap,
-                    &raw_seg.data_rc,
-                    &raw_seg.data,
-                    map_segments_terminators,
-                    map_segments,
-                    segment_groups,
-                    reference_segments,
-                    config,
-                );
-                sr = !sr;
-                // Fallback: If Case 3b returned MISSING, try fallback minimizers
-                // Note: C++ AGC uses segment_rc for fallback in Case 3b
-                if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
-                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
-                        &raw_seg.data_rc, // Use RC for Case 3b (matches C++ AGC)
-                        &raw_seg.data,
-                        config.k,
-                        5, // min_shared_kmers = 5 for Case 3
-                        fallback_filter,
-                        map_fallback_minimizers,
-                        map_segments,
-                        segment_groups,
-                        reference_segments,
-                        config,
-                    );
-                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
-                        kf = fb_kf;
-                        kb = fb_kb;
-                        sr = !fb_sr; // C++ AGC: store_rc = !store_dir_alt
-                    }
-                }
-                (kf, kb, sr)
-            } else {
-                // Case 1: Both MISSING - try fallback minimizers
-                let mut kf = MISSING_KMER;
-                let mut kb = MISSING_KMER;
-                let mut sr = false;
-
-                if fallback_filter.is_enabled() {
-                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
-                        &raw_seg.data,
-                        &raw_seg.data_rc,
-                        config.k,
-                        1, // min_shared_kmers = 1 for Case 1 (matches C++ AGC)
-                        fallback_filter,
-                        map_fallback_minimizers,
-                        map_segments,
-                        segment_groups,
-                        reference_segments,
-                        config,
-                    );
-                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
-                        kf = fb_kf;
-                        kb = fb_kb;
-                        sr = fb_sr;
-                    }
-                }
-                (kf, kb, sr)
-            };
-
-        let key = SegmentGroupKey {
-            kmer_front: key_front,
-            kmer_back: key_back,
-        };
-
-        // Prepare segment data (reverse complement if needed)
-        let segment_data = if should_reverse {
-            raw_seg.data_rc.clone()
-        } else {
-            raw_seg.data.clone()
-        };
-
-        // Add fallback mapping for this segment (matches C++ AGC add_fallback_mapping)
-        // This populates the fallback minimizers map for use by later segments
-        add_fallback_mapping(
-            &segment_data,
-            config.k,
-            key.kmer_front,
-            key.kmer_back,
-            fallback_filter,
-            map_fallback_minimizers,
-        );
-
-        // Check if group exists (NO CONTENTION - we're single-threaded)
-        let group_id_opt = {
-            let seg_map = map_segments.read().unwrap();
-            seg_map.get(&key).copied()
-        };
-
-        if let Some(group_id) = group_id_opt {
-            // KNOWN: add to per-group buffer
-            // FIX 18: For orphan segments (key = MISSING, MISSING), use round-robin across groups 0-15
-            // instead of always using group 0. This matches C++ AGC's distribute_segments() behavior.
-            let actual_group_id = if key.kmer_front == MISSING_KMER && key.kmer_back == MISSING_KMER {
-                // Orphan segment - distribute across raw groups 0-15 via round-robin
-                raw_group_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % NO_RAW_GROUPS
-            } else {
-                group_id
-            };
-            buffered_seg_part.add_known(actual_group_id, BufferedSegment {
-                sample_name: raw_seg.sample_name.clone(),
-                contig_name: raw_seg.contig_name.clone(),
-                seg_part_no: output_seg_part_no,
-                data: segment_data,
-                is_rev_comp: should_reverse,
-                sample_priority: raw_seg.sample_priority,
-            });
-            // Increment counter by 1 for non-split segment
-            seg_part_no += 1;
-        } else {
-            // NEW: Try segment splitting before adding as new group
-            // C++ AGC only attempts splits when key doesn't exist and both k-mers valid
-            if config.verbosity > 0 {
-                eprintln!("BARRIER_NEW_SEGMENT: key=({},{}) sample={}", key_front, key_back, raw_seg.sample_name);
-            }
-            let mut was_split = false;
-
-            // Skip barrier splitting if disabled (for C++ AGC parity testing)
-            let try_split = !crate::env_cache::disable_barrier_split()
-                && key_front != MISSING_KMER && key_back != MISSING_KMER && key_front != key_back;
-
-            if try_split {
-                // Try to find a middle splitter
-                let middle_kmer_opt = {
-                    let terminators = map_segments_terminators.read().unwrap();
-                    let front_conn = terminators.get(&key_front).map(|v| v.len()).unwrap_or(0);
-                    let back_conn = terminators.get(&key_back).map(|v| v.len()).unwrap_or(0);
-                    if config.verbosity > 0 {
-                        // Always print the first few, then only when connections exist
-                        eprintln!("BARRIER_SPLIT_TRY: key=({},{}) term_size={} front_conn={} back_conn={} sample={}",
-                            key_front, key_back, terminators.len(), front_conn, back_conn, raw_seg.sample_name);
-                    }
-                    find_middle_splitter(key_front, key_back, &terminators)
-                };
-
-                if let Some(middle_kmer) = middle_kmer_opt {
-                    if config.verbosity > 0 {
-                        eprintln!("BARRIER_SPLIT_FOUND_MIDDLE: key=({},{}) middle={}", key_front, key_back, middle_kmer);
-                    }
-                    // Found potential middle k-mer - check if both target groups exist
-                    let left_key = if key_front <= middle_kmer {
-                        SegmentGroupKey { kmer_front: key_front, kmer_back: middle_kmer }
-                    } else {
-                        SegmentGroupKey { kmer_front: middle_kmer, kmer_back: key_front }
-                    };
-                    let right_key = if middle_kmer <= key_back {
-                        SegmentGroupKey { kmer_front: middle_kmer, kmer_back: key_back }
-                    } else {
-                        SegmentGroupKey { kmer_front: key_back, kmer_back: middle_kmer }
-                    };
-
-                    let (left_group_id, right_group_id) = {
-                        let seg_map = map_segments.read().unwrap();
-                        (seg_map.get(&left_key).copied(), seg_map.get(&right_key).copied())
-                    };
-
-                    // Only split if BOTH target groups already exist
-                    if left_group_id.is_none() || right_group_id.is_none() {
-                        if config.verbosity > 0 {
-                            eprintln!("BARRIER_SPLIT_MISSING_GROUP: left={:?} right={:?} left_key=({},{}) right_key=({},{})",
-                                left_group_id, right_group_id, left_key.kmer_front, left_key.kmer_back, right_key.kmer_front, right_key.kmer_back);
-                        }
-                    }
-                    if let (Some(left_gid), Some(right_gid)) = (left_group_id, right_group_id) {
-                        // Get reference segment data for BOTH left and right
-                        let (left_ref_data, right_ref_data) = {
-                            let refs = reference_segments.read().unwrap();
-                            let left = refs.get(&left_gid).cloned().unwrap_or_default();
-                            let right = refs.get(&right_gid).cloned().unwrap_or_default();
-                            (left, right)
-                        };
-
-                        if config.verbosity > 1 {
-                            eprintln!("BARRIER_SPLIT_GROUPS_EXIST: left_gid={} right_gid={} left_ref_len={} right_ref_len={} seg_len={}",
-                                left_gid, right_gid, left_ref_data.len(), right_ref_data.len(), raw_seg.data.len());
-                        }
-
-                        // Find split decision using cost-based optimization
-                        // This matches C++ AGC's find_cand_segment_with_missing_middle_splitter
-                        // which computes LZ encoding cost at every position and decides:
-                        // - AssignToLeft: entire segment goes to (front, middle) group
-                        // - AssignToRight: entire segment goes to (middle, back) group
-                        // - SplitAt(pos): actually split the segment
-                        //
-                        // C++ AGC line 1393: passes (kmer1, kmer2) after normalization swap,
-                        // and swaps segment_dir/segment_rc based on use_rc flag.
-                        // When should_reverse=true (i.e., original front > back), we need to
-                        // swap the segments to match C++ AGC's behavior.
-                        let (seg_dir, seg_rc) = if should_reverse {
-                            (&raw_seg.data_rc, &raw_seg.data)  // Swap when use_rc=true
-                        } else {
-                            (&raw_seg.data, &raw_seg.data_rc)
-                        };
-                        let split_decision = find_split_by_cost(
-                            seg_dir,
-                            seg_rc,
-                            &left_ref_data,
-                            &right_ref_data,
-                            key_front,    // normalized k-mers (key_front < key_back)
-                            key_back,
-                            middle_kmer,
+                    // Fallback: If Case 3a returned MISSING, try fallback minimizers
+                    if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
+                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                            &raw_seg.data,
+                            &raw_seg.data_rc,
                             config.k,
-                            config.min_match_len as u32,
+                            5, // min_shared_kmers = 5 for Case 3
+                            fallback_filter,
+                            map_fallback_minimizers,
+                            map_segments,
+                            segment_groups,
+                            reference_segments,
+                            config,
                         );
-
-                        match split_decision {
-                            SplitDecision::SplitAt(split_pos) => {
-                                // Actually split the segment into two parts
-                                let (left_data, right_data) = split_segment_at_position(&segment_data, split_pos, config.k);
-                                let left_len = left_data.len();
-                                let right_len = right_data.len();
-
-                                // FIX 27 v4: Compute orientations using ORIGINAL k-mers and should_reverse
-                                let (left_should_reverse, right_should_reverse) = if should_reverse {
-                                    let left_rc = middle_kmer >= raw_seg.back_kmer;
-                                    let right_rc = raw_seg.front_kmer >= middle_kmer;
-                                    (left_rc, right_rc)
-                                } else {
-                                    let left_rc = raw_seg.front_kmer >= middle_kmer;
-                                    let right_rc = middle_kmer >= raw_seg.back_kmer;
-                                    (left_rc, right_rc)
-                                };
-
-                                let left_final = if left_should_reverse != should_reverse {
-                                    reverse_complement_sequence(&left_data)
-                                } else {
-                                    left_data
-                                };
-                                let right_final = if right_should_reverse != should_reverse {
-                                    reverse_complement_sequence(&right_data)
-                                } else {
-                                    right_data
-                                };
-
-                                // FIX: When should_reverse=true, left_data is the RIGHT part of
-                                // the original and right_data is the LEFT part. C++ AGC swaps
-                                // left_size/right_size when use_rc=true (line 1419), so the
-                                // first segment stored is always the LEFT part of the original.
-                                // We need to swap seg_part_no assignments to match.
-                                let (left_seg_part, right_seg_part) = if should_reverse {
-                                    (output_seg_part_no + 1, output_seg_part_no)
-                                } else {
-                                    (output_seg_part_no, output_seg_part_no + 1)
-                                };
-
-                                buffered_seg_part.add_known(left_gid, BufferedSegment {
-                                    sample_name: raw_seg.sample_name.clone(),
-                                    contig_name: raw_seg.contig_name.clone(),
-                                    seg_part_no: left_seg_part,
-                                    data: left_final,
-                                    is_rev_comp: left_should_reverse,
-                                    sample_priority: raw_seg.sample_priority,
-                                });
-
-                                buffered_seg_part.add_known(right_gid, BufferedSegment {
-                                    sample_name: raw_seg.sample_name.clone(),
-                                    contig_name: raw_seg.contig_name.clone(),
-                                    seg_part_no: right_seg_part,
-                                    data: right_final,
-                                    is_rev_comp: right_should_reverse,
-                                    sample_priority: raw_seg.sample_priority,
-                                });
-
-                                seg_part_no += 2;
-                                was_split = true;
-                                if config.verbosity > 0 {
-                                    eprintln!("BARRIER_SPLIT_SUCCESS: sample={} contig={} place={} split_pos={} left_len={} right_len={}",
-                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, split_pos, left_len, right_len);
-                                }
-                            }
-                            SplitDecision::AssignToLeft => {
-                                // Assign entire segment to left group (front -> middle)
-                                // C++ AGC lines 1408-1414: right_size == 0 case
-                                let assign_rc = if should_reverse {
-                                    middle_kmer >= raw_seg.back_kmer
-                                } else {
-                                    raw_seg.front_kmer >= middle_kmer
-                                };
-                                let assign_data = if assign_rc != should_reverse {
-                                    reverse_complement_sequence(&segment_data)
-                                } else {
-                                    segment_data.clone()
-                                };
-
-                                buffered_seg_part.add_known(left_gid, BufferedSegment {
-                                    sample_name: raw_seg.sample_name.clone(),
-                                    contig_name: raw_seg.contig_name.clone(),
-                                    seg_part_no: output_seg_part_no,
-                                    data: assign_data,
-                                    is_rev_comp: assign_rc,
-                                    sample_priority: raw_seg.sample_priority,
-                                });
-                                seg_part_no += 1;
-                                was_split = true;
-                                if config.verbosity > 0 {
-                                    eprintln!("BARRIER_ASSIGN_LEFT: sample={} contig={} place={} group={}",
-                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, left_gid);
-                                }
-                            }
-                            SplitDecision::AssignToRight => {
-                                // Assign entire segment to right group (middle -> back)
-                                // C++ AGC lines 1400-1406: left_size == 0 case
-                                let assign_rc = if should_reverse {
-                                    raw_seg.front_kmer >= middle_kmer
-                                } else {
-                                    middle_kmer >= raw_seg.back_kmer
-                                };
-                                let assign_data = if assign_rc != should_reverse {
-                                    reverse_complement_sequence(&segment_data)
-                                } else {
-                                    segment_data.clone()
-                                };
-
-                                buffered_seg_part.add_known(right_gid, BufferedSegment {
-                                    sample_name: raw_seg.sample_name.clone(),
-                                    contig_name: raw_seg.contig_name.clone(),
-                                    seg_part_no: output_seg_part_no,
-                                    data: assign_data,
-                                    is_rev_comp: assign_rc,
-                                    sample_priority: raw_seg.sample_priority,
-                                });
-                                seg_part_no += 1;
-                                was_split = true;
-                                if config.verbosity > 0 {
-                                    eprintln!("BARRIER_ASSIGN_RIGHT: sample={} contig={} place={} group={}",
-                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, right_gid);
-                                }
-                            }
-                            SplitDecision::NoDecision => {
-                                if config.verbosity > 0 {
-                                    eprintln!("BARRIER_SPLIT_SKIPPED: sample={} contig={} place={} left_ref={} right_ref={}",
-                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, left_ref_data.len(), right_ref_data.len());
-                                }
-                            }
+                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                            kf = fb_kf;
+                            kb = fb_kb;
+                            sr = fb_sr;
                         }
                     }
-                }
-            }
-
-            if !was_split {
-                // Register group IMMEDIATELY so later segments can split into it.
-                // With SEQUENTIAL processing (not parallel), this is now DETERMINISTIC.
-                // C++ AGC store_segments() updates map_segments at barrier, and segments
-                // within the same barrier batch CAN reference groups from earlier segments.
-                let new_group_id = {
-                    let mut seg_map = map_segments.write().unwrap();
-                    if let Some(&existing_gid) = seg_map.get(&key) {
-                        existing_gid
-                    } else {
-                        // Allocate new group ID (matches C++ AGC no_segments++)
-                        let gid = group_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        seg_map.insert(key.clone(), gid);
-                        gid
+                    (kf, kb, sr)
+                } else if raw_seg.back_kmer != MISSING_KMER {
+                    // Case 3b: Only back k-mer present
+                    let kmer_is_dir_after_swap = !raw_seg.back_kmer_is_dir;
+                    let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
+                        raw_seg.back_kmer,
+                        kmer_is_dir_after_swap,
+                        &raw_seg.data_rc,
+                        &raw_seg.data,
+                        map_segments_terminators,
+                        map_segments,
+                        segment_groups,
+                        reference_segments,
+                        config,
+                    );
+                    sr = !sr;
+                    // Fallback: If Case 3b returned MISSING, try fallback minimizers
+                    // Note: C++ AGC uses segment_rc for fallback in Case 3b
+                    if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
+                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                            &raw_seg.data_rc, // Use RC for Case 3b (matches C++ AGC)
+                            &raw_seg.data,
+                            config.k,
+                            5, // min_shared_kmers = 5 for Case 3
+                            fallback_filter,
+                            map_fallback_minimizers,
+                            map_segments,
+                            segment_groups,
+                            reference_segments,
+                            config,
+                        );
+                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                            kf = fb_kf;
+                            kb = fb_kb;
+                            sr = !fb_sr; // C++ AGC: store_rc = !store_dir_alt
+                        }
                     }
+                    (kf, kb, sr)
+                } else {
+                    // Case 1: Both MISSING - try fallback minimizers
+                    let mut kf = MISSING_KMER;
+                    let mut kb = MISSING_KMER;
+                    let mut sr = false;
+
+                    if fallback_filter.is_enabled() {
+                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                            &raw_seg.data,
+                            &raw_seg.data_rc,
+                            config.k,
+                            1, // min_shared_kmers = 1 for Case 1 (matches C++ AGC)
+                            fallback_filter,
+                            map_fallback_minimizers,
+                            map_segments,
+                            segment_groups,
+                            reference_segments,
+                            config,
+                        );
+                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                            kf = fb_kf;
+                            kb = fb_kb;
+                            sr = fb_sr;
+                        }
+                    }
+                    (kf, kb, sr)
                 };
 
-                // Ensure buffered_seg_part has capacity for this group ID
-                buffered_seg_part.ensure_capacity(new_group_id);
+            let key = SegmentGroupKey {
+                kmer_front: key_front,
+                kmer_back: key_back,
+            };
 
-                // Store reference data IMMEDIATELY for new groups
-                // C++ AGC: first segment becomes reference for LZ encoding
-                {
-                    let mut ref_segs = reference_segments.write().unwrap();
-                    ref_segs.entry(new_group_id).or_insert_with(|| segment_data.clone());
+            // Prepare segment data (reverse complement if needed)
+            let segment_data = if should_reverse {
+                raw_seg.data_rc.clone()
+            } else {
+                raw_seg.data.clone()
+            };
+
+            // Add fallback mapping for this segment (matches C++ AGC add_fallback_mapping)
+            // This populates the fallback minimizers map for use by later segments
+            add_fallback_mapping(
+                &segment_data,
+                config.k,
+                key.kmer_front,
+                key.kmer_back,
+                fallback_filter,
+                map_fallback_minimizers,
+            );
+
+            // Check if group exists (NO CONTENTION - we're single-threaded)
+            let group_id_opt = {
+                let seg_map = map_segments.read().unwrap();
+                seg_map.get(&key).copied()
+            };
+
+            if let Some(group_id) = group_id_opt {
+                // KNOWN: add to per-group buffer
+                // FIX 18: For orphan segments (key = MISSING, MISSING), use round-robin across groups 0-15
+                // instead of always using group 0. This matches C++ AGC's distribute_segments() behavior.
+                let actual_group_id =
+                    if key.kmer_front == MISSING_KMER && key.kmer_back == MISSING_KMER {
+                        // Orphan segment - distribute across raw groups 0-15 via round-robin
+                        raw_group_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            % NO_RAW_GROUPS
+                    } else {
+                        group_id
+                    };
+                buffered_seg_part.add_known(
+                    actual_group_id,
+                    BufferedSegment {
+                        sample_name: raw_seg.sample_name.clone(),
+                        contig_name: raw_seg.contig_name.clone(),
+                        seg_part_no: output_seg_part_no,
+                        data: segment_data,
+                        is_rev_comp: should_reverse,
+                        sample_priority: raw_seg.sample_priority,
+                    },
+                );
+                // Increment counter by 1 for non-split segment
+                seg_part_no += 1;
+            } else {
+                // NEW: Try segment splitting before adding as new group
+                // C++ AGC only attempts splits when key doesn't exist and both k-mers valid
+                if config.verbosity > 0 {
+                    eprintln!(
+                        "BARRIER_NEW_SEGMENT: key=({},{}) sample={}",
+                        key_front, key_back, raw_seg.sample_name
+                    );
                 }
+                let mut was_split = false;
 
-                // Update terminators IMMEDIATELY (C++ AGC lines 1015-1025)
-                // This allows find_middle_splitter to find shared k-mers for splitting
-                if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                    let mut term_map = map_segments_terminators.write().unwrap();
-                    let front_vec = term_map.entry(key.kmer_front).or_insert_with(Vec::new);
-                    if !front_vec.contains(&key.kmer_back) {
-                        front_vec.push(key.kmer_back);
-                        front_vec.sort();
-                    }
-                    if key.kmer_front != key.kmer_back {
-                        let back_vec = term_map.entry(key.kmer_back).or_insert_with(Vec::new);
-                        if !back_vec.contains(&key.kmer_front) {
-                            back_vec.push(key.kmer_front);
-                            back_vec.sort();
+                // Skip barrier splitting if disabled (for C++ AGC parity testing)
+                let try_split = !crate::env_cache::disable_barrier_split()
+                    && key_front != MISSING_KMER
+                    && key_back != MISSING_KMER
+                    && key_front != key_back;
+
+                if try_split {
+                    // Try to find a middle splitter
+                    let middle_kmer_opt = {
+                        let terminators = map_segments_terminators.read().unwrap();
+                        let front_conn = terminators.get(&key_front).map(|v| v.len()).unwrap_or(0);
+                        let back_conn = terminators.get(&key_back).map(|v| v.len()).unwrap_or(0);
+                        if config.verbosity > 0 {
+                            // Always print the first few, then only when connections exist
+                            eprintln!("BARRIER_SPLIT_TRY: key=({},{}) term_size={} front_conn={} back_conn={} sample={}",
+                            key_front, key_back, terminators.len(), front_conn, back_conn, raw_seg.sample_name);
+                        }
+                        find_middle_splitter(key_front, key_back, &terminators)
+                    };
+
+                    if let Some(middle_kmer) = middle_kmer_opt {
+                        if config.verbosity > 0 {
+                            eprintln!(
+                                "BARRIER_SPLIT_FOUND_MIDDLE: key=({},{}) middle={}",
+                                key_front, key_back, middle_kmer
+                            );
+                        }
+                        // Found potential middle k-mer - check if both target groups exist
+                        let left_key = if key_front <= middle_kmer {
+                            SegmentGroupKey {
+                                kmer_front: key_front,
+                                kmer_back: middle_kmer,
+                            }
+                        } else {
+                            SegmentGroupKey {
+                                kmer_front: middle_kmer,
+                                kmer_back: key_front,
+                            }
+                        };
+                        let right_key = if middle_kmer <= key_back {
+                            SegmentGroupKey {
+                                kmer_front: middle_kmer,
+                                kmer_back: key_back,
+                            }
+                        } else {
+                            SegmentGroupKey {
+                                kmer_front: key_back,
+                                kmer_back: middle_kmer,
+                            }
+                        };
+
+                        let (left_group_id, right_group_id) = {
+                            let seg_map = map_segments.read().unwrap();
+                            (
+                                seg_map.get(&left_key).copied(),
+                                seg_map.get(&right_key).copied(),
+                            )
+                        };
+
+                        // Only split if BOTH target groups already exist
+                        if left_group_id.is_none() || right_group_id.is_none() {
+                            if config.verbosity > 0 {
+                                eprintln!("BARRIER_SPLIT_MISSING_GROUP: left={:?} right={:?} left_key=({},{}) right_key=({},{})",
+                                left_group_id, right_group_id, left_key.kmer_front, left_key.kmer_back, right_key.kmer_front, right_key.kmer_back);
+                            }
+                        }
+                        if let (Some(left_gid), Some(right_gid)) = (left_group_id, right_group_id) {
+                            // Get reference segment data for BOTH left and right
+                            let (left_ref_data, right_ref_data) = {
+                                let refs = reference_segments.read().unwrap();
+                                let left = refs.get(&left_gid).cloned().unwrap_or_default();
+                                let right = refs.get(&right_gid).cloned().unwrap_or_default();
+                                (left, right)
+                            };
+
+                            if config.verbosity > 1 {
+                                eprintln!("BARRIER_SPLIT_GROUPS_EXIST: left_gid={} right_gid={} left_ref_len={} right_ref_len={} seg_len={}",
+                                left_gid, right_gid, left_ref_data.len(), right_ref_data.len(), raw_seg.data.len());
+                            }
+
+                            // Find split decision using cost-based optimization
+                            // This matches C++ AGC's find_cand_segment_with_missing_middle_splitter
+                            // which computes LZ encoding cost at every position and decides:
+                            // - AssignToLeft: entire segment goes to (front, middle) group
+                            // - AssignToRight: entire segment goes to (middle, back) group
+                            // - SplitAt(pos): actually split the segment
+                            //
+                            // C++ AGC line 1393: passes (kmer1, kmer2) after normalization swap,
+                            // and swaps segment_dir/segment_rc based on use_rc flag.
+                            // When should_reverse=true (i.e., original front > back), we need to
+                            // swap the segments to match C++ AGC's behavior.
+                            let (seg_dir, seg_rc) = if should_reverse {
+                                (&raw_seg.data_rc, &raw_seg.data) // Swap when use_rc=true
+                            } else {
+                                (&raw_seg.data, &raw_seg.data_rc)
+                            };
+                            let split_decision = find_split_by_cost(
+                                seg_dir,
+                                seg_rc,
+                                &left_ref_data,
+                                &right_ref_data,
+                                key_front, // normalized k-mers (key_front < key_back)
+                                key_back,
+                                middle_kmer,
+                                config.k,
+                                config.min_match_len as u32,
+                            );
+
+                            match split_decision {
+                                SplitDecision::SplitAt(split_pos) => {
+                                    // Actually split the segment into two parts
+                                    let (left_data, right_data) = split_segment_at_position(
+                                        &segment_data,
+                                        split_pos,
+                                        config.k,
+                                    );
+                                    let left_len = left_data.len();
+                                    let right_len = right_data.len();
+
+                                    // FIX 27 v4: Compute orientations using ORIGINAL k-mers and should_reverse
+                                    let (left_should_reverse, right_should_reverse) =
+                                        if should_reverse {
+                                            let left_rc = middle_kmer >= raw_seg.back_kmer;
+                                            let right_rc = raw_seg.front_kmer >= middle_kmer;
+                                            (left_rc, right_rc)
+                                        } else {
+                                            let left_rc = raw_seg.front_kmer >= middle_kmer;
+                                            let right_rc = middle_kmer >= raw_seg.back_kmer;
+                                            (left_rc, right_rc)
+                                        };
+
+                                    let left_final = if left_should_reverse != should_reverse {
+                                        reverse_complement_sequence(&left_data)
+                                    } else {
+                                        left_data
+                                    };
+                                    let right_final = if right_should_reverse != should_reverse {
+                                        reverse_complement_sequence(&right_data)
+                                    } else {
+                                        right_data
+                                    };
+
+                                    // FIX: When should_reverse=true, left_data is the RIGHT part of
+                                    // the original and right_data is the LEFT part. C++ AGC swaps
+                                    // left_size/right_size when use_rc=true (line 1419), so the
+                                    // first segment stored is always the LEFT part of the original.
+                                    // We need to swap seg_part_no assignments to match.
+                                    let (left_seg_part, right_seg_part) = if should_reverse {
+                                        (output_seg_part_no + 1, output_seg_part_no)
+                                    } else {
+                                        (output_seg_part_no, output_seg_part_no + 1)
+                                    };
+
+                                    buffered_seg_part.add_known(
+                                        left_gid,
+                                        BufferedSegment {
+                                            sample_name: raw_seg.sample_name.clone(),
+                                            contig_name: raw_seg.contig_name.clone(),
+                                            seg_part_no: left_seg_part,
+                                            data: left_final,
+                                            is_rev_comp: left_should_reverse,
+                                            sample_priority: raw_seg.sample_priority,
+                                        },
+                                    );
+
+                                    buffered_seg_part.add_known(
+                                        right_gid,
+                                        BufferedSegment {
+                                            sample_name: raw_seg.sample_name.clone(),
+                                            contig_name: raw_seg.contig_name.clone(),
+                                            seg_part_no: right_seg_part,
+                                            data: right_final,
+                                            is_rev_comp: right_should_reverse,
+                                            sample_priority: raw_seg.sample_priority,
+                                        },
+                                    );
+
+                                    seg_part_no += 2;
+                                    was_split = true;
+                                    if config.verbosity > 0 {
+                                        eprintln!("BARRIER_SPLIT_SUCCESS: sample={} contig={} place={} split_pos={} left_len={} right_len={}",
+                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, split_pos, left_len, right_len);
+                                    }
+                                }
+                                SplitDecision::AssignToLeft => {
+                                    // Assign entire segment to left group (front -> middle)
+                                    // C++ AGC lines 1408-1414: right_size == 0 case
+                                    let assign_rc = if should_reverse {
+                                        middle_kmer >= raw_seg.back_kmer
+                                    } else {
+                                        raw_seg.front_kmer >= middle_kmer
+                                    };
+                                    let assign_data = if assign_rc != should_reverse {
+                                        reverse_complement_sequence(&segment_data)
+                                    } else {
+                                        segment_data.clone()
+                                    };
+
+                                    buffered_seg_part.add_known(
+                                        left_gid,
+                                        BufferedSegment {
+                                            sample_name: raw_seg.sample_name.clone(),
+                                            contig_name: raw_seg.contig_name.clone(),
+                                            seg_part_no: output_seg_part_no,
+                                            data: assign_data,
+                                            is_rev_comp: assign_rc,
+                                            sample_priority: raw_seg.sample_priority,
+                                        },
+                                    );
+                                    seg_part_no += 1;
+                                    was_split = true;
+                                    if config.verbosity > 0 {
+                                        eprintln!("BARRIER_ASSIGN_LEFT: sample={} contig={} place={} group={}",
+                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, left_gid);
+                                    }
+                                }
+                                SplitDecision::AssignToRight => {
+                                    // Assign entire segment to right group (middle -> back)
+                                    // C++ AGC lines 1400-1406: left_size == 0 case
+                                    let assign_rc = if should_reverse {
+                                        raw_seg.front_kmer >= middle_kmer
+                                    } else {
+                                        middle_kmer >= raw_seg.back_kmer
+                                    };
+                                    let assign_data = if assign_rc != should_reverse {
+                                        reverse_complement_sequence(&segment_data)
+                                    } else {
+                                        segment_data.clone()
+                                    };
+
+                                    buffered_seg_part.add_known(
+                                        right_gid,
+                                        BufferedSegment {
+                                            sample_name: raw_seg.sample_name.clone(),
+                                            contig_name: raw_seg.contig_name.clone(),
+                                            seg_part_no: output_seg_part_no,
+                                            data: assign_data,
+                                            is_rev_comp: assign_rc,
+                                            sample_priority: raw_seg.sample_priority,
+                                        },
+                                    );
+                                    seg_part_no += 1;
+                                    was_split = true;
+                                    if config.verbosity > 0 {
+                                        eprintln!("BARRIER_ASSIGN_RIGHT: sample={} contig={} place={} group={}",
+                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, right_gid);
+                                    }
+                                }
+                                SplitDecision::NoDecision => {
+                                    if config.verbosity > 0 {
+                                        eprintln!("BARRIER_SPLIT_SKIPPED: sample={} contig={} place={} left_ref={} right_ref={}",
+                                        raw_seg.sample_name, raw_seg.contig_name, raw_seg.original_place, left_ref_data.len(), right_ref_data.len());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
-                // Add segment to buffer
-                buffered_seg_part.add_new(NewSegment {
-                    kmer_front: key.kmer_front,
-                    kmer_back: key.kmer_back,
-                    sample_priority: raw_seg.sample_priority,
-                    sample_name: raw_seg.sample_name,
-                    contig_name: raw_seg.contig_name,
-                    seg_part_no: output_seg_part_no,
-                    data: segment_data,
-                    should_reverse,
-                });
-                seg_part_no += 1;
+                if !was_split {
+                    // Register group IMMEDIATELY so later segments can split into it.
+                    // With SEQUENTIAL processing (not parallel), this is now DETERMINISTIC.
+                    // C++ AGC store_segments() updates map_segments at barrier, and segments
+                    // within the same barrier batch CAN reference groups from earlier segments.
+                    let new_group_id = {
+                        let mut seg_map = map_segments.write().unwrap();
+                        if let Some(&existing_gid) = seg_map.get(&key) {
+                            existing_gid
+                        } else {
+                            // Allocate new group ID (matches C++ AGC no_segments++)
+                            let gid =
+                                group_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            seg_map.insert(key.clone(), gid);
+                            gid
+                        }
+                    };
+
+                    // Ensure buffered_seg_part has capacity for this group ID
+                    buffered_seg_part.ensure_capacity(new_group_id);
+
+                    // Store reference data IMMEDIATELY for new groups
+                    // C++ AGC: first segment becomes reference for LZ encoding
+                    {
+                        let mut ref_segs = reference_segments.write().unwrap();
+                        ref_segs
+                            .entry(new_group_id)
+                            .or_insert_with(|| segment_data.clone());
+                    }
+
+                    // Update terminators IMMEDIATELY (C++ AGC lines 1015-1025)
+                    // This allows find_middle_splitter to find shared k-mers for splitting
+                    if key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
+                        let mut term_map = map_segments_terminators.write().unwrap();
+                        let front_vec = term_map.entry(key.kmer_front).or_insert_with(Vec::new);
+                        if !front_vec.contains(&key.kmer_back) {
+                            front_vec.push(key.kmer_back);
+                            front_vec.sort();
+                        }
+                        if key.kmer_front != key.kmer_back {
+                            let back_vec = term_map.entry(key.kmer_back).or_insert_with(Vec::new);
+                            if !back_vec.contains(&key.kmer_front) {
+                                back_vec.push(key.kmer_front);
+                                back_vec.sort();
+                            }
+                        }
+                    }
+
+                    // Add segment to buffer
+                    buffered_seg_part.add_new(NewSegment {
+                        kmer_front: key.kmer_front,
+                        kmer_back: key.kmer_back,
+                        sample_priority: raw_seg.sample_priority,
+                        sample_name: raw_seg.sample_name,
+                        contig_name: raw_seg.contig_name,
+                        seg_part_no: output_seg_part_no,
+                        data: segment_data,
+                        should_reverse,
+                    });
+                    seg_part_no += 1;
+                }
             }
-        }
         } // end for raw_seg
     } // end for contig (sequential)
 
@@ -4335,18 +4670,17 @@ fn classify_raw_segments_at_barrier(
         let mut term_map = map_segments_terminators.write().unwrap();
         let mut next_gid = group_counter.load(std::sync::atomic::Ordering::SeqCst);
 
-        let new_groups = buffered_seg_part.process_new(
-            &mut map_seg,
-            &mut next_gid,
-            &mut ref_seg,
-            &mut term_map,
-        );
+        let new_groups =
+            buffered_seg_part.process_new(&mut map_seg, &mut next_gid, &mut ref_seg, &mut term_map);
 
         // Update the atomic counter with the final value
         group_counter.store(next_gid, std::sync::atomic::Ordering::SeqCst);
 
         if config.verbosity > 0 && new_groups > 0 {
-            eprintln!("CLASSIFY_RAW_BARRIER: Registered {} new groups deterministically", new_groups);
+            eprintln!(
+                "CLASSIFY_RAW_BARRIER: Registered {} new groups deterministically",
+                new_groups
+            );
         }
     }
 
@@ -4371,8 +4705,7 @@ fn flush_batch(
     collection: &Arc<Mutex<CollectionV3>>,
     reference_segments: &Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
     reference_orientations: &Arc<RwLock<BTreeMap<u32, bool>>>,
-    #[cfg(feature = "cpp_agc")]
-    grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
+    #[cfg(feature = "cpp_agc")] grouping_engine: &Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     config: &StreamingQueueConfig,
 ) -> Result<()> {
     use crate::segment::MISSING_KMER;
@@ -4401,7 +4734,10 @@ fn flush_batch(
     pending.sort();
 
     if config.verbosity > 1 && !pending.is_empty() {
-        eprintln!("FLUSH_BATCH: Sorted {} pending segments for group_id assignment", pending.len());
+        eprintln!(
+            "FLUSH_BATCH: Sorted {} pending segments for group_id assignment",
+            pending.len()
+        );
     }
 
     // Process sorted pending segments - assign group_ids and write to archive
@@ -4416,12 +4752,14 @@ fn flush_batch(
         // FIX 18: Create unique buffer keys for each raw group (0-15)
         // Previously all orphans used key (MISSING, MISSING), causing them to share one buffer.
         // Now orphans use key (raw_group_id, MISSING) so each raw group has its own buffer.
-        let (group_id, buffer_key) = if pend.key.kmer_back == MISSING_KMER && pend.key.kmer_front == MISSING_KMER {
+        let (group_id, buffer_key) = if pend.key.kmer_back == MISSING_KMER
+            && pend.key.kmer_front == MISSING_KMER
+        {
             // Round-robin distribution across raw groups 0-15
             let raw_group_id = raw_group_counter.fetch_add(1, Ordering::SeqCst) % NO_RAW_GROUPS;
             // Create unique buffer key for this raw group
             let unique_key = SegmentGroupKey {
-                kmer_front: raw_group_id as u64,  // Use raw_group_id to distinguish buffers
+                kmer_front: raw_group_id as u64, // Use raw_group_id to distinguish buffers
                 kmer_back: MISSING_KMER,
             };
             // DEBUG: Trace orphan segment distribution
@@ -4459,9 +4797,15 @@ fn flush_batch(
         };
 
         if config.verbosity > 2 {
-            eprintln!("FLUSH_BATCH_ASSIGN: group_id={} front={} back={} sample={} contig={} place={}",
-                group_id, pend.key.kmer_front, pend.key.kmer_back,
-                pend.sample_name, pend.contig_name, pend.place);
+            eprintln!(
+                "FLUSH_BATCH_ASSIGN: group_id={} front={} back={} sample={} contig={} place={}",
+                group_id,
+                pend.key.kmer_front,
+                pend.key.kmer_back,
+                pend.sample_name,
+                pend.contig_name,
+                pend.place
+            );
         }
 
         // Register orphan segments to global map (non-orphans already registered above)
@@ -4496,12 +4840,14 @@ fn flush_batch(
         if pend.key.kmer_front != MISSING_KMER && pend.key.kmer_back != MISSING_KMER {
             let mut term_map = batch_local_terminators.lock().unwrap();
 
-            term_map.entry(pend.key.kmer_front)
+            term_map
+                .entry(pend.key.kmer_front)
                 .or_insert_with(Vec::new)
                 .push(pend.key.kmer_back);
 
             if pend.key.kmer_front != pend.key.kmer_back {
-                term_map.entry(pend.key.kmer_back)
+                term_map
+                    .entry(pend.key.kmer_back)
                     .or_insert_with(Vec::new)
                     .push(pend.key.kmer_front);
             }
@@ -4524,7 +4870,7 @@ fn flush_batch(
         });
 
         // Add to buffer or write as reference
-        let is_raw_group = group_id < NO_RAW_GROUPS;  // Groups 0-15 are raw groups (match C++ AGC)
+        let is_raw_group = group_id < NO_RAW_GROUPS; // Groups 0-15 are raw groups (match C++ AGC)
         if !is_raw_group && buffer.reference_segment.is_none() && buffer.segments.is_empty() {
             // First segment in LZ group - write as reference immediately
             // Create BufferedSegment with original orientation (reference sets the group orientation)
@@ -4537,7 +4883,13 @@ fn flush_batch(
                 sample_priority: pend.sample_priority,
             };
             if let Err(e) = write_reference_immediately(
-                &buffered, buffer, collection, archive, reference_segments, reference_orientations, config
+                &buffered,
+                buffer,
+                collection,
+                archive,
+                reference_segments,
+                reference_orientations,
+                config,
             ) {
                 eprintln!("ERROR in flush_batch: Failed to write reference: {}", e);
                 buffer.segments.push(buffered);
@@ -4639,8 +4991,8 @@ fn worker_thread(
     queue: Arc<MemoryBoundedQueue<ContigTask>>,
     collection: Arc<Mutex<CollectionV3>>,
     splitters: Arc<AHashSet<u64>>,
-    ref_singletons: Arc<Vec<u64>>,      // For dynamic splitter discovery (sorted)
-    ref_duplicates: Arc<AHashSet<u64>>,  // For dynamic splitter discovery
+    ref_singletons: Arc<Vec<u64>>, // For dynamic splitter discovery (sorted)
+    ref_duplicates: Arc<AHashSet<u64>>, // For dynamic splitter discovery
     archive: Arc<Mutex<Archive>>,
     segment_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, SegmentGroupBuffer>>>,
     group_counter: Arc<AtomicU32>,
@@ -4651,8 +5003,7 @@ fn worker_thread(
     reference_segments: Arc<RwLock<BTreeMap<u32, Vec<u8>>>>,
     reference_orientations: Arc<RwLock<BTreeMap<u32, bool>>>,
     split_offsets: Arc<Mutex<BTreeMap<(String, String, usize), usize>>>,
-    #[cfg(feature = "cpp_agc")]
-    grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
+    #[cfg(feature = "cpp_agc")] grouping_engine: Arc<Mutex<crate::ragc_ffi::GroupingEngine>>,
     batch_samples: Arc<Mutex<HashSet<String>>>,
     batch_local_groups: Arc<Mutex<BTreeMap<SegmentGroupKey, u32>>>,
     batch_local_terminators: Arc<Mutex<BTreeMap<u64, Vec<u64>>>>,
@@ -4707,7 +5058,8 @@ fn worker_thread(
                 #[cfg(feature = "cpp_agc")]
                 &grouping_engine,
                 &config,
-            ).ok(); // Ignore errors on final flush
+            )
+            .ok(); // Ignore errors on final flush
 
             if config.verbosity > 1 {
                 eprintln!(
@@ -4726,7 +5078,10 @@ fn worker_thread(
             let sync_start = std::time::Instant::now();
             sync_count += 1;
             if config.verbosity > 0 {
-                eprintln!("Worker {} hit sync token for sample {}", worker_id, task.sample_name);
+                eprintln!(
+                    "Worker {} hit sync token for sample {}",
+                    worker_id, task.sample_name
+                );
             }
 
             // =================================================================
@@ -4741,7 +5096,10 @@ fn worker_thread(
             // Phase 2 (Thread 0 only): Classify raw segments and prepare batch
             if worker_id == 0 {
                 if config.verbosity > 0 {
-                    eprintln!("Worker 0 preparing batch at sample boundary for {}", task.sample_name);
+                    eprintln!(
+                        "Worker 0 preparing batch at sample boundary for {}",
+                        task.sample_name
+                    );
                 }
 
                 let phase2_start = std::time::Instant::now();
@@ -4758,7 +5116,7 @@ fn worker_thread(
                     &fallback_filter,
                     &map_fallback_minimizers,
                     &group_counter,
-                    &raw_group_counter,  // FIX 18: Pass raw_group_counter for orphan distribution
+                    &raw_group_counter, // FIX 18: Pass raw_group_counter for orphan distribution
                     &config,
                 );
 
@@ -4815,13 +5173,20 @@ fn worker_thread(
                                 // Buffer archive writes using per-stream mutexes (NO global lock!)
                                 // Workers on different streams can buffer concurrently
                                 for part in result.archive_writes.drain(..) {
-                                    write_buffer.buffer_write(part.stream_id, part.data, part.metadata);
+                                    write_buffer.buffer_write(
+                                        part.stream_id,
+                                        part.data,
+                                        part.metadata,
+                                    );
                                 }
                                 // Store result (now without archive_writes)
                                 parallel_state.store_result(idx, result);
                             }
                             Err(e) => {
-                                eprintln!("Worker {} error compressing group {}: {}", worker_id, buffer.group_id, e);
+                                eprintln!(
+                                    "Worker {} error compressing group {}: {}",
+                                    worker_id, buffer.group_id, e
+                                );
                             }
                         }
                     }
@@ -4836,7 +5201,10 @@ fn worker_thread(
             total_barrier_wait += barrier_start.elapsed();
 
             if worker_id == 0 && config.verbosity > 0 {
-                eprintln!("TIMING: Compression took {:?} (all workers)", compress_start.elapsed());
+                eprintln!(
+                    "TIMING: Compression took {:?} (all workers)",
+                    compress_start.elapsed()
+                );
             }
 
             // Phase 3b + Phase 4 (Thread 0 only): Flush writes, registrations, and cleanup
@@ -4944,11 +5312,19 @@ fn worker_thread(
             if config.verbosity > 2 && !new_splitters.is_empty() {
                 eprintln!(
                     "DYNAMIC_SPLITTER: {} found {} new splitters for {} (total: {})",
-                    task.sample_name, new_splitters.len(), task.contig_name, combined_splitters.len()
+                    task.sample_name,
+                    new_splitters.len(),
+                    task.contig_name,
+                    combined_splitters.len()
                 );
             }
 
-            split_at_splitters_with_size(&task.data, &combined_splitters, config.k, config.segment_size)
+            split_at_splitters_with_size(
+                &task.data,
+                &combined_splitters,
+                config.k,
+                config.segment_size,
+            )
         } else {
             // Reference contig or dynamic discovery disabled - use base splitters only
             split_at_splitters_with_size(&task.data, &splitters, config.k, config.segment_size)
@@ -4974,19 +5350,26 @@ fn worker_thread(
         // =================================================================
         // OPTIMIZATION: Collect all segments for this contig locally, then push once
         // This reduces lock acquisitions from O(segments_per_contig) to O(1) per contig
-        let contig_segments: Vec<RawBufferedSegment> = segments.iter().enumerate()
+        let contig_segments: Vec<RawBufferedSegment> = segments
+            .iter()
+            .enumerate()
             .map(|(original_place, segment)| {
                 // Precompute reverse complement (NO LOCKS - can run in parallel)
                 // Segment data uses numeric encoding: 0=A, 1=C, 2=G, 3=T
-                let segment_data_rc: Vec<u8> = segment.data.iter().rev().map(|&base| {
-                    match base {
-                        0 => 3, // A -> T
-                        1 => 2, // C -> G
-                        2 => 1, // G -> C
-                        3 => 0, // T -> A
-                        _ => base, // N or other non-ACGT
-                    }
-                }).collect();
+                let segment_data_rc: Vec<u8> = segment
+                    .data
+                    .iter()
+                    .rev()
+                    .map(|&base| {
+                        match base {
+                            0 => 3,    // A -> T
+                            1 => 2,    // C -> G
+                            2 => 1,    // G -> C
+                            3 => 0,    // T -> A
+                            _ => base, // N or other non-ACGT
+                        }
+                    })
+                    .collect();
 
                 RawBufferedSegment {
                     data: segment.data.clone(),
@@ -5005,7 +5388,10 @@ fn worker_thread(
 
         // ONE lock acquisition for entire contig (reduces contention significantly)
         // Push to this worker's own buffer (NO CONTENTION - each worker has its own buffer)
-        raw_segment_buffers[worker_id].lock().unwrap().extend(contig_segments);
+        raw_segment_buffers[worker_id]
+            .lock()
+            .unwrap()
+            .extend(contig_segments);
 
         // End timing for segment processing
         total_segment_processing += segment_start.elapsed();
@@ -5024,9 +5410,15 @@ fn worker_thread(
 
             // DEBUG: Output every segment for comparison with C++ AGC
             #[cfg(feature = "verbose_debug")]
-            eprintln!("RAGC_SEGMENT: sample={} contig={} part={} len={} front={} back={}",
-                task.sample_name, task.contig_name, place, segment.data.len(),
-                segment.front_kmer, segment.back_kmer);
+            eprintln!(
+                "RAGC_SEGMENT: sample={} contig={} part={} len={} front={} back={}",
+                task.sample_name,
+                task.contig_name,
+                place,
+                segment.data.len(),
+                segment.front_kmer,
+                segment.back_kmer
+            );
 
             // Match C++ AGC Case 2: Normalize segment group key by ensuring front <= back
             // (agc_compressor.cpp lines 1306-1327)
@@ -5034,180 +5426,205 @@ fn worker_thread(
 
             // Precompute reverse complement for all cases that might need it
             // Segment data uses numeric encoding: 0=A, 1=C, 2=G, 3=T
-            let segment_data_rc: Vec<u8> = segment.data.iter().rev().map(|&base| {
-                match base {
-                    0 => 3, // A -> T
-                    1 => 2, // C -> G
-                    2 => 1, // G -> C
-                    3 => 0, // T -> A
-                    _ => base, // N or other non-ACGT
-                }
-            }).collect();
+            let segment_data_rc: Vec<u8> = segment
+                .data
+                .iter()
+                .rev()
+                .map(|&base| {
+                    match base {
+                        0 => 3,    // A -> T
+                        1 => 2,    // C -> G
+                        2 => 1,    // G -> C
+                        3 => 0,    // T -> A
+                        _ => base, // N or other non-ACGT
+                    }
+                })
+                .collect();
 
-            let (key_front, key_back, should_reverse) =
-                if segment.front_kmer != MISSING_KMER && segment.back_kmer != MISSING_KMER {
-                    // Both k-mers present
-                    // C++ AGC uses `<` not `<=`, which means degenerate k-mers (front == back)
-                    // go to the else branch and get store_rc=true (lines 1306-1313)
-                    if segment.front_kmer < segment.back_kmer {
-                        // Already normalized - keep original orientation
-                        if config.verbosity > 2 {
-                            #[cfg(feature = "verbose_debug")]
-                            eprintln!(
-                                "RAGC_CASE2_KEEP: sample={} front={} back={} len={}",
-                                task.sample_name, segment.front_kmer, segment.back_kmer, segment.data.len()
-                            );
-                        }
-                        (segment.front_kmer, segment.back_kmer, false)
-                    } else {
-                        // Swap k-mers and reverse complement data
-                        if config.verbosity > 2 {
-                            #[cfg(feature = "verbose_debug")]
-                            eprintln!(
-                                "RAGC_CASE2_SWAP: sample={} front={} back={} -> key=({},{}) len={}",
-                                task.sample_name, segment.front_kmer, segment.back_kmer,
-                                segment.back_kmer, segment.front_kmer, segment.data.len()
-                            );
-                        }
-                        (segment.back_kmer, segment.front_kmer, true)
+            let (key_front, key_back, should_reverse) = if segment.front_kmer != MISSING_KMER
+                && segment.back_kmer != MISSING_KMER
+            {
+                // Both k-mers present
+                // C++ AGC uses `<` not `<=`, which means degenerate k-mers (front == back)
+                // go to the else branch and get store_rc=true (lines 1306-1313)
+                if segment.front_kmer < segment.back_kmer {
+                    // Already normalized - keep original orientation
+                    if config.verbosity > 2 {
+                        #[cfg(feature = "verbose_debug")]
+                        eprintln!(
+                            "RAGC_CASE2_KEEP: sample={} front={} back={} len={}",
+                            task.sample_name,
+                            segment.front_kmer,
+                            segment.back_kmer,
+                            segment.data.len()
+                        );
                     }
-                } else if segment.front_kmer != MISSING_KMER {
-                    // Case 3a: Only front k-mer present, back is MISSING (terminator)
-                    // Match C++ AGC lines 1315-1336: reverse complement and find candidate with one splitter
-                    // Use the actual is_dir_oriented value from segment detection
-                    #[cfg(feature = "verbose_debug")]
-                    eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} front_is_dir={} back=MISSING -> finding best group",
+                    (segment.front_kmer, segment.back_kmer, false)
+                } else {
+                    // Swap k-mers and reverse complement data
+                    if config.verbosity > 2 {
+                        #[cfg(feature = "verbose_debug")]
+                        eprintln!(
+                            "RAGC_CASE2_SWAP: sample={} front={} back={} -> key=({},{}) len={}",
+                            task.sample_name,
+                            segment.front_kmer,
+                            segment.back_kmer,
+                            segment.back_kmer,
+                            segment.front_kmer,
+                            segment.data.len()
+                        );
+                    }
+                    (segment.back_kmer, segment.front_kmer, true)
+                }
+            } else if segment.front_kmer != MISSING_KMER {
+                // Case 3a: Only front k-mer present, back is MISSING (terminator)
+                // Match C++ AGC lines 1315-1336: reverse complement and find candidate with one splitter
+                // Use the actual is_dir_oriented value from segment detection
+                #[cfg(feature = "verbose_debug")]
+                eprintln!("RAGC_CASE3A_TERMINATOR: sample={} front={} front_is_dir={} back=MISSING -> finding best group",
                         task.sample_name, segment.front_kmer, segment.front_kmer_is_dir);
-                    // Debug: trace is_dir value before find_group call
-                    if crate::env_cache::debug_is_dir() {
-                        eprintln!("RAGC_CASE3A_CALL: contig={} seg_part={} front_kmer={} front_kmer_is_dir={}",
+                // Debug: trace is_dir value before find_group call
+                if crate::env_cache::debug_is_dir() {
+                    eprintln!("RAGC_CASE3A_CALL: contig={} seg_part={} front_kmer={} front_kmer_is_dir={}",
                             task.contig_name, place, segment.front_kmer, segment.front_kmer_is_dir);
-                    }
-                    let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
-                        segment.front_kmer,
-                        segment.front_kmer_is_dir, // Use actual orientation from segment detection
+                }
+                let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
+                    segment.front_kmer,
+                    segment.front_kmer_is_dir, // Use actual orientation from segment detection
+                    &segment.data,
+                    &segment_data_rc,
+                    &map_segments_terminators,
+                    &map_segments,
+                    &segment_groups,
+                    &reference_segments,
+                    &config,
+                );
+
+                // Fallback: If Case 3a returned MISSING, try fallback minimizers (C++ AGC lines 1322-1334)
+                if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
+                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
                         &segment.data,
                         &segment_data_rc,
-                        &map_segments_terminators,
+                        config.k,
+                        5, // min_shared_kmers = 5 for Case 3 (matches C++ AGC)
+                        &fallback_filter,
+                        &map_fallback_minimizers,
                         &map_segments,
                         &segment_groups,
                         &reference_segments,
                         &config,
                     );
-
-                    // Fallback: If Case 3a returned MISSING, try fallback minimizers (C++ AGC lines 1322-1334)
-                    if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
-                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
-                            &segment.data,
-                            &segment_data_rc,
-                            config.k,
-                            5, // min_shared_kmers = 5 for Case 3 (matches C++ AGC)
-                            &fallback_filter,
-                            &map_fallback_minimizers,
-                            &map_segments,
-                            &segment_groups,
-                            &reference_segments,
-                            &config,
-                        );
-                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
-                            if config.verbosity > 1 {
-                                #[cfg(feature = "verbose_debug")]
-                                eprintln!("RAGC_CASE3A_FALLBACK: found ({},{}) rc={}", fb_kf, fb_kb, fb_sr);
-                            }
-                            kf = fb_kf;
-                            kb = fb_kb;
-                            sr = fb_sr;
+                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                        if config.verbosity > 1 {
+                            #[cfg(feature = "verbose_debug")]
+                            eprintln!(
+                                "RAGC_CASE3A_FALLBACK: found ({},{}) rc={}",
+                                fb_kf, fb_kb, fb_sr
+                            );
                         }
+                        kf = fb_kf;
+                        kb = fb_kb;
+                        sr = fb_sr;
                     }
-                    (kf, kb, sr)
-                } else if segment.back_kmer != MISSING_KMER {
-                    // Case 3b: Only back k-mer present, front is MISSING (terminator)
-                    // Match C++ AGC lines 1337-1360: swap_dir_rc() inverts is_dir_oriented()
-                    //
-                    // C++ AGC calls kmer.swap_dir_rc() which swaps kmer_dir and kmer_rc fields,
-                    // effectively inverting is_dir_oriented() (which checks kmer_dir <= kmer_rc).
-                    // So if back_kmer was originally dir-oriented, after swap it becomes NOT dir-oriented.
-                    let kmer_is_dir_after_swap = !segment.back_kmer_is_dir;
-                    #[cfg(feature = "verbose_debug")]
-                    eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} back_is_dir={} -> kmer_is_dir_after_swap={}",
+                }
+                (kf, kb, sr)
+            } else if segment.back_kmer != MISSING_KMER {
+                // Case 3b: Only back k-mer present, front is MISSING (terminator)
+                // Match C++ AGC lines 1337-1360: swap_dir_rc() inverts is_dir_oriented()
+                //
+                // C++ AGC calls kmer.swap_dir_rc() which swaps kmer_dir and kmer_rc fields,
+                // effectively inverting is_dir_oriented() (which checks kmer_dir <= kmer_rc).
+                // So if back_kmer was originally dir-oriented, after swap it becomes NOT dir-oriented.
+                let kmer_is_dir_after_swap = !segment.back_kmer_is_dir;
+                #[cfg(feature = "verbose_debug")]
+                eprintln!("RAGC_CASE3B_TERMINATOR: sample={} front=MISSING back={} back_is_dir={} -> kmer_is_dir_after_swap={}",
                         task.sample_name, segment.back_kmer, segment.back_kmer_is_dir, kmer_is_dir_after_swap);
 
-                    // C++ AGC line 1344 passes (segment_rc, segment) to find_cand_segment_with_one_splitter
-                    // and then inverts the result: store_rc = !store_dir
-                    // So we swap the segment parameters here AND invert sr below
-                    let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
-                        segment.back_kmer, // Use original k-mer value
-                        kmer_is_dir_after_swap, // Inverted due to swap_dir_rc()
-                        &segment_data_rc,  // SWAPPED: RC first (matches C++ AGC segment_rc param)
-                        &segment.data,     // SWAPPED: Original second (matches C++ AGC segment param)
-                        &map_segments_terminators,
+                // C++ AGC line 1344 passes (segment_rc, segment) to find_cand_segment_with_one_splitter
+                // and then inverts the result: store_rc = !store_dir
+                // So we swap the segment parameters here AND invert sr below
+                let (mut kf, mut kb, mut sr) = find_group_with_one_kmer(
+                    segment.back_kmer,      // Use original k-mer value
+                    kmer_is_dir_after_swap, // Inverted due to swap_dir_rc()
+                    &segment_data_rc,       // SWAPPED: RC first (matches C++ AGC segment_rc param)
+                    &segment.data, // SWAPPED: Original second (matches C++ AGC segment param)
+                    &map_segments_terminators,
+                    &map_segments,
+                    &segment_groups,
+                    &reference_segments,
+                    &config,
+                );
+                // Invert sr to match C++ AGC's store_rc = !store_dir
+                sr = !sr;
+
+                // Fallback: If Case 3b returned MISSING, try fallback minimizers (C++ AGC lines 1347-1359)
+                // Note: C++ AGC uses segment_rc for fallback in Case 3b
+                if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
+                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                        &segment_data_rc, // Use RC for Case 3b (matches C++ AGC)
+                        &segment.data,
+                        config.k,
+                        5, // min_shared_kmers = 5 for Case 3 (matches C++ AGC)
+                        &fallback_filter,
+                        &map_fallback_minimizers,
                         &map_segments,
                         &segment_groups,
                         &reference_segments,
                         &config,
                     );
-                    // Invert sr to match C++ AGC's store_rc = !store_dir
-                    sr = !sr;
-
-                    // Fallback: If Case 3b returned MISSING, try fallback minimizers (C++ AGC lines 1347-1359)
-                    // Note: C++ AGC uses segment_rc for fallback in Case 3b
-                    if (kf == MISSING_KMER || kb == MISSING_KMER) && fallback_filter.is_enabled() {
-                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
-                            &segment_data_rc, // Use RC for Case 3b (matches C++ AGC)
-                            &segment.data,
-                            config.k,
-                            5, // min_shared_kmers = 5 for Case 3 (matches C++ AGC)
-                            &fallback_filter,
-                            &map_fallback_minimizers,
-                            &map_segments,
-                            &segment_groups,
-                            &reference_segments,
-                            &config,
-                        );
-                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
-                            if config.verbosity > 1 {
-                                #[cfg(feature = "verbose_debug")]
-                                eprintln!("RAGC_CASE3B_FALLBACK: found ({},{}) rc={}", fb_kf, fb_kb, !fb_sr);
-                            }
-                            kf = fb_kf;
-                            kb = fb_kb;
-                            sr = !fb_sr; // C++ AGC: store_rc = !store_dir_alt
+                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                        if config.verbosity > 1 {
+                            #[cfg(feature = "verbose_debug")]
+                            eprintln!(
+                                "RAGC_CASE3B_FALLBACK: found ({},{}) rc={}",
+                                fb_kf, fb_kb, !fb_sr
+                            );
                         }
+                        kf = fb_kf;
+                        kb = fb_kb;
+                        sr = !fb_sr; // C++ AGC: store_rc = !store_dir_alt
                     }
-                    (kf, kb, sr)
-                } else {
-                    // Case 1: Both MISSING - try fallback minimizers (C++ AGC lines 1286-1298)
-                    let mut kf = MISSING_KMER;
-                    let mut kb = MISSING_KMER;
-                    let mut sr = false;
+                }
+                (kf, kb, sr)
+            } else {
+                // Case 1: Both MISSING - try fallback minimizers (C++ AGC lines 1286-1298)
+                let mut kf = MISSING_KMER;
+                let mut kb = MISSING_KMER;
+                let mut sr = false;
 
-                    if fallback_filter.is_enabled() {
-                        let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
-                            &segment.data,
-                            &segment_data_rc,
-                            config.k,
-                            1, // min_shared_kmers = 1 for Case 1 (matches C++ AGC line 1293)
-                            &fallback_filter,
-                            &map_fallback_minimizers,
-                            &map_segments,
-                            &segment_groups,
-                            &reference_segments,
-                            &config,
-                        );
-                        if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
-                            if config.verbosity > 1 {
-                                #[cfg(feature = "verbose_debug")]
-                                eprintln!("RAGC_CASE1_FALLBACK: sample={} found ({},{}) rc={} len={}",
-                                    task.sample_name, fb_kf, fb_kb, fb_sr, segment.data.len());
-                            }
-                            kf = fb_kf;
-                            kb = fb_kb;
-                            sr = fb_sr;
+                if fallback_filter.is_enabled() {
+                    let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
+                        &segment.data,
+                        &segment_data_rc,
+                        config.k,
+                        1, // min_shared_kmers = 1 for Case 1 (matches C++ AGC line 1293)
+                        &fallback_filter,
+                        &map_fallback_minimizers,
+                        &map_segments,
+                        &segment_groups,
+                        &reference_segments,
+                        &config,
+                    );
+                    if fb_kf != MISSING_KMER && fb_kb != MISSING_KMER {
+                        if config.verbosity > 1 {
+                            #[cfg(feature = "verbose_debug")]
+                            eprintln!(
+                                "RAGC_CASE1_FALLBACK: sample={} found ({},{}) rc={} len={}",
+                                task.sample_name,
+                                fb_kf,
+                                fb_kb,
+                                fb_sr,
+                                segment.data.len()
+                            );
                         }
+                        kf = fb_kf;
+                        kb = fb_kb;
+                        sr = fb_sr;
                     }
+                }
 
-                    (kf, kb, sr)
-                };
+                (kf, kb, sr)
+            };
 
             // Create grouping key from normalized k-mers
             // For raw segments (both k-mers MISSING), use the same key for all
@@ -5220,15 +5637,20 @@ fn worker_thread(
 
             // Reverse complement data if needed (matching C++ AGC lines 1315-1316, 1320-1321)
             let segment_data = if should_reverse {
-                segment.data.iter().rev().map(|&base| {
-                    match base {
-                        0 => 3, // A -> T
-                        1 => 2, // C -> G
-                        2 => 1, // G -> C
-                        3 => 0, // T -> A
-                        _ => base, // N or other non-ACGT
-                    }
-                }).collect()
+                segment
+                    .data
+                    .iter()
+                    .rev()
+                    .map(|&base| {
+                        match base {
+                            0 => 3,    // A -> T
+                            1 => 2,    // C -> G
+                            2 => 1,    // G -> C
+                            3 => 0,    // T -> A
+                            _ => base, // N or other non-ACGT
+                        }
+                    })
+                    .collect()
             } else {
                 segment.data.clone()
             };
@@ -5251,16 +5673,28 @@ fn worker_thread(
                 // CRITICAL: C++ AGC lines 1374-1378 skip segment splitting when front == back!
                 // When front == back, it just sets store_rc based on orientation, does NOT call
                 // find_cand_segment_with_missing_middle_splitter. We must do the same.
-                let split_allowed = if crate::env_cache::split_all() { true } else { !key_exists };
+                let split_allowed = if crate::env_cache::split_all() {
+                    true
+                } else {
+                    !key_exists
+                };
 
                 // Debug: trace split decision
-                if crate::env_cache::debug_split() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
+                if crate::env_cache::debug_split()
+                    && task.contig_name.contains("chrVII")
+                    && place >= 2
+                    && place <= 5
+                {
                     eprintln!("RAGC_SPLIT_CHECK: contig={} seg={} key=({},{}) key_exists={} split_allowed={} front_missing={} back_missing={} front==back={}",
                         task.contig_name, place, key_front, key_back, key_exists, split_allowed,
                         key_front == MISSING_KMER, key_back == MISSING_KMER, key_front == key_back);
                 }
 
-                if split_allowed && key_front != MISSING_KMER && key_back != MISSING_KMER && key_front != key_back {
+                if split_allowed
+                    && key_front != MISSING_KMER
+                    && key_back != MISSING_KMER
+                    && key_front != key_back
+                {
                     // CRITICAL: First attempt to find middle splitter
                     // Use ONLY global terminators (not batch-local) to match C++ AGC behavior
                     // C++ AGC only sees terminators from previous batches, not the current one
@@ -5268,9 +5702,15 @@ fn worker_thread(
                         let terminators = map_segments_terminators.read().unwrap();
                         let result = find_middle_splitter(key_front, key_back, &terminators);
                         // Debug: trace middle splitter result
-                        if crate::env_cache::debug_split() && task.contig_name.contains("chrVII") && place >= 2 && place <= 5 {
-                            let front_conn = terminators.get(&key_front).map(|v| v.len()).unwrap_or(0);
-                            let back_conn = terminators.get(&key_back).map(|v| v.len()).unwrap_or(0);
+                        if crate::env_cache::debug_split()
+                            && task.contig_name.contains("chrVII")
+                            && place >= 2
+                            && place <= 5
+                        {
+                            let front_conn =
+                                terminators.get(&key_front).map(|v| v.len()).unwrap_or(0);
+                            let back_conn =
+                                terminators.get(&key_back).map(|v| v.len()).unwrap_or(0);
                             eprintln!("RAGC_SPLIT_MIDDLE: contig={} seg={} key=({},{}) middle={:?} front_conn={} back_conn={}",
                                 task.contig_name, place, key_front, key_back, result, front_conn, back_conn);
                         }
@@ -5280,8 +5720,10 @@ fn worker_thread(
                     #[cfg(feature = "verbose_debug")]
                     if config.verbosity > 0 {
                         if middle_kmer_opt.is_some() {
-                            eprintln!("DEBUG_SPLIT: Found middle k-mer for ({},{}) sample={}",
-                                key_front, key_back, task.sample_name);
+                            eprintln!(
+                                "DEBUG_SPLIT: Found middle k-mer for ({},{}) sample={}",
+                                key_front, key_back, task.sample_name
+                            );
                         } else if config.verbosity > 1 {
                             eprintln!(
                                 "SPLIT_NO_MIDDLE: ({},{}) sample={} place={} should_reverse={}",
@@ -5297,7 +5739,10 @@ fn worker_thread(
 
                         // Debug: trace middle found
                         if crate::env_cache::debug_split() {
-                            eprintln!("RAGC_SPLIT_FOUND_MIDDLE: contig={} seg={} middle={}", task.contig_name, place, middle_kmer);
+                            eprintln!(
+                                "RAGC_SPLIT_FOUND_MIDDLE: contig={} seg={} middle={}",
+                                task.contig_name, place, middle_kmer
+                            );
                         }
 
                         let left_key = if key_front <= middle_kmer {
@@ -5330,7 +5775,10 @@ fn worker_thread(
                         // We must check map_segments (global), not batch_local_groups, to match C++ behavior.
                         let (left_exists, right_exists) = {
                             let global_map = map_segments.read().unwrap();
-                            (global_map.contains_key(&left_key), global_map.contains_key(&right_key))
+                            (
+                                global_map.contains_key(&left_key),
+                                global_map.contains_key(&right_key),
+                            )
                         };
 
                         // EXPERIMENTAL: Allow split even when groups don't exist
@@ -5364,282 +5812,455 @@ fn worker_thread(
 
                         // Proceed with split if groups exist OR if we allow creating groups
                         if (left_exists && right_exists) || allow_create_groups {
-                        // Both groups exist - proceed with split cost calculation
-                        #[cfg(feature = "verbose_debug")]
-                        if config.verbosity > 0 {
-                            eprintln!("DEBUG_SPLIT: Attempting cost-based split for ({},{}) sample={}",
+                            // Both groups exist - proceed with split cost calculation
+                            #[cfg(feature = "verbose_debug")]
+                            if config.verbosity > 0 {
+                                eprintln!("DEBUG_SPLIT: Attempting cost-based split for ({},{}) sample={}",
                                 key_front, key_back, task.sample_name);
-                        }
-
-                        let split_result = try_split_segment_with_cost(
-                            &segment_data,
-                            key_front,
-                            key_back,
-                            middle_kmer,
-                            &left_key,
-                            &right_key,
-                            &map_segments,
-                            &map_segments_terminators,
-                            &reference_segments,
-                            &config,
-                            should_reverse,
-                            allow_create_groups, // Force split at middle k-mer position if refs are empty
-                        );
-
-                        if let Some((left_data, right_data, _mid)) = split_result {
-                            // PERF: Acquire lock only for split path (rare case)
-                            // Normal segments bypass this entirely for better parallelism
-                            let mut groups = segment_groups.lock().unwrap();
-
-                            // FIX 27 v4: Compute separate orientations for left and right parts
-                            // C++ AGC lines 1526-1536 and 1540-1550:
-                            //   store_rc = (kmer_front.data() >= split_match.first)  -- for left
-                            //   store2_rc = (split_match.first >= kmer_back.data())  -- for right
-                            //
-                            // When should_reverse=true, the segment was RC'd before splitting,
-                            // so "left" in the split is from original RIGHT, and "right" is from original LEFT.
-                            // We need to swap the k-mer comparisons accordingly.
-                            let (left_should_rc, right_should_rc) = if should_reverse {
-                                // Segment was RC'd: left is from original right, right is from original left
-                                // Swap the k-mer associations
-                                let left_should_rc = middle_kmer >= segment.back_kmer;  // use back_kmer for "left"
-                                let right_should_rc = segment.front_kmer >= middle_kmer;  // use front_kmer for "right"
-                                (left_should_rc, right_should_rc)
-                            } else {
-                                // Normal: left is from original left, right is from original right
-                                let left_should_rc = segment.front_kmer >= middle_kmer;
-                                let right_should_rc = middle_kmer >= segment.back_kmer;
-                                (left_should_rc, right_should_rc)
-                            };
-
-                            // Transform data if needed: current state is `should_reverse`
-                            // If target state differs, we RC the data
-                            let left_data = if left_should_rc != should_reverse {
-                                left_data.iter().rev().map(|&base| {
-                                    match base {
-                                        0 => 3, 1 => 2, 2 => 1, 3 => 0, _ => base
-                                    }
-                                }).collect::<Vec<u8>>()
-                            } else {
-                                left_data
-                            };
-                            let right_data = if right_should_rc != should_reverse {
-                                right_data.iter().rev().map(|&base| {
-                                    match base {
-                                        0 => 3, 1 => 2, 2 => 1, 3 => 0, _ => base
-                                    }
-                                }).collect::<Vec<u8>>()
-                            } else {
-                                right_data
-                            };
-
-                            // Check if this is a degenerate split (one side empty)
-                            let is_degenerate_left = left_data.is_empty();
-                            let is_degenerate_right = right_data.is_empty();
-
-                            if config.verbosity > 1 {
-                                if is_degenerate_right {
-                                    eprintln!(
-                                        "SPLIT_DEGENERATE_RIGHT: ({},{}) -> left_only=({},{})",
-                                        key_front, key_back, left_key.kmer_front, left_key.kmer_back
-                                    );
-                                } else if is_degenerate_left {
-                                    eprintln!(
-                                        "SPLIT_DEGENERATE_LEFT: ({},{}) -> right_only=({},{})",
-                                        key_front, key_back, right_key.kmer_front, right_key.kmer_back
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
-                                        key_front, key_back, left_key.kmer_front, left_key.kmer_back,
-                                        right_key.kmer_front, right_key.kmer_back
-                                    );
-                                }
                             }
 
-                            // Determine emission order. By default match C++ logic:
-                            // - Normal orientation (should_reverse=false): emit left then right
-                            // - Reversed orientation (should_reverse=true): emit right then left
-                            // Allow env override for diagnostics:
-                            //   RAGC_EMIT_ORDER=left  -> force left-first
-                            //   RAGC_EMIT_ORDER=right -> force right-first
-                            //   RAGC_EMIT_ORDER=flip  -> invert default
-                            //   RAGC_EMIT_ORDER=auto  -> default behavior (or if unset)
-                            let emit_left_first = match std::env::var("RAGC_EMIT_ORDER") {
-                                Ok(val) => match val.to_ascii_lowercase().as_str() {
-                                    "left" | "left-first" => true,
-                                    "right" | "right-first" => false,
-                                    "flip" => should_reverse, // invert default (!should_reverse)
-                                    _ => !should_reverse,      // auto/default
-                                },
-                                Err(_) => !should_reverse,
-                            };
-                            if config.verbosity > 1 {
-                                eprintln!(
+                            let split_result = try_split_segment_with_cost(
+                                &segment_data,
+                                key_front,
+                                key_back,
+                                middle_kmer,
+                                &left_key,
+                                &right_key,
+                                &map_segments,
+                                &map_segments_terminators,
+                                &reference_segments,
+                                &config,
+                                should_reverse,
+                                allow_create_groups, // Force split at middle k-mer position if refs are empty
+                            );
+
+                            if let Some((left_data, right_data, _mid)) = split_result {
+                                // PERF: Acquire lock only for split path (rare case)
+                                // Normal segments bypass this entirely for better parallelism
+                                let mut groups = segment_groups.lock().unwrap();
+
+                                // FIX 27 v4: Compute separate orientations for left and right parts
+                                // C++ AGC lines 1526-1536 and 1540-1550:
+                                //   store_rc = (kmer_front.data() >= split_match.first)  -- for left
+                                //   store2_rc = (split_match.first >= kmer_back.data())  -- for right
+                                //
+                                // When should_reverse=true, the segment was RC'd before splitting,
+                                // so "left" in the split is from original RIGHT, and "right" is from original LEFT.
+                                // We need to swap the k-mer comparisons accordingly.
+                                let (left_should_rc, right_should_rc) = if should_reverse {
+                                    // Segment was RC'd: left is from original right, right is from original left
+                                    // Swap the k-mer associations
+                                    let left_should_rc = middle_kmer >= segment.back_kmer; // use back_kmer for "left"
+                                    let right_should_rc = segment.front_kmer >= middle_kmer; // use front_kmer for "right"
+                                    (left_should_rc, right_should_rc)
+                                } else {
+                                    // Normal: left is from original left, right is from original right
+                                    let left_should_rc = segment.front_kmer >= middle_kmer;
+                                    let right_should_rc = middle_kmer >= segment.back_kmer;
+                                    (left_should_rc, right_should_rc)
+                                };
+
+                                // Transform data if needed: current state is `should_reverse`
+                                // If target state differs, we RC the data
+                                let left_data = if left_should_rc != should_reverse {
+                                    left_data
+                                        .iter()
+                                        .rev()
+                                        .map(|&base| match base {
+                                            0 => 3,
+                                            1 => 2,
+                                            2 => 1,
+                                            3 => 0,
+                                            _ => base,
+                                        })
+                                        .collect::<Vec<u8>>()
+                                } else {
+                                    left_data
+                                };
+                                let right_data = if right_should_rc != should_reverse {
+                                    right_data
+                                        .iter()
+                                        .rev()
+                                        .map(|&base| match base {
+                                            0 => 3,
+                                            1 => 2,
+                                            2 => 1,
+                                            3 => 0,
+                                            _ => base,
+                                        })
+                                        .collect::<Vec<u8>>()
+                                } else {
+                                    right_data
+                                };
+
+                                // Check if this is a degenerate split (one side empty)
+                                let is_degenerate_left = left_data.is_empty();
+                                let is_degenerate_right = right_data.is_empty();
+
+                                if config.verbosity > 1 {
+                                    if is_degenerate_right {
+                                        eprintln!(
+                                            "SPLIT_DEGENERATE_RIGHT: ({},{}) -> left_only=({},{})",
+                                            key_front,
+                                            key_back,
+                                            left_key.kmer_front,
+                                            left_key.kmer_back
+                                        );
+                                    } else if is_degenerate_left {
+                                        eprintln!(
+                                            "SPLIT_DEGENERATE_LEFT: ({},{}) -> right_only=({},{})",
+                                            key_front,
+                                            key_back,
+                                            right_key.kmer_front,
+                                            right_key.kmer_back
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "SPLIT: original=({},{}) -> left=({},{}) right=({},{})",
+                                            key_front,
+                                            key_back,
+                                            left_key.kmer_front,
+                                            left_key.kmer_back,
+                                            right_key.kmer_front,
+                                            right_key.kmer_back
+                                        );
+                                    }
+                                }
+
+                                // Determine emission order. By default match C++ logic:
+                                // - Normal orientation (should_reverse=false): emit left then right
+                                // - Reversed orientation (should_reverse=true): emit right then left
+                                // Allow env override for diagnostics:
+                                //   RAGC_EMIT_ORDER=left  -> force left-first
+                                //   RAGC_EMIT_ORDER=right -> force right-first
+                                //   RAGC_EMIT_ORDER=flip  -> invert default
+                                //   RAGC_EMIT_ORDER=auto  -> default behavior (or if unset)
+                                let emit_left_first = match std::env::var("RAGC_EMIT_ORDER") {
+                                    Ok(val) => match val.to_ascii_lowercase().as_str() {
+                                        "left" | "left-first" => true,
+                                        "right" | "right-first" => false,
+                                        "flip" => should_reverse, // invert default (!should_reverse)
+                                        _ => !should_reverse,     // auto/default
+                                    },
+                                    Err(_) => !should_reverse,
+                                };
+                                if config.verbosity > 1 {
+                                    eprintln!(
                                     "EMIT_ORDER: should_reverse={} -> emit_left_first={} (env RAGC_EMIT_ORDER)",
                                     should_reverse, emit_left_first
                                 );
-                            }
+                                }
 
-                            // Optional targeted split trace for a specific (sample, contig, index)
-                            if let (Ok(ts), Ok(tc), Ok(ti)) = (
-                                std::env::var("RAGC_TRACE_SAMPLE"),
-                                std::env::var("RAGC_TRACE_CONTIG"),
-                                std::env::var("RAGC_TRACE_INDEX").and_then(|s| s.parse::<usize>().map_err(|e| std::env::VarError::NotPresent)),
-                            ) {
-                                if ts == task.sample_name && tc == task.contig_name && ti == place {
-                                    // Derive seg2_start from lengths (robust for both FFI and local mapping)
-                                    let seg_len = segment_data.len();
-                                    let right_len = right_data.len();
-                                    let left_len = left_data.len();
-                                    let seg2_start_derived = seg_len.saturating_sub(right_len);
-                                    let left_end_derived = seg2_start_derived.saturating_add(config.k).min(seg_len);
-                                    eprintln!(
+                                // Optional targeted split trace for a specific (sample, contig, index)
+                                if let (Ok(ts), Ok(tc), Ok(ti)) = (
+                                    std::env::var("RAGC_TRACE_SAMPLE"),
+                                    std::env::var("RAGC_TRACE_CONTIG"),
+                                    std::env::var("RAGC_TRACE_INDEX").and_then(|s| {
+                                        s.parse::<usize>()
+                                            .map_err(|e| std::env::VarError::NotPresent)
+                                    }),
+                                ) {
+                                    if ts == task.sample_name
+                                        && tc == task.contig_name
+                                        && ti == place
+                                    {
+                                        // Derive seg2_start from lengths (robust for both FFI and local mapping)
+                                        let seg_len = segment_data.len();
+                                        let right_len = right_data.len();
+                                        let left_len = left_data.len();
+                                        let seg2_start_derived = seg_len.saturating_sub(right_len);
+                                        let left_end_derived = seg2_start_derived
+                                            .saturating_add(config.k)
+                                            .min(seg_len);
+                                        eprintln!(
                                         "TRACE_SPLIT: {}/{} idx={} rev={} emit_left_first={} degL={} degR={} seg2_start={} left_end={} left_len={} right_len={}",
                                         task.sample_name, task.contig_name, place, should_reverse, emit_left_first,
                                         is_degenerate_left, is_degenerate_right, seg2_start_derived, left_end_derived, left_len, right_len
                                     );
+                                    }
                                 }
-                            }
 
-                            // Emit in correct contig order
-                            if emit_left_first {
-                                // left first
-                                if !is_degenerate_left {
-                                    let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
-                                        // OPTIMIZATION: Read-check-write pattern to reduce lock contention
-                                        // First check with read lock (fast path - most groups already exist)
-                                        let group_id = {
-                                            let global_map = map_segments.read().unwrap();
-                                            if let Some(&existing_id) = global_map.get(&left_key) {
-                                                existing_id
-                                            } else {
-                                                drop(global_map);
-                                                // Group doesn't exist - upgrade to write lock
-                                                let mut global_map = map_segments.write().unwrap();
-                                                // Double-check after acquiring write lock (race condition)
-                                                if let Some(&existing_id) = global_map.get(&left_key) {
-                                                    existing_id
-                                                } else {
-                                                    // Create new group ID and register IMMEDIATELY to global map
-                                                    let new_id = group_counter.fetch_add(1, Ordering::SeqCst);
-                                                    global_map.insert(left_key.clone(), new_id);
-                                                    drop(global_map);
-                                                    // Also register to batch-local for flush tracking
-                                                    let mut batch_map = batch_local_groups.lock().unwrap();
-                                                    batch_map.insert(left_key.clone(), new_id);
-                                                    new_id
+                                // Emit in correct contig order
+                                if emit_left_first {
+                                    // left first
+                                    if !is_degenerate_left {
+                                        let left_buffer =
+                                            groups.entry(left_key.clone()).or_insert_with(|| {
+                                                // OPTIMIZATION: Read-check-write pattern to reduce lock contention
+                                                // First check with read lock (fast path - most groups already exist)
+                                                let group_id = {
+                                                    let global_map = map_segments.read().unwrap();
+                                                    if let Some(&existing_id) =
+                                                        global_map.get(&left_key)
+                                                    {
+                                                        existing_id
+                                                    } else {
+                                                        drop(global_map);
+                                                        // Group doesn't exist - upgrade to write lock
+                                                        let mut global_map =
+                                                            map_segments.write().unwrap();
+                                                        // Double-check after acquiring write lock (race condition)
+                                                        if let Some(&existing_id) =
+                                                            global_map.get(&left_key)
+                                                        {
+                                                            existing_id
+                                                        } else {
+                                                            // Create new group ID and register IMMEDIATELY to global map
+                                                            let new_id = group_counter
+                                                                .fetch_add(1, Ordering::SeqCst);
+                                                            global_map
+                                                                .insert(left_key.clone(), new_id);
+                                                            drop(global_map);
+                                                            // Also register to batch-local for flush tracking
+                                                            let mut batch_map =
+                                                                batch_local_groups.lock().unwrap();
+                                                            batch_map
+                                                                .insert(left_key.clone(), new_id);
+                                                            new_id
+                                                        }
+                                                    }
+                                                };
+                                                // Register with FFI engine
+                                                #[cfg(feature = "cpp_agc")]
+                                                if left_key.kmer_front != MISSING_KMER
+                                                    && left_key.kmer_back != MISSING_KMER
+                                                {
+                                                    let mut eng = grouping_engine.lock().unwrap();
+                                                    eng.register_group(
+                                                        left_key.kmer_front,
+                                                        left_key.kmer_back,
+                                                        group_id,
+                                                    );
                                                 }
-                                            }
+                                                // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC)
+                                                if left_key.kmer_front != MISSING_KMER
+                                                    && left_key.kmer_back != MISSING_KMER
+                                                {
+                                                    let mut term_map =
+                                                        map_segments_terminators.write().unwrap();
+                                                    term_map
+                                                        .entry(left_key.kmer_front)
+                                                        .or_insert_with(Vec::new)
+                                                        .push(left_key.kmer_back);
+                                                    if left_key.kmer_front != left_key.kmer_back {
+                                                        term_map
+                                                            .entry(left_key.kmer_back)
+                                                            .or_insert_with(Vec::new)
+                                                            .push(left_key.kmer_front);
+                                                    }
+                                                    if let Some(front_vec) =
+                                                        term_map.get_mut(&left_key.kmer_front)
+                                                    {
+                                                        front_vec.sort_unstable();
+                                                        front_vec.dedup();
+                                                    }
+                                                    if left_key.kmer_front != left_key.kmer_back {
+                                                        if let Some(back_vec) =
+                                                            term_map.get_mut(&left_key.kmer_back)
+                                                        {
+                                                            back_vec.sort_unstable();
+                                                            back_vec.dedup();
+                                                        }
+                                                    }
+                                                }
+                                                // Register streams for this group
+                                                let archive_version = ragc_common::AGC_FILE_MAJOR
+                                                    * 1000
+                                                    + ragc_common::AGC_FILE_MINOR;
+                                                let delta_stream_name =
+                                                    ragc_common::stream_delta_name(
+                                                        archive_version,
+                                                        group_id,
+                                                    );
+                                                let ref_stream_name = ragc_common::stream_ref_name(
+                                                    archive_version,
+                                                    group_id,
+                                                );
+                                                let mut arch = archive.lock().unwrap();
+                                                let stream_id =
+                                                    arch.register_stream(&delta_stream_name);
+                                                let ref_stream_id =
+                                                    arch.register_stream(&ref_stream_name);
+                                                drop(arch);
+                                                SegmentGroupBuffer::new(
+                                                    group_id,
+                                                    stream_id,
+                                                    ref_stream_id,
+                                                )
+                                            });
+                                        // FIX 27 v4: Use left_should_rc instead of should_reverse
+                                        let (fixed_left_data, fixed_left_rc) =
+                                            fix_orientation_for_group(
+                                                &left_data,
+                                                left_should_rc,
+                                                &left_key,
+                                                &map_segments,
+                                                &batch_local_groups,
+                                                &reference_orientations,
+                                            );
+                                        let left_buffered = BufferedSegment {
+                                            sample_name: task.sample_name.clone(),
+                                            contig_name: task.contig_name.clone(),
+                                            seg_part_no: place,
+                                            data: fixed_left_data,
+                                            is_rev_comp: fixed_left_rc,
+                                            sample_priority: task.sample_priority,
                                         };
-                                        // Register with FFI engine
-                                        #[cfg(feature = "cpp_agc")]
-                                        if left_key.kmer_front != MISSING_KMER && left_key.kmer_back != MISSING_KMER {
-                                            let mut eng = grouping_engine.lock().unwrap();
-                                            eng.register_group(left_key.kmer_front, left_key.kmer_back, group_id);
-                                        }
-                                        // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC)
-                                        if left_key.kmer_front != MISSING_KMER && left_key.kmer_back != MISSING_KMER {
-                                            let mut term_map = map_segments_terminators.write().unwrap();
-                                            term_map.entry(left_key.kmer_front).or_insert_with(Vec::new).push(left_key.kmer_back);
-                                            if left_key.kmer_front != left_key.kmer_back {
-                                                term_map.entry(left_key.kmer_back).or_insert_with(Vec::new).push(left_key.kmer_front);
-                                            }
-                                            if let Some(front_vec) = term_map.get_mut(&left_key.kmer_front) { front_vec.sort_unstable(); front_vec.dedup(); }
-                                            if left_key.kmer_front != left_key.kmer_back {
-                                                if let Some(back_vec) = term_map.get_mut(&left_key.kmer_back) { back_vec.sort_unstable(); back_vec.dedup(); }
-                                            }
-                                        }
-                                        // Register streams for this group
-                                        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                                        let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
-                                        let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-                                        let mut arch = archive.lock().unwrap();
-                                        let stream_id = arch.register_stream(&delta_stream_name);
-                                        let ref_stream_id = arch.register_stream(&ref_stream_name);
-                                        drop(arch);
-                                        SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
-                                    });
-                                    // FIX 27 v4: Use left_should_rc instead of should_reverse
-                                    let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, left_should_rc, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
-                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_left_data, is_rev_comp: fixed_left_rc, sample_priority: task.sample_priority };
-                                    left_buffer.segments.push(left_buffered);
-                                    // Flush pack if full (matches C++ AGC write-as-you-go behavior)
-                                    if left_buffer.should_flush_pack(config.pack_size) {
-                                        flush_pack(left_buffer, &collection, &archive, &config, &reference_segments)
+                                        left_buffer.segments.push(left_buffered);
+                                        // Flush pack if full (matches C++ AGC write-as-you-go behavior)
+                                        if left_buffer.should_flush_pack(config.pack_size) {
+                                            flush_pack(
+                                                left_buffer,
+                                                &collection,
+                                                &archive,
+                                                &config,
+                                                &reference_segments,
+                                            )
                                             .context("Failed to flush left pack")?;
+                                        }
                                     }
-                                }
-                                if !is_degenerate_right {
-                                    let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
-                                        // OPTIMIZATION: Read-check-write pattern to reduce lock contention
-                                        // First check with read lock (fast path - most groups already exist)
-                                        let group_id = {
-                                            let global_map = map_segments.read().unwrap();
-                                            if let Some(&existing_id) = global_map.get(&right_key) {
-                                                existing_id
-                                            } else {
-                                                drop(global_map);
-                                                // Group doesn't exist - upgrade to write lock
-                                                let mut global_map = map_segments.write().unwrap();
-                                                // Double-check after acquiring write lock (race condition)
-                                                if let Some(&existing_id) = global_map.get(&right_key) {
-                                                    existing_id
-                                                } else {
-                                                    // Create new group ID and register IMMEDIATELY to global map
-                                                    let new_id = group_counter.fetch_add(1, Ordering::SeqCst);
-                                                    global_map.insert(right_key.clone(), new_id);
-                                                    drop(global_map);
-                                                    // Also register to batch-local for flush tracking
-                                                    let mut batch_map = batch_local_groups.lock().unwrap();
-                                                    batch_map.insert(right_key.clone(), new_id);
-                                                    new_id
+                                    if !is_degenerate_right {
+                                        let right_buffer =
+                                            groups.entry(right_key.clone()).or_insert_with(|| {
+                                                // OPTIMIZATION: Read-check-write pattern to reduce lock contention
+                                                // First check with read lock (fast path - most groups already exist)
+                                                let group_id = {
+                                                    let global_map = map_segments.read().unwrap();
+                                                    if let Some(&existing_id) =
+                                                        global_map.get(&right_key)
+                                                    {
+                                                        existing_id
+                                                    } else {
+                                                        drop(global_map);
+                                                        // Group doesn't exist - upgrade to write lock
+                                                        let mut global_map =
+                                                            map_segments.write().unwrap();
+                                                        // Double-check after acquiring write lock (race condition)
+                                                        if let Some(&existing_id) =
+                                                            global_map.get(&right_key)
+                                                        {
+                                                            existing_id
+                                                        } else {
+                                                            // Create new group ID and register IMMEDIATELY to global map
+                                                            let new_id = group_counter
+                                                                .fetch_add(1, Ordering::SeqCst);
+                                                            global_map
+                                                                .insert(right_key.clone(), new_id);
+                                                            drop(global_map);
+                                                            // Also register to batch-local for flush tracking
+                                                            let mut batch_map =
+                                                                batch_local_groups.lock().unwrap();
+                                                            batch_map
+                                                                .insert(right_key.clone(), new_id);
+                                                            new_id
+                                                        }
+                                                    }
+                                                };
+                                                // Register with FFI engine
+                                                #[cfg(feature = "cpp_agc")]
+                                                if right_key.kmer_front != MISSING_KMER
+                                                    && right_key.kmer_back != MISSING_KMER
+                                                {
+                                                    let mut eng = grouping_engine.lock().unwrap();
+                                                    eng.register_group(
+                                                        right_key.kmer_front,
+                                                        right_key.kmer_back,
+                                                        group_id,
+                                                    );
                                                 }
-                                            }
+                                                // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC)
+                                                if right_key.kmer_front != MISSING_KMER
+                                                    && right_key.kmer_back != MISSING_KMER
+                                                {
+                                                    let mut term_map =
+                                                        map_segments_terminators.write().unwrap();
+                                                    term_map
+                                                        .entry(right_key.kmer_front)
+                                                        .or_insert_with(Vec::new)
+                                                        .push(right_key.kmer_back);
+                                                    if right_key.kmer_front != right_key.kmer_back {
+                                                        term_map
+                                                            .entry(right_key.kmer_back)
+                                                            .or_insert_with(Vec::new)
+                                                            .push(right_key.kmer_front);
+                                                    }
+                                                    if let Some(front_vec) =
+                                                        term_map.get_mut(&right_key.kmer_front)
+                                                    {
+                                                        front_vec.sort_unstable();
+                                                        front_vec.dedup();
+                                                    }
+                                                    if right_key.kmer_front != right_key.kmer_back {
+                                                        if let Some(back_vec) =
+                                                            term_map.get_mut(&right_key.kmer_back)
+                                                        {
+                                                            back_vec.sort_unstable();
+                                                            back_vec.dedup();
+                                                        }
+                                                    }
+                                                }
+                                                // Register streams for this group
+                                                let archive_version = ragc_common::AGC_FILE_MAJOR
+                                                    * 1000
+                                                    + ragc_common::AGC_FILE_MINOR;
+                                                let delta_stream_name =
+                                                    ragc_common::stream_delta_name(
+                                                        archive_version,
+                                                        group_id,
+                                                    );
+                                                let ref_stream_name = ragc_common::stream_ref_name(
+                                                    archive_version,
+                                                    group_id,
+                                                );
+                                                let mut arch = archive.lock().unwrap();
+                                                let stream_id =
+                                                    arch.register_stream(&delta_stream_name);
+                                                let ref_stream_id =
+                                                    arch.register_stream(&ref_stream_name);
+                                                drop(arch);
+                                                SegmentGroupBuffer::new(
+                                                    group_id,
+                                                    stream_id,
+                                                    ref_stream_id,
+                                                )
+                                            });
+                                        let seg_part =
+                                            if is_degenerate_left { place } else { place + 1 };
+                                        // FIX 27 v4: Use right_should_rc instead of should_reverse
+                                        let (fixed_right_data, fixed_right_rc) =
+                                            fix_orientation_for_group(
+                                                &right_data,
+                                                right_should_rc,
+                                                &right_key,
+                                                &map_segments,
+                                                &batch_local_groups,
+                                                &reference_orientations,
+                                            );
+                                        let right_buffered = BufferedSegment {
+                                            sample_name: task.sample_name.clone(),
+                                            contig_name: task.contig_name.clone(),
+                                            seg_part_no: seg_part,
+                                            data: fixed_right_data,
+                                            is_rev_comp: fixed_right_rc,
+                                            sample_priority: task.sample_priority,
                                         };
-                                        // Register with FFI engine
-                                        #[cfg(feature = "cpp_agc")]
-                                        if right_key.kmer_front != MISSING_KMER && right_key.kmer_back != MISSING_KMER {
-                                            let mut eng = grouping_engine.lock().unwrap();
-                                            eng.register_group(right_key.kmer_front, right_key.kmer_back, group_id);
-                                        }
-                                        // Update GLOBAL terminators map IMMEDIATELY (matches C++ AGC)
-                                        if right_key.kmer_front != MISSING_KMER && right_key.kmer_back != MISSING_KMER {
-                                            let mut term_map = map_segments_terminators.write().unwrap();
-                                            term_map.entry(right_key.kmer_front).or_insert_with(Vec::new).push(right_key.kmer_back);
-                                            if right_key.kmer_front != right_key.kmer_back {
-                                                term_map.entry(right_key.kmer_back).or_insert_with(Vec::new).push(right_key.kmer_front);
-                                            }
-                                            if let Some(front_vec) = term_map.get_mut(&right_key.kmer_front) { front_vec.sort_unstable(); front_vec.dedup(); }
-                                            if right_key.kmer_front != right_key.kmer_back {
-                                                if let Some(back_vec) = term_map.get_mut(&right_key.kmer_back) { back_vec.sort_unstable(); back_vec.dedup(); }
-                                            }
-                                        }
-                                        // Register streams for this group
-                                        let archive_version = ragc_common::AGC_FILE_MAJOR * 1000 + ragc_common::AGC_FILE_MINOR;
-                                        let delta_stream_name = ragc_common::stream_delta_name(archive_version, group_id);
-                                        let ref_stream_name = ragc_common::stream_ref_name(archive_version, group_id);
-                                        let mut arch = archive.lock().unwrap();
-                                        let stream_id = arch.register_stream(&delta_stream_name);
-                                        let ref_stream_id = arch.register_stream(&ref_stream_name);
-                                        drop(arch);
-                                        SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
-                                    });
-                                    let seg_part = if is_degenerate_left { place } else { place + 1 };
-                                    // FIX 27 v4: Use right_should_rc instead of should_reverse
-                                    let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, right_should_rc, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
-                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_right_data, is_rev_comp: fixed_right_rc, sample_priority: task.sample_priority };
-                                    right_buffer.segments.push(right_buffered);
-                                    // Flush pack if full (matches C++ AGC write-as-you-go behavior)
-                                    if right_buffer.should_flush_pack(config.pack_size) {
-                                        flush_pack(right_buffer, &collection, &archive, &config, &reference_segments)
+                                        right_buffer.segments.push(right_buffered);
+                                        // Flush pack if full (matches C++ AGC write-as-you-go behavior)
+                                        if right_buffer.should_flush_pack(config.pack_size) {
+                                            flush_pack(
+                                                right_buffer,
+                                                &collection,
+                                                &archive,
+                                                &config,
+                                                &reference_segments,
+                                            )
                                             .context("Failed to flush right pack")?;
+                                        }
                                     }
-                                }
-                            } else {
-                                // reversed: right first
-                                if !is_degenerate_right {
-                                    let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
+                                } else {
+                                    // reversed: right first
+                                    if !is_degenerate_right {
+                                        let right_buffer = groups.entry(right_key.clone()).or_insert_with(|| {
                                         // BATCH-LOCAL: Check global first, then batch-local (group must exist from earlier)
                                         let group_id = {
                                             let global_map = map_segments.read().unwrap();
@@ -5660,18 +6281,39 @@ fn worker_thread(
                                         drop(arch);
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
-                                    // FIX 27 v4: Use right_should_rc instead of should_reverse
-                                    let (fixed_right_data, fixed_right_rc) = fix_orientation_for_group(&right_data, right_should_rc, &right_key, &map_segments, &batch_local_groups, &reference_orientations);
-                                    let right_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: place, data: fixed_right_data, is_rev_comp: fixed_right_rc, sample_priority: task.sample_priority };
-                                    right_buffer.segments.push(right_buffered);
-                                    // Flush pack if full (matches C++ AGC write-as-you-go behavior)
-                                    if right_buffer.should_flush_pack(config.pack_size) {
-                                        flush_pack(right_buffer, &collection, &archive, &config, &reference_segments)
+                                        // FIX 27 v4: Use right_should_rc instead of should_reverse
+                                        let (fixed_right_data, fixed_right_rc) =
+                                            fix_orientation_for_group(
+                                                &right_data,
+                                                right_should_rc,
+                                                &right_key,
+                                                &map_segments,
+                                                &batch_local_groups,
+                                                &reference_orientations,
+                                            );
+                                        let right_buffered = BufferedSegment {
+                                            sample_name: task.sample_name.clone(),
+                                            contig_name: task.contig_name.clone(),
+                                            seg_part_no: place,
+                                            data: fixed_right_data,
+                                            is_rev_comp: fixed_right_rc,
+                                            sample_priority: task.sample_priority,
+                                        };
+                                        right_buffer.segments.push(right_buffered);
+                                        // Flush pack if full (matches C++ AGC write-as-you-go behavior)
+                                        if right_buffer.should_flush_pack(config.pack_size) {
+                                            flush_pack(
+                                                right_buffer,
+                                                &collection,
+                                                &archive,
+                                                &config,
+                                                &reference_segments,
+                                            )
                                             .context("Failed to flush right pack")?;
+                                        }
                                     }
-                                }
-                                if !is_degenerate_left {
-                                    let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
+                                    if !is_degenerate_left {
+                                        let left_buffer = groups.entry(left_key.clone()).or_insert_with(|| {
                                         // BATCH-LOCAL: Check global first, then batch-local (group must exist from earlier)
                                         let group_id = {
                                             let global_map = map_segments.read().unwrap();
@@ -5692,88 +6334,180 @@ fn worker_thread(
                                         drop(arch);
                                         SegmentGroupBuffer::new(group_id, stream_id, ref_stream_id)
                                     });
-                                    let seg_part = if is_degenerate_right { place } else { place + 1 };
-                                    // FIX 27 v4: Use left_should_rc instead of should_reverse
-                                    let (fixed_left_data, fixed_left_rc) = fix_orientation_for_group(&left_data, left_should_rc, &left_key, &map_segments, &batch_local_groups, &reference_orientations);
-                                    let left_buffered = BufferedSegment { sample_name: task.sample_name.clone(), contig_name: task.contig_name.clone(), seg_part_no: seg_part, data: fixed_left_data, is_rev_comp: fixed_left_rc, sample_priority: task.sample_priority };
-                                    left_buffer.segments.push(left_buffered);
-                                    // Flush pack if full (matches C++ AGC write-as-you-go behavior)
-                                    if left_buffer.should_flush_pack(config.pack_size) {
-                                        flush_pack(left_buffer, &collection, &archive, &config, &reference_segments)
+                                        let seg_part = if is_degenerate_right {
+                                            place
+                                        } else {
+                                            place + 1
+                                        };
+                                        // FIX 27 v4: Use left_should_rc instead of should_reverse
+                                        let (fixed_left_data, fixed_left_rc) =
+                                            fix_orientation_for_group(
+                                                &left_data,
+                                                left_should_rc,
+                                                &left_key,
+                                                &map_segments,
+                                                &batch_local_groups,
+                                                &reference_orientations,
+                                            );
+                                        let left_buffered = BufferedSegment {
+                                            sample_name: task.sample_name.clone(),
+                                            contig_name: task.contig_name.clone(),
+                                            seg_part_no: seg_part,
+                                            data: fixed_left_data,
+                                            is_rev_comp: fixed_left_rc,
+                                            sample_priority: task.sample_priority,
+                                        };
+                                        left_buffer.segments.push(left_buffered);
+                                        // Flush pack if full (matches C++ AGC write-as-you-go behavior)
+                                        if left_buffer.should_flush_pack(config.pack_size) {
+                                            flush_pack(
+                                                left_buffer,
+                                                &collection,
+                                                &archive,
+                                                &config,
+                                                &reference_segments,
+                                            )
                                             .context("Failed to flush left pack")?;
+                                        }
                                     }
                                 }
-                            }
 
-                            // Optional: assert lengths vs C++ archive if provided
-                            if let Some(assert_path) = crate::env_cache::assert_cpp_archive() {
-                                use crate::{Decompressor, DecompressorConfig};
-                                let mut dec = match Decompressor::open(&assert_path, DecompressorConfig{ verbosity: 0 }) {
-                                    Ok(d) => d, Err(_) => {
-                                        if config.verbosity > 1 { eprintln!("ASSERT_SKIP: cannot open {}", assert_path); }
-                                        return Ok(());
-                                    }
-                                };
-                                if let Ok(all) = dec.get_all_segments() {
-                                    if let Some((_, _, segs)) = all.into_iter().find(|(s,c,_)| *s == task.sample_name && *c == task.contig_name) {
-                                        // Compute our emitted lens and expected lens at indices
-                                        let mut checks: Vec<(usize, usize)> = Vec::new();
-                                        if emit_left_first {
-                                            if !is_degenerate_left { checks.push((place, left_data.len())); }
-                                            if !is_degenerate_right { checks.push((if is_degenerate_left { place } else { place + 1 }, right_data.len())); }
-                                        } else {
-                                            if !is_degenerate_right { checks.push((place, right_data.len())); }
-                                            if !is_degenerate_left { checks.push((if is_degenerate_right { place } else { place + 1 }, left_data.len())); }
+                                // Optional: assert lengths vs C++ archive if provided
+                                if let Some(assert_path) = crate::env_cache::assert_cpp_archive() {
+                                    use crate::{Decompressor, DecompressorConfig};
+                                    let mut dec = match Decompressor::open(
+                                        &assert_path,
+                                        DecompressorConfig { verbosity: 0 },
+                                    ) {
+                                        Ok(d) => d,
+                                        Err(_) => {
+                                            if config.verbosity > 1 {
+                                                eprintln!(
+                                                    "ASSERT_SKIP: cannot open {}",
+                                                    assert_path
+                                                );
+                                            }
+                                            return Ok(());
                                         }
+                                    };
+                                    if let Ok(all) = dec.get_all_segments() {
+                                        if let Some((_, _, segs)) =
+                                            all.into_iter().find(|(s, c, _)| {
+                                                *s == task.sample_name && *c == task.contig_name
+                                            })
+                                        {
+                                            // Compute our emitted lens and expected lens at indices
+                                            let mut checks: Vec<(usize, usize)> = Vec::new();
+                                            if emit_left_first {
+                                                if !is_degenerate_left {
+                                                    checks.push((place, left_data.len()));
+                                                }
+                                                if !is_degenerate_right {
+                                                    checks.push((
+                                                        if is_degenerate_left {
+                                                            place
+                                                        } else {
+                                                            place + 1
+                                                        },
+                                                        right_data.len(),
+                                                    ));
+                                                }
+                                            } else {
+                                                if !is_degenerate_right {
+                                                    checks.push((place, right_data.len()));
+                                                }
+                                                if !is_degenerate_left {
+                                                    checks.push((
+                                                        if is_degenerate_right {
+                                                            place
+                                                        } else {
+                                                            place + 1
+                                                        },
+                                                        left_data.len(),
+                                                    ));
+                                                }
+                                            }
 
-                                        // Derive segmentation geometry for detailed diagnostics
-                                        let seg_len = segment_data.len();
-                                        let right_len = right_data.len();
-                                        let left_len = left_data.len();
-                                        let seg2_start_derived = seg_len.saturating_sub(right_len);
-                                        let left_end_derived = seg2_start_derived.saturating_add(config.k).min(seg_len);
-                                        let emit_idx_left = if emit_left_first { place } else { if is_degenerate_right { place } else { place + 1 } };
-                                        let emit_idx_right = if emit_left_first { if is_degenerate_left { place } else { place + 1 } } else { place };
+                                            // Derive segmentation geometry for detailed diagnostics
+                                            let seg_len = segment_data.len();
+                                            let right_len = right_data.len();
+                                            let left_len = left_data.len();
+                                            let seg2_start_derived =
+                                                seg_len.saturating_sub(right_len);
+                                            let left_end_derived = seg2_start_derived
+                                                .saturating_add(config.k)
+                                                .min(seg_len);
+                                            let emit_idx_left = if emit_left_first {
+                                                place
+                                            } else {
+                                                if is_degenerate_right {
+                                                    place
+                                                } else {
+                                                    place + 1
+                                                }
+                                            };
+                                            let emit_idx_right = if emit_left_first {
+                                                if is_degenerate_left {
+                                                    place
+                                                } else {
+                                                    place + 1
+                                                }
+                                            } else {
+                                                place
+                                            };
 
-                                        for (idx, got) in checks {
-                                            if idx < segs.len() {
-                                                let exp = segs[idx].raw_length as usize;
-                                                if exp != got {
-                                                    eprintln!("ASSERT_LEN_MISMATCH: {}/{} idx={} got={} exp={} keys L=({:#x},{:#x}) R=({:#x},{:#x})",
+                                            for (idx, got) in checks {
+                                                if idx < segs.len() {
+                                                    let exp = segs[idx].raw_length as usize;
+                                                    if exp != got {
+                                                        eprintln!("ASSERT_LEN_MISMATCH: {}/{} idx={} got={} exp={} keys L=({:#x},{:#x}) R=({:#x},{:#x})",
                                                         task.sample_name, task.contig_name, idx, got, exp,
                                                         left_key.kmer_front, left_key.kmer_back,
                                                         right_key.kmer_front, right_key.kmer_back);
-                                                    // Extended context (guarded by env to limit noise)
-                                                    if crate::env_cache::assert_verbose() {
-                                                        eprintln!("  CONTEXT: place={} orig_place={} emit_left_first={} should_reverse={}",
+                                                        // Extended context (guarded by env to limit noise)
+                                                        if crate::env_cache::assert_verbose() {
+                                                            eprintln!("  CONTEXT: place={} orig_place={} emit_left_first={} should_reverse={}",
                                                             place, original_place, emit_left_first, should_reverse);
-                                                        eprintln!("  GEOM: seg_len={} left_len={} right_len={} seg2_start={} left_end={}",
+                                                            eprintln!("  GEOM: seg_len={} left_len={} right_len={} seg2_start={} left_end={}",
                                                             seg_len, left_len, right_len, seg2_start_derived, left_end_derived);
-                                                        eprintln!("  EMIT_IDX: left_at={} right_at={}", emit_idx_left, emit_idx_right);
+                                                            eprintln!("  EMIT_IDX: left_at={} right_at={}", emit_idx_left, emit_idx_right);
+                                                        }
                                                     }
+                                                } else {
+                                                    eprintln!(
+                                                        "ASSERT_IDX_OOB: {}/{} idx={} (segs={})",
+                                                        task.sample_name,
+                                                        task.contig_name,
+                                                        idx,
+                                                        segs.len()
+                                                    );
                                                 }
-                                            } else {
-                                                eprintln!("ASSERT_IDX_OOB: {}/{} idx={} (segs={})", task.sample_name, task.contig_name, idx, segs.len());
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            // Record this split so subsequent segments from this contig get shifted
-                            // (matches C++ AGC lines 2033-2036: ++seg_part_no twice when split)
-                            // For degenerate splits, only increment once (no actual split)
-                            if !is_degenerate_left && !is_degenerate_right {
-                                // OPTIMIZATION: Track locally for this task AND globally for other workers
-                                local_splits.insert(original_place);
-                                let mut offsets = split_offsets.lock().unwrap();
-                                offsets.insert((task.sample_name.clone(), task.contig_name.clone(), original_place), 1);
-                            }
+                                // Record this split so subsequent segments from this contig get shifted
+                                // (matches C++ AGC lines 2033-2036: ++seg_part_no twice when split)
+                                // For degenerate splits, only increment once (no actual split)
+                                if !is_degenerate_left && !is_degenerate_right {
+                                    // OPTIMIZATION: Track locally for this task AND globally for other workers
+                                    local_splits.insert(original_place);
+                                    let mut offsets = split_offsets.lock().unwrap();
+                                    offsets.insert(
+                                        (
+                                            task.sample_name.clone(),
+                                            task.contig_name.clone(),
+                                            original_place,
+                                        ),
+                                        1,
+                                    );
+                                }
 
-                            // Skip adding original segment - we've added the split/reclassified segment
-                            continue;
-                        }
-                        // If split_result was None, fall through to normal path
+                                // Skip adding original segment - we've added the split/reclassified segment
+                                continue;
+                            }
+                            // If split_result was None, fall through to normal path
                         } // end of else { both groups exist }
                     }
                 }
@@ -5790,9 +6524,18 @@ fn worker_thread(
 
                     // Debug: count how many segments could be eligible for secondary fallback
                     if crate::env_cache::debug_fallback2_enabled() {
-                        if !key_exists_now && key.kmer_front != MISSING_KMER && key.kmer_back != MISSING_KMER {
-                            eprintln!("SECONDARY_FB_CANDIDATE: sample={} contig={} place={} key=({},{})",
-                                task.sample_name, task.contig_name, place, key.kmer_front, key.kmer_back);
+                        if !key_exists_now
+                            && key.kmer_front != MISSING_KMER
+                            && key.kmer_back != MISSING_KMER
+                        {
+                            eprintln!(
+                                "SECONDARY_FB_CANDIDATE: sample={} contig={} place={} key=({},{})",
+                                task.sample_name,
+                                task.contig_name,
+                                place,
+                                key.kmer_front,
+                                key.kmer_back
+                            );
                         }
                     }
 
@@ -5802,9 +6545,11 @@ fn worker_thread(
                         && fallback_filter.is_enabled()
                     {
                         // Generate reverse complement for fallback lookup
-                        let segment_data_rc_fb: Vec<u8> = segment_data.iter().rev().map(|&b| {
-                            if b > 3 { b } else { 3 - b }
-                        }).collect();
+                        let segment_data_rc_fb: Vec<u8> = segment_data
+                            .iter()
+                            .rev()
+                            .map(|&b| if b > 3 { b } else { 3 - b })
+                            .collect();
 
                         let (fb_kf, fb_kb, fb_sr) = find_cand_segment_using_fallback_minimizers(
                             &segment_data,
@@ -5821,10 +6566,15 @@ fn worker_thread(
 
                         if crate::env_cache::debug_fallback2_enabled() {
                             if fb_kf == MISSING_KMER || fb_kb == MISSING_KMER {
-                                eprintln!("SECONDARY_FB_NO_MATCH: orig_key=({},{})", key.kmer_front, key.kmer_back);
+                                eprintln!(
+                                    "SECONDARY_FB_NO_MATCH: orig_key=({},{})",
+                                    key.kmer_front, key.kmer_back
+                                );
                             } else {
-                                eprintln!("SECONDARY_FB_FOUND: orig=({},{}) found=({},{}) rc={}",
-                                    key.kmer_front, key.kmer_back, fb_kf, fb_kb, fb_sr);
+                                eprintln!(
+                                    "SECONDARY_FB_FOUND: orig=({},{}) found=({},{}) rc={}",
+                                    key.kmer_front, key.kmer_back, fb_kf, fb_kb, fb_sr
+                                );
                             }
                         }
 
@@ -5841,8 +6591,10 @@ fn worker_thread(
 
                             if found_exists {
                                 if config.verbosity > 1 {
-                                    eprintln!("SECONDARY_FALLBACK_SUCCESS: ({},{}) -> ({},{}) sr={}->{}",
-                                        key_front, key_back, fb_kf, fb_kb, should_reverse, fb_sr);
+                                    eprintln!(
+                                        "SECONDARY_FALLBACK_SUCCESS: ({},{}) -> ({},{}) sr={}->{}",
+                                        key_front, key_back, fb_kf, fb_kb, should_reverse, fb_sr
+                                    );
                                 }
                                 (found_key, fb_kf, fb_kb, fb_sr)
                             } else {
@@ -5867,8 +6619,10 @@ fn worker_thread(
                 let (final_should_reverse, final_segment_data) = (should_reverse, segment_data);
 
                 if config.verbosity > 2 {
-                    eprintln!("DEFER_SEGMENT: front={} back={} sample={} contig={} place={}",
-                        key_front, key_back, task.sample_name, task.contig_name, place);
+                    eprintln!(
+                        "DEFER_SEGMENT: front={} back={} sample={} contig={} place={}",
+                        key_front, key_back, task.sample_name, task.contig_name, place
+                    );
                 }
 
                 // PHASE 1 (PARALLEL): Add segment to buffered_seg_part
@@ -5880,14 +6634,17 @@ fn worker_thread(
 
                 if let Some(group_id) = group_id_opt {
                     // KNOWN: add to per-group buffer (per-group lock only - PARALLEL)
-                    buffered_seg_part.add_known(group_id, BufferedSegment {
-                        sample_name: task.sample_name.clone(),
-                        contig_name: task.contig_name.clone(),
-                        seg_part_no: place,
-                        data: final_segment_data,
-                        is_rev_comp: final_should_reverse,
-                        sample_priority: task.sample_priority,
-                    });
+                    buffered_seg_part.add_known(
+                        group_id,
+                        BufferedSegment {
+                            sample_name: task.sample_name.clone(),
+                            contig_name: task.contig_name.clone(),
+                            seg_part_no: place,
+                            data: final_segment_data,
+                            is_rev_comp: final_should_reverse,
+                            sample_priority: task.sample_priority,
+                        },
+                    );
                 } else {
                     // NEW: add to s_seg_part (brief global lock on BTreeSet)
                     buffered_seg_part.add_new(NewSegment {
@@ -5934,7 +6691,10 @@ fn find_middle_splitter(
         if crate::env_cache::debug_split_find() {
             eprintln!(
                 "DEBUG_FIND_MIDDLE_MISS: front={} back={} front_conn={} back_conn={} shared=0",
-                front_kmer, back_kmer, front_connections.len(), back_connections.len()
+                front_kmer,
+                back_kmer,
+                front_connections.len(),
+                back_connections.len()
             );
         }
         None
@@ -5949,8 +6709,11 @@ fn find_middle_splitter(
             let a = front_connections[i];
             let b = back_connections[j];
             if a == b {
-                if a != MISSING_KMER { return Some(a); }
-                i += 1; j += 1;
+                if a != MISSING_KMER {
+                    return Some(a);
+                }
+                i += 1;
+                j += 1;
             } else if a < b {
                 i += 1;
             } else {
@@ -5960,10 +6723,19 @@ fn find_middle_splitter(
         if crate::env_cache::debug_split_find() {
             eprintln!(
                 "DEBUG_FIND_MIDDLE_MISS: front={} back={} front_conn={} back_conn={} shared=0",
-                front_kmer, back_kmer, front_connections.len(), back_connections.len()
+                front_kmer,
+                back_kmer,
+                front_connections.len(),
+                back_connections.len()
             );
-            eprintln!("  front_connections: {:?}", &front_connections[..front_connections.len().min(5)]);
-            eprintln!("  back_connections: {:?}", &back_connections[..back_connections.len().min(5)]);
+            eprintln!(
+                "  front_connections: {:?}",
+                &front_connections[..front_connections.len().min(5)]
+            );
+            eprintln!(
+                "  back_connections: {:?}",
+                &back_connections[..back_connections.len().min(5)]
+            );
         }
         None
     }
@@ -5977,11 +6749,7 @@ fn find_middle_splitter(
 /// 1. Extract the first few k-mers from the right reference segment
 /// 2. Search for these k-mers in the MIDDLE portion of the current segment
 /// 3. Return the position closest to the expected split (based on reference proportions)
-fn find_split_by_kmer_match(
-    segment_data: &[u8],
-    right_ref_data: &[u8],
-    k: usize,
-) -> Option<usize> {
+fn find_split_by_kmer_match(segment_data: &[u8], right_ref_data: &[u8], k: usize) -> Option<usize> {
     use crate::kmer::{Kmer, KmerMode};
     use ahash::AHashSet;
 
@@ -6203,7 +6971,12 @@ fn find_split_by_cost(
 /// Scans the segment to find where the middle k-mer actually occurs
 /// Returns the split position (in bytes) at the END of the middle k-mer
 #[allow(dead_code)]
-fn find_split_position(segment_data: &[u8], middle_kmer: u64, segment_len: usize, k: usize) -> Option<usize> {
+fn find_split_position(
+    segment_data: &[u8],
+    middle_kmer: u64,
+    segment_len: usize,
+    k: usize,
+) -> Option<usize> {
     use crate::kmer::{Kmer, KmerMode};
 
     // Ensure we don't split too close to the ends
@@ -6268,7 +7041,11 @@ fn split_segment_at_position(
 }
 
 /// Split using seg2_start byte index (start of right segment) matching C++ layout
-fn split_segment_from_start(segment_data: &[u8], seg2_start: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+fn split_segment_from_start(
+    segment_data: &[u8],
+    seg2_start: usize,
+    k: usize,
+) -> (Vec<u8>, Vec<u8>) {
     let seg2_start_pos = seg2_start.min(segment_data.len());
     let right = segment_data[seg2_start_pos..].to_vec();
     let left_end = seg2_start_pos.saturating_add(k).min(segment_data.len());
@@ -6303,10 +7080,16 @@ fn try_split_segment_with_cost(
 
     // Debug: trace split attempt
     if crate::env_cache::debug_split() {
-        eprintln!("RAGC_SPLIT_TRY: front={} back={} middle={} left_key=({},{}) right_key=({},{})",
-            front_kmer, back_kmer, middle_kmer,
-            left_key.kmer_front, left_key.kmer_back,
-            right_key.kmer_front, right_key.kmer_back);
+        eprintln!(
+            "RAGC_SPLIT_TRY: front={} back={} middle={} left_key=({},{}) right_key=({},{})",
+            front_kmer,
+            back_kmer,
+            middle_kmer,
+            left_key.kmer_front,
+            left_key.kmer_back,
+            right_key.kmer_front,
+            right_key.kmer_back
+        );
     }
 
     // Prepare LZDiff for both groups from persistent storage
@@ -6331,7 +7114,11 @@ fn try_split_segment_with_cost(
             if crate::env_cache::debug_split_ref() {
                 eprintln!(
                     "RAGC_SPLIT_REF: {}_key=({},{}) segment_id={:?} ref_size={} (ACTUAL)",
-                    label, key.kmer_front, key.kmer_back, segment_id, ref_data.len()
+                    label,
+                    key.kmer_front,
+                    key.kmer_back,
+                    segment_id,
+                    ref_data.len()
                 );
             }
 
@@ -6360,7 +7147,7 @@ fn try_split_segment_with_cost(
 
     // Build segment in both orientations once
     let segment_dir = segment_data; // &Vec<u8>
-    // Reverse-complement once
+                                    // Reverse-complement once
     let segment_rc_vec: Vec<u8> = reverse_complement_sequence(segment_data);
 
     // Calculate compression costs and best split position using C++ FFI if enabled
@@ -6371,12 +7158,21 @@ fn try_split_segment_with_cost(
         // Inspect availability of left/right references and log keys
         let (left_seg_id_opt, right_seg_id_opt) = {
             let map_segments_locked = map_segments.read().unwrap();
-            (map_segments_locked.get(left_key).copied(), map_segments_locked.get(right_key).copied())
+            (
+                map_segments_locked.get(left_key).copied(),
+                map_segments_locked.get(right_key).copied(),
+            )
         };
         let (left_have_ref, right_have_ref) = {
             let ref_segments_locked = reference_segments.read().unwrap();
-            (left_seg_id_opt.and_then(|id| ref_segments_locked.get(&id)).is_some(),
-             right_seg_id_opt.and_then(|id| ref_segments_locked.get(&id)).is_some())
+            (
+                left_seg_id_opt
+                    .and_then(|id| ref_segments_locked.get(&id))
+                    .is_some(),
+                right_seg_id_opt
+                    .and_then(|id| ref_segments_locked.get(&id))
+                    .is_some(),
+            )
         };
 
         if config.verbosity > 1 {
@@ -6390,8 +7186,10 @@ fn try_split_segment_with_cost(
         // Prepare neighbor lists for FFI decision
         let (front_neighbors, back_neighbors) = {
             let term_map = map_segments_terminators.read().unwrap();
-            (term_map.get(&front_kmer).cloned().unwrap_or_default(),
-             term_map.get(&back_kmer).cloned().unwrap_or_default())
+            (
+                term_map.get(&front_kmer).cloned().unwrap_or_default(),
+                term_map.get(&back_kmer).cloned().unwrap_or_default(),
+            )
         };
 
         // Always attempt FFI decision; if refs are missing, C++ will decide no-split
@@ -6406,10 +7204,13 @@ fn try_split_segment_with_cost(
         let ref_right = ref_right_opt.as_ref().unwrap_or(&empty);
 
         if let Some((has_mid, mid, bp, s2, should)) = crate::ragc_ffi::decide_split(
-            &front_neighbors, &back_neighbors,
-            ref_left, ref_right,
+            &front_neighbors,
+            &back_neighbors,
+            ref_left,
+            ref_right,
             segment_dir,
-            front_kmer, back_kmer,
+            front_kmer,
+            back_kmer,
             config.min_match_len as u32,
             config.k as u32,
             should_reverse,
@@ -6417,7 +7218,9 @@ fn try_split_segment_with_cost(
             if config.verbosity > 1 {
                 eprintln!("FFI_DECIDE: has_middle={} middle={:#x} best_pos={} seg2_start={} should_split={} refs L={} R={}", has_mid, mid, bp, s2, should, ref_left.len(), ref_right.len());
             }
-            if !has_mid { return None; }
+            if !has_mid {
+                return None;
+            }
 
             // FFI found middle k-mer but may have said !should due to empty refs
             if should {
@@ -6444,7 +7247,10 @@ fn try_split_segment_with_cost(
                 }
 
                 if config.verbosity > 1 {
-                    eprintln!("SPLIT_FALLBACK: {} potential middle k-mers from terminators", potential_middles.len());
+                    eprintln!(
+                        "SPLIT_FALLBACK: {} potential middle k-mers from terminators",
+                        potential_middles.len()
+                    );
                     for &pm in potential_middles.iter().take(5) {
                         eprintln!("  potential_middle: {:#x}", pm);
                     }
@@ -6454,7 +7260,8 @@ fn try_split_segment_with_cost(
                 let k = config.k;
                 if segment_dir.len() >= k && !potential_middles.is_empty() {
                     let mut found_pos: Option<(usize, u64)> = None; // (pos, kmer)
-                    let mut kmer_obj = crate::kmer::Kmer::new(k as u32, crate::kmer::KmerMode::Canonical);
+                    let mut kmer_obj =
+                        crate::kmer::Kmer::new(k as u32, crate::kmer::KmerMode::Canonical);
                     for (i, &base) in segment_dir.iter().enumerate() {
                         if base > 3 {
                             kmer_obj.reset();
@@ -6463,7 +7270,7 @@ fn try_split_segment_with_cost(
                             if kmer_obj.is_full() {
                                 let kmer_at_pos = kmer_obj.data();
                                 let pos = i + 1 - k; // Position of k-mer start
-                                // Check if this k-mer is in our set of potential middles
+                                                     // Check if this k-mer is in our set of potential middles
                                 if potential_middles.contains(&kmer_at_pos) {
                                     // Ensure we're not at the very beginning or end
                                     if pos > k && pos + k + k < segment_dir.len() {
@@ -6484,7 +7291,12 @@ fn try_split_segment_with_cost(
                             }
                             maybe_best = Some((split_pos, split_pos));
                         } else if config.verbosity > 1 {
-                            eprintln!("SPLIT_FALLBACK_DEGENERATE: pos={} split_pos={} segment_len={}", pos, split_pos, segment_dir.len());
+                            eprintln!(
+                                "SPLIT_FALLBACK_DEGENERATE: pos={} split_pos={} segment_len={}",
+                                pos,
+                                split_pos,
+                                segment_dir.len()
+                            );
                         }
                     } else {
                         // FALLBACK 2: Terminators not found - discover a NEW singleton k-mer in the segment
@@ -6501,9 +7313,12 @@ fn try_split_segment_with_cost(
                         if search_end > search_start + k {
                             // Enumerate k-mers and find singletons
                             let mut kmer_positions: Vec<(u64, usize)> = Vec::new();
-                            let mut kmer_obj2 = crate::kmer::Kmer::new(k as u32, crate::kmer::KmerMode::Canonical);
+                            let mut kmer_obj2 =
+                                crate::kmer::Kmer::new(k as u32, crate::kmer::KmerMode::Canonical);
 
-                            for (i, &base) in segment_dir[search_start..search_end].iter().enumerate() {
+                            for (i, &base) in
+                                segment_dir[search_start..search_end].iter().enumerate()
+                            {
                                 if base > 3 {
                                     kmer_obj2.reset();
                                 } else {
@@ -6542,14 +7357,19 @@ fn try_split_segment_with_cost(
                             if let Some(pos) = singleton_pos {
                                 let split_pos = pos + k;
                                 if config.verbosity > 1 {
-                                    eprintln!("SPLIT_FALLBACK_SINGLETON_SPLIT: splitting at {}", split_pos);
+                                    eprintln!(
+                                        "SPLIT_FALLBACK_SINGLETON_SPLIT: splitting at {}",
+                                        split_pos
+                                    );
                                 }
                                 maybe_best = Some((split_pos, split_pos));
                             } else if config.verbosity > 1 {
                                 eprintln!("SPLIT_FALLBACK_NO_SINGLETON: no singleton k-mers found in middle region");
                             }
                         } else if config.verbosity > 1 {
-                            eprintln!("SPLIT_FALLBACK_TOO_SHORT: segment too short for singleton search");
+                            eprintln!(
+                                "SPLIT_FALLBACK_TOO_SHORT: segment too short for singleton search"
+                            );
                         }
                     }
                 }
@@ -6564,44 +7384,65 @@ fn try_split_segment_with_cost(
     // If FFI provided best position, use it; otherwise compute costs in Rust
     let mut v_costs1 = if maybe_best.is_none() {
         if let Some(lz_left) = prepare_on_demand(left_key, "left") {
-        #[cfg(feature = "cpp_agc")]
-        {
-            // Unused path when FFI returns best split; kept for completeness
-            let ref_left = {
-                let map_segments_locked = map_segments.read().unwrap();
-                let ref_segments_locked = reference_segments.read().unwrap();
-                let seg_id = map_segments_locked.get(left_key).copied().unwrap_or(0);
-                ref_segments_locked.get(&seg_id).cloned()
-            };
-            if let Some(ref_data) = ref_left {
-                if front_kmer < middle_kmer {
-                    crate::ragc_ffi::cost_vector(true, &ref_data, segment_dir, config.min_match_len as u32)
+            #[cfg(feature = "cpp_agc")]
+            {
+                // Unused path when FFI returns best split; kept for completeness
+                let ref_left = {
+                    let map_segments_locked = map_segments.read().unwrap();
+                    let ref_segments_locked = reference_segments.read().unwrap();
+                    let seg_id = map_segments_locked.get(left_key).copied().unwrap_or(0);
+                    ref_segments_locked.get(&seg_id).cloned()
+                };
+                if let Some(ref_data) = ref_left {
+                    if front_kmer < middle_kmer {
+                        crate::ragc_ffi::cost_vector(
+                            true,
+                            &ref_data,
+                            segment_dir,
+                            config.min_match_len as u32,
+                        )
+                    } else {
+                        let mut v = crate::ragc_ffi::cost_vector(
+                            false,
+                            &ref_data,
+                            &segment_rc_vec,
+                            config.min_match_len as u32,
+                        );
+                        v.reverse();
+                        v
+                    }
                 } else {
-                    let mut v = crate::ragc_ffi::cost_vector(false, &ref_data, &segment_rc_vec, config.min_match_len as u32);
-                    v.reverse(); v
+                    if config.verbosity > 1 {
+                        eprintln!("SPLIT_SKIP: left group has no reference yet");
+                    }
+                    return None;
                 }
-            } else {
-                if config.verbosity > 1 { eprintln!("SPLIT_SKIP: left group has no reference yet"); }
-                return None;
             }
-        }
-        #[cfg(not(feature = "cpp_agc"))]
-        {
-            if front_kmer < middle_kmer {
-                lz_left.get_coding_cost_vector(segment_dir, true)
-            } else {
-                let mut v = lz_left.get_coding_cost_vector(&segment_rc_vec, false);
-                v.reverse(); v
+            #[cfg(not(feature = "cpp_agc"))]
+            {
+                if front_kmer < middle_kmer {
+                    lz_left.get_coding_cost_vector(segment_dir, true)
+                } else {
+                    let mut v = lz_left.get_coding_cost_vector(&segment_rc_vec, false);
+                    v.reverse();
+                    v
+                }
             }
-        }
         } else {
-        if config.verbosity > 1 { eprintln!("SPLIT_SKIP: left group has no reference yet"); }
-        if crate::env_cache::debug_split() {
-            eprintln!("RAGC_SPLIT_SKIP_LEFT: left_key=({},{}) has no reference", left_key.kmer_front, left_key.kmer_back);
+            if config.verbosity > 1 {
+                eprintln!("SPLIT_SKIP: left group has no reference yet");
+            }
+            if crate::env_cache::debug_split() {
+                eprintln!(
+                    "RAGC_SPLIT_SKIP_LEFT: left_key=({},{}) has no reference",
+                    left_key.kmer_front, left_key.kmer_back
+                );
+            }
+            return None;
         }
-        return None;
-        }
-    } else { Vec::new() };
+    } else {
+        Vec::new()
+    };
 
     // Cumulative sum forward for v_costs1
     let mut sum = 0u32;
@@ -6612,24 +7453,61 @@ fn try_split_segment_with_cost(
 
     let v_costs2 = if maybe_best.is_none() {
         if let Some(lz_right) = prepare_on_demand(right_key, "right") {
-        #[cfg(feature = "cpp_agc")]
-        {
-            let ref_right = {
-                let map_segments_locked = map_segments.read().unwrap();
-                let ref_segments_locked = reference_segments.read().unwrap();
-                let seg_id = map_segments_locked.get(right_key).copied().unwrap_or(0);
-                ref_segments_locked.get(&seg_id).cloned()
-            };
-            if let Some(ref_data) = ref_right {
-                let mut v = if middle_kmer < back_kmer {
-                    // Suffix placement, cumulative sum right-to-left
-                    crate::ragc_ffi::cost_vector(false, &ref_data, segment_dir, config.min_match_len as u32)
-                } else {
-                    // RC + prefix placement; cumulative sum left-to-right then reverse
-                    crate::ragc_ffi::cost_vector(true, &ref_data, &segment_rc_vec, config.min_match_len as u32)
+            #[cfg(feature = "cpp_agc")]
+            {
+                let ref_right = {
+                    let map_segments_locked = map_segments.read().unwrap();
+                    let ref_segments_locked = reference_segments.read().unwrap();
+                    let seg_id = map_segments_locked.get(right_key).copied().unwrap_or(0);
+                    ref_segments_locked.get(&seg_id).cloned()
                 };
+                if let Some(ref_data) = ref_right {
+                    let mut v = if middle_kmer < back_kmer {
+                        // Suffix placement, cumulative sum right-to-left
+                        crate::ragc_ffi::cost_vector(
+                            false,
+                            &ref_data,
+                            segment_dir,
+                            config.min_match_len as u32,
+                        )
+                    } else {
+                        // RC + prefix placement; cumulative sum left-to-right then reverse
+                        crate::ragc_ffi::cost_vector(
+                            true,
+                            &ref_data,
+                            &segment_rc_vec,
+                            config.min_match_len as u32,
+                        )
+                    };
+                    if middle_kmer < back_kmer {
+                        // Reverse cumulative sum
+                        let mut acc = 0u32;
+                        for cost in v.iter_mut().rev() {
+                            acc = acc.saturating_add(*cost);
+                            *cost = acc;
+                        }
+                        v
+                    } else {
+                        // Forward cumulative then reverse
+                        let mut acc = 0u32;
+                        for cost in v.iter_mut() {
+                            acc = acc.saturating_add(*cost);
+                            *cost = acc;
+                        }
+                        v.reverse();
+                        v
+                    }
+                } else {
+                    if config.verbosity > 1 {
+                        eprintln!("SPLIT_SKIP: right group has no reference yet");
+                    }
+                    return None;
+                }
+            }
+            #[cfg(not(feature = "cpp_agc"))]
+            {
                 if middle_kmer < back_kmer {
-                    // Reverse cumulative sum
+                    let mut v = lz_right.get_coding_cost_vector(segment_dir, false);
                     let mut acc = 0u32;
                     for cost in v.iter_mut().rev() {
                         acc = acc.saturating_add(*cost);
@@ -6637,7 +7515,7 @@ fn try_split_segment_with_cost(
                     }
                     v
                 } else {
-                    // Forward cumulative then reverse
+                    let mut v = lz_right.get_coding_cost_vector(&segment_rc_vec, true);
                     let mut acc = 0u32;
                     for cost in v.iter_mut() {
                         acc = acc.saturating_add(*cost);
@@ -6646,26 +7524,16 @@ fn try_split_segment_with_cost(
                     v.reverse();
                     v
                 }
-            } else {
-                if config.verbosity > 1 { eprintln!("SPLIT_SKIP: right group has no reference yet"); }
-                return None;
             }
-        }
-        #[cfg(not(feature = "cpp_agc"))]
-        {
-            if middle_kmer < back_kmer {
-                let mut v = lz_right.get_coding_cost_vector(segment_dir, false);
-                let mut acc = 0u32; for cost in v.iter_mut().rev() { acc = acc.saturating_add(*cost); *cost = acc; } v
-            } else {
-                let mut v = lz_right.get_coding_cost_vector(&segment_rc_vec, true);
-                let mut acc = 0u32; for cost in v.iter_mut() { acc = acc.saturating_add(*cost); *cost = acc; } v.reverse(); v
-            }
-        }
         } else {
-        if config.verbosity > 1 { eprintln!("SPLIT_SKIP: right group has no reference yet"); }
-        return None;
+            if config.verbosity > 1 {
+                eprintln!("SPLIT_SKIP: right group has no reference yet");
+            }
+            return None;
         }
-    } else { Vec::new() };
+    } else {
+        Vec::new()
+    };
 
     if maybe_best.is_none() && (v_costs1.is_empty() || v_costs2.is_empty()) {
         if config.verbosity > 1 {
@@ -6683,7 +7551,9 @@ fn try_split_segment_with_cost(
 
     // Find position with minimum combined cost
     // Matches C++ AGC agc_compressor.cpp:1663-1674
-    let mut best_pos = if let Some((p, _)) = maybe_best { p } else {
+    let mut best_pos = if let Some((p, _)) = maybe_best {
+        p
+    } else {
         let mut best_sum = u32::MAX;
         let mut pos = 0usize;
         for i in 0..v_costs1.len() {
@@ -6700,7 +7570,11 @@ fn try_split_segment_with_cost(
     if crate::env_cache::debug_split_map() && maybe_best.is_none() {
         let start = best_pos.saturating_sub(3);
         let end = (best_pos + 4).min(v_costs1.len());
-        eprintln!("RAGC_COST_WINDOW: len={} best_pos={}", v_costs1.len(), best_pos);
+        eprintln!(
+            "RAGC_COST_WINDOW: len={} best_pos={}",
+            v_costs1.len(),
+            best_pos
+        );
         for i in start..end {
             eprintln!(
                 "  i={} Lcum={} Rcum={} Sum={}{}",
@@ -6717,7 +7591,7 @@ fn try_split_segment_with_cost(
     // Even when FFI or fallback paths provide best_pos, we must enforce this constraint
     // to match C++ AGC behavior (agc_compressor.cpp:1685-1688).
     let k = config.k;
-    let original_best_pos = best_pos;  // Save for logging
+    let original_best_pos = best_pos; // Save for logging
     if best_pos < k + 1 {
         best_pos = 0; // Too close to start
     }
@@ -6728,8 +7602,15 @@ fn try_split_segment_with_cost(
     if config.verbosity > 1 && original_best_pos != best_pos {
         eprintln!(
             "BOUNDARY_CLAMP: original_best_pos={} clamped_to={} (len={}, k+1={}) source={}",
-            original_best_pos, best_pos, v_costs1.len(), k + 1,
-            if maybe_best.is_some() { "FFI/fallback" } else { "cost_calc" }
+            original_best_pos,
+            best_pos,
+            v_costs1.len(),
+            k + 1,
+            if maybe_best.is_some() {
+                "FFI/fallback"
+            } else {
+                "cost_calc"
+            }
         );
     }
 
@@ -6743,9 +7624,7 @@ fn try_split_segment_with_cost(
         // Degenerate: whole segment matches RIGHT group
         // Return empty left, full segment as right (C++ AGC line 1400-1407)
         if config.verbosity > 1 {
-            eprintln!(
-                "SPLIT_DEGENERATE_RIGHT: best_pos=0, assigning whole segment to RIGHT group"
-            );
+            eprintln!("SPLIT_DEGENERATE_RIGHT: best_pos=0, assigning whole segment to RIGHT group");
         }
         return Some((Vec::new(), segment_data.to_vec(), middle_kmer));
     }
@@ -6754,9 +7633,7 @@ fn try_split_segment_with_cost(
         // Degenerate: whole segment matches LEFT group
         // Return full segment as left, empty right (C++ AGC line 1408-1415)
         if config.verbosity > 1 {
-            eprintln!(
-                "SPLIT_DEGENERATE_LEFT: best_pos=len, assigning whole segment to LEFT group"
-            );
+            eprintln!("SPLIT_DEGENERATE_LEFT: best_pos=len, assigning whole segment to LEFT group");
         }
         return Some((segment_data.to_vec(), Vec::new(), middle_kmer));
     }
@@ -6771,7 +7648,11 @@ fn try_split_segment_with_cost(
         }
         split_segment_from_start(segment_data.as_slice(), s2, config.k)
     } else {
-        let half = if should_reverse { (config.k + 1) / 2 } else { config.k / 2 };
+        let half = if should_reverse {
+            (config.k + 1) / 2
+        } else {
+            config.k / 2
+        };
         let seg2_start = best_pos.saturating_sub(half);
         if config.verbosity > 1 {
             eprintln!(

@@ -2,8 +2,8 @@
 // Splits contigs at splitter k-mer positions
 
 use crate::kmer::{Kmer, KmerMode};
-use ragc_common::Contig;
 use ahash::AHashSet;
+use ragc_common::Contig;
 
 /// Missing k-mer sentinel value (matches C++ AGC's kmer_t(-1) = u64::MAX)
 /// Used when a segment doesn't have a front or back k-mer (e.g., at contig boundaries)
@@ -26,7 +26,13 @@ pub struct Segment {
 
 impl Segment {
     /// Create a new segment
-    pub fn new(data: Contig, front_kmer: u64, back_kmer: u64, front_kmer_is_dir: bool, back_kmer_is_dir: bool) -> Self {
+    pub fn new(
+        data: Contig,
+        front_kmer: u64,
+        back_kmer: u64,
+        front_kmer_is_dir: bool,
+        back_kmer_is_dir: bool,
+    ) -> Self {
         Segment {
             data,
             front_kmer,
@@ -81,7 +87,11 @@ pub fn split_at_splitters_with_size(
 ) -> Vec<Segment> {
     let debug = crate::env_cache::debug_segment_coverage();
     if debug {
-        eprintln!("\n=== SEGMENTATION START: contig_len={} k={} ===", contig.len(), k);
+        eprintln!(
+            "\n=== SEGMENTATION START: contig_len={} k={} ===",
+            contig.len(),
+            k
+        );
     }
 
     let mut segments = Vec::new();
@@ -91,7 +101,13 @@ pub fn split_at_splitters_with_size(
         if debug {
             eprintln!("Contig too short for k-mers, returning as single segment");
         }
-        return vec![Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false)];
+        return vec![Segment::new(
+            contig.clone(),
+            MISSING_KMER,
+            MISSING_KMER,
+            false,
+            false,
+        )];
     }
 
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
@@ -136,22 +152,29 @@ pub fn split_at_splitters_with_size(
 
                     if !segment_data.is_empty() {
                         // Determine front and back k-mers and their orientations
-                        let (seg_front, seg_back, seg_front_is_dir, seg_back_is_dir) = if front_kmer == MISSING_KMER {
-                            // First segment of contig - ALWAYS back k-mer only
-                            // The splitter is at the END of the segment, so it's the back k-mer
-                            (MISSING_KMER, kmer_value, false, is_dir)
-                        } else {
-                            // Normal case: both k-mers present
-                            (front_kmer, kmer_value, front_kmer_is_dir, is_dir)
-                        };
+                        let (seg_front, seg_back, seg_front_is_dir, seg_back_is_dir) =
+                            if front_kmer == MISSING_KMER {
+                                // First segment of contig - ALWAYS back k-mer only
+                                // The splitter is at the END of the segment, so it's the back k-mer
+                                (MISSING_KMER, kmer_value, false, is_dir)
+                            } else {
+                                // Normal case: both k-mers present
+                                (front_kmer, kmer_value, front_kmer_is_dir, is_dir)
+                            };
                         // Note: Contig name is logged at call site, this is just position info
                         if debug {
-                            eprintln!("  MAIN_LOOP_SPLIT: segment=[{}..{}) len={}", segment_start, segment_end, segment_data.len());
+                            eprintln!(
+                                "  MAIN_LOOP_SPLIT: segment=[{}..{}) len={}",
+                                segment_start,
+                                segment_end,
+                                segment_data.len()
+                            );
                         }
                         #[cfg(feature = "verbose_debug")]
                         if crate::env_cache::debug_overlap() {
                             let first_5: Vec<u8> = segment_data.iter().take(5).copied().collect();
-                            let last_5: Vec<u8> = segment_data.iter().rev().take(5).rev().copied().collect();
+                            let last_5: Vec<u8> =
+                                segment_data.iter().rev().take(5).rev().copied().collect();
                             eprintln!("RAGC_SEG_SPLIT: pos={} splitter={} segment=[{}..{}) len={} front={} back={} first_5={:?} last_5={:?}",
                                 pos, kmer_value, segment_start, segment_end, segment_data.len(),
                                 if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
@@ -164,7 +187,13 @@ pub fn split_at_splitters_with_size(
                                 if seg_front == MISSING_KMER { "MISSING".to_string() } else { seg_front.to_string() },
                                 if seg_back == MISSING_KMER { "MISSING".to_string() } else { seg_back.to_string() });
                         }
-                        segments.push(Segment::new(segment_data, seg_front, seg_back, seg_front_is_dir, seg_back_is_dir));
+                        segments.push(Segment::new(
+                            segment_data,
+                            seg_front,
+                            seg_back,
+                            seg_front_is_dir,
+                            seg_back_is_dir,
+                        ));
                     }
 
                     // Reset for next segment
@@ -172,7 +201,12 @@ pub fn split_at_splitters_with_size(
                     // Each segment must include the FULL k-mer at the start
                     let new_start = (pos + 1).saturating_sub(k);
                     if debug {
-                        eprintln!("  Setting segment_start: {} -> {} (overlap of {} bytes)", segment_start, new_start, (pos + 1) - new_start);
+                        eprintln!(
+                            "  Setting segment_start: {} -> {} (overlap of {} bytes)",
+                            segment_start,
+                            new_start,
+                            (pos + 1) - new_start
+                        );
                     }
                     segment_start = new_start;
                     front_kmer = kmer_value;
@@ -194,37 +228,71 @@ pub fn split_at_splitters_with_size(
     // - A segment >= k bytes if we split at a splitter that left enough room
     if debug {
         eprintln!("\n=== FINAL SEGMENT ===");
-        eprintln!("  segment_start={}, contig.len()={}", segment_start, contig.len());
+        eprintln!(
+            "  segment_start={}, contig.len()={}",
+            segment_start,
+            contig.len()
+        );
     }
     if segment_start < contig.len() {
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
             // Final segment k-mer extraction
-            let (final_front, final_back, final_front_is_dir, final_back_is_dir) = if front_kmer == MISSING_KMER {
-                // No splitters found in entire contig - this is an orphan segment
-                // C++ AGC uses (MISSING_KMER, MISSING_KMER) for orphan segments,
-                // which routes them to raw group 0 (see distribute_segments in agc_compressor.h)
-                // FIX 15: Match C++ AGC behavior - use MISSING for both k-mers
-                (MISSING_KMER, MISSING_KMER, false, false)
-            } else {
-                // Front k-mer present (from last splitter)
-                // C++ AGC uses MISSING_KMER for back k-mer of final segments
-                // (see agc_compressor.cpp line 2188)
-                (front_kmer, MISSING_KMER, front_kmer_is_dir, false)
-            };
+            let (final_front, final_back, final_front_is_dir, final_back_is_dir) =
+                if front_kmer == MISSING_KMER {
+                    // No splitters found in entire contig - this is an orphan segment
+                    // C++ AGC uses (MISSING_KMER, MISSING_KMER) for orphan segments,
+                    // which routes them to raw group 0 (see distribute_segments in agc_compressor.h)
+                    // FIX 15: Match C++ AGC behavior - use MISSING for both k-mers
+                    (MISSING_KMER, MISSING_KMER, false, false)
+                } else {
+                    // Front k-mer present (from last splitter)
+                    // C++ AGC uses MISSING_KMER for back k-mer of final segments
+                    // (see agc_compressor.cpp line 2188)
+                    (front_kmer, MISSING_KMER, front_kmer_is_dir, false)
+                };
             if debug {
-                eprintln!("  FINAL: segment=[{}..{}) len={}", segment_start, contig.len(), segment_data.len());
+                eprintln!(
+                    "  FINAL: segment=[{}..{}) len={}",
+                    segment_start,
+                    contig.len(),
+                    segment_data.len()
+                );
             }
             #[cfg(feature = "verbose_debug")]
-            eprintln!("RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back={}",
-                segment_start, contig.len(), segment_data.len(),
-                if final_front == MISSING_KMER { "MISSING".to_string() } else { final_front.to_string() },
-                if final_back == MISSING_KMER { "MISSING".to_string() } else { final_back.to_string() });
+            eprintln!(
+                "RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back={}",
+                segment_start,
+                contig.len(),
+                segment_data.len(),
+                if final_front == MISSING_KMER {
+                    "MISSING".to_string()
+                } else {
+                    final_front.to_string()
+                },
+                if final_back == MISSING_KMER {
+                    "MISSING".to_string()
+                } else {
+                    final_back.to_string()
+                }
+            );
             // Debug logging for Case 3 is_dir investigation
-            if crate::env_cache::debug_is_dir() && final_back == MISSING_KMER && final_front != MISSING_KMER {
-                eprintln!("RAGC_FINAL_SEG_IS_DIR: front_kmer={} front_kmer_is_dir={}", final_front, final_front_is_dir);
+            if crate::env_cache::debug_is_dir()
+                && final_back == MISSING_KMER
+                && final_front != MISSING_KMER
+            {
+                eprintln!(
+                    "RAGC_FINAL_SEG_IS_DIR: front_kmer={} front_kmer_is_dir={}",
+                    final_front, final_front_is_dir
+                );
             }
-            segments.push(Segment::new(segment_data, final_front, final_back, final_front_is_dir, final_back_is_dir));
+            segments.push(Segment::new(
+                segment_data,
+                final_front,
+                final_back,
+                final_front_is_dir,
+                final_back_is_dir,
+            ));
         }
     }
 
@@ -234,8 +302,17 @@ pub fn split_at_splitters_with_size(
             eprintln!("  NO_SPLIT: Returning entire contig as single segment");
         }
         #[cfg(feature = "verbose_debug")]
-        eprintln!("RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING", contig.len());
-        segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false));
+        eprintln!(
+            "RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING",
+            contig.len()
+        );
+        segments.push(Segment::new(
+            contig.clone(),
+            MISSING_KMER,
+            MISSING_KMER,
+            false,
+            false,
+        ));
     }
 
     // Summary
@@ -253,14 +330,26 @@ pub fn split_at_splitters_with_size(
             segments[0].len()
         } else {
             // First segment contributes all bytes, subsequent segments skip (k-1) overlap
-            segments[0].len() + segments[1..].iter().map(|s| s.len().saturating_sub(k - 1)).sum::<usize>()
+            segments[0].len()
+                + segments[1..]
+                    .iter()
+                    .map(|s| s.len().saturating_sub(k - 1))
+                    .sum::<usize>()
         };
-        eprintln!("  Expected reconstructed size: {} (with {} overlaps of {} bytes)",
-                  expected_size, segments.len().saturating_sub(1), k - 1);
+        eprintln!(
+            "  Expected reconstructed size: {} (with {} overlaps of {} bytes)",
+            expected_size,
+            segments.len().saturating_sub(1),
+            k - 1
+        );
 
         if expected_size != contig.len() {
-            eprintln!("  ⚠️  SIZE MISMATCH: Expected {} but contig is {} (diff: {})",
-                      expected_size, contig.len(), contig.len() as i64 - expected_size as i64);
+            eprintln!(
+                "  ⚠️  SIZE MISMATCH: Expected {} but contig is {} (diff: {})",
+                expected_size,
+                contig.len(),
+                contig.len() as i64 - expected_size as i64
+            );
         } else {
             eprintln!("  ✓ Size matches!");
         }
@@ -284,7 +373,13 @@ pub fn split_at_splitters(contig: &Contig, splitters: &AHashSet<u64>, k: usize) 
 
     if contig.len() < k {
         // Contig too short for k-mers, return as single segment
-        return vec![Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false)];
+        return vec![Segment::new(
+            contig.clone(),
+            MISSING_KMER,
+            MISSING_KMER,
+            false,
+            false,
+        )];
     }
 
     let mut kmer = Kmer::new(k as u32, KmerMode::Canonical);
@@ -315,7 +410,13 @@ pub fn split_at_splitters(contig: &Contig, splitters: &AHashSet<u64>, k: usize) 
                             pos, kmer_value, segment_start, segment_end, segment_data.len(),
                             if front_kmer == MISSING_KMER { "MISSING".to_string() } else { front_kmer.to_string() },
                             kmer_value);
-                        segments.push(Segment::new(segment_data, front_kmer, kmer_value, front_kmer_is_dir, is_dir));
+                        segments.push(Segment::new(
+                            segment_data,
+                            front_kmer,
+                            kmer_value,
+                            front_kmer_is_dir,
+                            is_dir,
+                        ));
                     }
 
                     // Start new segment with k-base overlap
@@ -332,18 +433,41 @@ pub fn split_at_splitters(contig: &Contig, splitters: &AHashSet<u64>, k: usize) 
         let segment_data = contig[segment_start..].to_vec();
         if !segment_data.is_empty() {
             #[cfg(feature = "verbose_debug")]
-            eprintln!("RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back=MISSING",
-                segment_start, contig.len(), segment_data.len(),
-                if front_kmer == MISSING_KMER { "MISSING".to_string() } else { front_kmer.to_string() });
-            segments.push(Segment::new(segment_data, front_kmer, MISSING_KMER, front_kmer_is_dir, false));
+            eprintln!(
+                "RAGC_SEG_FINAL: segment=[{}..{}) len={} front={} back=MISSING",
+                segment_start,
+                contig.len(),
+                segment_data.len(),
+                if front_kmer == MISSING_KMER {
+                    "MISSING".to_string()
+                } else {
+                    front_kmer.to_string()
+                }
+            );
+            segments.push(Segment::new(
+                segment_data,
+                front_kmer,
+                MISSING_KMER,
+                front_kmer_is_dir,
+                false,
+            ));
         }
     }
 
     // If no segments were created (no splitters), return entire contig as one segment
     if segments.is_empty() {
         #[cfg(feature = "verbose_debug")]
-        eprintln!("RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING", contig.len());
-        segments.push(Segment::new(contig.clone(), MISSING_KMER, MISSING_KMER, false, false));
+        eprintln!(
+            "RAGC_SEG_NOSPLIT: len={} front=MISSING back=MISSING",
+            contig.len()
+        );
+        segments.push(Segment::new(
+            contig.clone(),
+            MISSING_KMER,
+            MISSING_KMER,
+            false,
+            false,
+        ));
     }
 
     segments

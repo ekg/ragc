@@ -56,9 +56,18 @@ fn main() {
             build.compile("agc_full");
 
             // Link against C++ AGC dependencies
-            println!("cargo:rustc-link-search=native={}/agc/3rd_party/zstd/lib", home);
-            println!("cargo:rustc-link-search=native={}/agc/3rd_party/libdeflate/build", home);
-            println!("cargo:rustc-link-search=native={}/agc/3rd_party/raduls-inplace/Raduls", home);
+            println!(
+                "cargo:rustc-link-search=native={}/agc/3rd_party/zstd/lib",
+                home
+            );
+            println!(
+                "cargo:rustc-link-search=native={}/agc/3rd_party/libdeflate/build",
+                home
+            );
+            println!(
+                "cargo:rustc-link-search=native={}/agc/3rd_party/raduls-inplace/Raduls",
+                home
+            );
 
             println!("cargo:rustc-link-lib=static=zstd");
             println!("cargo:rustc-link-lib=static=deflate");

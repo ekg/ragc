@@ -2,7 +2,9 @@
 // Tests that Rust k-mer canonicalization matches C++ CKmer exactly
 
 use crate::kmer::{Kmer, KmerMode};
-use crate::kmer_extract::{remove_non_singletons, remove_non_singletons_with_duplicates, find_new_splitters_kmers};
+use crate::kmer_extract::{
+    find_new_splitters_kmers, remove_non_singletons, remove_non_singletons_with_duplicates,
+};
 use std::slice;
 
 /// Extract all canonical k-mer values from a contig

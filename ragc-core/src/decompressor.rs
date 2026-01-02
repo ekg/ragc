@@ -2,7 +2,8 @@
 // Extracts genomes from AGC archives
 
 use crate::{
-    genome_io::{GenomeWriter, CNV_NUM}, lz_diff::LZDiff,
+    genome_io::{GenomeWriter, CNV_NUM},
+    lz_diff::LZDiff,
     segment_compression::decompress_segment_with_marker,
 };
 
@@ -202,7 +203,8 @@ impl Decompressor {
             }
             let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
             for batch_id in 0..num_batches {
-                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+                self.collection
+                    .load_contig_batch(&mut self.archive, batch_id)?;
             }
 
             if self.config.verbosity > 1 {
@@ -236,7 +238,8 @@ impl Decompressor {
         {
             let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
             for batch_id in 0..num_batches {
-                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+                self.collection
+                    .load_contig_batch(&mut self.archive, batch_id)?;
             }
         }
 
@@ -279,7 +282,8 @@ impl Decompressor {
         {
             let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
             for batch_id in 0..num_batches {
-                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+                self.collection
+                    .load_contig_batch(&mut self.archive, batch_id)?;
             }
         }
         self.collection
@@ -340,7 +344,8 @@ impl Decompressor {
 
             // Load ALL contig batches, not just batch 0
             for batch_id in 0..num_batches {
-                self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+                self.collection
+                    .load_contig_batch(&mut self.archive, batch_id)?;
             }
         }
 
@@ -415,7 +420,11 @@ impl Decompressor {
         let should_debug = false;
 
         if should_debug {
-            eprintln!("DEBUG_RECONSTRUCT: {} segments, k={}", segments.len(), self.kmer_length);
+            eprintln!(
+                "DEBUG_RECONSTRUCT: {} segments, k={}",
+                segments.len(),
+                self.kmer_length
+            );
         }
 
         for (i, segment_desc) in segments.iter().enumerate() {
@@ -429,8 +438,21 @@ impl Decompressor {
             if i == 0 {
                 // First segment: add completely
                 if should_debug {
-                    let last_k: Vec<u8> = segment_data.iter().rev().take(self.kmer_length as usize).rev().copied().collect();
-                    eprintln!("  Seg {}: len={} (added fully), last_{}_bytes={:?}, contig_len={}", i, segment_data.len(), self.kmer_length, last_k, contig.len() + segment_data.len());
+                    let last_k: Vec<u8> = segment_data
+                        .iter()
+                        .rev()
+                        .take(self.kmer_length as usize)
+                        .rev()
+                        .copied()
+                        .collect();
+                    eprintln!(
+                        "  Seg {}: len={} (added fully), last_{}_bytes={:?}, contig_len={}",
+                        i,
+                        segment_data.len(),
+                        self.kmer_length,
+                        last_k,
+                        contig.len() + segment_data.len()
+                    );
                 }
                 contig.extend_from_slice(&segment_data);
             } else {
@@ -453,7 +475,16 @@ impl Decompressor {
                 let added = segment_data.len() - overlap;
                 let first_k: Vec<u8> = segment_data.iter().take(overlap).copied().collect();
                 if should_debug {
-                    eprintln!("  Seg {}: len={} (skip {}), first_{}_bytes={:?}, added={}, contig_len={}", i, segment_data.len(), overlap, overlap, first_k, added, contig.len() + added);
+                    eprintln!(
+                        "  Seg {}: len={} (skip {}), first_{}_bytes={:?}, added={}, contig_len={}",
+                        i,
+                        segment_data.len(),
+                        overlap,
+                        overlap,
+                        first_k,
+                        added,
+                        contig.len() + added
+                    );
                 }
                 contig.extend_from_slice(&segment_data[overlap..]);
             }
@@ -568,8 +599,7 @@ impl Decompressor {
 
                 if is_packed {
                     // Unpack from 2-bit format to 1-byte-per-base format
-                    decompressed_ref =
-                        Self::unpack_2bit(&decompressed_ref, expected_ref_len);
+                    decompressed_ref = Self::unpack_2bit(&decompressed_ref, expected_ref_len);
 
                     if self.config.verbosity > 1 {
                         eprintln!(
@@ -672,7 +702,10 @@ impl Decompressor {
                 if decoded.len() as u32 != desc.raw_length {
                     eprintln!("RAGC_DEBUG_DECODE_MISMATCH: group={} in_group={} raw_len={} decoded_len={} ref_len={} lz_encoded_len={}",
                         desc.group_id, desc.in_group_id, desc.raw_length, decoded.len(), reference.len(), lz_encoded.len());
-                    eprintln!("  LZ encoded bytes (first 100): {:?}", &lz_encoded[..lz_encoded.len().min(100)]);
+                    eprintln!(
+                        "  LZ encoded bytes (first 100): {:?}",
+                        &lz_encoded[..lz_encoded.len().min(100)]
+                    );
 
                     // Show first few bytes of decoded and expected
                     let dec_start: Vec<u8> = decoded.iter().take(30).copied().collect();
@@ -870,7 +903,8 @@ impl Decompressor {
         // Load ALL contig batches to get complete segment information
         let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
         for batch_id in 0..num_batches {
-            self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+            self.collection
+                .load_contig_batch(&mut self.archive, batch_id)?;
         }
 
         let sample_names = self.list_samples();
@@ -879,7 +913,9 @@ impl Decompressor {
         let mut group_stats: HashMap<u32, (usize, usize, usize)> = HashMap::new();
 
         for sample_name in &sample_names {
-            let contig_list = self.collection.get_contig_list(sample_name)
+            let contig_list = self
+                .collection
+                .get_contig_list(sample_name)
                 .ok_or_else(|| anyhow!("Failed to get contig list for {}", sample_name))?;
 
             for contig_name in &contig_list {
@@ -887,8 +923,8 @@ impl Decompressor {
                     for seg in segments {
                         let entry = group_stats.entry(seg.group_id).or_insert((0, 0, 0));
                         entry.0 += 1; // total segments
-                        // Raw groups (0-15) have NO references - all segments are raw/delta
-                        // LZ groups (16+) have references at in_group_id==0
+                                      // Raw groups (0-15) have NO references - all segments are raw/delta
+                                      // LZ groups (16+) have references at in_group_id==0
                         if seg.group_id >= 16 && seg.in_group_id == 0 {
                             entry.1 += 1; // reference segments (LZ groups only)
                         } else {
@@ -899,7 +935,8 @@ impl Decompressor {
             }
         }
 
-        let mut stats: Vec<_> = group_stats.into_iter()
+        let mut stats: Vec<_> = group_stats
+            .into_iter()
             .map(|(gid, (total, refs, deltas))| (gid, total, refs, deltas))
             .collect();
         stats.sort_by_key(|s| s.0);
@@ -913,15 +950,17 @@ impl Decompressor {
         // Load ALL contig batches
         let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
         for batch_id in 0..num_batches {
-            self.collection.load_contig_batch(&mut self.archive, batch_id)?;
+            self.collection
+                .load_contig_batch(&mut self.archive, batch_id)?;
         }
 
         let sample_names = self.list_samples();
         let mut all_segments = Vec::new();
 
         for sample_name in &sample_names {
-
-            let contig_list = self.collection.get_contig_list(sample_name)
+            let contig_list = self
+                .collection
+                .get_contig_list(sample_name)
                 .ok_or_else(|| anyhow!("Failed to get contig list for {}", sample_name))?;
 
             for contig_name in &contig_list {

@@ -16,7 +16,11 @@ fn main() -> anyhow::Result<()> {
 
     let mut contigs = Vec::new();
     while let Some((name, contig)) = gio.read_contig_converted()? {
-        println!("  Read contig '{}': {} bases (converted)", name, contig.len());
+        println!(
+            "  Read contig '{}': {} bases (converted)",
+            name,
+            contig.len()
+        );
         // Show first 20 bases in numeric encoding
         if contig.len() > 0 {
             print!("    First 20 bases (0=A,1=C,2=G,3=T): ");
@@ -52,7 +56,10 @@ fn main() -> anyhow::Result<()> {
 
     println!("\n=== C++ AGC Splitter Detection ===");
     println!("Create archive with C++ AGC to see its splitter count in output...");
-    println!("Run: /home/erik/agc/bin/agc create -o /tmp/cpp_test.agc -k 21 -s 10000 -l 20 -t 1 {}", test_file);
+    println!(
+        "Run: /home/erik/agc/bin/agc create -o /tmp/cpp_test.agc -k 21 -s 10000 -l 20 -t 1 {}",
+        test_file
+    );
     println!("Look for 'No. of splitters:' in output");
 
     Ok(())

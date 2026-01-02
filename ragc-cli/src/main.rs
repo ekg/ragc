@@ -378,8 +378,28 @@ fn main() -> Result<()> {
             inspect::inspect_archive(archive, config)?
         }
 
-        Commands::DebugCost { archive, sample, contig, index, left_group, right_group, left_prefix, right_prefix, verbosity } => {
-            debug_cost_command(archive, sample, contig, index, left_group, right_group, left_prefix, right_prefix, verbosity)?;
+        Commands::DebugCost {
+            archive,
+            sample,
+            contig,
+            index,
+            left_group,
+            right_group,
+            left_prefix,
+            right_prefix,
+            verbosity,
+        } => {
+            debug_cost_command(
+                archive,
+                sample,
+                contig,
+                index,
+                left_group,
+                right_group,
+                left_prefix,
+                right_prefix,
+                verbosity,
+            )?;
         }
     }
 
@@ -565,18 +585,20 @@ fn create_archive(
         } else {
             // Multi-file mode: Use splitters from first file (reference sample)
             // (matches C++ AGC default behavior - agc_compressor.cpp:428-563)
-            let (splitters, _singletons, _duplicates) =
-                ragc_core::determine_splitters_streaming(
-                    &inputs[0],
-                    kmer_length as usize,
-                    segment_size as usize,
-                )?;
+            let (splitters, _singletons, _duplicates) = ragc_core::determine_splitters_streaming(
+                &inputs[0],
+                kmer_length as usize,
+                segment_size as usize,
+            )?;
             splitters
         };
 
         if verbosity > 0 {
             eprintln!("Final splitter count: {}", splitters.len());
-            eprintln!("CLI_TIMING: Splitter discovery took {:?}", phase_start.elapsed());
+            eprintln!(
+                "CLI_TIMING: Splitter discovery took {:?}",
+                phase_start.elapsed()
+            );
             eprintln!();
         }
 
@@ -602,7 +624,8 @@ fn create_archive(
 
             let mut file_iterator = MultiFileIterator::new(vec![inputs[0].clone()])?;
             let mut current_sample: Option<String> = None;
-            let mut seen_samples: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_samples: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut sample_count = 0;
             let mut is_reference_done = false;
 
@@ -628,7 +651,9 @@ fn create_archive(
                     // If we've completed the reference sample, drain before continuing
                     if !is_reference_done && current_sample.is_some() {
                         if verbosity > 0 {
-                            eprintln!("Reference sample queued - waiting for processing to complete...");
+                            eprintln!(
+                                "Reference sample queued - waiting for processing to complete..."
+                            );
                         }
                         compressor.drain()?;
                         is_reference_done = true;
@@ -659,7 +684,10 @@ fn create_archive(
         } else {
             // MULTI-FILE MODE: Each file is a separate sample
             if verbosity > 0 {
-                eprintln!("CLI_TIMING: Compressor init took {:?}", phase_start.elapsed());
+                eprintln!(
+                    "CLI_TIMING: Compressor init took {:?}",
+                    phase_start.elapsed()
+                );
                 eprintln!("Processing reference sample (first input): {:?}", inputs[0]);
             }
 
@@ -683,8 +711,14 @@ fn create_archive(
             compressor.sync_and_flush("AAA#0_REF")?;
 
             if verbosity > 0 {
-                eprintln!("CLI_TIMING: Reference sample took {:?}", phase_start.elapsed());
-                eprintln!("Reference sample complete! Processing remaining {} samples...", inputs.len() - 1);
+                eprintln!(
+                    "CLI_TIMING: Reference sample took {:?}",
+                    phase_start.elapsed()
+                );
+                eprintln!(
+                    "Reference sample complete! Processing remaining {} samples...",
+                    inputs.len() - 1
+                );
                 eprintln!();
             }
 
@@ -696,7 +730,9 @@ fn create_archive(
                 }
 
                 let mut file_iterator = MultiFileIterator::new(vec![input_file.clone()])?;
-                while let Some((sample_name, contig_name, sequence)) = file_iterator.next_contig()? {
+                while let Some((sample_name, contig_name, sequence)) =
+                    file_iterator.next_contig()?
+                {
                     if !sequence.is_empty() {
                         compressor.push(sample_name, contig_name, sequence)?;
                     }
@@ -707,7 +743,10 @@ fn create_archive(
                 }
             }
             if verbosity > 0 {
-                eprintln!("CLI_TIMING: Remaining samples took {:?}", phase_start.elapsed());
+                eprintln!(
+                    "CLI_TIMING: Remaining samples took {:?}",
+                    phase_start.elapsed()
+                );
             }
         }
 
@@ -744,30 +783,49 @@ fn debug_cost_command(
     right_prefix: bool,
     verbosity: u32,
 ) -> Result<()> {
-    let archive_str = archive.to_str().ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
+    let archive_str = archive
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
     let mut dec = Decompressor::open(archive_str, DecompressorConfig { verbosity })?;
 
     // Load contig descriptors
     let segments = dec.get_contig_segments_desc(&sample, &contig)?;
     if index >= segments.len() {
-        anyhow::bail!("Index {} out of range (contig has {} segments)", index, segments.len());
+        anyhow::bail!(
+            "Index {} out of range (contig has {} segments)",
+            index,
+            segments.len()
+        );
     }
 
     let seg_desc = &segments[index];
     let seg_data = dec.get_segment_data_by_desc(seg_desc)?;
 
     // Auto-pick neighbor groups if not provided
-    let left_gid = if let Some(g) = left_group { g } else {
-        if index == 0 { anyhow::bail!("No left group for index 0; provide --left-group explicitly"); }
+    let left_gid = if let Some(g) = left_group {
+        g
+    } else {
+        if index == 0 {
+            anyhow::bail!("No left group for index 0; provide --left-group explicitly");
+        }
         segments[index - 1].group_id
     };
-    let right_gid = if let Some(g) = right_group { g } else { segments[index].group_id };
+    let right_gid = if let Some(g) = right_group {
+        g
+    } else {
+        segments[index].group_id
+    };
 
     let left_ref = dec.get_reference_segment(left_gid)?;
     let right_ref = dec.get_reference_segment(right_gid)?;
 
     // Write to tmp folder
-    let out_dir = PathBuf::from(format!("./tmp/cost_debug_{}_{}_{}", sample.replace('#', "_"), contig.replace('#', "_"), index));
+    let out_dir = PathBuf::from(format!(
+        "./tmp/cost_debug_{}_{}_{}",
+        sample.replace('#', "_"),
+        contig.replace('#', "_"),
+        index
+    ));
     std::fs::create_dir_all(&out_dir)?;
     let seg_path = out_dir.join("segment.bin");
     let left_path = out_dir.join("left_ref.bin");
@@ -777,20 +835,37 @@ fn debug_cost_command(
     write_bin(&right_path, &right_ref)?;
 
     println!("Wrote files:");
-    println!("  segment:   {} (len={})", seg_path.display(), seg_data.len());
-    println!("  left_ref:  {} (group_id={} len={})", left_path.display(), left_gid, left_ref.len());
-    println!("  right_ref: {} (group_id={} len={})", right_path.display(), right_gid, right_ref.len());
+    println!(
+        "  segment:   {} (len={})",
+        seg_path.display(),
+        seg_data.len()
+    );
+    println!(
+        "  left_ref:  {} (group_id={} len={})",
+        left_path.display(),
+        left_gid,
+        left_ref.len()
+    );
+    println!(
+        "  right_ref: {} (group_id={} len={})",
+        right_path.display(),
+        right_gid,
+        right_ref.len()
+    );
 
     // Try run cost verifier if built
     let verifier = PathBuf::from("./target/cost_verifier");
     if !verifier.exists() {
-        println!("\nCost verifier not found at {}. To build it:", verifier.display());
+        println!(
+            "\nCost verifier not found at {}. To build it:",
+            verifier.display()
+        );
         println!("  scripts/build_cost_verifier.sh");
     } else {
         println!("\nRunning C++ verifier (left, prefix={})…", left_prefix);
         let out = std::process::Command::new(&verifier)
             .args([
-                if left_prefix {"1"} else {"0"},
+                if left_prefix { "1" } else { "0" },
                 left_path.to_str().unwrap(),
                 seg_path.to_str().unwrap(),
             ])
@@ -800,7 +875,7 @@ fn debug_cost_command(
         println!("\nRunning C++ verifier (right, prefix={})…", right_prefix);
         let out2 = std::process::Command::new(&verifier)
             .args([
-                if right_prefix {"1"} else {"0"},
+                if right_prefix { "1" } else { "0" },
                 right_path.to_str().unwrap(),
                 seg_path.to_str().unwrap(),
             ])
@@ -823,33 +898,106 @@ fn debug_cost_command(
     // Apply cumulative sums as streaming splitter does
     // Left: always forward cumulative sum
     let mut sum = 0u32;
-    for c in v_left.iter_mut() { sum = sum.saturating_add(*c); *c = sum; }
+    for c in v_left.iter_mut() {
+        sum = sum.saturating_add(*c);
+        *c = sum;
+    }
 
     // Right: if suffix costs (prefix=false), we need reverse cumulative sum (right to left)
     // Otherwise (prefix=true), forward cumulative then reverse the vector
     if !right_prefix {
-        let mut acc = 0u32; for c in v_right.iter_mut().rev() { acc = acc.saturating_add(*c); *c = acc; }
+        let mut acc = 0u32;
+        for c in v_right.iter_mut().rev() {
+            acc = acc.saturating_add(*c);
+            *c = acc;
+        }
     } else {
-        let mut acc = 0u32; for c in v_right.iter_mut() { acc = acc.saturating_add(*c); *c = acc; }
+        let mut acc = 0u32;
+        for c in v_right.iter_mut() {
+            acc = acc.saturating_add(*c);
+            *c = acc;
+        }
         v_right.reverse();
     }
 
     // Find best split pos by minimizing left[i] + right[i]
-    let mut best_sum = u64::MAX; let mut best_pos = 0usize;
+    let mut best_sum = u64::MAX;
+    let mut best_pos = 0usize;
     for i in 0..v_left.len().min(v_right.len()) {
         let s = (v_left[i] as u64) + (v_right[i] as u64);
-        if s < best_sum { best_sum = s; best_pos = i; }
+        if s < best_sum {
+            best_sum = s;
+            best_pos = i;
+        }
     }
 
-    println!("\n[RUST] RAW left len={} head20={:?}", v_left_raw.len(), &v_left_raw.iter().take(20).cloned().collect::<Vec<_>>());
-    println!("[RUST] RAW left tail20={:?}", &v_left_raw.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
-    println!("[RUST] RAW right len={} head20={:?}", v_right_raw.len(), &v_right_raw.iter().take(20).cloned().collect::<Vec<_>>());
-    println!("[RUST] RAW right tail20={:?}", &v_right_raw.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
+    println!(
+        "\n[RUST] RAW left len={} head20={:?}",
+        v_left_raw.len(),
+        &v_left_raw.iter().take(20).cloned().collect::<Vec<_>>()
+    );
+    println!(
+        "[RUST] RAW left tail20={:?}",
+        &v_left_raw
+            .iter()
+            .rev()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "[RUST] RAW right len={} head20={:?}",
+        v_right_raw.len(),
+        &v_right_raw.iter().take(20).cloned().collect::<Vec<_>>()
+    );
+    println!(
+        "[RUST] RAW right tail20={:?}",
+        &v_right_raw
+            .iter()
+            .rev()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+    );
 
-    println!("[RUST] CUM left head20={:?}", &v_left.iter().take(20).cloned().collect::<Vec<_>>());
-    println!("[RUST] CUM left tail20={:?}", &v_left.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
-    println!("[RUST] CUM right head20={:?}", &v_right.iter().take(20).cloned().collect::<Vec<_>>());
-    println!("[RUST] CUM right tail20={:?}", &v_right.iter().rev().take(20).cloned().collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
+    println!(
+        "[RUST] CUM left head20={:?}",
+        &v_left.iter().take(20).cloned().collect::<Vec<_>>()
+    );
+    println!(
+        "[RUST] CUM left tail20={:?}",
+        &v_left
+            .iter()
+            .rev()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "[RUST] CUM right head20={:?}",
+        &v_right.iter().take(20).cloned().collect::<Vec<_>>()
+    );
+    println!(
+        "[RUST] CUM right tail20={:?}",
+        &v_right
+            .iter()
+            .rev()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+    );
     println!("[RUST] best_pos={} best_sum={}", best_pos, best_sum);
 
     // If FFI is available, compute C++ best split and show seg2_start
@@ -870,7 +1018,10 @@ fn debug_cost_command(
             flm,
             mlb,
         ) {
-            println!("[FFI] best_pos={} seg2_start={}", ffi_best_pos, ffi_seg2_start);
+            println!(
+                "[FFI] best_pos={} seg2_start={}",
+                ffi_best_pos, ffi_seg2_start
+            );
         } else {
             println!("[FFI] best split unavailable (missing refs?)");
         }

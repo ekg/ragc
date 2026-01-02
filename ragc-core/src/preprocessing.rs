@@ -10,13 +10,13 @@ const CNV_NUM: [u8; 128] = [
     b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ',
     b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ', b' ',
     // 64-79: ASCII uppercase letters
-    b' ',   0,  11,   1,  12,  30,  30,   2,  13,  30,  30,   9,  30,  10,   4,  30,
+    b' ', 0, 11, 1, 12, 30, 30, 2, 13, 30, 30, 9, 30, 10, 4, 30,
     // 80-95: ASCII uppercase letters continued
-     30,  30,   5,   7,   3,  15,  14,   8,  30,   6,  30,  30,  30,  30,  30,  30,
+    30, 30, 5, 7, 3, 15, 14, 8, 30, 6, 30, 30, 30, 30, 30, 30,
     // 96-111: ASCII lowercase letters
-    b' ',   0,  11,   1,  12,  30,  30,   2,  13,  30,  30,   9,  30,  10,   4,  30,
+    b' ', 0, 11, 1, 12, 30, 30, 2, 13, 30, 30, 9, 30, 10, 4, 30,
     // 112-127: ASCII lowercase letters continued
-     30,  30,   5,   7,   3,  15,  14,   8,  30,   6,  30,  30,  30,  30,  30,  30
+    30, 30, 5, 7, 3, 15, 14, 8, 30, 6, 30, 30, 30, 30, 30, 30,
 ];
 
 /// Preprocess raw contig by converting ASCII characters to numeric codes
@@ -43,7 +43,8 @@ pub fn preprocess_raw_contig(contig: &mut Vec<u8>) {
         3 => {
             let c = contig[in_pos];
             in_pos += 1;
-            if c >> 6 != 0 {  // c >= 64
+            if c >> 6 != 0 {
+                // c >= 64
                 contig[out_pos] = CNV_NUM[c as usize];
                 out_pos += 1;
             }
@@ -61,7 +62,7 @@ pub fn preprocess_raw_contig(contig: &mut Vec<u8>) {
                 contig[out_pos] = CNV_NUM[c as usize];
                 out_pos += 1;
             }
-        },
+        }
         2 => {
             let c = contig[in_pos];
             in_pos += 1;
@@ -76,7 +77,7 @@ pub fn preprocess_raw_contig(contig: &mut Vec<u8>) {
                 contig[out_pos] = CNV_NUM[c as usize];
                 out_pos += 1;
             }
-        },
+        }
         1 => {
             let c = contig[in_pos];
             in_pos += 1;
@@ -84,7 +85,7 @@ pub fn preprocess_raw_contig(contig: &mut Vec<u8>) {
                 contig[out_pos] = CNV_NUM[c as usize];
                 out_pos += 1;
             }
-        },
+        }
         _ => {} // len % 4 == 0, nothing to do
     }
 

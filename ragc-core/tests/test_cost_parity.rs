@@ -5,14 +5,20 @@ use ragc_core::{ragc_ffi, LZDiff};
 fn cumulative_left(v: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(v.len());
     let mut acc = 0u32;
-    for &c in v { acc = acc.saturating_add(c); out.push(acc); }
+    for &c in v {
+        acc = acc.saturating_add(c);
+        out.push(acc);
+    }
     out
 }
 
 fn cumulative_right_suffix(v: &[u32]) -> Vec<u32> {
     let mut out = v.to_vec();
     let mut acc = 0u32;
-    for c in out.iter_mut().rev() { acc = acc.saturating_add(*c); *c = acc; }
+    for c in out.iter_mut().rev() {
+        acc = acc.saturating_add(*c);
+        *c = acc;
+    }
     out
 }
 

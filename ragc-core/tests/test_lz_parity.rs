@@ -8,8 +8,8 @@
 #[cfg(feature = "cpp_agc")]
 mod lz_parity {
     use ragc_common::types::Contig;
-    use ragc_core::LZDiff;
     use ragc_core::ragc_ffi;
+    use ragc_core::LZDiff;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
@@ -91,7 +91,11 @@ mod lz_parity {
         match cpp_encoded {
             Some(cpp) => {
                 if ragc_encoded == cpp {
-                    println!("[PASS] {}: Identical encoding ({} bytes)", test_name, ragc_encoded.len());
+                    println!(
+                        "[PASS] {}: Identical encoding ({} bytes)",
+                        test_name,
+                        ragc_encoded.len()
+                    );
                     true
                 } else {
                     println!("[FAIL] {}: Encoding differs!", test_name);
@@ -99,10 +103,14 @@ mod lz_parity {
                     println!("  C++:  {} bytes", cpp.len());
 
                     if let Some((pos, r, c)) = find_divergence(&ragc_encoded, &cpp) {
-                        println!("  First divergence at byte {}: RAGC={:#04x} '{}' C++={:#04x} '{}'",
+                        println!(
+                            "  First divergence at byte {}: RAGC={:#04x} '{}' C++={:#04x} '{}'",
                             pos,
-                            r, char::from(r).escape_default(),
-                            c, char::from(c).escape_default());
+                            r,
+                            char::from(r).escape_default(),
+                            c,
+                            char::from(c).escape_default()
+                        );
 
                         // Show context around divergence
                         let ctx_start = pos.saturating_sub(10);
@@ -155,7 +163,10 @@ mod lz_parity {
                 }
             }
             None => {
-                println!("[SKIP] {}: C++ FFI returned None (buffer too small?)", test_name);
+                println!(
+                    "[SKIP] {}: C++ FFI returned None (buffer too small?)",
+                    test_name
+                );
                 true // Don't fail on FFI issues
             }
         }
@@ -167,7 +178,12 @@ mod lz_parity {
         let reference: Vec<u8> = (0..100).map(|i| (i % 4) as u8).collect();
         let target = reference.clone();
 
-        assert!(compare_lz_encoding(&reference, &target, 20, "identical_sequences"));
+        assert!(compare_lz_encoding(
+            &reference,
+            &target,
+            20,
+            "identical_sequences"
+        ));
     }
 
     #[test]
@@ -176,7 +192,12 @@ mod lz_parity {
         let reference: Vec<u8> = (0..50).map(|i| (i % 4) as u8).collect();
         let target: Vec<u8> = (0..50).map(|i| ((i + 1) % 4) as u8).collect();
 
-        assert!(compare_lz_encoding(&reference, &target, 20, "simple_literal"));
+        assert!(compare_lz_encoding(
+            &reference,
+            &target,
+            20,
+            "simple_literal"
+        ));
     }
 
     #[test]
@@ -229,7 +250,12 @@ mod lz_parity {
             }
         };
 
-        assert!(compare_lz_encoding(&reference, &target, 20, "real_yeast_segment"));
+        assert!(compare_lz_encoding(
+            &reference,
+            &target,
+            20,
+            "real_yeast_segment"
+        ));
     }
 
     #[test]
@@ -259,7 +285,12 @@ mod lz_parity {
             }
         };
 
-        assert!(compare_lz_encoding(&reference, &target, 20, "different_samples"));
+        assert!(compare_lz_encoding(
+            &reference,
+            &target,
+            20,
+            "different_samples"
+        ));
     }
 
     /// Run multiple comparison tests and report summary
@@ -274,15 +305,25 @@ mod lz_parity {
         if compare_lz_encoding(
             &(0..100).map(|i| (i % 4) as u8).collect::<Vec<_>>(),
             &(0..100).map(|i| (i % 4) as u8).collect::<Vec<_>>(),
-            20, "identical",
-        ) { passed += 1; } else { failed += 1; }
+            20,
+            "identical",
+        ) {
+            passed += 1;
+        } else {
+            failed += 1;
+        }
 
         // Test 2: All literals
         if compare_lz_encoding(
             &(0..100).map(|i| (i % 4) as u8).collect::<Vec<_>>(),
             &(0..100).map(|i| ((i + 1) % 4) as u8).collect::<Vec<_>>(),
-            20, "all_literals",
-        ) { passed += 1; } else { failed += 1; }
+            20,
+            "all_literals",
+        ) {
+            passed += 1;
+        } else {
+            failed += 1;
+        }
 
         // Test 3: Long match at start
         let ref3: Vec<u8> = (0..500).map(|i| (i % 4) as u8).collect();

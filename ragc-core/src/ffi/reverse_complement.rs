@@ -11,7 +11,7 @@ fn complement_base(base: u8) -> u8 {
     if base < 4 {
         3 - base
     } else {
-        base  // N or invalid stays unchanged
+        base // N or invalid stays unchanged
     }
 }
 
@@ -22,10 +22,7 @@ fn complement_base(base: u8) -> u8 {
 /// # Safety
 /// - sequence must point to valid mutable memory of length bytes
 #[no_mangle]
-pub extern "C" fn ragc_reverse_complement_inplace(
-    sequence: *mut u8,
-    length: usize,
-) {
+pub extern "C" fn ragc_reverse_complement_inplace(sequence: *mut u8, length: usize) {
     if length == 0 {
         return;
     }
@@ -68,10 +65,7 @@ pub struct Sequence {
 }
 
 #[no_mangle]
-pub extern "C" fn ragc_reverse_complement_copy(
-    src: *const u8,
-    src_len: usize,
-) -> Sequence {
+pub extern "C" fn ragc_reverse_complement_copy(src: *const u8, src_len: usize) -> Sequence {
     if src_len == 0 {
         return Sequence {
             data: std::ptr::null_mut(),

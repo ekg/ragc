@@ -259,7 +259,10 @@ impl BufferedSegments {
     /// Matches C++ AGC's CBufferedSegPart::process_new (agc_compressor.h:384-415)
     ///
     /// Returns: Number of NEW groups created
-    pub fn process_new(&mut self, map_segments: &std::sync::Mutex<AHashMap<(u64, u64), u32>>) -> u32 {
+    pub fn process_new(
+        &mut self,
+        map_segments: &std::sync::Mutex<AHashMap<(u64, u64), u32>>,
+    ) -> u32 {
         let _lock = self.resize_mtx.lock().unwrap();
         let mut s_seg_part = self.s_seg_part.lock().unwrap();
 

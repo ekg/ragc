@@ -20,10 +20,7 @@
 /// # Safety
 /// This function performs safe arithmetic with overflow protection
 #[no_mangle]
-pub extern "C" fn ragc_calculate_seg2_start_pos(
-    left_size: u32,
-    kmer_length: u32,
-) -> u32 {
+pub extern "C" fn ragc_calculate_seg2_start_pos(left_size: u32, kmer_length: u32) -> u32 {
     // Match C++ AGC logic exactly
     // seg2_start_pos = left_size - kmer_length / 2
     left_size.saturating_sub(kmer_length / 2)
@@ -40,10 +37,7 @@ pub extern "C" fn ragc_calculate_seg2_start_pos(
 /// # Returns
 /// New size for first segment
 #[no_mangle]
-pub extern "C" fn ragc_calculate_segment1_size(
-    seg2_start_pos: u32,
-    kmer_length: u32,
-) -> u32 {
+pub extern "C" fn ragc_calculate_segment1_size(seg2_start_pos: u32, kmer_length: u32) -> u32 {
     seg2_start_pos.saturating_add(kmer_length)
 }
 

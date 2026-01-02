@@ -7,8 +7,8 @@ use crate::segment_buffer::BufferedSegments;
 use crate::segment_compression::compress_reference_segment;
 use crate::task::{ContigProcessingStage, Task};
 use crate::zstd_pool::compress_segment_pooled;
-use ragc_common::{Archive, Contig};
 use ahash::{AHashMap, AHashSet};
+use ragc_common::{Archive, Contig};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 

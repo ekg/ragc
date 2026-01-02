@@ -63,7 +63,10 @@ pub extern "C" fn ragc_find_splitters_in_contig(
         eprintln!("[RUST FFI]   segment_size: {}", segment_size);
         eprintln!("[RUST FFI]   candidate_kmers_len: {}", candidate_kmers_len);
         if candidate_kmers_len > 0 {
-            eprintln!("[RUST FFI]   first 5 candidates: {:?}", &candidate_kmers[..candidate_kmers_len.min(5)]);
+            eprintln!(
+                "[RUST FFI]   first 5 candidates: {:?}",
+                &candidate_kmers[..candidate_kmers_len.min(5)]
+            );
         }
 
         // Initialize output vectors
@@ -118,8 +121,11 @@ pub extern "C" fn ragc_find_splitters_in_contig(
                             if found_count <= 3 {
                                 eprintln!("[RUST FFI] Found splitter #{}: kmer_value=0x{:016x} at current_len={}",
                                     found_count, kmer_value, current_len);
-                                eprintln!("[RUST FFI]   kmer_dir=0x{:016x}, kmer_rc=0x{:016x}",
-                                    kmer.data_dir(), kmer.data_rc());
+                                eprintln!(
+                                    "[RUST FFI]   kmer_dir=0x{:016x}, kmer_rc=0x{:016x}",
+                                    kmer.data_dir(),
+                                    kmer.data_rc()
+                                );
                             }
                             splitters.push(kmer_value);
 
@@ -151,21 +157,22 @@ pub extern "C" fn ragc_find_splitters_in_contig(
         for &kmer_value in v_recent_kmers.iter().rev() {
             if is_splitter(kmer_value, candidate_kmers) {
                 found_count += 1;
-                eprintln!("[RUST FFI] Found rightmost splitter: kmer_value=0x{:016x}", kmer_value);
+                eprintln!(
+                    "[RUST FFI] Found rightmost splitter: kmer_value=0x{:016x}",
+                    kmer_value
+                );
                 splitters.push(kmer_value);
                 for &(fallback_kmer, is_dir) in &fallback_kmers_in_segment {
-                    fallbacks.push([
-                        prev_splitter,
-                        kmer_value,
-                        fallback_kmer,
-                        is_dir as u64,
-                    ]);
+                    fallbacks.push([prev_splitter, kmer_value, fallback_kmer, is_dir as u64]);
                 }
                 break;
             }
         }
 
-        eprintln!("[RUST FFI] Total: checked {} boundary positions, found {} splitters", checked_count, found_count);
+        eprintln!(
+            "[RUST FFI] Total: checked {} boundary positions, found {} splitters",
+            checked_count, found_count
+        );
 
         // Flatten fallbacks array for FFI
         let mut fallbacks_flat: Vec<u64> = Vec::with_capacity(fallbacks.len() * 4);

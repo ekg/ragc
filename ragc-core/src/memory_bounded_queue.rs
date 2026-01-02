@@ -49,8 +49,8 @@ impl<T: Ord> Eq for PriorityItem<T> {}
 
 struct QueueInner<T: Ord> {
     items: BinaryHeap<PriorityItem<T>>, // Max-heap ordered by item priority
-    current_size: usize,                 // Total bytes currently in queue
-    closed: bool,                        // No more pushes allowed
+    current_size: usize,                // Total bytes currently in queue
+    closed: bool,                       // No more pushes allowed
 }
 
 impl<T: Ord> MemoryBoundedQueue<T> {
@@ -108,7 +108,10 @@ impl<T: Ord> MemoryBoundedQueue<T> {
         }
 
         // Add item (BinaryHeap maintains priority order)
-        inner.items.push(PriorityItem { item, size: size_bytes });
+        inner.items.push(PriorityItem {
+            item,
+            size: size_bytes,
+        });
         inner.current_size += size_bytes;
 
         // Signal that queue is not empty
@@ -132,7 +135,10 @@ impl<T: Ord> MemoryBoundedQueue<T> {
         }
 
         // Add item (BinaryHeap maintains priority order)
-        inner.items.push(PriorityItem { item, size: size_bytes });
+        inner.items.push(PriorityItem {
+            item,
+            size: size_bytes,
+        });
         inner.current_size += size_bytes;
 
         // Signal that queue is not empty

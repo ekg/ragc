@@ -189,9 +189,9 @@ fn set_difference_sorted(left: &[u64], right: &[u64]) -> Vec<u64> {
 pub fn find_new_splitters_kmers(
     contig: &[u8],
     k: u32,
-    candidate_kmers: &[u64],  // sorted reference singleton k-mers
+    candidate_kmers: &[u64], // sorted reference singleton k-mers
     candidate_kmers_offset: usize,
-    duplicated_kmers: &[u64],  // sorted reference duplicate k-mers
+    duplicated_kmers: &[u64], // sorted reference duplicate k-mers
 ) -> Vec<u64> {
     // Step 1: Extract k-mers from contig and filter to singletons
     let contig_vec = contig.to_vec();

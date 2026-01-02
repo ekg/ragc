@@ -5,9 +5,9 @@
 //!
 //! See docs/INLINE_SEGMENTATION_PATTERN.md for detailed C++ AGC analysis.
 
-use ahash::{AHashMap, AHashSet};
 use crate::kmer::{Kmer, KmerMode};
 use crate::segment_buffer::BufferedSegments;
+use ahash::{AHashMap, AHashSet};
 use std::sync::{Arc, Mutex};
 
 /// Contig type (vector of nucleotides in numeric encoding)
@@ -484,7 +484,7 @@ mod tests {
             splitters: Arc::new(Mutex::new(AHashSet::new())),
             bloom_splitters: Arc::new(Mutex::new(crate::bloom_filter::BloomFilter::new(1024))),
             buffered_segments: Arc::new(Mutex::new(BufferedSegments::new(0))),
-            kmer_length: 3, // Use short k-mer to work with small test contig
+            kmer_length: 3,      // Use short k-mer to work with small test contig
             adaptive_mode: true, // Adaptive mode enabled
             map_segments: Arc::new(Mutex::new(AHashMap::new())),
             map_segments_terminators: Arc::new(Mutex::new(AHashMap::new())),

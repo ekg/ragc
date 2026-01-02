@@ -15,12 +15,14 @@ static TOTAL_NRUNS: AtomicU64 = AtomicU64::new(0);
 
 /// Print LZ encoding statistics (call at end of compression)
 pub fn print_lz_stats() {
-    eprintln!("LZ_STATS: matches={} literals={} bang_replacements={} nruns={} encoded_bytes={}",
+    eprintln!(
+        "LZ_STATS: matches={} literals={} bang_replacements={} nruns={} encoded_bytes={}",
         TOTAL_MATCHES.load(Ordering::Relaxed),
         TOTAL_LITERALS.load(Ordering::Relaxed),
         TOTAL_BANG_REPLACEMENTS.load(Ordering::Relaxed),
         TOTAL_NRUNS.load(Ordering::Relaxed),
-        TOTAL_ENCODED_BYTES.load(Ordering::Relaxed));
+        TOTAL_ENCODED_BYTES.load(Ordering::Relaxed)
+    );
 }
 
 /// Constants for LZ diff encoding
@@ -33,9 +35,9 @@ const HASHING_STEP: usize = 4; // USE_SPARSE_HT mode
 /// LZ Diff encoder/decoder (V2 implementation)
 pub struct LZDiff {
     reference: Vec<u8>,
-    reference_len: usize,       // Original length before padding
+    reference_len: usize, // Original length before padding
     // Linear-probing table for exact coding-cost matching with C++
-    ht_lp: Vec<u32>,            // stores (i / HASHING_STEP) or u32::MAX for empty
+    ht_lp: Vec<u32>, // stores (i / HASHING_STEP) or u32::MAX for empty
     ht_mask: u64,
     min_match_len: u32,
     key_len: u32,
@@ -76,12 +78,21 @@ impl LZDiff {
         self.build_index_lp();
 
         if debug_lz {
-            eprintln!("RAGC_LZ_PREPARE: ref_len={} key_len={} ht_lp_size={} ht_mask={:#x}",
-                self.reference_len, self.key_len, self.ht_lp.len(), self.ht_mask);
+            eprintln!(
+                "RAGC_LZ_PREPARE: ref_len={} key_len={} ht_lp_size={} ht_mask={:#x}",
+                self.reference_len,
+                self.key_len,
+                self.ht_lp.len(),
+                self.ht_mask
+            );
             // Count non-empty slots
             let filled = self.ht_lp.iter().filter(|&&x| x != u32::MAX).count();
-            eprintln!("RAGC_LZ_PREPARE: ht_lp filled={}/{} ({:.1}%)",
-                filled, self.ht_lp.len(), 100.0 * filled as f64 / self.ht_lp.len() as f64);
+            eprintln!(
+                "RAGC_LZ_PREPARE: ht_lp filled={}/{} ({:.1}%)",
+                filled,
+                self.ht_lp.len(),
+                100.0 * filled as f64 / self.ht_lp.len() as f64
+            );
         }
     }
 
@@ -93,9 +104,15 @@ impl LZDiff {
         let mut cnt_mod: u32 = 0;
         let key_len_mod: u32 = self.key_len % (HASHING_STEP as u32);
         for &c in &self.reference {
-            if c < 4 { no_prev_valid += 1; } else { no_prev_valid = 0; }
+            if c < 4 {
+                no_prev_valid += 1;
+            } else {
+                no_prev_valid = 0;
+            }
             cnt_mod += 1;
-            if cnt_mod == HASHING_STEP as u32 { cnt_mod = 0; }
+            if cnt_mod == HASHING_STEP as u32 {
+                cnt_mod = 0;
+            }
             if cnt_mod == key_len_mod && no_prev_valid >= self.key_len {
                 ht_size += 1;
             }
@@ -103,10 +120,16 @@ impl LZDiff {
 
         // Adjust size by load factor (0.7) and round to power of two then double
         let mut ht_size = (ht_size as f64 / 0.7) as u64;
-        if ht_size == 0 { ht_size = 1; }
-        while (ht_size & (ht_size - 1)) != 0 { ht_size &= ht_size - 1; }
+        if ht_size == 0 {
+            ht_size = 1;
+        }
+        while (ht_size & (ht_size - 1)) != 0 {
+            ht_size &= ht_size - 1;
+        }
         ht_size <<= 1;
-        if ht_size < 8 { ht_size = 8; }
+        if ht_size < 8 {
+            ht_size = 8;
+        }
 
         self.ht_mask = ht_size - 1;
         self.ht_lp.clear();
@@ -230,7 +253,9 @@ impl LZDiff {
         no_prev_literals: usize,
     ) -> Option<(u32, u32, u32)> {
         let debug_lz = crate::env_cache::debug_lz_enabled();
-        if self.ht_lp.is_empty() { return None; }
+        if self.ht_lp.is_empty() {
+            return None;
+        }
 
         let mut best_ref_pos = 0u32;
         let mut best_len_bck = 0u32;
@@ -245,25 +270,35 @@ impl LZDiff {
             let idx = (ht_pos + j) & (self.ht_mask as usize);
             let slot = self.ht_lp[idx];
             probes += 1;
-            if slot == u32::MAX { break; }
+            if slot == u32::MAX {
+                break;
+            }
             found_match = true;
 
             let h_pos = (slot as usize) * HASHING_STEP;
-            if h_pos >= self.reference.len() { continue; }
+            if h_pos >= self.reference.len() {
+                continue;
+            }
 
             // CRITICAL: Verify the k-mer actually matches (not just hash collision)
             if let Some(ref_kmer_code) = self.get_code(&self.reference[h_pos..]) {
                 if ref_kmer_code != kmer_code {
                     // Hash collision - this position has a different k-mer
                     if debug_lz && text_pos < 10 && probes < 3 {
-                        eprintln!("RAGC_LZ_COLLISION: text_pos={} probe={} h_pos={} kmer_mismatch", text_pos, j, h_pos);
+                        eprintln!(
+                            "RAGC_LZ_COLLISION: text_pos={} probe={} h_pos={} kmer_mismatch",
+                            text_pos, j, h_pos
+                        );
                     }
                     continue;
                 }
             } else {
                 // Invalid k-mer at this position (contains N)
                 if debug_lz && text_pos < 10 && probes < 3 {
-                    eprintln!("RAGC_LZ_INVALID_KMER: text_pos={} probe={} h_pos={} contains_N", text_pos, j, h_pos);
+                    eprintln!(
+                        "RAGC_LZ_INVALID_KMER: text_pos={} probe={} h_pos={} contains_N",
+                        text_pos, j, h_pos
+                    );
                 }
                 continue;
             }
@@ -275,16 +310,26 @@ impl LZDiff {
             if debug_lz && text_pos < 5 && j == 0 {
                 // Show the actual k-mer (key_len bytes) being compared
                 let kmer_len = self.key_len as usize;
-                let ref_kmer: String = ref_ptr.iter().take(kmer_len).map(|&b| {
-                    if b < 4 { (b'A' + b) as char } else { 'N' }
-                }).collect();
-                let tgt_kmer: String = text_ptr.iter().take(kmer_len).map(|&b| {
-                    if b < 4 { (b'A' + b) as char } else { 'N' }
-                }).collect();
-                let kmer_match = ref_ptr.iter().zip(text_ptr.iter()).take(kmer_len).all(|(a, b)| a == b);
+                let ref_kmer: String = ref_ptr
+                    .iter()
+                    .take(kmer_len)
+                    .map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' })
+                    .collect();
+                let tgt_kmer: String = text_ptr
+                    .iter()
+                    .take(kmer_len)
+                    .map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' })
+                    .collect();
+                let kmer_match = ref_ptr
+                    .iter()
+                    .zip(text_ptr.iter())
+                    .take(kmer_len)
+                    .all(|(a, b)| a == b);
 
-                eprintln!("RAGC_LZ_KMER: text_pos={} h_pos={} kmer_match={} f_len={}",
-                    text_pos, h_pos, kmer_match, f_len);
+                eprintln!(
+                    "RAGC_LZ_KMER: text_pos={} h_pos={} kmer_match={} f_len={}",
+                    text_pos, h_pos, kmer_match, f_len
+                );
                 eprintln!("  ref_kmer[{}]: {}", kmer_len, ref_kmer);
                 eprintln!("  tgt_kmer[{}]: {}", kmer_len, tgt_kmer);
             }
@@ -308,14 +353,21 @@ impl LZDiff {
                         text_pos, j, h_pos, b_len + f_len, min_to_update);
                 }
             } else if debug_lz && text_pos < 10 && probes < 3 {
-                eprintln!("RAGC_LZ_FLEN_SHORT: text_pos={} probe={} h_pos={} f_len={} < key_len={}",
-                    text_pos, j, h_pos, f_len, self.key_len);
+                eprintln!(
+                    "RAGC_LZ_FLEN_SHORT: text_pos={} probe={} h_pos={} f_len={} < key_len={}",
+                    text_pos, j, h_pos, f_len, self.key_len
+                );
             }
         }
 
         if debug_lz && text_pos < 100 {
-            eprintln!("RAGC_LZ_LOOKUP: text_pos={} probes={} found_slot={} best_len={}",
-                text_pos, probes, found_match, best_len_bck + best_len_fwd);
+            eprintln!(
+                "RAGC_LZ_LOOKUP: text_pos={} probes={} found_slot={} best_len={}",
+                text_pos,
+                probes,
+                found_match,
+                best_len_bck + best_len_fwd
+            );
         }
 
         if (best_len_bck + best_len_fwd) as usize >= self.min_match_len as usize {
@@ -357,14 +409,22 @@ impl LZDiff {
                 .all(|(a, b)| a == b)
         {
             if debug_lz {
-                eprintln!("RAGC_LZ: target == reference, returning empty (len={})", target.len());
+                eprintln!(
+                    "RAGC_LZ: target == reference, returning empty (len={})",
+                    target.len()
+                );
             }
             return encoded;
         }
 
         if debug_lz {
-            eprintln!("RAGC_LZ_START: ref_len={} target_len={} min_match={} ht_lp_size={}",
-                self.reference_len, target.len(), self.min_match_len, self.ht_lp.len());
+            eprintln!(
+                "RAGC_LZ_START: ref_len={} target_len={} min_match={} ht_lp_size={}",
+                self.reference_len,
+                target.len(),
+                self.min_match_len,
+                self.ht_lp.len()
+            );
             eprintln!("RAGC_LZ_ENCODING_TRACE: Starting LZ encoding");
         }
 
@@ -506,28 +566,75 @@ impl LZDiff {
         }
 
         if debug_lz {
-            let avg_match_len = if match_count > 0 { total_match_len as f64 / match_count as f64 } else { 0.0 };
-            let compression_ratio = if target.len() > 0 { encoded.len() as f64 / target.len() as f64 } else { 0.0 };
+            let avg_match_len = if match_count > 0 {
+                total_match_len as f64 / match_count as f64
+            } else {
+                0.0
+            };
+            let compression_ratio = if target.len() > 0 {
+                encoded.len() as f64 / target.len() as f64
+            } else {
+                0.0
+            };
             let bases_covered_by_matches = total_match_len;
             let bases_as_literals = literal_count as u64;
-            let coverage_pct = if target.len() > 0 { 100.0 * bases_covered_by_matches as f64 / target.len() as f64 } else { 0.0 };
+            let coverage_pct = if target.len() > 0 {
+                100.0 * bases_covered_by_matches as f64 / target.len() as f64
+            } else {
+                0.0
+            };
 
             eprintln!("RAGC_LZ_END: matches={} (avg_len={:.1}) literals={} nruns={} bangs={} encoded_len={}",
                 match_count, avg_match_len, literal_count, nrun_count, bang_count, encoded.len());
-            eprintln!("RAGC_LZ_SUMMARY: target_len={} match_coverage={}/{} ({:.1}%) ratio={:.3}",
-                target.len(), bases_covered_by_matches, target.len(), coverage_pct, compression_ratio);
+            eprintln!(
+                "RAGC_LZ_SUMMARY: target_len={} match_coverage={}/{} ({:.1}%) ratio={:.3}",
+                target.len(),
+                bases_covered_by_matches,
+                target.len(),
+                coverage_pct,
+                compression_ratio
+            );
 
             // Debug: Show first/last 20 bytes when 0 matches - helps detect orientation mismatch
             if match_count == 0 && target.len() > 40 {
-                let ref_first: String = self.reference.iter().take(20).map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
-                let ref_last: String = self.reference[self.reference_len.saturating_sub(20)..self.reference_len].iter().map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
-                let tgt_first: String = target.iter().take(20).map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
-                let tgt_last: String = target[target.len().saturating_sub(20)..].iter().map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
-                eprintln!("RAGC_ZERO_MATCH_DATA: ref_first={} ref_last={} tgt_first={} tgt_last={}",
-                    ref_first, ref_last, tgt_first, tgt_last);
+                let ref_first: String = self
+                    .reference
+                    .iter()
+                    .take(20)
+                    .map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' })
+                    .collect();
+                let ref_last: String = self.reference
+                    [self.reference_len.saturating_sub(20)..self.reference_len]
+                    .iter()
+                    .map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' })
+                    .collect();
+                let tgt_first: String = target
+                    .iter()
+                    .take(20)
+                    .map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' })
+                    .collect();
+                let tgt_last: String = target[target.len().saturating_sub(20)..]
+                    .iter()
+                    .map(|&b| if b < 4 { (b'A' + b) as char } else { 'N' })
+                    .collect();
+                eprintln!(
+                    "RAGC_ZERO_MATCH_DATA: ref_first={} ref_last={} tgt_first={} tgt_last={}",
+                    ref_first, ref_last, tgt_first, tgt_last
+                );
                 // Check if target matches reverse of reference (strong orientation mismatch signal)
-                let ref_rc_first: String = self.reference[self.reference_len.saturating_sub(20)..self.reference_len]
-                    .iter().rev().map(|&b| match b { 0=>3, 1=>2, 2=>1, 3=>0, _=>b }).map(|b| if b < 4 { (b'A' + b) as char } else { 'N' }).collect();
+                let ref_rc_first: String = self.reference
+                    [self.reference_len.saturating_sub(20)..self.reference_len]
+                    .iter()
+                    .rev()
+                    .map(|&b| match b {
+                        0 => 3,
+                        1 => 2,
+                        2 => 1,
+                        3 => 0,
+                        _ => b,
+                    })
+                    .map(|b| if b < 4 { (b'A' + b) as char } else { 'N' })
+                    .collect();
                 if tgt_first == ref_rc_first {
                     eprintln!("RAGC_ZERO_MATCH_ORIENTATION: Target matches RC of reference - ORIENTATION MISMATCH DETECTED!");
                 }
@@ -535,8 +642,12 @@ impl LZDiff {
 
             // Warning if encoding is bloated
             if encoded.len() > target.len() {
-                eprintln!("RAGC_LZ_WARNING: encoded LARGER than target! {} vs {} bytes (+{})",
-                    encoded.len(), target.len(), encoded.len() - target.len());
+                eprintln!(
+                    "RAGC_LZ_WARNING: encoded LARGER than target! {} vs {} bytes (+{})",
+                    encoded.len(),
+                    target.len(),
+                    encoded.len() - target.len()
+                );
             }
         }
 
@@ -571,8 +682,13 @@ impl LZDiff {
                 let (len, consumed) = self.decode_nrun(&encoded[i..]);
                 decoded.resize(decoded.len() + len as usize, N_CODE);
                 if debug_decode && op_count < 10 {
-                    eprintln!("  LZ_DECODE op={}: NRUN len={} consumed={} decoded_len={}",
-                        op_count, len, consumed, decoded.len());
+                    eprintln!(
+                        "  LZ_DECODE op={}: NRUN len={} consumed={} decoded_len={}",
+                        op_count,
+                        len,
+                        consumed,
+                        decoded.len()
+                    );
                 }
                 i += consumed;
                 op_count += 1;
@@ -597,14 +713,26 @@ impl LZDiff {
         }
 
         if debug_decode {
-            eprintln!("  LZ_DECODE: total_ops={} final_decoded_len={} ref_len={}",
-                op_count, decoded.len(), self.reference_len);
+            eprintln!(
+                "  LZ_DECODE: total_ops={} final_decoded_len={} ref_len={}",
+                op_count,
+                decoded.len(),
+                self.reference_len
+            );
         }
 
         // Debug: trace when decoded is significantly longer than reference
         if crate::env_cache::debug_lz_decode_full() && decoded.len() > self.reference_len + 50 {
-            eprintln!("  LZ_DECODE_BLOAT: ref_len={} decoded_len={} encoded_len={}", self.reference_len, decoded.len(), encoded.len());
-            eprintln!("    Encoded first 100 bytes: {:?}", &encoded[..encoded.len().min(100)]);
+            eprintln!(
+                "  LZ_DECODE_BLOAT: ref_len={} decoded_len={} encoded_len={}",
+                self.reference_len,
+                decoded.len(),
+                encoded.len()
+            );
+            eprintln!(
+                "    Encoded first 100 bytes: {:?}",
+                &encoded[..encoded.len().min(100)]
+            );
         }
 
         decoded
@@ -649,7 +777,11 @@ impl LZDiff {
         // Bounds check before reading next character
         if i >= data.len() {
             eprintln!("ERROR: decode_match - expected comma or period at position {} but data length is {}", i, data.len());
-            eprintln!("  ref_pos={}, data prefix: {:?}", ref_pos, &data[..data.len().min(20)]);
+            eprintln!(
+                "  ref_pos={}, data prefix: {:?}",
+                ref_pos,
+                &data[..data.len().min(20)]
+            );
             panic!("Malformed LZ match encoding: missing separator after position");
         }
 
@@ -662,8 +794,16 @@ impl LZDiff {
             i += 1; // Skip comma
 
             if i >= data.len() {
-                eprintln!("ERROR: decode_match - expected length at position {} but data length is {}", i, data.len());
-                eprintln!("  ref_pos={}, data prefix: {:?}", ref_pos, &data[..data.len().min(20)]);
+                eprintln!(
+                    "ERROR: decode_match - expected length at position {} but data length is {}",
+                    i,
+                    data.len()
+                );
+                eprintln!(
+                    "  ref_pos={}, data prefix: {:?}",
+                    ref_pos,
+                    &data[..data.len().min(20)]
+                );
                 panic!("Malformed LZ match encoding: missing length after comma");
             }
 
@@ -672,8 +812,15 @@ impl LZDiff {
             i += 1; // Skip period
             (raw_len as u32) + self.min_match_len
         } else {
-            eprintln!("ERROR: decode_match - unexpected character {} at position {}", data[i], i);
-            eprintln!("  ref_pos={}, data prefix: {:?}", ref_pos, &data[..data.len().min(20)]);
+            eprintln!(
+                "ERROR: decode_match - unexpected character {} at position {}",
+                data[i], i
+            );
+            eprintln!(
+                "  ref_pos={}, data prefix: {:?}",
+                ref_pos,
+                &data[..data.len().min(20)]
+            );
             panic!("Malformed LZ match encoding: expected comma or period");
         };
 
@@ -818,16 +965,27 @@ impl LZDiff {
 
     /// Compute decimal digit length like C++ int_len()
     fn int_len(x: u32) -> u32 {
-        if x < 10 { 1 }
-        else if x < 100 { 2 }
-        else if x < 1_000 { 3 }
-        else if x < 10_000 { 4 }
-        else if x < 100_000 { 5 }
-        else if x < 1_000_000 { 6 }
-        else if x < 10_000_000 { 7 }
-        else if x < 100_000_000 { 8 }
-        else if x < 1_000_000_000 { 9 }
-        else { 10 }
+        if x < 10 {
+            1
+        } else if x < 100 {
+            2
+        } else if x < 1_000 {
+            3
+        } else if x < 10_000 {
+            4
+        } else if x < 100_000 {
+            5
+        } else if x < 1_000_000 {
+            6
+        } else if x < 10_000_000 {
+            7
+        } else if x < 100_000_000 {
+            8
+        } else if x < 1_000_000_000 {
+            9
+        } else {
+            10
+        }
     }
 
     /// Compute coding cost for N-run (matches C++ coding_cost_Nrun)
@@ -854,14 +1012,23 @@ impl LZDiff {
 
     /// Compute uint_len like C++ CLZDiff_V2::uint_len (caps at 8 digits)
     fn uint_len_v2(x: u32) -> u32 {
-        if x < 10 { 1 }
-        else if x < 100 { 2 }
-        else if x < 1_000 { 3 }
-        else if x < 10_000 { 4 }
-        else if x < 100_000 { 5 }
-        else if x < 1_000_000 { 6 }
-        else if x < 10_000_000 { 7 }
-        else { 8 }
+        if x < 10 {
+            1
+        } else if x < 100 {
+            2
+        } else if x < 1_000 {
+            3
+        } else if x < 10_000 {
+            4
+        } else if x < 100_000 {
+            5
+        } else if x < 1_000_000 {
+            6
+        } else if x < 10_000_000 {
+            7
+        } else {
+            8
+        }
     }
 
     /// Compute int_len like C++ CLZDiff_V2::int_len
@@ -909,7 +1076,11 @@ impl LZDiff {
 
         // Quick check for equal sequences
         if text_size == self.reference_len as u32 {
-            if target.iter().zip(self.reference.iter()).all(|(a, b)| a == b) {
+            if target
+                .iter()
+                .zip(self.reference.iter())
+                .all(|(a, b)| a == b)
+            {
                 return 0; // Equal sequences
             }
         }
@@ -958,9 +1129,14 @@ impl LZDiff {
             let hash = MurMur64Hash::hash(kmer_code);
             let max_len = (text_size - i) as usize;
 
-            if let Some((match_pos, len_bck, len_fwd)) =
-                self.find_best_match_lp(kmer_code, hash, target, i as usize, max_len, no_prev_literals as usize)
-            {
+            if let Some((match_pos, len_bck, len_fwd)) = self.find_best_match_lp(
+                kmer_code,
+                hash,
+                target,
+                i as usize,
+                max_len,
+                no_prev_literals as usize,
+            ) {
                 let total_len = len_bck + len_fwd;
                 // CRITICAL: C++ AGC's Estimate uses match_pos directly (NOT adjusted by len_bck)
                 // This differs from the actual encode which does adjust for backward extension

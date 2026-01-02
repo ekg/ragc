@@ -47,7 +47,9 @@ pub fn inspect_archive(archive_path: PathBuf, config: InspectConfig) -> Result<(
     };
 
     let mut decompressor = Decompressor::open(
-        archive_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
+        archive_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
         dec_config,
     )?;
 
@@ -65,8 +67,11 @@ pub fn inspect_archive(archive_path: PathBuf, config: InspectConfig) -> Result<(
     println!("Samples: {}", samples.len());
 
     // Check if this is a segment lookup query
-    if let (Some(sample), Some(contig), Some(idx)) =
-        (&config.sample_filter, &config.contig_filter, config.segment_index) {
+    if let (Some(sample), Some(contig), Some(idx)) = (
+        &config.sample_filter,
+        &config.contig_filter,
+        config.segment_index,
+    ) {
         lookup_segment(&mut decompressor, sample, contig, idx)?;
         return Ok(());
     }
@@ -110,8 +115,10 @@ fn inspect_groups(decompressor: &mut Decompressor, config: &InspectConfig) -> Re
     if let Some(filter_gid) = config.group_id_filter {
         // Show only filtered group
         if let Some(stats) = group_stats.iter().find(|s| s.0 == filter_gid) {
-            println!("Group {}: total={}, refs={}, deltas={}",
-                     stats.0, stats.1, stats.2, stats.3);
+            println!(
+                "Group {}: total={}, refs={}, deltas={}",
+                stats.0, stats.1, stats.2, stats.3
+            );
         } else {
             println!("Group {} not found", filter_gid);
         }
@@ -148,7 +155,10 @@ fn inspect_segments(decompressor: &mut Decompressor, config: &InspectConfig) -> 
     for (sample_name, contig_name, segments) in &all_segments {
         // Filter by group if requested
         let filtered_segments: Vec<_> = if let Some(filter_gid) = config.group_id_filter {
-            segments.iter().filter(|s| s.group_id == filter_gid).collect()
+            segments
+                .iter()
+                .filter(|s| s.group_id == filter_gid)
+                .collect()
         } else {
             segments.iter().collect()
         };
@@ -160,8 +170,10 @@ fn inspect_segments(decompressor: &mut Decompressor, config: &InspectConfig) -> 
         println!("\n{}/{}", sample_name, contig_name);
         println!("  Segments: {}", filtered_segments.len());
         for (i, seg) in filtered_segments.iter().enumerate() {
-            println!("    [{}] group={}, in_group={}, rc={}, len={}",
-                     i, seg.group_id, seg.in_group_id, seg.is_rev_comp, seg.raw_length);
+            println!(
+                "    [{}] group={}, in_group={}, rc={}, len={}",
+                i, seg.group_id, seg.in_group_id, seg.is_rev_comp, seg.raw_length
+            );
         }
     }
 
@@ -169,7 +181,12 @@ fn inspect_segments(decompressor: &mut Decompressor, config: &InspectConfig) -> 
 }
 
 /// Look up which group a specific segment ended up in
-fn lookup_segment(decompressor: &mut Decompressor, sample: &str, contig: &str, index: usize) -> Result<()> {
+fn lookup_segment(
+    decompressor: &mut Decompressor,
+    sample: &str,
+    contig: &str,
+    index: usize,
+) -> Result<()> {
     println!("\n=== Segment Lookup ===");
     println!("Sample: {}", sample);
     println!("Contig: {}", contig);
@@ -189,7 +206,11 @@ fn lookup_segment(decompressor: &mut Decompressor, sample: &str, contig: &str, i
                 println!("  Length:      {}", seg.raw_length);
                 return Ok(());
             } else {
-                println!("ERROR: Index {} out of range (contig has {} segments)", index, segments.len());
+                println!(
+                    "ERROR: Index {} out of range (contig has {} segments)",
+                    index,
+                    segments.len()
+                );
                 return Ok(());
             }
         }
@@ -207,7 +228,8 @@ fn show_single_segment_groups(decompressor: &mut Decompressor) -> Result<()> {
     let all_segments = decompressor.get_all_segments()?;
 
     // Find all groups with exactly 1 segment
-    let single_groups: Vec<_> = group_stats.iter()
+    let single_groups: Vec<_> = group_stats
+        .iter()
         .filter(|(_, total, _, _)| *total == 1)
         .map(|(gid, _, _, _)| *gid)
         .collect();
@@ -220,8 +242,10 @@ fn show_single_segment_groups(decompressor: &mut Decompressor) -> Result<()> {
         for (sample_name, contig_name, segments) in &all_segments {
             for (idx, seg) in segments.iter().enumerate() {
                 if seg.group_id == *group_id {
-                    println!("Group {}: {}/{} segment[{}] len={} rc={}",
-                             group_id, sample_name, contig_name, idx, seg.raw_length, seg.is_rev_comp);
+                    println!(
+                        "Group {}: {}/{} segment[{}] len={} rc={}",
+                        group_id, sample_name, contig_name, idx, seg.raw_length, seg.is_rev_comp
+                    );
                 }
             }
         }
@@ -239,9 +263,16 @@ fn show_segment_layout(decompressor: &mut Decompressor) -> Result<()> {
 
     for (sample_name, contig_name, segments) in &all_segments {
         for (seg_idx, seg) in segments.iter().enumerate() {
-            println!("{},{},{},{},{},{},{}",
-                sample_name, contig_name, seg_idx,
-                seg.group_id, seg.in_group_id, seg.is_rev_comp, seg.raw_length);
+            println!(
+                "{},{},{},{},{},{},{}",
+                sample_name,
+                contig_name,
+                seg_idx,
+                seg.group_id,
+                seg.in_group_id,
+                seg.is_rev_comp,
+                seg.raw_length
+            );
         }
     }
 
@@ -262,11 +293,25 @@ fn show_compression_stats(decompressor: &Decompressor) -> Result<()> {
     println!("\nOverall:");
     println!("  Total streams:     {}", stats.len());
     println!("  Total parts:       {}", total_parts);
-    println!("  Total raw size:    {} bytes ({:.2} MB)", total_raw, total_raw as f64 / 1_000_000.0);
-    println!("  Total packed size: {} bytes ({:.2} MB)", total_packed, total_packed as f64 / 1_000_000.0);
+    println!(
+        "  Total raw size:    {} bytes ({:.2} MB)",
+        total_raw,
+        total_raw as f64 / 1_000_000.0
+    );
+    println!(
+        "  Total packed size: {} bytes ({:.2} MB)",
+        total_packed,
+        total_packed as f64 / 1_000_000.0
+    );
     if total_raw > 0 {
-        println!("  Compression ratio: {:.2}:1", total_raw as f64 / total_packed as f64);
-        println!("  Space saved:       {:.2}%", (1.0 - (total_packed as f64 / total_raw as f64)) * 100.0);
+        println!(
+            "  Compression ratio: {:.2}:1",
+            total_raw as f64 / total_packed as f64
+        );
+        println!(
+            "  Space saved:       {:.2}%",
+            (1.0 - (total_packed as f64 / total_raw as f64)) * 100.0
+        );
     }
 
     // Group streams by type
@@ -289,9 +334,16 @@ fn show_compression_stats(decompressor: &Decompressor) -> Result<()> {
         println!("\n=== Reference Streams ({}) ===", ref_streams.len());
         let ref_raw: u64 = ref_streams.iter().map(|(_, raw, _, _)| raw).sum();
         let ref_packed: u64 = ref_streams.iter().map(|(_, _, packed, _)| packed).sum();
-        println!("Total: {} bytes -> {} bytes (ratio: {:.2}:1)",
-                 ref_raw, ref_packed,
-                 if ref_packed > 0 { ref_raw as f64 / ref_packed as f64 } else { 0.0 });
+        println!(
+            "Total: {} bytes -> {} bytes (ratio: {:.2}:1)",
+            ref_raw,
+            ref_packed,
+            if ref_packed > 0 {
+                ref_raw as f64 / ref_packed as f64
+            } else {
+                0.0
+            }
+        );
     }
 
     // Show delta streams
@@ -299,9 +351,16 @@ fn show_compression_stats(decompressor: &Decompressor) -> Result<()> {
         println!("\n=== Delta Streams ({}) ===", delta_streams.len());
         let delta_raw: u64 = delta_streams.iter().map(|(_, raw, _, _)| raw).sum();
         let delta_packed: u64 = delta_streams.iter().map(|(_, _, packed, _)| packed).sum();
-        println!("Total: {} bytes -> {} bytes (ratio: {:.2}:1)",
-                 delta_raw, delta_packed,
-                 if delta_packed > 0 { delta_raw as f64 / delta_packed as f64 } else { 0.0 });
+        println!(
+            "Total: {} bytes -> {} bytes (ratio: {:.2}:1)",
+            delta_raw,
+            delta_packed,
+            if delta_packed > 0 {
+                delta_raw as f64 / delta_packed as f64
+            } else {
+                0.0
+            }
+        );
     }
 
     // Show metadata/other streams
@@ -329,10 +388,12 @@ fn show_pack_layout(decompressor: &mut Decompressor) -> Result<()> {
 
     for (sample_name, contig_name, segments) in &all_segments {
         for (seg_idx, seg) in segments.iter().enumerate() {
-            group_segments
-                .entry(seg.group_id)
-                .or_default()
-                .push((sample_name.clone(), contig_name.clone(), seg_idx, seg.in_group_id as usize));
+            group_segments.entry(seg.group_id).or_default().push((
+                sample_name.clone(),
+                contig_name.clone(),
+                seg_idx,
+                seg.in_group_id as usize,
+            ));
         }
     }
 
@@ -402,17 +463,17 @@ fn show_pack_layout(decompressor: &mut Decompressor) -> Result<()> {
 /// Decode base64 stream name to group_id (matches C++ int_to_base64)
 fn base64_decode(s: &str) -> u32 {
     const DIGITS: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_#";
-    
+
     let mut result = 0u32;
     let mut multiplier = 1u32;
-    
+
     for c in s.chars() {
         if let Some(digit_value) = DIGITS.find(c) {
             result += (digit_value as u32) * multiplier;
             multiplier *= 64;
         }
     }
-    
+
     result
 }
 // Archive comparison functions for debugging differences between implementations
@@ -423,18 +484,26 @@ fn base64_decode(s: &str) -> u32 {
 // 4. Pack structure: How do ZSTD pack boundaries differ?
 
 /// Main comparison entry point - calls all 4 comparison functions
-fn compare_archives(archive1_path: &Path, archive2_path: &Path, config: &InspectConfig) -> Result<()> {
+fn compare_archives(
+    archive1_path: &Path,
+    archive2_path: &Path,
+    config: &InspectConfig,
+) -> Result<()> {
     let dec_config = DecompressorConfig {
         verbosity: config.verbosity,
     };
 
     let mut dec1 = Decompressor::open(
-        archive1_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
+        archive1_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
         dec_config.clone(),
     )?;
 
     let mut dec2 = Decompressor::open(
-        archive2_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
+        archive2_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
         dec_config,
     )?;
 
@@ -471,13 +540,19 @@ fn compare_segment_boundaries(
 
     for (sample, contig, segments) in &segs1 {
         for (idx, seg) in segments.iter().enumerate() {
-            map1.insert((sample.clone(), contig.clone(), idx), seg.raw_length as usize);
+            map1.insert(
+                (sample.clone(), contig.clone(), idx),
+                seg.raw_length as usize,
+            );
         }
     }
 
     for (sample, contig, segments) in &segs2 {
         for (idx, seg) in segments.iter().enumerate() {
-            map2.insert((sample.clone(), contig.clone(), idx), seg.raw_length as usize);
+            map2.insert(
+                (sample.clone(), contig.clone(), idx),
+                seg.raw_length as usize,
+            );
         }
     }
 
@@ -506,8 +581,16 @@ fn compare_segment_boundaries(
     }
 
     println!("Total segments:");
-    println!("  {}: {} segments", arch1_name.file_name().unwrap().to_str().unwrap(), map1.len());
-    println!("  {}: {} segments", arch2_name.file_name().unwrap().to_str().unwrap(), map2.len());
+    println!(
+        "  {}: {} segments",
+        arch1_name.file_name().unwrap().to_str().unwrap(),
+        map1.len()
+    );
+    println!(
+        "  {}: {} segments",
+        arch2_name.file_name().unwrap().to_str().unwrap(),
+        map2.len()
+    );
     println!();
 
     if diff_lengths.is_empty() && only_in_1.is_empty() && only_in_2.is_empty() {
@@ -515,7 +598,9 @@ fn compare_segment_boundaries(
     } else {
         println!("❌ DIFFERENT segment splitting:");
         println!("  Note: Segments are compared by INDEX, not genomic position.");
-        println!("  When one archive splits a segment and the other doesn't, indices become misaligned.");
+        println!(
+            "  When one archive splits a segment and the other doesn't, indices become misaligned."
+        );
         println!();
         println!("  Segment index mismatches: {}", diff_lengths.len());
         println!("  Extra segments in archive 1: {}", only_in_1.len());
@@ -525,8 +610,15 @@ fn compare_segment_boundaries(
         if !diff_lengths.is_empty() {
             println!("\nFirst 10 index mismatches (may indicate different split decisions):");
             for ((sample, contig, idx), len1, len2) in diff_lengths.iter().take(10) {
-                println!("  {} {} seg[{}]: {} vs {} bytes (diff: {})",
-                    sample, contig, idx, len1, len2, (*len1 as i64 - *len2 as i64).abs());
+                println!(
+                    "  {} {} seg[{}]: {} vs {} bytes (diff: {})",
+                    sample,
+                    contig,
+                    idx,
+                    len1,
+                    len2,
+                    (*len1 as i64 - *len2 as i64).abs()
+                );
             }
         }
 
@@ -592,15 +684,29 @@ fn compare_grouping(
             // Check if these groups have identical membership
             if let (Some(members1), Some(members2)) = (groups1.get(gid1), groups2.get(gid2)) {
                 if members1 != members2 {
-                    mismatched_segments.push((key.clone(), *gid1, *gid2, members1.len(), members2.len()));
+                    mismatched_segments.push((
+                        key.clone(),
+                        *gid1,
+                        *gid2,
+                        members1.len(),
+                        members2.len(),
+                    ));
                 }
             }
         }
     }
 
     println!("Total groups:");
-    println!("  {}: {} groups", arch1_name.file_name().unwrap().to_str().unwrap(), groups1.len());
-    println!("  {}: {} groups", arch2_name.file_name().unwrap().to_str().unwrap(), groups2.len());
+    println!(
+        "  {}: {} groups",
+        arch1_name.file_name().unwrap().to_str().unwrap(),
+        groups1.len()
+    );
+    println!(
+        "  {}: {} groups",
+        arch2_name.file_name().unwrap().to_str().unwrap(),
+        groups2.len()
+    );
     println!();
 
     if mismatched_segments.is_empty() {
@@ -609,10 +715,14 @@ fn compare_grouping(
         println!("   (Group IDs may differ, but that's just labeling)");
     } else {
         println!("❌ DIFFERENT logical grouping:");
-        println!("  {} segments are in groups with different membership", mismatched_segments.len());
+        println!(
+            "  {} segments are in groups with different membership",
+            mismatched_segments.len()
+        );
 
         println!("\nFirst 10 segments with different group membership:");
-        for ((sample, contig, idx), gid1, gid2, size1, size2) in mismatched_segments.iter().take(10) {
+        for ((sample, contig, idx), gid1, gid2, size1, size2) in mismatched_segments.iter().take(10)
+        {
             println!("  {} {} seg[{}]:", sample, contig, idx);
             println!("    Archive 1: group {} ({} segments)", gid1, size1);
             println!("    Archive 2: group {} ({} segments)", gid2, size2);
@@ -661,13 +771,21 @@ fn compare_references(
 
     for (sample, contig, segments) in &segs1 {
         for (idx, seg) in segments.iter().enumerate() {
-            group_members1.entry(seg.group_id).or_default().insert((sample.clone(), contig.clone(), idx));
+            group_members1.entry(seg.group_id).or_default().insert((
+                sample.clone(),
+                contig.clone(),
+                idx,
+            ));
         }
     }
 
     for (sample, contig, segments) in &segs2 {
         for (idx, seg) in segments.iter().enumerate() {
-            group_members2.entry(seg.group_id).or_default().insert((sample.clone(), contig.clone(), idx));
+            group_members2.entry(seg.group_id).or_default().insert((
+                sample.clone(),
+                contig.clone(),
+                idx,
+            ));
         }
     }
 
@@ -702,8 +820,16 @@ fn compare_references(
     }
 
     println!("Total groups with references:");
-    println!("  {}: {} groups", arch1_name.file_name().unwrap().to_str().unwrap(), refs1.len());
-    println!("  {}: {} groups", arch2_name.file_name().unwrap().to_str().unwrap(), refs2.len());
+    println!(
+        "  {}: {} groups",
+        arch1_name.file_name().unwrap().to_str().unwrap(),
+        refs1.len()
+    );
+    println!(
+        "  {}: {} groups",
+        arch2_name.file_name().unwrap().to_str().unwrap(),
+        refs2.len()
+    );
     println!();
 
     if diff_refs.is_empty() {
@@ -711,7 +837,10 @@ fn compare_references(
         println!("   All groups choose the same segment as reference.");
     } else {
         println!("❌ DIFFERENT reference selection:");
-        println!("  {} groups have different reference segments", diff_refs.len());
+        println!(
+            "  {} groups have different reference segments",
+            diff_refs.len()
+        );
 
         println!("\nFirst 10 groups with different references:");
         for (gid1, gid2, (s1, c1, i1), (s2, c2, i2), size) in diff_refs.iter().take(10) {
@@ -768,10 +897,18 @@ fn compare_orientations(
     let rc_true_2 = map2.values().filter(|&&rc| rc).count();
 
     println!("Orientation statistics:");
-    println!("  {}: {} rev_comp=true out of {} total",
-        arch1_name.file_name().unwrap().to_str().unwrap(), rc_true_1, map1.len());
-    println!("  {}: {} rev_comp=true out of {} total",
-        arch2_name.file_name().unwrap().to_str().unwrap(), rc_true_2, map2.len());
+    println!(
+        "  {}: {} rev_comp=true out of {} total",
+        arch1_name.file_name().unwrap().to_str().unwrap(),
+        rc_true_1,
+        map1.len()
+    );
+    println!(
+        "  {}: {} rev_comp=true out of {} total",
+        arch2_name.file_name().unwrap().to_str().unwrap(),
+        rc_true_2,
+        map2.len()
+    );
     println!();
 
     if diff_orientations.is_empty() {
@@ -779,18 +916,25 @@ fn compare_orientations(
         println!("   All segments have the same is_rev_comp flag.");
     } else {
         println!("❌ DIFFERENT segment orientations:");
-        println!("  {} segments have different orientations", diff_orientations.len());
+        println!(
+            "  {} segments have different orientations",
+            diff_orientations.len()
+        );
 
         println!("\nFirst 20 segments with different orientations:");
         for ((sample, contig, idx), rc1, rc2) in diff_orientations.iter().take(20) {
-            println!("  {} {} seg[{}]: archive1 rc={} vs archive2 rc={}",
-                sample, contig, idx, rc1, rc2);
+            println!(
+                "  {} {} seg[{}]: archive1 rc={} vs archive2 rc={}",
+                sample, contig, idx, rc1, rc2
+            );
         }
 
         // Show summary by contig
         let mut contig_diffs: BTreeMap<(String, String), usize> = BTreeMap::new();
         for ((sample, contig, _), _, _) in &diff_orientations {
-            *contig_diffs.entry((sample.clone(), contig.clone())).or_default() += 1;
+            *contig_diffs
+                .entry((sample.clone(), contig.clone()))
+                .or_default() += 1;
         }
 
         println!("\nOrientation differences by contig:");
@@ -841,17 +985,27 @@ fn compare_packs(
     let total_packed2: u64 = stats2.iter().map(|(_, _, packed, _)| packed).sum();
 
     println!("Archive sizes:");
-    println!("  {}: {:.2} MB raw → {:.2} MB packed (ratio: {:.2}:1)",
+    println!(
+        "  {}: {:.2} MB raw → {:.2} MB packed (ratio: {:.2}:1)",
         arch1_name.file_name().unwrap().to_str().unwrap(),
         total_raw1 as f64 / 1_000_000.0,
         total_packed1 as f64 / 1_000_000.0,
-        if total_packed1 > 0 { total_raw1 as f64 / total_packed1 as f64 } else { 0.0 }
+        if total_packed1 > 0 {
+            total_raw1 as f64 / total_packed1 as f64
+        } else {
+            0.0
+        }
     );
-    println!("  {}: {:.2} MB raw → {:.2} MB packed (ratio: {:.2}:1)",
+    println!(
+        "  {}: {:.2} MB raw → {:.2} MB packed (ratio: {:.2}:1)",
         arch2_name.file_name().unwrap().to_str().unwrap(),
         total_raw2 as f64 / 1_000_000.0,
         total_packed2 as f64 / 1_000_000.0,
-        if total_packed2 > 0 { total_raw2 as f64 / total_packed2 as f64 } else { 0.0 }
+        if total_packed2 > 0 {
+            total_raw2 as f64 / total_packed2 as f64
+        } else {
+            0.0
+        }
     );
     println!();
 

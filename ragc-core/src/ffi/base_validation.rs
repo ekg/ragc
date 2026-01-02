@@ -50,10 +50,7 @@ pub struct BaseCounts {
 }
 
 #[no_mangle]
-pub extern "C" fn ragc_count_base_validity(
-    sequence: *const u8,
-    length: usize,
-) -> BaseCounts {
+pub extern "C" fn ragc_count_base_validity(sequence: *const u8, length: usize) -> BaseCounts {
     unsafe {
         let seq = std::slice::from_raw_parts(sequence, length);
 
@@ -156,8 +153,8 @@ mod tests {
         let sequence = vec![0, 1, 2, 3, 4, 0, 1, 5]; // ACGTNACX
         let counts = ragc_count_base_validity(sequence.as_ptr(), sequence.len());
 
-        assert_eq!(counts.n_valid, 6);    // A,C,G,T,A,C
-        assert_eq!(counts.n_invalid, 2);  // N,X
+        assert_eq!(counts.n_valid, 6); // A,C,G,T,A,C
+        assert_eq!(counts.n_invalid, 2); // N,X
     }
 
     #[test]

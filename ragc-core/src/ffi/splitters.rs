@@ -2,8 +2,8 @@
 
 use crate::{determine_splitters, GenomeIO};
 use std::ffi::CStr;
-use std::os::raw::c_char;
 use std::fs::File;
+use std::os::raw::c_char;
 
 /// C-compatible result structure for splitter detection
 #[repr(C)]
@@ -27,13 +27,25 @@ pub extern "C" fn ragc_free_splitters(result: *mut SplitterResult) {
         let r = Box::from_raw(result);
 
         if !r.splitters.is_null() {
-            drop(Vec::from_raw_parts(r.splitters, r.n_splitters, r.n_splitters));
+            drop(Vec::from_raw_parts(
+                r.splitters,
+                r.n_splitters,
+                r.n_splitters,
+            ));
         }
         if !r.singletons.is_null() {
-            drop(Vec::from_raw_parts(r.singletons, r.n_singletons, r.n_singletons));
+            drop(Vec::from_raw_parts(
+                r.singletons,
+                r.n_singletons,
+                r.n_singletons,
+            ));
         }
         if !r.duplicates.is_null() {
-            drop(Vec::from_raw_parts(r.duplicates, r.n_duplicates, r.n_duplicates));
+            drop(Vec::from_raw_parts(
+                r.duplicates,
+                r.n_duplicates,
+                r.n_duplicates,
+            ));
         }
     }
 }

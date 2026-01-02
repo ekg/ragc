@@ -13,15 +13,16 @@
 
 use anyhow::{bail, Context, Result};
 use ragc_core::{
-    contig_iterator::ContigIterator,
-    determine_splitters_streaming, Decompressor, DecompressorConfig, MultiFileIterator,
-    StreamingQueueCompressor, StreamingQueueConfig,
+    contig_iterator::ContigIterator, determine_splitters_streaming, Decompressor,
+    DecompressorConfig, MultiFileIterator, StreamingQueueCompressor, StreamingQueueConfig,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn build_ragc_archive(out_path: &str, inputs: &[PathBuf]) -> Result<()> {
-    if inputs.is_empty() { bail!("RAGC_INPUTS is empty"); }
+    if inputs.is_empty() {
+        bail!("RAGC_INPUTS is empty");
+    }
 
     let k = 21usize;
     let segment_size = 10000usize;
@@ -60,7 +61,10 @@ fn layout_map(archive_path: &str) -> Result<BTreeMap<(String, String), Vec<usize
         .with_context(|| format!("Failed to open archive: {}", archive_path))?;
     let mut map: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
     for (sample, contig, segs) in dec.get_all_segments()? {
-        let lens = segs.iter().map(|s| s.raw_length as usize).collect::<Vec<_>>();
+        let lens = segs
+            .iter()
+            .map(|s| s.raw_length as usize)
+            .collect::<Vec<_>>();
         map.insert((sample, contig), lens);
     }
     Ok(map)
@@ -70,15 +74,11 @@ fn layout_map(archive_path: &str) -> Result<BTreeMap<(String, String), Vec<usize
 #[ignore]
 fn layout_parity_against_cpp_archive() -> Result<()> {
     // Read environment config
-    let cpp_archive = std::env::var("RAGC_CPP_ARCHIVE")
-        .unwrap_or_else(|_| String::new());
-    let inputs = std::env::var("RAGC_INPUTS")
-        .unwrap_or_else(|_| String::new());
+    let cpp_archive = std::env::var("RAGC_CPP_ARCHIVE").unwrap_or_else(|_| String::new());
+    let inputs = std::env::var("RAGC_INPUTS").unwrap_or_else(|_| String::new());
 
     if cpp_archive.is_empty() || inputs.is_empty() {
-        eprintln!(
-            "Skipping: set RAGC_CPP_ARCHIVE and RAGC_INPUTS to run this test"
-        );
+        eprintln!("Skipping: set RAGC_CPP_ARCHIVE and RAGC_INPUTS to run this test");
         return Ok(());
     }
 
@@ -105,12 +105,20 @@ fn layout_parity_against_cpp_archive() -> Result<()> {
     // Compare lengths per segment index
     for (key, lens_a) in &a {
         let lens_b = &b[key];
-        assert_eq!(lens_a.len(), lens_b.len(), "Row count differs for {:?}", key);
+        assert_eq!(
+            lens_a.len(),
+            lens_b.len(),
+            "Row count differs for {:?}",
+            key
+        );
         for (i, (la, lb)) in lens_a.iter().zip(lens_b.iter()).enumerate() {
-            assert_eq!(la, lb, "Length mismatch at {:?} index {}: {} vs {}", key, i, la, lb);
+            assert_eq!(
+                la, lb,
+                "Length mismatch at {:?} index {}: {} vs {}",
+                key, i, la, lb
+            );
         }
     }
 
     Ok(())
 }
-

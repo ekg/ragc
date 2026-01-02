@@ -29,11 +29,7 @@ extern "C" {
         kmer_length: u32,
     ) -> bool;
     fn agc_collection_complete_serialization(coll_ptr: *mut std::ffi::c_void);
-    fn agc_collection_store_contig_batch(
-        coll_ptr: *mut std::ffi::c_void,
-        id_from: u32,
-        id_to: u32,
-    );
+    fn agc_collection_store_contig_batch(coll_ptr: *mut std::ffi::c_void, id_from: u32, id_to: u32);
     fn agc_collection_get_no_samples(coll_ptr: *mut std::ffi::c_void) -> usize;
     fn agc_collection_destroy(coll_ptr: *mut std::ffi::c_void);
 
@@ -114,7 +110,10 @@ impl CppArchive {
             if agc_archive_add_part(self.ptr, stream_id, data.as_ptr(), data.len(), metadata) {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!("Failed to add part to stream {}", stream_id))
+                Err(anyhow::anyhow!(
+                    "Failed to add part to stream {}",
+                    stream_id
+                ))
             }
         }
     }
@@ -184,7 +183,11 @@ impl CppCollection {
         }
     }
 
-    pub fn register_sample_contig(&mut self, sample_name: &str, contig_name: &str) -> anyhow::Result<()> {
+    pub fn register_sample_contig(
+        &mut self,
+        sample_name: &str,
+        contig_name: &str,
+    ) -> anyhow::Result<()> {
         let c_sample_name = CString::new(sample_name)?;
         let c_contig_name = CString::new(contig_name)?;
 
@@ -256,9 +259,7 @@ impl CppCollection {
     }
 
     pub fn get_no_samples(&self) -> usize {
-        unsafe {
-            agc_collection_get_no_samples(self.ptr)
-        }
+        unsafe { agc_collection_get_no_samples(self.ptr) }
     }
 }
 

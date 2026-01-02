@@ -32,7 +32,8 @@ pub fn debug_ref_write() -> bool {
 
 static DEBUG_COMPRESSION_SIZES_CACHE: OnceLock<bool> = OnceLock::new();
 pub fn debug_compression_sizes() -> bool {
-    *DEBUG_COMPRESSION_SIZES_CACHE.get_or_init(|| std::env::var("RAGC_DEBUG_COMPRESSION_SIZES").is_ok())
+    *DEBUG_COMPRESSION_SIZES_CACHE
+        .get_or_init(|| std::env::var("RAGC_DEBUG_COMPRESSION_SIZES").is_ok())
 }
 
 static DEBUG_IS_DIR_CACHE: OnceLock<bool> = OnceLock::new();
@@ -72,7 +73,8 @@ pub fn debug_fallback2() -> bool {
 
 static DEBUG_SEGMENT_COVERAGE_CACHE: OnceLock<bool> = OnceLock::new();
 pub fn debug_segment_coverage() -> bool {
-    *DEBUG_SEGMENT_COVERAGE_CACHE.get_or_init(|| std::env::var("RAGC_DEBUG_SEGMENT_COVERAGE").is_ok())
+    *DEBUG_SEGMENT_COVERAGE_CACHE
+        .get_or_init(|| std::env::var("RAGC_DEBUG_SEGMENT_COVERAGE").is_ok())
 }
 
 static DEBUG_ENDPOS_CACHE: OnceLock<bool> = OnceLock::new();
@@ -123,7 +125,8 @@ pub fn debug_reconstruct() -> bool {
 // Boolean env vars with specific value checks
 static DEBUG_LZ_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
 pub fn debug_lz_enabled() -> bool {
-    *DEBUG_LZ_ENABLED_CACHE.get_or_init(|| std::env::var("RAGC_DEBUG_LZ").unwrap_or_default() == "1")
+    *DEBUG_LZ_ENABLED_CACHE
+        .get_or_init(|| std::env::var("RAGC_DEBUG_LZ").unwrap_or_default() == "1")
 }
 
 static SPLIT_ALL_CACHE: OnceLock<bool> = OnceLock::new();
@@ -133,7 +136,8 @@ pub fn split_all() -> bool {
 
 static SPLIT_CREATE_GROUPS_CACHE: OnceLock<bool> = OnceLock::new();
 pub fn split_create_groups() -> bool {
-    *SPLIT_CREATE_GROUPS_CACHE.get_or_init(|| std::env::var("RAGC_SPLIT_CREATE_GROUPS").unwrap_or_default() == "1")
+    *SPLIT_CREATE_GROUPS_CACHE
+        .get_or_init(|| std::env::var("RAGC_SPLIT_CREATE_GROUPS").unwrap_or_default() == "1")
 }
 
 static GROUP_LOG_CACHE: OnceLock<bool> = OnceLock::new();
@@ -143,13 +147,15 @@ pub fn group_log() -> bool {
 
 static DEBUG_FALLBACK2_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
 pub fn debug_fallback2_enabled() -> bool {
-    *DEBUG_FALLBACK2_ENABLED_CACHE.get_or_init(|| std::env::var("RAGC_DEBUG_FALLBACK2").unwrap_or_default() == "1")
+    *DEBUG_FALLBACK2_ENABLED_CACHE
+        .get_or_init(|| std::env::var("RAGC_DEBUG_FALLBACK2").unwrap_or_default() == "1")
 }
 
 // Optional: cache the assert path (less hot but still called)
 static ASSERT_CPP_ARCHIVE_CACHE: OnceLock<Option<String>> = OnceLock::new();
 pub fn assert_cpp_archive() -> Option<&'static str> {
-    ASSERT_CPP_ARCHIVE_CACHE.get_or_init(|| std::env::var("RAGC_ASSERT_CPP_ARCHIVE").ok())
+    ASSERT_CPP_ARCHIVE_CACHE
+        .get_or_init(|| std::env::var("RAGC_ASSERT_CPP_ARCHIVE").ok())
         .as_deref()
 }
 

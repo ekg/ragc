@@ -1,6 +1,6 @@
 use ragc_common::archive::Archive;
 use ragc_core::decompress_segment_with_marker;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 fn hash_data(data: &[u8]) -> String {
@@ -41,11 +41,13 @@ fn main() -> anyhow::Result<()> {
         s.starts_with("seg-") || (s.starts_with("x") && (s.ends_with("r") || s.ends_with("d")))
     };
 
-    let cpp_seg_streams: Vec<String> = cpp_streams.iter()
+    let cpp_seg_streams: Vec<String> = cpp_streams
+        .iter()
         .filter(is_segment_stream)
         .cloned()
         .collect();
-    let ragc_seg_streams: Vec<String> = ragc_streams.iter()
+    let ragc_seg_streams: Vec<String> = ragc_streams
+        .iter()
         .filter(is_segment_stream)
         .cloned()
         .collect();
@@ -58,7 +60,10 @@ fn main() -> anyhow::Result<()> {
     let cpp_set: std::collections::HashSet<_> = cpp_seg_streams.iter().collect();
     let ragc_set: std::collections::HashSet<_> = ragc_seg_streams.iter().collect();
 
-    let mut common_streams: Vec<_> = cpp_set.intersection(&ragc_set).map(|s| s.to_string()).collect();
+    let mut common_streams: Vec<_> = cpp_set
+        .intersection(&ragc_set)
+        .map(|s| s.to_string())
+        .collect();
     common_streams.sort();
 
     println!("  Common streams: {}", common_streams.len());
@@ -228,10 +233,11 @@ fn main() -> anyhow::Result<()> {
             let cpp_hash = &cpp.2;
             let ragc_hash = &ragc.2;
 
-            if cpp_hash.starts_with("DECOMPRESS_FAILED") ||
-               cpp_hash.starts_with("READ_FAILED") ||
-               ragc_hash.starts_with("DECOMPRESS_FAILED") ||
-               ragc_hash.starts_with("READ_FAILED") {
+            if cpp_hash.starts_with("DECOMPRESS_FAILED")
+                || cpp_hash.starts_with("READ_FAILED")
+                || ragc_hash.starts_with("DECOMPRESS_FAILED")
+                || ragc_hash.starts_with("READ_FAILED")
+            {
                 failures += 1;
                 differences.push((*cpp_idx, cpp, ragc, "FAILURE"));
             } else if cpp_hash == ragc_hash {
@@ -267,27 +273,42 @@ fn main() -> anyhow::Result<()> {
 
     if total_compared > 0 {
         println!("\nComparison of common blocks:");
-        println!("  Identical decompressed content: {} ({:.1}%)",
-            identical, 100.0 * identical as f64 / total_compared as f64);
-        println!("  Different content (same size): {} ({:.1}%)",
-            different_content, 100.0 * different_content as f64 / total_compared as f64);
-        println!("  Different decompressed size: {} ({:.1}%)",
-            different_size, 100.0 * different_size as f64 / total_compared as f64);
-        println!("  Decompression failures: {} ({:.1}%)",
-            failures, 100.0 * failures as f64 / total_compared as f64);
+        println!(
+            "  Identical decompressed content: {} ({:.1}%)",
+            identical,
+            100.0 * identical as f64 / total_compared as f64
+        );
+        println!(
+            "  Different content (same size): {} ({:.1}%)",
+            different_content,
+            100.0 * different_content as f64 / total_compared as f64
+        );
+        println!(
+            "  Different decompressed size: {} ({:.1}%)",
+            different_size,
+            100.0 * different_size as f64 / total_compared as f64
+        );
+        println!(
+            "  Decompression failures: {} ({:.1}%)",
+            failures,
+            100.0 * failures as f64 / total_compared as f64
+        );
     }
 
     if !differences.is_empty() {
         println!("\nFirst 20 differing blocks:");
-        println!("{:<6} {:<15} {:<5} {:<18} {:<18} {:<12} {:<12} {:<8}",
-            "Index", "Stream", "Part", "CPP Hash", "RAGC Hash", "Comp Size", "Decomp Size", "Type");
+        println!(
+            "{:<6} {:<15} {:<5} {:<18} {:<18} {:<12} {:<12} {:<8}",
+            "Index", "Stream", "Part", "CPP Hash", "RAGC Hash", "Comp Size", "Decomp Size", "Type"
+        );
         println!("{}", "-".repeat(120));
 
         for (idx, cpp, ragc, diff_type) in differences.iter().take(20) {
             let comp_info = format!("{} vs {}", cpp.3, ragc.3);
             let decomp_info = format!("{} vs {}", cpp.4, ragc.4);
 
-            println!("{:<6} {:<15} {:<5} {:<18} {:<18} {:<12} {:<12} {:<8}",
+            println!(
+                "{:<6} {:<15} {:<5} {:<18} {:<18} {:<12} {:<12} {:<8}",
                 idx,
                 cpp.0.chars().take(13).collect::<String>(),
                 cpp.1,
@@ -295,7 +316,8 @@ fn main() -> anyhow::Result<()> {
                 ragc.2.chars().take(16).collect::<String>(),
                 comp_info,
                 decomp_info,
-                diff_type);
+                diff_type
+            );
         }
     }
 
@@ -307,29 +329,40 @@ fn main() -> anyhow::Result<()> {
     for (key, cpp_idx) in &cpp_map {
         let cpp = &cpp_hashes[*cpp_idx];
 
-        let (ragc_hash, ragc_comp, ragc_decomp, ragc_marker, status) = if let Some(&ragc_idx) = ragc_map.get(key) {
-            let ragc = &ragc_hashes[ragc_idx];
-            let status = if cpp.2.starts_with("DECOMPRESS_FAILED") ||
-                           cpp.2.starts_with("READ_FAILED") ||
-                           ragc.2.starts_with("DECOMPRESS_FAILED") ||
-                           ragc.2.starts_with("READ_FAILED") {
-                "FAILURE"
-            } else if cpp.2 == ragc.2 {
-                "IDENTICAL"
-            } else if cpp.4 == ragc.4 {
-                "CONTENT_DIFFERS"
+        let (ragc_hash, ragc_comp, ragc_decomp, ragc_marker, status) =
+            if let Some(&ragc_idx) = ragc_map.get(key) {
+                let ragc = &ragc_hashes[ragc_idx];
+                let status = if cpp.2.starts_with("DECOMPRESS_FAILED")
+                    || cpp.2.starts_with("READ_FAILED")
+                    || ragc.2.starts_with("DECOMPRESS_FAILED")
+                    || ragc.2.starts_with("READ_FAILED")
+                {
+                    "FAILURE"
+                } else if cpp.2 == ragc.2 {
+                    "IDENTICAL"
+                } else if cpp.4 == ragc.4 {
+                    "CONTENT_DIFFERS"
+                } else {
+                    "SIZE_DIFFERS"
+                };
+                (ragc.2.clone(), ragc.3, ragc.4, ragc.5, status)
             } else {
-                "SIZE_DIFFERS"
+                ("ONLY_IN_CPP".to_string(), 0, 0, 0, "ONLY_IN_CPP")
             };
-            (ragc.2.clone(), ragc.3, ragc.4, ragc.5, status)
-        } else {
-            ("ONLY_IN_CPP".to_string(), 0, 0, 0, "ONLY_IN_CPP")
-        };
 
         csv_output.push_str(&format!(
             "{},{},{},{},{},{},{},{},{},{},{}\n",
-            cpp.0, cpp.1, cpp.2, cpp.3, cpp.4, cpp.5,
-            ragc_hash, ragc_comp, ragc_decomp, ragc_marker, status
+            cpp.0,
+            cpp.1,
+            cpp.2,
+            cpp.3,
+            cpp.4,
+            cpp.5,
+            ragc_hash,
+            ragc_comp,
+            ragc_decomp,
+            ragc_marker,
+            status
         ));
     }
 

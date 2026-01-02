@@ -116,11 +116,12 @@
 //! - Format version 3.0 support
 //! - SHA256-verified roundtrip testing
 
+pub mod agc_compressor;
 pub mod bloom_filter;
-pub mod env_cache;
 pub mod contig_compression;
 pub mod contig_iterator;
 pub mod decompressor;
+pub mod env_cache;
 pub mod genome_io;
 pub mod kmer;
 pub mod kmer_extract;
@@ -128,7 +129,6 @@ pub mod lz_diff;
 pub mod lz_matcher;
 pub mod memory_bounded_queue;
 pub mod preprocessing;
-pub mod agc_compressor;
 pub mod priority_queue;
 pub mod segment;
 pub mod segment_buffer;
@@ -243,10 +243,28 @@ pub mod ragc_ffi {
         // Grouping Engine FFI
         pub fn agc_grouping_engine_create(k: u32, start_group_id: u32) -> *mut std::ffi::c_void;
         pub fn agc_grouping_engine_destroy(engine: *mut std::ffi::c_void);
-        pub fn agc_grouping_engine_register(engine: *mut std::ffi::c_void, kmer_front: u64, kmer_back: u64, group_id: u32);
-        pub fn agc_grouping_engine_find_middle(engine: *mut std::ffi::c_void, front: u64, back: u64, out_middle: *mut u64) -> i32;
-        pub fn agc_grouping_engine_group_exists(engine: *mut std::ffi::c_void, kmer_front: u64, kmer_back: u64) -> i32;
-        pub fn agc_grouping_engine_get_group_id(engine: *mut std::ffi::c_void, kmer_front: u64, kmer_back: u64) -> u32;
+        pub fn agc_grouping_engine_register(
+            engine: *mut std::ffi::c_void,
+            kmer_front: u64,
+            kmer_back: u64,
+            group_id: u32,
+        );
+        pub fn agc_grouping_engine_find_middle(
+            engine: *mut std::ffi::c_void,
+            front: u64,
+            back: u64,
+            out_middle: *mut u64,
+        ) -> i32;
+        pub fn agc_grouping_engine_group_exists(
+            engine: *mut std::ffi::c_void,
+            kmer_front: u64,
+            kmer_back: u64,
+        ) -> i32;
+        pub fn agc_grouping_engine_get_group_id(
+            engine: *mut std::ffi::c_void,
+            kmer_front: u64,
+            kmer_back: u64,
+        ) -> u32;
         pub fn agc_grouping_engine_alloc_id(engine: *mut std::ffi::c_void) -> u32;
 
         // Estimate function for comparing with RAGC's estimate()
@@ -298,7 +316,12 @@ pub mod ragc_ffi {
 
     /// Compute estimate using the REAL CLZDiff_V2::Estimate from C++ AGC
     /// This is the EXACT algorithm used by find_cand_segment_with_one_splitter
-    pub fn lzdiff_v2_estimate(reference: &[u8], text: &[u8], min_match_len: u32, bound: u32) -> u32 {
+    pub fn lzdiff_v2_estimate(
+        reference: &[u8],
+        text: &[u8],
+        min_match_len: u32,
+        bound: u32,
+    ) -> u32 {
         unsafe {
             agc_lzdiff_v2_estimate(
                 reference.as_ptr(),
@@ -335,7 +358,12 @@ pub mod ragc_ffi {
         }
     }
 
-    pub fn cost_vector(prefix: bool, reference: &[u8], text: &[u8], min_match_len: u32) -> Vec<u32> {
+    pub fn cost_vector(
+        prefix: bool,
+        reference: &[u8],
+        text: &[u8],
+        min_match_len: u32,
+    ) -> Vec<u32> {
         unsafe {
             let mut out = vec![0u32; text.len()];
             let _ = agc_cost_vector(
@@ -351,25 +379,41 @@ pub mod ragc_ffi {
         }
     }
 
-    pub fn best_split(left_ref: &[u8], right_ref: &[u8], text: &[u8], min_match_len: u32, k: u32, front_lt_mid: bool, mid_lt_back: bool, should_reverse: bool) -> Option<(usize, usize, bool)> {
+    pub fn best_split(
+        left_ref: &[u8],
+        right_ref: &[u8],
+        text: &[u8],
+        min_match_len: u32,
+        k: u32,
+        front_lt_mid: bool,
+        mid_lt_back: bool,
+        should_reverse: bool,
+    ) -> Option<(usize, usize, bool)> {
         unsafe {
             let mut best: u32 = 0;
             let mut seg2: u32 = 0;
             let mut should: i32 = 0;
             let ok = agc_best_split(
-                left_ref.as_ptr(), left_ref.len(),
-                right_ref.as_ptr(), right_ref.len(),
-                text.as_ptr(), text.len(),
+                left_ref.as_ptr(),
+                left_ref.len(),
+                right_ref.as_ptr(),
+                right_ref.len(),
+                text.as_ptr(),
+                text.len(),
                 min_match_len,
                 k,
-                if front_lt_mid {1} else {0},
-                if mid_lt_back {1} else {0},
-                if should_reverse {1} else {0},
+                if front_lt_mid { 1 } else { 0 },
+                if mid_lt_back { 1 } else { 0 },
+                if should_reverse { 1 } else { 0 },
                 &mut best as *mut u32,
                 &mut seg2 as *mut u32,
                 &mut should as *mut i32,
             );
-            if ok != 0 { Some((best as usize, seg2 as usize, should != 0)) } else { None }
+            if ok != 0 {
+                Some((best as usize, seg2 as usize, should != 0))
+            } else {
+                None
+            }
         }
     }
 
@@ -377,11 +421,17 @@ pub mod ragc_ffi {
         unsafe {
             let mut out: u64 = 0;
             let ok = agc_find_middle(
-                front_neighbors.as_ptr(), front_neighbors.len(),
-                back_neighbors.as_ptr(), back_neighbors.len(),
+                front_neighbors.as_ptr(),
+                front_neighbors.len(),
+                back_neighbors.as_ptr(),
+                back_neighbors.len(),
                 &mut out as *mut u64,
             );
-            if ok != 0 { Some(out) } else { None }
+            if ok != 0 {
+                Some(out)
+            } else {
+                None
+            }
         }
     }
 
@@ -404,14 +454,21 @@ pub mod ragc_ffi {
             let mut seg2: u32 = 0;
             let mut should: i32 = 0;
             let ok = agc_decide_split(
-                front_neighbors.as_ptr(), front_neighbors.len(),
-                back_neighbors.as_ptr(), back_neighbors.len(),
-                left_ref.as_ptr(), left_ref.len(),
-                right_ref.as_ptr(), right_ref.len(),
-                text.as_ptr(), text.len(),
-                front_kmer, back_kmer,
-                min_match_len, k,
-                if should_reverse {1} else {0},
+                front_neighbors.as_ptr(),
+                front_neighbors.len(),
+                back_neighbors.as_ptr(),
+                back_neighbors.len(),
+                left_ref.as_ptr(),
+                left_ref.len(),
+                right_ref.as_ptr(),
+                right_ref.len(),
+                text.as_ptr(),
+                text.len(),
+                front_kmer,
+                back_kmer,
+                min_match_len,
+                k,
+                if should_reverse { 1 } else { 0 },
                 &mut has_mid as *mut i32,
                 &mut middle as *mut u64,
                 &mut best as *mut u32,
@@ -419,8 +476,16 @@ pub mod ragc_ffi {
                 &mut should as *mut i32,
             );
             if ok != 0 {
-                Some((has_mid != 0, middle, best as usize, seg2 as usize, should != 0))
-            } else { None }
+                Some((
+                    has_mid != 0,
+                    middle,
+                    best as usize,
+                    seg2 as usize,
+                    should != 0,
+                ))
+            } else {
+                None
+            }
         }
     }
 
@@ -447,28 +512,33 @@ pub mod ragc_ffi {
         pub fn find_middle(&self, front: u64, back: u64) -> Option<u64> {
             unsafe {
                 let mut out: u64 = 0;
-                let ok = agc_grouping_engine_find_middle(self.ptr, front, back, &mut out as *mut u64);
-                if ok != 0 { Some(out) } else { None }
+                let ok =
+                    agc_grouping_engine_find_middle(self.ptr, front, back, &mut out as *mut u64);
+                if ok != 0 {
+                    Some(out)
+                } else {
+                    None
+                }
             }
         }
 
         pub fn group_exists(&self, kmer_front: u64, kmer_back: u64) -> bool {
-            unsafe {
-                agc_grouping_engine_group_exists(self.ptr, kmer_front, kmer_back) != 0
-            }
+            unsafe { agc_grouping_engine_group_exists(self.ptr, kmer_front, kmer_back) != 0 }
         }
 
         pub fn get_group_id(&self, kmer_front: u64, kmer_back: u64) -> Option<u32> {
             unsafe {
                 let gid = agc_grouping_engine_get_group_id(self.ptr, kmer_front, kmer_back);
-                if gid == u32::MAX { None } else { Some(gid) }
+                if gid == u32::MAX {
+                    None
+                } else {
+                    Some(gid)
+                }
             }
         }
 
         pub fn alloc_group_id(&mut self) -> u32 {
-            unsafe {
-                agc_grouping_engine_alloc_id(self.ptr)
-            }
+            unsafe { agc_grouping_engine_alloc_id(self.ptr) }
         }
     }
 
@@ -486,6 +556,7 @@ pub mod ragc_ffi {
 }
 
 // Re-export commonly used types
+pub use agc_compressor::{QueueStats, StreamingQueueCompressor, StreamingQueueConfig};
 pub use contig_iterator::{MultiFileIterator, PansnFileIterator};
 pub use decompressor::{Decompressor, DecompressorConfig};
 pub use genome_io::{GenomeIO, GenomeWriter};
@@ -505,5 +576,4 @@ pub use splitters::{
     determine_splitters, determine_splitters_streaming, determine_splitters_streaming_first_sample,
     find_candidate_kmers_multi, is_hard_contig, is_splitter, two_pass_splitter_discovery,
 };
-pub use agc_compressor::{QueueStats, StreamingQueueCompressor, StreamingQueueConfig};
 pub use worker::create_agc_archive;

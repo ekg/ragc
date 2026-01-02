@@ -19,10 +19,7 @@
 /// # Returns
 /// Position where next segment should start
 #[no_mangle]
-pub extern "C" fn ragc_calculate_split_position(
-    pos: u64,
-    kmer_length: u32,
-) -> u64 {
+pub extern "C" fn ragc_calculate_split_position(pos: u64, kmer_length: u32) -> u64 {
     // Match C++ logic exactly
     // pos + 1 gives us the position after the splitter k-mer
     // Subtracting kmer_length creates the k-byte overlap
@@ -39,9 +36,7 @@ pub extern "C" fn ragc_calculate_split_position(
 /// get_part(contig, split_pos, pos + 1 - split_pos)
 /// ```
 #[no_mangle]
-pub extern "C" fn ragc_calculate_segment_end(
-    pos: u64,
-) -> u64 {
+pub extern "C" fn ragc_calculate_segment_end(pos: u64) -> u64 {
     pos + 1
 }
 
@@ -57,10 +52,7 @@ pub extern "C" fn ragc_calculate_segment_end(
 /// # Returns
 /// Length of segment
 #[no_mangle]
-pub extern "C" fn ragc_calculate_segment_length(
-    split_pos: u64,
-    segment_end: u64,
-) -> u64 {
+pub extern "C" fn ragc_calculate_segment_length(split_pos: u64, segment_end: u64) -> u64 {
     segment_end.saturating_sub(split_pos)
 }
 
@@ -136,9 +128,9 @@ mod tests {
         // Scenario: Found splitter at pos=100, k=21, current split_pos=0
         let boundary = ragc_calculate_segment_boundary(100, 0, 21);
 
-        assert_eq!(boundary.segment_end, 101);      // pos + 1
-        assert_eq!(boundary.new_split_pos, 80);     // pos + 1 - k
-        assert_eq!(boundary.segment_length, 101);   // segment_end - split_pos
+        assert_eq!(boundary.segment_end, 101); // pos + 1
+        assert_eq!(boundary.new_split_pos, 80); // pos + 1 - k
+        assert_eq!(boundary.segment_length, 101); // segment_end - split_pos
     }
 
     #[test]
@@ -146,9 +138,9 @@ mod tests {
         // Scenario: Second segment, found splitter at pos=250, k=21, current split_pos=80
         let boundary = ragc_calculate_segment_boundary(250, 80, 21);
 
-        assert_eq!(boundary.segment_end, 251);      // pos + 1
-        assert_eq!(boundary.new_split_pos, 230);    // pos + 1 - k
-        assert_eq!(boundary.segment_length, 171);   // 251 - 80
+        assert_eq!(boundary.segment_end, 251); // pos + 1
+        assert_eq!(boundary.new_split_pos, 230); // pos + 1 - k
+        assert_eq!(boundary.segment_length, 171); // 251 - 80
     }
 
     #[test]
@@ -157,7 +149,7 @@ mod tests {
         let boundary = ragc_calculate_segment_boundary(100, 0, 3);
 
         assert_eq!(boundary.segment_end, 101);
-        assert_eq!(boundary.new_split_pos, 98);  // pos + 1 - 3
+        assert_eq!(boundary.new_split_pos, 98); // pos + 1 - 3
         assert_eq!(boundary.segment_length, 101);
     }
 }

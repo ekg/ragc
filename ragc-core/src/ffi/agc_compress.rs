@@ -172,7 +172,9 @@ pub fn compress_with_rust_splitters(
         if agc_compress_create_with_rust_splitters(&params, c_samples.as_ptr(), c_samples.len()) {
             Ok(())
         } else {
-            Err(anyhow::anyhow!("[RAGC FORK] C++ AGC compression with Rust splitters failed"))
+            Err(anyhow::anyhow!(
+                "[RAGC FORK] C++ AGC compression with Rust splitters failed"
+            ))
         }
     }
 }
