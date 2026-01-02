@@ -1861,7 +1861,8 @@ impl StreamingQueueCompressor {
             let work_items: Vec<_> = groups.iter_mut()
                 .filter(|(_, buffer)| !buffer.pending_deltas.is_empty())
                 .map(|(_, buffer)| {
-                    let use_lz_encoding = buffer.group_id > 0;
+                    // FIX: Raw groups are 0-15 (group_id < 16), not just group 0
+                    let use_lz_encoding = buffer.group_id >= NO_RAW_GROUPS;
                     let mut packed_data = Vec::new();
 
                     if !use_lz_encoding && !buffer.raw_placeholder_written {
@@ -2395,9 +2396,20 @@ fn flush_pack(
             segment_in_group_ids.push((seg_idx, in_group_id));
             buffer.pending_deltas.push(contig_data);
 
-            // CRITICAL: Flush when pending_deltas reaches PACK_CARDINALITY (matching C++ AGC segment.cpp lines 51-54)
-            // C++ AGC: if (v_lzp.size() == contigs_in_pack) { store_in_archive(v_lzp); v_lzp.clear(); }
-            if buffer.pending_deltas.len() == PACK_CARDINALITY {
+            // CRITICAL: Flush pack when it reaches capacity
+            // For raw groups (group_id < 16):
+            //   - Pack 0: placeholder (position 0) + 49 segments (positions 1-49) = 50 positions
+            //   - Pack 1+: 50 segments (positions 0-49)
+            // This ensures extraction formula (pack_id = in_group_id / 50, position = in_group_id % 50) works correctly
+            let flush_threshold = if !use_lz_encoding && !buffer.raw_placeholder_written {
+                // Raw group pack 0: flush at 49 to leave room for placeholder
+                PACK_CARDINALITY - 1
+            } else {
+                // All other packs (raw pack 1+ or LZ packs): flush at 50
+                PACK_CARDINALITY
+            };
+
+            if buffer.pending_deltas.len() == flush_threshold {
                 // Compress pack WITHOUT holding any lock
                 let needs_placeholder = !use_lz_encoding && !buffer.raw_placeholder_written;
                 let pack = compress_pack(&buffer.pending_deltas, needs_placeholder, buffer.stream_id, config.compression_level)?;
@@ -2605,7 +2617,16 @@ fn flush_pack_compress_only(
             segment_in_group_ids.push((seg_idx, in_group_id));
             buffer.pending_deltas.push(contig_data);
 
-            if buffer.pending_deltas.len() == PACK_CARDINALITY {
+            // CRITICAL: Flush pack when it reaches capacity
+            // For raw groups pack 0: flush at 49 (placeholder takes position 0)
+            // For all other packs: flush at 50
+            let flush_threshold = if !use_lz_encoding && !buffer.raw_placeholder_written {
+                PACK_CARDINALITY - 1
+            } else {
+                PACK_CARDINALITY
+            };
+
+            if buffer.pending_deltas.len() == flush_threshold {
                 let needs_placeholder = !use_lz_encoding && !buffer.raw_placeholder_written;
                 let pack = compress_pack(&buffer.pending_deltas, needs_placeholder, buffer.stream_id, config.compression_level)?;
                 archive_writes.push(pack);
