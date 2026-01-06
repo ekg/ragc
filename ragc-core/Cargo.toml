@@ -17,7 +17,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Local dependencies
-ragc-common = { path = "../ragc-common", version = "0.1.0" }
+ragc-common = { path = "../ragc-common", version = "0.1.1" }
 
 # Workspace dependencies
 serde = { workspace = true }

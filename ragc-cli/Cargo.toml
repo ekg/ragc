@@ -21,8 +21,8 @@ path = "src/bin/split_fasta.rs"
 
 [dependencies]
 # Local dependencies
-ragc-common = { path = "../ragc-common", version = "0.1.0" }
-ragc-core = { path = "../ragc-core", version = "0.1.0" }
+ragc-common = { path = "../ragc-common", version = "0.1.1" }
+ragc-core = { path = "../ragc-core", version = "0.1.1" }
 
 # Workspace dependencies
 clap = { workspace = true }
