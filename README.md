@@ -197,6 +197,10 @@ Core compression/decompression algorithms:
 Command-line interface:
 - **create** - Create AGC archive from FASTA files
 - **getset** - Extract samples from archive
+- **listset** - List sample names in archive
+- **listctg** - List contig names for a sample
+- **info** - Display archive information
+- **inspect** - Inspect archive structure (groups, segments, compression)
 
 ## Architecture
 
@@ -323,8 +327,8 @@ This implementation was created as a guided development with Claude Code. The co
 - No minimizer-based optimization (future enhancement)
 
 **CLI:**
-- Limited commands implemented (create, getset, listset, listctg, getctg, inspect)
-- Some C++ AGC commands not yet ported (getcol, append, etc.)
+- Core commands implemented (create, getset, listset, listctg, info, inspect)
+- Some C++ AGC commands not yet ported (getcol, getctg, append, etc.)
 
 ### Format Compatibility
 - Archive version: 3.0 (matches C++ AGC)
