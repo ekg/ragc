@@ -560,7 +560,7 @@ pub mod ragc_ffi {
 pub use agc_compressor::{QueueStats, StreamingQueueCompressor, StreamingQueueConfig};
 pub use contig_iterator::{MultiFileIterator, PansnFileIterator};
 pub use decompressor::{Decompressor, DecompressorConfig};
-pub use genome_io::{GenomeIO, GenomeWriter};
+pub use genome_io::{GenomeIO, GenomeWriter, CNV_NUM};
 pub use kmer::{
     canonical_kmer, decode_base, encode_base, reverse_complement, reverse_complement_kmer,
 };
