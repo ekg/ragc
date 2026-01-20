@@ -228,6 +228,180 @@ impl Decompressor {
         result.ok_or_else(|| anyhow!("Sample not found: {sample_name}"))
     }
 
+    /// Get the length of a contig without decompressing it
+    ///
+    /// This is O(1) once segment metadata is loaded, as it computes the length
+    /// from the `raw_length` fields in segment descriptors.
+    ///
+    /// # Arguments
+    /// * `sample_name` - The sample containing the contig
+    /// * `contig_name` - The contig name
+    ///
+    /// # Returns
+    /// The total length of the contig in bases
+    pub fn get_contig_length(&mut self, sample_name: &str, contig_name: &str) -> Result<usize> {
+        // Load contig batches if needed
+        if self
+            .collection
+            .get_no_contigs(sample_name)
+            .is_none_or(|count| count == 0)
+        {
+            let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
+            for batch_id in 0..num_batches {
+                self.collection
+                    .load_contig_batch(&mut self.archive, batch_id)?;
+            }
+        }
+
+        // Get segment descriptors
+        let segments = self
+            .collection
+            .get_contig_desc(sample_name, contig_name)
+            .ok_or_else(|| anyhow!("Contig not found: {sample_name}/{contig_name}"))?;
+
+        // Compute length: first segment fully counted, subsequent segments have k-mer overlap
+        let kmer_len = self.kmer_length as usize;
+        let mut total_length = 0usize;
+
+        for (i, segment) in segments.iter().enumerate() {
+            if i == 0 {
+                total_length += segment.raw_length as usize;
+            } else {
+                // Subsequent segments overlap by kmer_length bases
+                total_length += segment.raw_length as usize - kmer_len;
+            }
+        }
+
+        Ok(total_length)
+    }
+
+    /// Extract a subsequence from a contig
+    ///
+    /// This is more efficient than `get_contig()` for small ranges, as it only
+    /// decompresses the segments that overlap the requested range.
+    ///
+    /// # Arguments
+    /// * `sample_name` - The sample containing the contig
+    /// * `contig_name` - The contig name
+    /// * `start` - 0-based start position (inclusive)
+    /// * `end` - 0-based end position (exclusive)
+    ///
+    /// # Returns
+    /// The subsequence as `Vec<u8>` in numeric encoding (0=A, 1=C, 2=G, 3=T)
+    ///
+    /// # Example
+    /// ```no_run
+    /// use ragc_core::{Decompressor, DecompressorConfig};
+    ///
+    /// let mut dec = Decompressor::open("data.agc", DecompressorConfig::default())?;
+    ///
+    /// // Extract bases 1000-2000 from chr1
+    /// let seq = dec.get_contig_range("sample", "chr1", 1000, 2000)?;
+    /// assert_eq!(seq.len(), 1000);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn get_contig_range(
+        &mut self,
+        sample_name: &str,
+        contig_name: &str,
+        start: usize,
+        end: usize,
+    ) -> Result<Contig> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+
+        // Load contig batches if needed
+        if self
+            .collection
+            .get_no_contigs(sample_name)
+            .is_none_or(|count| count == 0)
+        {
+            let num_batches = self.collection.get_no_contig_batches(&self.archive)?;
+            for batch_id in 0..num_batches {
+                self.collection
+                    .load_contig_batch(&mut self.archive, batch_id)?;
+            }
+        }
+
+        // Get segment descriptors
+        let segments = self
+            .collection
+            .get_contig_desc(sample_name, contig_name)
+            .ok_or_else(|| anyhow!("Contig not found: {sample_name}/{contig_name}"))?;
+
+        let kmer_len = self.kmer_length as usize;
+
+        // Calculate segment positions in the contig
+        // Each entry is (segment_start_in_contig, segment_end_in_contig, segment_idx)
+        let mut segment_ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(segments.len());
+        let mut contig_pos = 0usize;
+
+        for (i, segment) in segments.iter().enumerate() {
+            let seg_len = segment.raw_length as usize;
+            let contribution = if i == 0 { seg_len } else { seg_len - kmer_len };
+            let seg_start = contig_pos;
+            let seg_end = contig_pos + contribution;
+            segment_ranges.push((seg_start, seg_end, i));
+            contig_pos = seg_end;
+        }
+
+        let contig_len = contig_pos;
+
+        // Clamp end to contig length
+        let end = end.min(contig_len);
+        if start >= end {
+            return Ok(Vec::new());
+        }
+
+        // Find segments that overlap [start, end)
+        let mut result = Vec::with_capacity(end - start);
+
+        for (seg_start, seg_end, seg_idx) in segment_ranges {
+            // Skip segments entirely before the range
+            if seg_end <= start {
+                continue;
+            }
+            // Stop if we've passed the range
+            if seg_start >= end {
+                break;
+            }
+
+            // This segment overlaps the range - decompress it
+            let segment_desc = &segments[seg_idx];
+            let mut segment_data = self.get_segment(segment_desc)?;
+
+            // Apply reverse complement if needed
+            if segment_desc.is_rev_comp {
+                segment_data = Self::reverse_complement_segment(&segment_data);
+            }
+
+            // Determine which part of this segment's contribution we need
+            // For segment 0: contribution starts at segment byte 0
+            // For segment 1+: contribution starts at segment byte kmer_len
+            let contribution_start_in_segment = if seg_idx == 0 { 0 } else { kmer_len };
+
+            // Map [start, end) back to positions within segment_data
+            // seg_start..seg_end maps to segment_data[contribution_start_in_segment..]
+            //
+            // If requested range starts at position P in contig, and segment contributes
+            // from seg_start, then the offset within the contribution is P - seg_start.
+            // The actual byte in segment_data is contribution_start_in_segment + (P - seg_start).
+
+            let range_start_in_contribution = start.saturating_sub(seg_start);
+            let range_end_in_contribution = (end - seg_start).min(seg_end - seg_start);
+
+            let data_start = contribution_start_in_segment + range_start_in_contribution;
+            let data_end = contribution_start_in_segment + range_end_in_contribution;
+
+            if data_start < data_end && data_end <= segment_data.len() {
+                result.extend_from_slice(&segment_data[data_start..data_end]);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Extract a specific contig from a sample
     pub fn get_contig(&mut self, sample_name: &str, contig_name: &str) -> Result<Contig> {
         // Load ALL contig batches if sample not found (samples may be in any batch)

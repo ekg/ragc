@@ -136,6 +136,54 @@ enum Commands {
         verbosity: u32,
     },
 
+    /// Extract a subsequence from a contig (efficient range query)
+    Getrange {
+        /// Input archive file path
+        archive: PathBuf,
+
+        /// Sample name containing the contig
+        #[arg(short = 's', long)]
+        sample: String,
+
+        /// Contig name
+        #[arg(short = 'c', long)]
+        contig: String,
+
+        /// Start position (0-based, inclusive)
+        #[arg(long)]
+        start: usize,
+
+        /// End position (0-based, exclusive). If omitted, extracts to end of contig.
+        #[arg(long)]
+        end: Option<usize>,
+
+        /// Output file (default: stdout)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+
+        /// Output format: fasta or raw (default: fasta)
+        #[arg(short = 'f', long, default_value = "fasta")]
+        format: String,
+
+        /// Verbosity level (0=quiet, 1=normal, 2=verbose)
+        #[arg(short = 'v', long, default_value_t = 0)]
+        verbosity: u32,
+    },
+
+    /// Get the length of a contig without extracting it
+    Ctglen {
+        /// Input archive file path
+        archive: PathBuf,
+
+        /// Sample name containing the contig
+        #[arg(short = 's', long)]
+        sample: String,
+
+        /// Contig name
+        #[arg(short = 'c', long)]
+        contig: String,
+    },
+
     /// List sample names in archive
     Listset {
         /// Input archive file path
@@ -344,6 +392,25 @@ fn main() -> Result<()> {
             output,
             verbosity,
         } => getset_command(archive, samples, prefix, output, verbosity)?,
+
+        Commands::Getrange {
+            archive,
+            sample,
+            contig,
+            start,
+            end,
+            output,
+            format,
+            verbosity,
+        } => getrange_command(
+            archive, sample, contig, start, end, output, format, verbosity,
+        )?,
+
+        Commands::Ctglen {
+            archive,
+            sample,
+            contig,
+        } => ctglen_command(archive, sample, contig)?,
 
         Commands::Listset { archive, output } => listset_command(archive, output)?,
 
@@ -1153,6 +1220,92 @@ fn listctg_command(archive: PathBuf, samples: Vec<String>, output: Option<PathBu
             println!("{line}");
         }
     }
+
+    decompressor.close()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn getrange_command(
+    archive: PathBuf,
+    sample: String,
+    contig: String,
+    start: usize,
+    end: Option<usize>,
+    output: Option<PathBuf>,
+    format: String,
+    verbosity: u32,
+) -> Result<()> {
+    use ragc_core::CNV_NUM;
+
+    let archive_str = archive
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
+
+    let config = DecompressorConfig { verbosity };
+    let mut decompressor = Decompressor::open(archive_str, config)?;
+
+    // Get end position (use contig length if not specified)
+    let end = match end {
+        Some(e) => e,
+        None => decompressor.get_contig_length(&sample, &contig)?,
+    };
+
+    if verbosity > 0 {
+        eprintln!(
+            "Extracting {}:{} range {}..{} ({} bp)",
+            sample,
+            contig,
+            start,
+            end,
+            end.saturating_sub(start)
+        );
+    }
+
+    // Extract the range
+    let sequence = decompressor.get_contig_range(&sample, &contig, start, end)?;
+
+    // Convert to ASCII
+    let ascii_seq: Vec<u8> = sequence
+        .iter()
+        .map(|&b| if b < 16 { CNV_NUM[b as usize] } else { b'N' })
+        .collect();
+
+    // Output
+    let output_data = if format == "raw" {
+        ascii_seq
+    } else {
+        // FASTA format
+        let header = format!(">{}:{} {}:{}-{}\n", sample, contig, contig, start, end);
+        let mut fasta = header.into_bytes();
+        // Wrap at 80 characters
+        for chunk in ascii_seq.chunks(80) {
+            fasta.extend_from_slice(chunk);
+            fasta.push(b'\n');
+        }
+        fasta
+    };
+
+    if let Some(output_path) = output {
+        std::fs::write(output_path, &output_data)?;
+    } else {
+        io::stdout().write_all(&output_data)?;
+    }
+
+    decompressor.close()?;
+    Ok(())
+}
+
+fn ctglen_command(archive: PathBuf, sample: String, contig: String) -> Result<()> {
+    let archive_str = archive
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid archive path"))?;
+
+    let config = DecompressorConfig { verbosity: 0 };
+    let mut decompressor = Decompressor::open(archive_str, config)?;
+
+    let length = decompressor.get_contig_length(&sample, &contig)?;
+    println!("{}", length);
 
     decompressor.close()?;
     Ok(())
