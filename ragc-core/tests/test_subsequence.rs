@@ -16,8 +16,8 @@ fn create_test_archive(path: &str, contigs: Vec<(&str, &str, Vec<u8>)>) {
     };
 
     let splitters = AHashSet::new();
-    let mut compressor =
-        StreamingQueueCompressor::with_splitters(path, config, splitters).expect("Failed to create compressor");
+    let mut compressor = StreamingQueueCompressor::with_splitters(path, config, splitters)
+        .expect("Failed to create compressor");
 
     // Push all contigs
     for (sample, contig, data) in contigs {
@@ -48,8 +48,12 @@ fn test_get_contig_length() {
     let config = DecompressorConfig { verbosity: 0 };
     let mut dec = Decompressor::open(archive_path, config).expect("Failed to open archive");
 
-    let len1 = dec.get_contig_length("sample1", "chr1").expect("Failed to get length");
-    let len2 = dec.get_contig_length("sample1", "chr2").expect("Failed to get length");
+    let len1 = dec
+        .get_contig_length("sample1", "chr1")
+        .expect("Failed to get length");
+    let len2 = dec
+        .get_contig_length("sample1", "chr2")
+        .expect("Failed to get length");
 
     assert_eq!(len1, contig1_len, "chr1 length mismatch");
     assert_eq!(len2, contig2_len, "chr2 length mismatch");
@@ -77,17 +81,19 @@ fn test_get_contig_range_basic() {
     let mut dec = Decompressor::open(archive_path, config).expect("Failed to open archive");
 
     // Get full contig for comparison
-    let full_contig = dec.get_contig("sample1", "chr1").expect("Failed to get full contig");
+    let full_contig = dec
+        .get_contig("sample1", "chr1")
+        .expect("Failed to get full contig");
 
     // Test various ranges
     let test_cases = vec![
-        (0, 100),      // Beginning
-        (500, 600),    // Middle of first section
-        (900, 1100),   // Across A/C boundary
-        (2000, 3000),  // Middle (all G)
-        (3900, 4000),  // End
-        (0, 4000),     // Full range
-        (1000, 1001),  // Single base
+        (0, 100),     // Beginning
+        (500, 600),   // Middle of first section
+        (900, 1100),  // Across A/C boundary
+        (2000, 3000), // Middle (all G)
+        (3900, 4000), // End
+        (0, 4000),    // Full range
+        (1000, 1001), // Single base
     ];
 
     for (start, end) in test_cases {
@@ -165,16 +171,18 @@ fn test_get_contig_range_large_contig() {
     let mut dec = Decompressor::open(archive_path, config).expect("Failed to open archive");
 
     // Get full contig for comparison
-    let full_contig = dec.get_contig("sample1", "chr1").expect("Failed to get full contig");
+    let full_contig = dec
+        .get_contig("sample1", "chr1")
+        .expect("Failed to get full contig");
     assert_eq!(full_contig.len(), contig_size);
 
     // Test ranges across segment boundaries (~60KB segments)
     let test_cases = vec![
-        (0, 1000),           // First segment only
-        (59000, 61000),      // Across first segment boundary
-        (119000, 121000),    // Across second segment boundary
-        (250000, 260000),    // Middle
-        (490000, 500000),    // End
+        (0, 1000),        // First segment only
+        (59000, 61000),   // Across first segment boundary
+        (119000, 121000), // Across second segment boundary
+        (250000, 260000), // Middle
+        (490000, 500000), // End
     ];
 
     for (start, end) in test_cases {
@@ -201,7 +209,9 @@ fn test_get_contig_range_large_contig() {
     }
 
     // Verify length calculation
-    let reported_len = dec.get_contig_length("sample1", "chr1").expect("Failed to get length");
+    let reported_len = dec
+        .get_contig_length("sample1", "chr1")
+        .expect("Failed to get length");
     assert_eq!(reported_len, contig_size, "Length calculation mismatch");
 
     // Clean up

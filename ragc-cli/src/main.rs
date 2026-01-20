@@ -402,7 +402,9 @@ fn main() -> Result<()> {
             output,
             format,
             verbosity,
-        } => getrange_command(archive, sample, contig, start, end, output, format, verbosity)?,
+        } => getrange_command(
+            archive, sample, contig, start, end, output, format, verbosity,
+        )?,
 
         Commands::Ctglen {
             archive,
