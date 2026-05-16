@@ -286,6 +286,10 @@ pub struct CollectionV3 {
 
     // For in_group_id delta encoding
     in_group_ids: Vec<i32>,
+
+    /// Whether segment details (group_id, in_group_id, etc.) have been loaded.
+    /// False after names-only loading; true after full load_contig_batch().
+    details_loaded: bool,
 }
 
 impl Default for CollectionV3 {
@@ -311,6 +315,7 @@ impl CollectionV3 {
             no_samples_in_last_batch: 0,
             samples_loaded: 0,
             in_group_ids: Vec::new(),
+            details_loaded: false,
         }
     }
 
@@ -1151,8 +1156,54 @@ impl CollectionV3 {
 
         // Update cumulative counter for next batch
         self.samples_loaded += self.no_samples_in_last_batch;
+        self.details_loaded = true;
 
         Ok(())
+    }
+
+    /// Load only contig names from a batch, skipping segment details.
+    /// This is much faster than `load_contig_batch()` because it avoids
+    /// decompressing the 5 ZSTD sub-streams in `collection-details`.
+    pub fn load_contig_names_batch(&mut self, archive: &mut Archive, id_batch: usize) -> Result<()> {
+        let i_sample = self.samples_loaded;
+
+        let contig_stream_id = self
+            .collection_contigs_id
+            .context("collection-contigs stream not found")?;
+
+        let (v_tmp_names, raw_size_names) = archive.get_part_by_id(contig_stream_id, id_batch)?;
+        let v_data_names =
+            zstd::decode_all(&v_tmp_names[..]).context("Failed to decompress contig names")?;
+
+        if v_data_names.len() != raw_size_names as usize {
+            anyhow::bail!(
+                "Decompressed size mismatch for contig names: expected {}, got {}",
+                raw_size_names,
+                v_data_names.len()
+            );
+        }
+
+        self.deserialize_contig_names(&v_data_names, i_sample)?;
+
+        // Update cumulative counter for next batch
+        self.samples_loaded += self.no_samples_in_last_batch;
+
+        Ok(())
+    }
+
+    /// Whether segment details have been loaded (vs names-only).
+    pub fn are_details_loaded(&self) -> bool {
+        self.details_loaded
+    }
+
+    /// Reset the samples_loaded counter so batches can be re-loaded.
+    /// Also invalidates `details_loaded`, because a subsequent names-only reload
+    /// calls `deserialize_contig_names` which clears `contigs[]` (wiping any
+    /// previously-loaded segment descriptors). Full-load paths immediately set
+    /// `details_loaded = true` again at the end of `load_contig_batch`.
+    pub fn reset_samples_loaded(&mut self) {
+        self.samples_loaded = 0;
+        self.details_loaded = false;
     }
 
     /// Store a batch of contigs (names + details)
